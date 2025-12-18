@@ -30,6 +30,7 @@ option("target_32bit")
 option_end()
 
 includes("runtime")
+includes("util/symcc_fuzzing_cpp")
 
 target("SymCC")
     set_kind("shared")

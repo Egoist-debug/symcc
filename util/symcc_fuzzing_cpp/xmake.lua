@@ -1,0 +1,8 @@
+target("symcc_fuzzing_helper")
+  set_kind("binary")
+  set_default(false)
+  set_group("tools")
+  set_languages("c++17")
+  add_files("src/**.cpp")
+  add_includedirs("include", {public = false})
+  add_syslinks("pthread")
