@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 
@@ -19,12 +20,22 @@ struct CLI {
   std::filesystem::path output_dir;
   std::string name;
   bool verbose = false;
+  bool stdin_is_filename = false;  // -f: stdin 传入文件名而不是数据
   std::vector<std::string> command;
+  std::vector<std::string> afl_target;  // AFL 编译的程序，用于 afl-showmap
 };
 
 static void usage() {
   std::cerr
-      << "Usage: symcc_fuzzing_helper -a <fuzzer_name> -o <afl_output_dir> -n <symcc_name> [-v] -- <program> [args...]\n";
+      << "Usage: symcc_fuzzing_helper -a <fuzzer_name> -o <afl_output_dir> -n <symcc_name> [-v] [-t <afl_prog>] -- <symcc_program> [args...]\n"
+      << "\n"
+      << "Options:\n"
+      << "  -a <name>    Name of the AFL fuzzer instance\n"
+      << "  -o <dir>     AFL output directory\n"
+      << "  -n <name>    Name for this SymCC instance\n"
+      << "  -v           Verbose output\n"
+      << "  -t <prog>    AFL-compiled target for afl-showmap (default: same as SymCC target)\n"
+      << "  @@           Use @@ in command for file input mode\n";
 }
 
 static CLI parse_args(int argc, char** argv) {
@@ -40,6 +51,17 @@ static CLI parse_args(int argc, char** argv) {
       o.name = argv[++i];
     } else if (a == "-v") {
       o.verbose = true;
+    } else if (a == "-t" && i + 1 < argc) {
+      // AFL target 可以包含参数，用逗号分隔
+      std::string target_str = argv[++i];
+      std::istringstream iss(target_str);
+      std::string token;
+      while (std::getline(iss, token, ',')) {
+        if (!token.empty()) o.afl_target.push_back(token);
+      }
+    } else if (a == "-h" || a == "--help") {
+      usage();
+      std::exit(0);
     } else if (a == "--") {
       ++i;
       break;
@@ -130,20 +152,50 @@ static State init_state(const std::filesystem::path& symcc_dir) {
 
 enum class TestcaseResult { Uninteresting, New, Hang, Crash };
 
+// 从父测试用例文件名提取 ID (格式: id:NNNNNN,...)
+static std::string extract_parent_id(const std::filesystem::path& parent) {
+  auto name = parent.filename().string();
+  // 格式: id:NNNNNN,...
+  if (name.rfind("id:", 0) == 0 && name.size() >= 9) {
+    return name.substr(3, 6);
+  }
+  return "000000";
+}
+
 static TestcaseResult process_new_testcase(const std::filesystem::path& testcase,
                                            const std::filesystem::path& parent,
                                            const std::filesystem::path& tmp_dir,
                                            const AflConfig& afl,
                                            State& state,
                                            const Logger& log) {
-  log.debug("Processing test case " + testcase.string());
-  const auto testcase_bitmap_path = tmp_dir / "testcase_bitmap";
-  auto r = afl.run_showmap(testcase_bitmap_path, testcase);
+  // log.debug("Processing test case " + testcase.string());
+  // 每个测试用例使用不同的 bitmap 文件避免冲突
+  const auto testcase_bitmap_path = tmp_dir / ("bitmap_" + testcase.filename().string());
+  
+  AflShowmapResult r;
+  try {
+    r = afl.run_showmap(testcase_bitmap_path, testcase);
+  } catch (const std::exception& e) {
+    log.warn("afl-showmap failed: " + std::string(e.what()));
+    return TestcaseResult::Uninteresting;
+  }
 
-  if (r.kind == AflShowmapResult::Kind::Success) {
+  if (r.kind == AflShowmapResult::Kind::Success && r.bitmap.has_value()) {
     const bool interesting = state.current_bitmap.merge(*r.bitmap);
     if (interesting) {
-      copy_testcase(testcase, state.queue, parent);
+      // log.debug("Test case provides new coverage!");
+      // 复制到 SymCC 队列
+      try {
+        copy_testcase(testcase, state.queue, parent);
+      } catch (...) {}
+      
+      // 关键：复制到 AFL 队列让 AFL 继续 fuzz
+      const auto src_id = extract_parent_id(parent);
+      try {
+        afl.copy_to_afl_queue(testcase, src_id);
+      } catch (const std::exception& e) {
+        log.warn("Failed to copy to AFL queue: " + std::string(e.what()));
+      }
       return TestcaseResult::New;
     }
     return TestcaseResult::Uninteresting;
@@ -153,9 +205,16 @@ static TestcaseResult process_new_testcase(const std::filesystem::path& testcase
     return TestcaseResult::Hang;
   }
 
+  // Crash
   log.info("Test case " + testcase.string() + " crashes afl-showmap; archiving");
-  copy_testcase(testcase, state.crashes, parent);
-  copy_testcase(testcase, state.queue, parent);
+  try {
+    copy_testcase(testcase, state.crashes, parent);
+    // 崩溃用例也放入 AFL 队列
+    const auto src_id = extract_parent_id(parent);
+    afl.copy_to_afl_queue(testcase, src_id);
+  } catch (const std::exception& e) {
+    log.warn("Failed to archive crash: " + std::string(e.what()));
+  }
   return TestcaseResult::Crash;
 }
 
@@ -164,7 +223,7 @@ static void test_input(const std::filesystem::path& input,
                        const AflConfig& afl,
                        State& state,
                        const Logger& log) {
-  log.info("Running on input " + input.string());
+  log.info("Running SymCC on input " + input.string());
 
   const auto tmp_dir = create_temp_dir("symcc_fuzzing");
   const auto output_dir = tmp_dir / "output";
@@ -172,20 +231,37 @@ static void test_input(const std::filesystem::path& input,
   std::uint64_t num_interesting = 0;
   std::uint64_t num_total = 0;
 
-  auto res = symcc.run(input, output_dir);
+  SymCCResult res;
+  try {
+    res = symcc.run(input, output_dir);
+  } catch (const std::exception& e) {
+    log.error("SymCC execution failed: " + std::string(e.what()));
+    state.processed_files.insert(input.string());
+    // 清理临时目录
+    std::error_code ec;
+    std::filesystem::remove_all(tmp_dir, ec);
+    return;
+  }
+
   for (const auto& new_test : res.test_cases) {
     const auto tr = process_new_testcase(new_test, input, tmp_dir, afl, state, log);
     num_total += 1;
     if (tr == TestcaseResult::New) num_interesting += 1;
   }
-  log.info("Generated " + std::to_string(num_total) + " test cases (" + std::to_string(num_interesting) + " new)");
+  log.info("Generated " + std::to_string(num_total) + " test cases, copied " + std::to_string(num_interesting) + " to AFL queue");
 
   if (res.killed) {
     log.info("The target process was killed (probably timeout/OOM); archiving to " + state.hangs.path.string());
-    copy_testcase(input, state.hangs, input);
+    try {
+      copy_testcase(input, state.hangs, input);
+    } catch (...) {}
   }
   state.processed_files.insert(input.string());
   state.stats.add(res);
+
+  // 清理临时目录
+  std::error_code ec;
+  std::filesystem::remove_all(tmp_dir, ec);
 }
 
 int main(int argc, char** argv) {
@@ -193,33 +269,67 @@ int main(int argc, char** argv) {
     auto options = parse_args(argc, argv);
     Logger log{options.verbose};
 
+    log.info("SymCC Fuzzing Helper (C++ version) starting...");
+    log.info("AFL fuzzer: " + options.fuzzer_name);
+    log.info("Output dir: " + options.output_dir.string());
+
+    // 检查用户指定的目标程序是否存在
+    if (!options.command.empty()) {
+      std::filesystem::path target_bin = options.command[0];
+      if (!std::filesystem::exists(target_bin)) {
+        log.error("Target program does not exist: " + target_bin.string());
+        log.error("Please provide the path to SymCC-compiled binary!");
+        return 1;
+      }
+      log.info("Target binary: " + target_bin.string());
+    }
+
     if (!std::filesystem::is_directory(options.output_dir)) {
       log.error("The directory " + options.output_dir.string() + " does not exist!");
-      return 0;
+      return 1;
     }
 
-    auto afl_queue = options.output_dir / options.fuzzer_name / "queue";
+    // AFL 目录结构: output_dir / name / fuzzer_name
+    const auto fuzzer_dir = options.output_dir / options.name / options.fuzzer_name;
+    auto afl_queue = fuzzer_dir / "queue";
     if (!std::filesystem::is_directory(afl_queue)) {
       log.error("The AFL queue " + afl_queue.string() + " does not exist!");
-      return 0;
+      return 1;
     }
 
-    const auto symcc_dir = options.output_dir / options.name;
+    // SymCC 输出目录: output_dir / name / symcc_name
+    const auto symcc_dir = options.output_dir / options.name / (options.name + "_symcc");
     if (std::filesystem::is_directory(symcc_dir)) {
       log.error(symcc_dir.string() + " already exists; resuming is not supported");
-      return 0;
+      return 1;
     }
 
-    auto symcc = SymCC::make(symcc_dir, options.command);
-    auto afl = AflConfig::load_from_fuzzer_output(options.output_dir / options.fuzzer_name);
+    auto symcc = SymCC::make(symcc_dir, options.command, options.stdin_is_filename);
+    // log.debug("SymCC config: use_stdin=" + std::string(symcc.use_standard_input ? "yes" : "no") +
+    //           ", stdin_is_filename=" + std::string(symcc.stdin_is_filename ? "yes" : "no"));
+    
+    // 如果用户没指定 AFL target，默认使用和 SymCC 相同的命令
+    std::vector<std::string> afl_target = options.afl_target;
+    if (afl_target.empty()) {
+      // 警告：fuzzer_stats 中的 target 可能与 SymCC 测试的 target 不同
+      log.warn("No AFL target specified (-t), will use target from fuzzer_stats");
+      log.warn("If afl-showmap times out, specify AFL-compiled target with -t <path>");
+    } else {
+      log.info("Using custom AFL target: " + afl_target[0]);
+    }
+    
+    auto afl = AflConfig::load_from_fuzzer_output(fuzzer_dir, afl_target);
+    log.info("AFL++ map size: " + std::to_string(afl.map_size));
+    // log.debug("AFL showmap: " + afl.showmap_path.string());
+    // log.debug("Target command: " + (afl.target_command.empty() ? "(empty)" : afl.target_command[0]));
+    
     State state = init_state(symcc_dir);
-
-    log.debug("AFL++ map size detected: " + std::to_string(afl.map_size));
+    log.info("SymCC directory created: " + symcc_dir.string());
 
     while (true) {
       auto next = afl.best_new_testcase(state.processed_files);
       if (!next.has_value()) {
-        log.debug("Waiting for new test cases...");
+        // log.debug("Waiting for new test cases...");
         std::this_thread::sleep_for(std::chrono::seconds(5));
       } else {
         test_input(*next, symcc, afl, state, log);
@@ -230,6 +340,11 @@ int main(int argc, char** argv) {
         state.stats.log(state.stats_file);
         state.stats_file.flush();
         state.last_stats_ms = now;
+        
+        // 控制台输出简要统计
+        log.info("Stats: ok=" + std::to_string(state.stats.ok_count) +
+                 " fail=" + std::to_string(state.stats.fail_count) +
+                 " processed=" + std::to_string(state.processed_files.size()));
       }
     }
   } catch (const std::exception& e) {

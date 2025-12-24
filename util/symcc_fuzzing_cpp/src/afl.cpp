@@ -5,10 +5,13 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 namespace symcc_fuzzing {
@@ -116,7 +119,8 @@ static std::string read_file_as_string(const std::filesystem::path& p) {
   return ss.str();
 }
 
-AflConfig AflConfig::load_from_fuzzer_output(const std::filesystem::path& fuzzer_output_dir) {
+AflConfig AflConfig::load_from_fuzzer_output(const std::filesystem::path& fuzzer_output_dir,
+                                             const std::vector<std::string>& custom_target) {
   const auto stats_path = fuzzer_output_dir / "fuzzer_stats";
   const auto afl_stats = read_file_as_string(stats_path);
 
@@ -138,33 +142,54 @@ AflConfig AflConfig::load_from_fuzzer_output(const std::filesystem::path& fuzzer
   if (afl_command.empty()) throw std::runtime_error("Unexpected empty AFL command line");
 
   std::vector<std::string> target_command;
-  {
+  
+  // 如果用户指定了自定义 target，使用它；否则从 fuzzer_stats 解析
+  if (!custom_target.empty()) {
+    target_command = custom_target;
+  } else {
     bool seen_sep = false;
     for (const auto& tok : afl_command) {
       if (!seen_sep) {
         if (tok == "--") {
           seen_sep = true;
-          target_command.push_back(tok);
+          // 不把 "--" 放入 target_command
         }
       } else {
         target_command.push_back(tok);
       }
     }
-  }
-  if (target_command.empty() || target_command.front() != "--") {
-    throw std::runtime_error("Cannot locate '--' separator in command_line from fuzzer_stats");
+    if (target_command.empty()) {
+      throw std::runtime_error("Cannot locate '--' separator or target command in command_line from fuzzer_stats");
+    }
   }
 
+  // 查找 afl-showmap：优先使用 AFL 二进制目录，否则用系统 PATH
   std::filesystem::path afl_bin = afl_command[0];
   std::filesystem::path afl_bin_dir = afl_bin.parent_path();
-  if (afl_bin_dir.empty()) afl_bin_dir = ".";
+  
+  std::filesystem::path showmap_path;
+  if (!afl_bin_dir.empty() && afl_bin_dir != ".") {
+    showmap_path = afl_bin_dir / "afl-showmap";
+  }
+  // 如果路径不存在或为空，尝试常见位置
+  if (showmap_path.empty() || !std::filesystem::exists(showmap_path)) {
+    if (std::filesystem::exists("/usr/local/bin/afl-showmap")) {
+      showmap_path = "/usr/local/bin/afl-showmap";
+    } else if (std::filesystem::exists("/usr/bin/afl-showmap")) {
+      showmap_path = "/usr/bin/afl-showmap";
+    } else {
+      // 最后尝试 PATH
+      showmap_path = "afl-showmap";
+    }
+  }
 
   AflConfig cfg;
-  cfg.showmap_path = afl_bin_dir / "afl-showmap";
+  cfg.showmap_path = showmap_path;
   cfg.target_command = std::move(target_command);
   cfg.use_standard_input = (std::find(cfg.target_command.begin(), cfg.target_command.end(), "@@") == cfg.target_command.end());
   cfg.use_qemu_mode = (std::find(afl_command.begin(), afl_command.end(), "-Q") != afl_command.end());
   cfg.queue_dir = fuzzer_output_dir / "queue";
+  cfg.fuzzer_output_dir = fuzzer_output_dir;
   cfg.map_size = parse_map_size_from_fuzzer_stats(stats_path);
   return cfg;
 }
@@ -227,8 +252,12 @@ AflShowmapResult AflConfig::run_showmap(const std::filesystem::path& bitmap_out,
   env["AFL_MAP_SIZE"] = std::to_string(map_size);
   env["AFL_MAPSIZE"] = std::to_string(map_size);
 
+  // 工作目录设置为 output 目录的父目录（即 AFL 主目录）
+  // 这样相对路径（如 ./dist/sbin/named）能正确解析
+  auto working_dir = fuzzer_output_dir.parent_path();
+
   const std::optional<std::filesystem::path> stdin_file = use_standard_input ? std::make_optional(testcase) : std::nullopt;
-  auto pr = run_process(argv, env, stdin_file, false);
+  auto pr = run_process(argv, env, stdin_file, false, working_dir);
 
   if (pr.exit_code == 0) {
     auto bmp = read_binary(bitmap_out);
@@ -241,6 +270,25 @@ AflShowmapResult AflConfig::run_showmap(const std::filesystem::path& bitmap_out,
     return {AflShowmapResult::Kind::Crash, std::nullopt};
   }
   throw std::runtime_error("Unexpected return code from afl-showmap: " + std::to_string(pr.exit_code));
+}
+
+void AflConfig::copy_to_afl_queue(const std::filesystem::path& testcase,
+                                  const std::string& src_id) const {
+  // 生成唯一文件名，放入 AFL 队列
+  // 格式: id:NNNNNN,src:XXXXXX,symcc
+  static std::atomic<std::uint64_t> counter{0};
+  
+  std::ostringstream name;
+  name << "id:" << std::setw(6) << std::setfill('0') << counter.fetch_add(1);
+  name << ",src:" << src_id << ",symcc";
+  
+  auto dst = queue_dir / name.str();
+  std::error_code ec;
+  std::filesystem::copy_file(testcase, dst, std::filesystem::copy_options::overwrite_existing, ec);
+  if (ec) {
+    // 非致命错误，只记录日志
+    // throw std::runtime_error("Failed to copy to AFL queue: " + ec.message());
+  }
 }
 
 }  // namespace symcc_fuzzing

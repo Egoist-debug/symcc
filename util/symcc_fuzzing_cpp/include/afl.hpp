@@ -44,20 +44,26 @@ class AflMap {
 
 struct AflConfig {
   std::filesystem::path showmap_path;
-  std::vector<std::string> target_command;  // includes "--" separator
+  std::vector<std::string> target_command;  // target program and args (without "--")
   bool use_standard_input = false;
   bool use_qemu_mode = false;
   std::filesystem::path queue_dir;
+  std::filesystem::path fuzzer_output_dir;  // AFL output directory for this fuzzer
 
   // AFL++ map size handling.
   std::size_t map_size = 65536;
 
-  static AflConfig load_from_fuzzer_output(const std::filesystem::path& fuzzer_output_dir);
+  static AflConfig load_from_fuzzer_output(const std::filesystem::path& fuzzer_output_dir,
+                                           const std::vector<std::string>& custom_target = {});
   std::optional<std::filesystem::path> best_new_testcase(
       const std::unordered_set<std::string>& seen) const;
 
   AflShowmapResult run_showmap(const std::filesystem::path& bitmap_out,
                               const std::filesystem::path& testcase) const;
+  
+  // 将新测试用例复制到 AFL 队列中，让 AFL 也能使用
+  void copy_to_afl_queue(const std::filesystem::path& testcase, 
+                         const std::string& src_id) const;
 };
 
 }  // namespace symcc_fuzzing

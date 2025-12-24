@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <regex>
 #include <stdexcept>
 
@@ -54,10 +55,13 @@ static std::optional<std::uint64_t> parse_solver_time_us(const std::string& stde
 }
 
 SymCC SymCC::make(const std::filesystem::path& symcc_dir,
-                  const std::vector<std::string>& command_line) {
+                  const std::vector<std::string>& command_line,
+                  bool stdin_is_filename) {
   SymCC s;
   s.input_file = symcc_dir / ".cur_input";
   s.bitmap_file = symcc_dir / "bitmap";
+  s.stdin_is_filename = stdin_is_filename;
+  // 没有 @@ 就是 stdin 模式
   s.use_standard_input = (std::find(command_line.begin(), command_line.end(), "@@") == command_line.end());
   s.command = insert_input_file(command_line, s.input_file);
   return s;
@@ -81,12 +85,37 @@ SymCCResult SymCC::run(const std::filesystem::path& input,
   env["SYMCC_ENABLE_LINEARIZATION"] = "1";
   env["SYMCC_AFL_COVERAGE_MAP"] = bitmap_file.string();
   env["SYMCC_OUTPUT_DIR"] = output_dir.string();
+  // 只有文件输入模式(有@@)才设置 SYMCC_INPUT_FILE
+  // stdin 模式下不设置，让 SymCC 自动把 stdin 数据符号化
   if (!use_standard_input) {
     env["SYMCC_INPUT_FILE"] = input_file.string();
   }
+  
+  // 继承并扩展 LD_LIBRARY_PATH，确保能找到 libsymcc-rt.so
+  std::string ld_path;
+  if (const char* existing = std::getenv("LD_LIBRARY_PATH")) {
+    ld_path = existing;
+  }
+  if (!ld_path.empty()) ld_path += ":";
+  ld_path += "/home/ubuntu/symcc/build/linux/x86_64/release";
+  env["LD_LIBRARY_PATH"] = ld_path;
+
+  // Debug: 打印执行命令
+//   std::cerr << "[DEBUG] SymCC command: ";
+//   for (const auto& a : argv) std::cerr << a << " ";
+//   std::cerr << "\n";
+//   std::cerr << "[DEBUG] SYMCC_OUTPUT_DIR=" << output_dir.string() << "\n";
+//   std::cerr << "[DEBUG] SYMCC_INPUT_FILE=" << input_file.string() << "\n";
+//   std::cerr << "[DEBUG] use_stdin=" << (use_standard_input ? "yes" : "no") << "\n";
 
   const auto start = std::chrono::steady_clock::now();
-  const std::optional<std::filesystem::path> stdin_path = use_standard_input ? std::make_optional(input_file) : std::nullopt;
+  
+  // stdin 模式：传入数据内容；文件模式：不传 stdin
+  std::optional<std::filesystem::path> stdin_path;
+  if (use_standard_input) {
+    stdin_path = input_file;  // 直接把数据内容传入 stdin
+  }
+
   auto pr = run_process(argv, env, stdin_path, true);
   const auto end = std::chrono::steady_clock::now();
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();

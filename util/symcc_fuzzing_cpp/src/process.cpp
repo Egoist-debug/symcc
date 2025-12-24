@@ -19,7 +19,8 @@ static void set_env(const std::map<std::string, std::string>& extra_env) {
 ProcessResult run_process(const std::vector<std::string>& argv,
                           const std::map<std::string, std::string>& extra_env,
                           const std::optional<std::filesystem::path>& stdin_file,
-                          bool capture_stderr) {
+                          bool capture_stderr,
+                          const std::optional<std::filesystem::path>& working_dir) {
   ProcessResult out;
 
   int stderr_pipe[2] = {-1, -1};
@@ -36,6 +37,12 @@ ProcessResult run_process(const std::vector<std::string>& argv,
 
   if (pid == 0) {
     // Child
+    // 设置工作目录
+    if (working_dir.has_value()) {
+      if (::chdir(working_dir->c_str()) != 0) {
+        _exit(127);
+      }
+    }
     set_env(extra_env);
 
     // stdout -> /dev/null

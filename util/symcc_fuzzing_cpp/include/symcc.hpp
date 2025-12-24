@@ -17,12 +17,14 @@ struct SymCCResult {
 
 struct SymCC {
   bool use_standard_input = false;
+  bool stdin_is_filename = false;  // stdin 传入的是文件名而不是数据
   std::filesystem::path bitmap_file;
   std::filesystem::path input_file;
   std::vector<std::string> command;
 
   static SymCC make(const std::filesystem::path& symcc_dir,
-                    const std::vector<std::string>& command_line);
+                    const std::vector<std::string>& command_line,
+                    bool stdin_is_filename = false);
 
   SymCCResult run(const std::filesystem::path& input,
                   const std::filesystem::path& output_dir) const;

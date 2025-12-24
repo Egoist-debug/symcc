@@ -17,9 +17,11 @@ struct ProcessResult {
 
 // Run a process with optional stdin redirected from a file and with stdout
 // redirected to /dev/null. If capture_stderr is true, stderr is captured.
+// If working_dir is set, the process will run in that directory.
 ProcessResult run_process(const std::vector<std::string>& argv,
                           const std::map<std::string, std::string>& extra_env,
                           const std::optional<std::filesystem::path>& stdin_file,
-                          bool capture_stderr);
+                          bool capture_stderr,
+                          const std::optional<std::filesystem::path>& working_dir = std::nullopt);
 
 }  // namespace symcc_fuzzing
