@@ -47,3 +47,8 @@ compile_commands.json
 
 # xmake cache
 .xmake/
+
+*paper*
+
+# AGENTS
+AGENTS.md

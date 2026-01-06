@@ -31,6 +31,7 @@ option_end()
 
 includes("runtime")
 includes("util/symcc_fuzzing_cpp")
+includes("gen_input")
 
 target("SymCC")
     set_kind("shared")
