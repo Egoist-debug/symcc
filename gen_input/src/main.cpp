@@ -1,10 +1,13 @@
 #include "SymCCRunner.h"
+#include "BinaryFormat.h"
+#include "FormatAwareGenerator.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <queue>
 #include <set>
 #include <string>
@@ -15,11 +18,14 @@ struct Options {
   std::string ProgramPath;
   std::string OutputDir = "/tmp/geninput_output";
   std::string SeedInput;
+  std::string Format;
   size_t MaxLength = 64;
   size_t MaxIterations = 1000;
   unsigned TimeoutSec = 10;
   bool Verbose = false;
   bool PrintableOnly = true;
+  size_t PreserveHeaderBytes = 20;
+  bool HybridMode = false;
 };
 
 void printUsage(const char *ProgName) {
@@ -29,11 +35,14 @@ void printUsage(const char *ProgName) {
       << "  -o, --output <dir>    Output directory (default: "
          "/tmp/geninput_output)\n"
       << "  -s, --seed <string>   Initial seed input\n"
+      << "  -f, --format <name>   Binary format (dns, dns-response, tlv)\n"
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
       << "  -i, --max-iter <n>    Maximum iterations (default: 1000)\n"
       << "  -t, --timeout <s>     Execution timeout in seconds (default: 10)\n"
       << "  -a, --all-chars       Allow non-printable characters\n"
       << "  -v, --verbose         Verbose output\n"
+      << "  --hybrid              Hybrid mode: preserve header, explore payload\n"
+      << "  --preserve <n>        Bytes to preserve in hybrid mode (default: 20)\n"
       << "  -h, --help            Show this help\n";
 }
 
@@ -61,6 +70,15 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
         return false;
       }
       Opts.SeedInput = Argv[I];
+      continue;
+    }
+
+    if (Arg == "-f" || Arg == "--format") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.Format = Argv[I];
       continue;
     }
 
@@ -98,6 +116,20 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
 
     if (Arg == "-v" || Arg == "--verbose") {
       Opts.Verbose = true;
+      continue;
+    }
+
+    if (Arg == "--hybrid") {
+      Opts.HybridMode = true;
+      continue;
+    }
+
+    if (Arg == "--preserve") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.PreserveHeaderBytes = std::stoul(Argv[I]);
       continue;
     }
 
@@ -149,79 +181,178 @@ int main(int Argc, char *Argv[]) {
 
   std::filesystem::create_directories(Opts.OutputDir);
 
-  geninput::SymCCRunner Runner(RunCfg);
-
   std::cerr << "Starting input generation for: " << Opts.ProgramPath << "\n";
   std::cerr << "Output directory: " << Opts.OutputDir << "\n";
 
-  std::queue<std::vector<uint8_t>> Queue;
-  std::set<std::vector<uint8_t>> Seen;
   std::vector<std::vector<uint8_t>> ValidInputs;
 
-  std::vector<uint8_t> Seed;
-  if (!Opts.SeedInput.empty()) {
-    Seed.assign(Opts.SeedInput.begin(), Opts.SeedInput.end());
-  }
-  Queue.push(Seed);
-  Seen.insert(Seed);
+  if (!Opts.Format.empty()) {
+    std::unique_ptr<geninput::BinaryFormat> Format;
+    bool IsResponse = false;
 
-  size_t Iterations = 0;
-  const uint8_t Placeholder = '~';
-
-  while (!Queue.empty() && Iterations < Opts.MaxIterations) {
-    auto Current = Queue.front();
-    Queue.pop();
-    Iterations++;
-
-    if (Opts.Verbose) {
-      std::cerr << "\rIteration: " << Iterations << ", Queue: " << Queue.size()
-                << ", Valid: " << ValidInputs.size() << std::flush;
+    if (Opts.Format == "dns") {
+      Format = std::make_unique<geninput::BinaryFormat>(
+          geninput::BinaryFormatFactory::createDNS());
+      std::cerr << "Using DNS query format\n";
+    } else if (Opts.Format == "dns-response") {
+      Format = std::make_unique<geninput::BinaryFormat>(
+          geninput::BinaryFormatFactory::createDNSResponse());
+      IsResponse = true;
+      std::cerr << "Using DNS response format\n";
+    } else if (Opts.Format == "tlv") {
+      Format = std::make_unique<geninput::BinaryFormat>(
+          geninput::BinaryFormatFactory::createTLV());
+      std::cerr << "Using TLV format\n";
+    } else {
+      std::cerr << "Error: Unknown format '" << Opts.Format << "'\n";
+      std::cerr << "Available formats: dns, dns-response, tlv\n";
+      return 1;
     }
 
-    if (Current.size() >= Opts.MaxLength) {
-      continue;
-    }
+    auto Runner = std::make_shared<geninput::SymCCRunner>(RunCfg);
 
-    if (Runner.isAccepted(Current) && !Current.empty()) {
-      if (Seen.find(Current) == Seen.end() ||
-          std::find(ValidInputs.begin(), ValidInputs.end(), Current) ==
-              ValidInputs.end()) {
-        ValidInputs.push_back(Current);
-        if (Opts.Verbose) {
-          std::cerr << "\nFound valid input: "
-                    << std::string(Current.begin(), Current.end()) << "\n";
+    if (Opts.HybridMode) {
+      std::cerr << "Using hybrid mode (preserve " << Opts.PreserveHeaderBytes
+                << " header bytes)\n";
+
+      geninput::HybridDNSGenerator::Config HybridCfg;
+      HybridCfg.PreserveHeaderBytes = Opts.PreserveHeaderBytes;
+      HybridCfg.MaxPayloadLength = Opts.MaxLength;
+      HybridCfg.MaxIterations = Opts.MaxIterations;
+      HybridCfg.TimeoutSec = Opts.TimeoutSec;
+      HybridCfg.IsResponse = IsResponse;
+
+      geninput::HybridDNSGenerator HybridGen(HybridCfg);
+      HybridGen.setRunner(Runner);
+
+      if (!Opts.SeedInput.empty()) {
+        std::vector<uint8_t> Seed(Opts.SeedInput.begin(), Opts.SeedInput.end());
+        HybridGen.addSeed(Seed);
+      }
+
+      if (Opts.Verbose) {
+        size_t Count = 0;
+        HybridGen.setInputCallback([&Count](const std::vector<uint8_t> &) {
+          std::cerr << "\rGenerated: " << ++Count << std::flush;
+        });
+      }
+
+      ValidInputs = HybridGen.generate();
+
+      if (Opts.Verbose) {
+        std::cerr << "\n";
+      }
+
+      std::cerr << "Hybrid generation complete:\n"
+                << "  Valid inputs found: " << ValidInputs.size() << "\n";
+    } else {
+      geninput::FormatGeneratorConfig GenCfg;
+      GenCfg.MaxIterations = Opts.MaxIterations;
+      GenCfg.MaxInputLength = Opts.MaxLength;
+      GenCfg.TimeoutSec = Opts.TimeoutSec;
+
+      geninput::FormatAwareGenerator Generator(*Format, GenCfg);
+      Generator.setRunner(Runner);
+
+      if (!Opts.SeedInput.empty()) {
+        std::vector<uint8_t> Seed(Opts.SeedInput.begin(), Opts.SeedInput.end());
+        Generator.addSeed(Seed);
+      }
+
+      if (Opts.Verbose) {
+        Generator.setProgressCallback(
+            [](size_t Iter, size_t QueueSize, size_t ValidCount) {
+              std::cerr << "\rIteration: " << Iter << ", Queue: " << QueueSize
+                        << ", Valid: " << ValidCount << std::flush;
+            });
+      }
+
+      auto Result = Generator.run();
+      ValidInputs = std::move(Result.ValidInputs);
+
+      if (Opts.Verbose) {
+        std::cerr << "\n";
+      }
+
+      const auto &Stats = Generator.getStats();
+      std::cerr << "Generation complete:\n"
+                << "  Total iterations: " << Stats.TotalIterations << "\n"
+                << "  Total SymCC runs: " << Stats.TotalSymCCRuns << "\n"
+                << "  Field mutations: " << Stats.FieldMutations << "\n"
+                << "  Format violations: " << Stats.FormatViolations << "\n"
+                << "  Valid inputs found: " << ValidInputs.size() << "\n";
+    }
+  } else {
+    geninput::SymCCRunner Runner(RunCfg);
+
+    std::queue<std::vector<uint8_t>> Queue;
+    std::set<std::vector<uint8_t>> Seen;
+
+    std::vector<uint8_t> Seed;
+    if (!Opts.SeedInput.empty()) {
+      Seed.assign(Opts.SeedInput.begin(), Opts.SeedInput.end());
+    }
+    Queue.push(Seed);
+    Seen.insert(Seed);
+
+    size_t Iterations = 0;
+    const uint8_t Placeholder = '~';
+
+    while (!Queue.empty() && Iterations < Opts.MaxIterations) {
+      auto Current = Queue.front();
+      Queue.pop();
+      Iterations++;
+
+      if (Opts.Verbose) {
+        std::cerr << "\rIteration: " << Iterations << ", Queue: " << Queue.size()
+                  << ", Valid: " << ValidInputs.size() << std::flush;
+      }
+
+      if (Current.size() >= Opts.MaxLength) {
+        continue;
+      }
+
+      if (Runner.isAccepted(Current) && !Current.empty()) {
+        if (Seen.find(Current) == Seen.end() ||
+            std::find(ValidInputs.begin(), ValidInputs.end(), Current) ==
+                ValidInputs.end()) {
+          ValidInputs.push_back(Current);
+          if (Opts.Verbose) {
+            std::cerr << "\nFound valid input: "
+                      << std::string(Current.begin(), Current.end()) << "\n";
+          }
+        }
+      }
+
+      auto Extensions = Runner.findValidExtensions(Current, Placeholder);
+
+      if (Opts.PrintableOnly) {
+        Extensions = filterPrintable(Extensions);
+      }
+
+      for (uint8_t Byte : Extensions) {
+        std::vector<uint8_t> NewInput = Current;
+        NewInput.push_back(Byte);
+
+        if (Seen.find(NewInput) == Seen.end()) {
+          Seen.insert(NewInput);
+          Queue.push(NewInput);
         }
       }
     }
 
-    auto Extensions = Runner.findValidExtensions(Current, Placeholder);
-
-    if (Opts.PrintableOnly) {
-      Extensions = filterPrintable(Extensions);
+    if (Opts.Verbose) {
+      std::cerr << "\n";
     }
 
-    for (uint8_t Byte : Extensions) {
-      std::vector<uint8_t> NewInput = Current;
-      NewInput.push_back(Byte);
-
-      if (Seen.find(NewInput) == Seen.end()) {
-        Seen.insert(NewInput);
-        Queue.push(NewInput);
-      }
-    }
+    const auto &Stats = Runner.getStats();
+    std::cerr << "Generation complete:\n"
+              << "  Total iterations: " << Iterations << "\n"
+              << "  Total SymCC runs: " << Stats.TotalRuns << "\n"
+              << "  Test cases generated: " << Stats.TotalTestCasesGenerated
+              << "\n"
+              << "  Valid inputs found: " << ValidInputs.size() << "\n";
   }
-
-  if (Opts.Verbose) {
-    std::cerr << "\n";
-  }
-
-  const auto &Stats = Runner.getStats();
-  std::cerr << "Generation complete:\n"
-            << "  Total iterations: " << Iterations << "\n"
-            << "  Total SymCC runs: " << Stats.TotalRuns << "\n"
-            << "  Test cases generated: " << Stats.TotalTestCasesGenerated
-            << "\n"
-            << "  Valid inputs found: " << ValidInputs.size() << "\n";
 
   size_t Index = 0;
   for (const auto &Input : ValidInputs) {
