@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <memory>
@@ -239,6 +240,37 @@ std::vector<std::vector<uint8_t>> SymCCIntegration::parseGeneratedInputs() {
     return Inputs;
   }
 
+  DIR *Dir = opendir(Config_.OutputDir.c_str());
+  if (!Dir) {
+    return Inputs;
+  }
+
+  struct dirent *Entry;
+  while ((Entry = readdir(Dir)) != nullptr) {
+    if (Entry->d_name[0] == '.') {
+      continue;
+    }
+
+    std::string FilePath = Config_.OutputDir + "/" + Entry->d_name;
+
+    struct stat StatBuf;
+    if (stat(FilePath.c_str(), &StatBuf) != 0 || !S_ISREG(StatBuf.st_mode)) {
+      continue;
+    }
+
+    std::ifstream Ifs(FilePath, std::ios::binary);
+    if (!Ifs) {
+      continue;
+    }
+
+    std::vector<uint8_t> Content((std::istreambuf_iterator<char>(Ifs)),
+                                  std::istreambuf_iterator<char>());
+    if (!Content.empty()) {
+      Inputs.push_back(std::move(Content));
+    }
+  }
+
+  closedir(Dir);
   return Inputs;
 }
 

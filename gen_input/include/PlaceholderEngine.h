@@ -38,6 +38,9 @@ using CallCallback = std::function<void(const std::string &, uintptr_t)>;
 /// Callback invoked when a function returns.
 using RetCallback = std::function<void(uintptr_t)>;
 
+/// Callback to check if input is accepted.
+using AcceptanceCallback = std::function<bool(const std::vector<uint8_t> &)>;
+
 /// Configuration for the placeholder engine.
 struct PlaceholderConfig {
   uint8_t PlaceholderChar = '~';   // Character to use as placeholder
@@ -117,6 +120,9 @@ public:
   /// Set the function return callback.
   void setRetCallback(RetCallback Cb) { RetCb_ = std::move(Cb); }
 
+  /// Set the acceptance callback.
+  void setAcceptanceCallback(AcceptanceCallback Cb) { AcceptanceCb_ = std::move(Cb); }
+
   /// Statistics about the engine's operation.
   struct Stats {
     size_t TotalExtensions = 0;
@@ -139,6 +145,7 @@ private:
   BranchCallback BranchCb_;
   CallCallback CallCb_;
   RetCallback RetCb_;
+  AcceptanceCallback AcceptanceCb_;
 
   Stats Stats_;
 

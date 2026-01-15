@@ -1,8 +1,10 @@
 #include "SymCCRunner.h"
 #include "BinaryFormat.h"
 #include "FormatAwareGenerator.h"
+#include "ThreePhaseGenerator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +28,7 @@ struct Options {
   bool PrintableOnly = true;
   size_t PreserveHeaderBytes = 20;
   bool HybridMode = false;
+  bool ThreePhaseMode = false;
 };
 
 void printUsage(const char *ProgName) {
@@ -38,7 +41,8 @@ void printUsage(const char *ProgName) {
       << "  -f, --format <name>   Binary format (dns, dns-response, tlv)\n"
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
       << "  -i, --max-iter <n>    Maximum iterations (default: 1000)\n"
-      << "  -t, --timeout <s>     Execution timeout in seconds (default: 10)\n"
+      << "  -t, --timeout <s>     SymCC execution timeout per run in seconds (default: 10)\n"
+      << "  --three-phase         Use three-phase algorithm (init → expand → complete)\n"
       << "  -a, --all-chars       Allow non-printable characters\n"
       << "  -v, --verbose         Verbose output\n"
       << "  --hybrid              Hybrid mode: preserve header, explore payload\n"
@@ -121,6 +125,11 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
 
     if (Arg == "--hybrid") {
       Opts.HybridMode = true;
+      continue;
+    }
+
+    if (Arg == "--three-phase") {
+      Opts.ThreePhaseMode = true;
       continue;
     }
 
@@ -244,6 +253,49 @@ int main(int Argc, char *Argv[]) {
       }
 
       std::cerr << "Hybrid generation complete:\n"
+                << "  Valid inputs found: " << ValidInputs.size() << "\n";
+    } else if (Opts.ThreePhaseMode) {
+      std::cerr << "Using three-phase algorithm (init -> expand -> complete)\n";
+
+      geninput::GeneratorConfig GenCfg;
+      GenCfg.MaxIterations = Opts.MaxIterations;
+      // Phase budget: 10% init, 40% expand, 50% complete (prevents Phase 3 starvation)
+      GenCfg.Phase1MaxIterations = std::max<size_t>(1, Opts.MaxIterations / 10);
+      GenCfg.Phase2MaxIterations = std::max<size_t>(1, Opts.MaxIterations * 4 / 10);
+      GenCfg.MaxInputLength = Opts.MaxLength;
+      GenCfg.OnlyPrintable = Opts.PrintableOnly;
+
+      geninput::ThreePhaseGenerator Generator(GenCfg);
+      Generator.setRunner(Runner);
+
+      if (!Opts.SeedInput.empty()) {
+        std::vector<uint8_t> Seed(Opts.SeedInput.begin(), Opts.SeedInput.end());
+        Generator.addSeed(Seed);
+      } else {
+        Generator.addSeed(Format->createSeed());
+      }
+
+      if (Opts.Verbose) {
+        Generator.setProgressCallback(
+            [](size_t Iter, size_t QueueSize, size_t ValidCount) {
+              std::cerr << "\rIteration: " << Iter << ", Queue: " << QueueSize
+                        << ", Valid: " << ValidCount << std::flush;
+            });
+      }
+
+      ValidInputs = Generator.run();
+
+      if (Opts.Verbose) {
+        std::cerr << "\n";
+      }
+
+      const auto &Stats = Generator.getStats();
+      std::cerr << "Three-phase generation complete:\n"
+                << "  Phase 1 iterations: " << Stats.Phase1Iterations << "\n"
+                << "  Phase 2 iterations: " << Stats.Phase2Iterations << "\n"
+                << "  Phase 3 iterations: " << Stats.Phase3Iterations << "\n"
+                << "  Stems collected: " << Stats.TotalStemsCollected << "\n"
+                << "  Stem injections: " << Stats.StemInjections << "\n"
                 << "  Valid inputs found: " << ValidInputs.size() << "\n";
     } else {
       geninput::FormatGeneratorConfig GenCfg;

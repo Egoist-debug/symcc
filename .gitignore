@@ -52,3 +52,6 @@ compile_commands.json
 
 # AGENTS
 AGENTS.md
+
+# bind9 test
+bind9*

@@ -320,7 +320,19 @@ void FormatAwareGenerator::addValidInput(const std::vector<uint8_t> &Input) {
 }
 
 bool FormatAwareGenerator::shouldStop() const {
-  return Stats_.TotalIterations >= Config_.MaxIterations;
+  if (Stats_.TotalIterations >= Config_.MaxIterations) {
+    return true;
+  }
+  
+  // Check time-based stopping condition
+  if (Config_.TimeoutSec > 0 && Stats_.TotalTimeMs > 0) {
+    double ElapsedSec = Stats_.TotalTimeMs / 1000.0;
+    if (ElapsedSec >= static_cast<double>(Config_.TimeoutSec)) {
+      return true;
+    }
+  }
+  
+  return false;
 }
 
 void FormatAwareGenerator::reset() {

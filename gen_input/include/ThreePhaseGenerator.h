@@ -33,6 +33,7 @@
 
 #include "InputPrefix.h"
 #include "PlaceholderEngine.h"
+#include "SymCCRunner.h"
 
 namespace geninput {
 
@@ -42,9 +43,12 @@ struct GeneratorConfig {
   size_t MaxQueueSize = 1000;         // Maximum queue size in phase 3
   size_t MaxStemsPerFunction = 10;    // Maximum stems to keep per function
   size_t MaxIterations = 10000;       // Maximum iterations before stopping
+  size_t Phase1MaxIterations = 1000;  // Maximum iterations for Phase 1
+  size_t Phase2MaxIterations = 5000;  // Maximum iterations for Phase 2
   unsigned SolverTimeoutMs = 5000;    // Z3 solver timeout
   bool OnlyPrintable = true;          // Only generate printable characters
   bool VerboseLogging = false;        // Enable verbose output
+  uint8_t PlaceholderChar = '~';      // Placeholder character for exploration
 };
 
 /// A stem is a partial input that represents a valid production of a grammar
@@ -86,6 +90,9 @@ public:
 
   /// Get the placeholder engine.
   PlaceholderEngine &getEngine() { return Engine_; }
+
+  /// Set the SymCC runner for executing instrumented programs.
+  void setRunner(std::shared_ptr<SymCCRunner> Runner) { Runner_ = std::move(Runner); }
 
   /// Set callback for generated inputs.
   void setInputCallback(InputCallback Cb) { InputCb_ = std::move(Cb); }
@@ -140,6 +147,7 @@ public:
     size_t TotalInputsGenerated = 0;
     size_t StemInjections = 0;
     size_t QueueBoundHits = 0;
+    size_t SymCCRuns = 0;
     double TotalTimeMs = 0.0;
   };
 
@@ -150,25 +158,37 @@ public:
 private:
   GeneratorConfig Config_;
   PlaceholderEngine Engine_;
+  std::shared_ptr<SymCCRunner> Runner_;
   PrefixQueue Queue_;
+  PrefixQueue Phase2Queue_;
   std::map<std::string, std::vector<Stem>> Stems_;
   std::vector<std::vector<uint8_t>> GeneratedInputs_;
-  std::set<std::vector<uint8_t>> SeenInputs_; // Deduplication
+  std::set<std::vector<uint8_t>> SeenInputs_;
 
   InputCallback InputCb_;
   ProgressCallback ProgressCb_;
 
   Stats Stats_;
 
-  // Phase tracking
   enum class Phase { Init, Phase1, Phase2, Phase3, Done };
   Phase CurrentPhase_ = Phase::Init;
 
-  // Current function call stack for stem tracking
   std::vector<std::pair<std::string, size_t>> CallStack_;
 
-  /// Process a single prefix from the queue.
-  void processPrefix(std::unique_ptr<InputPrefix> Prefix);
+  /// Process a single prefix from the queue (Phase 1 mode - collect stems).
+  void processPrefixPhase1(std::unique_ptr<InputPrefix> Prefix);
+
+  /// Process a single prefix from the queue (Phase 2/3 mode - normal exploration).
+  void processPrefixPhase2And3(std::unique_ptr<InputPrefix> Prefix);
+
+  /// Run SymCC on the given input and collect test cases.
+  std::set<uint8_t> runSymCCAndFindExtensions(const std::vector<uint8_t> &Input);
+
+  /// Run SymCC on the given input and return ALL generated test cases.
+  std::vector<std::vector<uint8_t>> runSymCCAndCollectTestCases(const std::vector<uint8_t> &Input);
+
+  /// Check if input is accepted by the parser.
+  bool isAcceptedByParser(const std::vector<uint8_t> &Input);
 
   /// Record a stem for the current function.
   void recordStem(const InputPrefix &Prefix, const std::string &FuncName);
@@ -181,7 +201,9 @@ private:
   void reportProgress();
 
   /// Check if we should stop (max iterations reached, etc.).
-  bool shouldStop() const;
+  bool shouldStopPhase1() const;
+  bool shouldStopPhase2() const;
+  bool shouldStopPhase3() const;
 
   /// Add a generated input (with deduplication).
   void addGeneratedInput(const std::vector<uint8_t> &Input);

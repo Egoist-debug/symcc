@@ -57,7 +57,9 @@ ExtensionResult PlaceholderEngine::extendPrefix(const InputPrefix &Prefix) {
 }
 
 bool PlaceholderEngine::isAccepted(const InputPrefix &Prefix) {
-  (void)Prefix;
+  if (AcceptanceCb_) {
+    return AcceptanceCb_(Prefix.getData());
+  }
   return false;
 }
 

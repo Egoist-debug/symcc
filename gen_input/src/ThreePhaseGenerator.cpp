@@ -44,20 +44,34 @@ std::vector<std::vector<uint8_t>> ThreePhaseGenerator::run() {
 void ThreePhaseGenerator::runPhase1() {
   CurrentPhase_ = Phase::Phase1;
 
-  while (!Queue_.empty() && !shouldStop()) {
+  while (!Queue_.empty() && !shouldStopPhase1()) {
     auto Prefix = Queue_.pop();
     if (!Prefix) break;
 
     Stats_.Phase1Iterations++;
-    processPrefix(std::move(Prefix));
+    processPrefixPhase1(std::move(Prefix));
     reportProgress();
+  }
+
+  while (!Queue_.empty()) {
+    auto Prefix = Queue_.pop();
+    if (Prefix) {
+      Phase2Queue_.push(std::move(Prefix));
+    }
   }
 }
 
 void ThreePhaseGenerator::runPhase2() {
   CurrentPhase_ = Phase::Phase2;
 
-  while (!Queue_.empty() && !shouldStop()) {
+  while (!Phase2Queue_.empty()) {
+    auto Prefix = Phase2Queue_.pop();
+    if (Prefix) {
+      Queue_.push(std::move(Prefix));
+    }
+  }
+
+  while (!Queue_.empty() && !shouldStopPhase2()) {
     auto Prefix = Queue_.pop();
     if (!Prefix) break;
 
@@ -65,14 +79,19 @@ void ThreePhaseGenerator::runPhase2() {
 
     if (Prefix->getFunctionName()) {
       const std::string &FuncName = *Prefix->getFunctionName();
-      auto InjectedPrefixes = injectStems(*Prefix, FuncName);
-      for (auto &P : InjectedPrefixes) {
-        Queue_.push(std::move(P));
-        Stats_.StemInjections++;
+      const auto &FuncStems = getStemsForFunction(FuncName);
+
+      if (!FuncStems.empty()) {
+        auto InjectedPrefixes = injectStems(*Prefix, FuncName);
+        for (auto &P : InjectedPrefixes) {
+          Queue_.push(std::move(P));
+          Stats_.StemInjections++;
+        }
+        continue;
       }
     }
 
-    processPrefix(std::move(Prefix));
+    processPrefixPhase2And3(std::move(Prefix));
     reportProgress();
   }
 }
@@ -81,7 +100,7 @@ void ThreePhaseGenerator::runPhase3() {
   CurrentPhase_ = Phase::Phase3;
   Queue_.setMaxSize(Config_.MaxQueueSize);
 
-  while (!Queue_.empty() && !shouldStop()) {
+  while (!Queue_.empty() && !shouldStopPhase3()) {
     auto Prefix = Queue_.pop();
     if (!Prefix) break;
 
@@ -91,7 +110,7 @@ void ThreePhaseGenerator::runPhase3() {
       Stats_.QueueBoundHits++;
     }
 
-    processPrefix(std::move(Prefix));
+    processPrefixPhase2And3(std::move(Prefix));
     reportProgress();
   }
 }
@@ -119,6 +138,9 @@ void ThreePhaseGenerator::reset() {
   while (!Queue_.empty()) {
     Queue_.pop();
   }
+  while (!Phase2Queue_.empty()) {
+    Phase2Queue_.pop();
+  }
   Stems_.clear();
   GeneratedInputs_.clear();
   SeenInputs_.clear();
@@ -128,21 +150,113 @@ void ThreePhaseGenerator::reset() {
 
 void ThreePhaseGenerator::resetStats() { Stats_ = Stats{}; }
 
-void ThreePhaseGenerator::processPrefix(std::unique_ptr<InputPrefix> Prefix) {
-  auto Result = Engine_.extendPrefix(*Prefix);
-
-  if (Result.ReachedAcceptance) {
+void ThreePhaseGenerator::processPrefixPhase1(std::unique_ptr<InputPrefix> Prefix) {
+  if (isAcceptedByParser(Prefix->getData())) {
     addGeneratedInput(Prefix->getData());
+  }
+
+  auto TestCases = runSymCCAndCollectTestCases(Prefix->getData());
+
+  if (TestCases.empty()) {
     return;
   }
 
-  if (Result.ReachedRejection) {
+  if (Prefix->getFunctionName()) {
+    recordStem(*Prefix, *Prefix->getFunctionName());
+  }
+
+  for (const auto &TestCase : TestCases) {
+    if (TestCase.size() > Config_.MaxInputLength) {
+      continue;
+    }
+
+    bool AlreadySeen = (SeenInputs_.count(TestCase) > 0);
+    SeenInputs_.insert(TestCase);
+
+    if (!AlreadySeen && isAcceptedByParser(TestCase)) {
+      GeneratedInputs_.push_back(TestCase);
+      Stats_.TotalInputsGenerated++;
+      if (InputCb_) {
+        InputCb_(TestCase);
+      }
+    }
+
+    if (!AlreadySeen) {
+      auto NewPrefix = std::make_unique<InputPrefix>(
+          Engine_.getConstraintManager().getContext(), TestCase);
+      Queue_.push(std::move(NewPrefix));
+    }
+  }
+}
+
+void ThreePhaseGenerator::processPrefixPhase2And3(std::unique_ptr<InputPrefix> Prefix) {
+  if (isAcceptedByParser(Prefix->getData())) {
+    addGeneratedInput(Prefix->getData());
+  }
+
+  auto TestCases = runSymCCAndCollectTestCases(Prefix->getData());
+
+  if (TestCases.empty()) {
     return;
   }
 
-  for (auto &NewPrefix : Result.NewPrefixes) {
-    Queue_.push(std::move(NewPrefix));
+  for (const auto &TestCase : TestCases) {
+    if (TestCase.size() > Config_.MaxInputLength) {
+      continue;
+    }
+
+    bool AlreadySeen = (SeenInputs_.count(TestCase) > 0);
+    SeenInputs_.insert(TestCase);
+
+    if (!AlreadySeen && isAcceptedByParser(TestCase)) {
+      GeneratedInputs_.push_back(TestCase);
+      Stats_.TotalInputsGenerated++;
+      if (InputCb_) {
+        InputCb_(TestCase);
+      }
+    }
+
+    if (!AlreadySeen) {
+      auto NewPrefix = std::make_unique<InputPrefix>(
+          Engine_.getConstraintManager().getContext(), TestCase);
+      Queue_.push(std::move(NewPrefix));
+    }
   }
+}
+
+std::set<uint8_t> ThreePhaseGenerator::runSymCCAndFindExtensions(
+    const std::vector<uint8_t> &Input) {
+
+  if (!Runner_) {
+    auto Prefix = std::make_unique<InputPrefix>(
+        Engine_.getConstraintManager().getContext(), Input);
+    return Engine_.findValidNextChars(*Prefix);
+  }
+
+  Stats_.SymCCRuns++;
+  return Runner_->findValidExtensions(Input, Config_.PlaceholderChar);
+}
+
+std::vector<std::vector<uint8_t>> ThreePhaseGenerator::runSymCCAndCollectTestCases(
+    const std::vector<uint8_t> &Input) {
+
+  if (!Runner_) {
+    return {};
+  }
+
+  Stats_.SymCCRuns++;
+  auto Result = Runner_->run(Input);
+  return Result.GeneratedTestCases;
+}
+
+bool ThreePhaseGenerator::isAcceptedByParser(const std::vector<uint8_t> &Input) {
+  if (!Runner_) {
+    auto Prefix = std::make_unique<InputPrefix>(
+        Engine_.getConstraintManager().getContext(), Input);
+    return Engine_.isAccepted(*Prefix);
+  }
+
+  return Runner_->isAccepted(Input);
 }
 
 void ThreePhaseGenerator::recordStem(const InputPrefix &Prefix,
@@ -191,7 +305,15 @@ void ThreePhaseGenerator::reportProgress() {
   }
 }
 
-bool ThreePhaseGenerator::shouldStop() const {
+bool ThreePhaseGenerator::shouldStopPhase1() const {
+  return Stats_.Phase1Iterations >= Config_.Phase1MaxIterations;
+}
+
+bool ThreePhaseGenerator::shouldStopPhase2() const {
+  return Stats_.Phase2Iterations >= Config_.Phase2MaxIterations;
+}
+
+bool ThreePhaseGenerator::shouldStopPhase3() const {
   size_t TotalIter = Stats_.Phase1Iterations + Stats_.Phase2Iterations +
                      Stats_.Phase3Iterations;
   return TotalIter >= Config_.MaxIterations;
