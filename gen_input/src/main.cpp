@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <queue>
 #include <set>
@@ -20,6 +21,7 @@ struct Options {
   std::string ProgramPath;
   std::string OutputDir = "/tmp/geninput_output";
   std::string SeedInput;
+  std::string SeedFile;
   std::string Format;
   size_t MaxLength = 64;
   size_t MaxIterations = 1000;
@@ -38,6 +40,7 @@ void printUsage(const char *ProgName) {
       << "  -o, --output <dir>    Output directory (default: "
          "/tmp/geninput_output)\n"
       << "  -s, --seed <string>   Initial seed input\n"
+      << "  --seed-file <path>    Initial seed input file (binary)\n"
       << "  -f, --format <name>   Binary format (dns, dns-response, tlv)\n"
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
       << "  -i, --max-iter <n>    Maximum iterations (default: 1000)\n"
@@ -74,6 +77,15 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
         return false;
       }
       Opts.SeedInput = Argv[I];
+      continue;
+    }
+
+    if (Arg == "--seed-file") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.SeedFile = Argv[I];
       continue;
     }
 
@@ -174,12 +186,52 @@ std::set<uint8_t> filterPrintable(const std::set<uint8_t> &Chars) {
   return Result;
 }
 
+std::vector<uint8_t> ensureResponseSeed(const std::vector<uint8_t> &Seed) {
+  if (Seed.size() < 12) {
+    return Seed;
+  }
+
+  bool IsResponse = (Seed[2] & 0x80) != 0;
+  if (IsResponse) {
+    return Seed;
+  }
+
+  std::vector<uint8_t> DefaultAnswer = {127, 0, 0, 1};
+  auto Response = geninput::DNSPacketBuilder::buildResponseFromQuery(
+      Seed, DefaultAnswer, 1, 300);
+  if (!Response.empty()) {
+    return Response;
+  }
+
+  return Seed;
+}
+
 }
 
 int main(int Argc, char *Argv[]) {
   Options Opts;
   if (!parseArgs(Argc, Argv, Opts)) {
     return 1;
+  }
+
+  if (!Opts.SeedInput.empty() && !Opts.SeedFile.empty()) {
+    std::cerr << "Error: --seed and --seed-file are mutually exclusive\n";
+    return 1;
+  }
+
+  if (!Opts.SeedFile.empty()) {
+    std::ifstream SeedStream(Opts.SeedFile, std::ios::binary);
+    if (!SeedStream) {
+      std::cerr << "Error: failed to open seed file '" << Opts.SeedFile
+                << "'\n";
+      return 1;
+    }
+    Opts.SeedInput.assign(std::istreambuf_iterator<char>(SeedStream),
+                          std::istreambuf_iterator<char>());
+    if (Opts.SeedInput.empty()) {
+      std::cerr << "Error: seed file '" << Opts.SeedFile << "' is empty\n";
+      return 1;
+    }
   }
 
   geninput::RunConfig RunCfg;
@@ -236,6 +288,14 @@ int main(int Argc, char *Argv[]) {
 
       if (!Opts.SeedInput.empty()) {
         std::vector<uint8_t> Seed(Opts.SeedInput.begin(), Opts.SeedInput.end());
+        if (IsResponse) {
+          Seed = ensureResponseSeed(Seed);
+          if (Seed.size() < Opts.PreserveHeaderBytes) {
+            std::cerr << "Error: response seed must be at least "
+                      << Opts.PreserveHeaderBytes << " bytes\n";
+            return 1;
+          }
+        }
         HybridGen.addSeed(Seed);
       }
 
