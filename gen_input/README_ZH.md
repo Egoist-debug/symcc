@@ -172,6 +172,7 @@ gen_input [选项] <程序路径>
 | `-l, --max-length <n>` | 生成输入的最大长度 | 64 字节 |
 | `-i, --max-iter <n>` | 最大探索迭代次数 | 1000 |
 | `-t, --timeout <秒>` | 每次 SymCC 执行的超时时间 | 10 秒 |
+| `--max-byte-diff <n>` | 格式感知模式下与父测试用例的最大字节差异 | 32 |
 | `-a, --all-chars` | 允许非可打印字符 | 仅可打印 |
 | `-v, --verbose` | 启用详细输出 | 禁用 |
 | `-h, --help` | 显示帮助信息 | - |
@@ -186,7 +187,7 @@ gen_input [选项] <程序路径>
 2. **运行 gen_input**：
    ```bash
    # 发现最长 10 字节的输入，最多 100 次迭代
-   ./gen_input -v -l 10 -i 100 -o ./valid_inputs ./simple_parser_sym
+   ./gen_input -v -l 10 -i 100 --max-byte-diff 32 -o ./valid_inputs ./simple_parser_sym
    ```
 
 3. **查看结果**：
@@ -203,6 +204,10 @@ gen_input [选项] <程序路径>
 生成的有效输入保存为二进制文件：
 - 文件名格式：`valid_N`（N 从 0 开始递增）
 - 文件内容：原始字节数据
+
+在 `--format dns-response --hybrid` 模式下，输出会拆分为两类语料：
+- `accepted_*`：被目标程序接受（退出码 0）的输入
+- `generated_*`：结构上生成但未被目标程序接受的输入
 
 ## 格式感知生成
 
@@ -302,6 +307,10 @@ auto seed = format.createSeed();
 ```bash
 ./gen_input --format dns-response --hybrid --preserve 20 -v -i 500 -o ./seeds ./dns_resolver_sym
 ```
+
+混合模式输出：
+- `accepted_*`：已接受语料
+- `generated_*`：未接受但可用于后续变异的语料
 
 | 选项 | 描述 | 默认值 |
 |------|------|--------|
@@ -748,6 +757,18 @@ struct PlaceholderConfig {
 - SymCC 在执行过程中在 `/tmp/` 生成临时测试用例
 - `gen_input` 会自动清理这些文件
 - 确保 `/tmp/` 有足够空间
+
+### 超时控制
+
+- 超过 `--timeout` 的运行会被终止（SIGKILL）
+- 被终止的运行会统计到 `Timeout runs`
+
+### 运行指标
+
+生成摘要会输出：
+- `Timeout runs`
+- `SymCC acceptance rate`
+- `SymCC runs per accepted input`
 
 ### 符号可达性
 

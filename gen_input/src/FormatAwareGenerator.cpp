@@ -7,10 +7,166 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <random>
 #include <sstream>
 
 namespace geninput {
+
+namespace {
+
+size_t computeByteDifference(const std::vector<uint8_t> &Left,
+                             const std::vector<uint8_t> &Right) {
+  const size_t MinSize = std::min(Left.size(), Right.size());
+  size_t Differences = Left.size() > Right.size() ? Left.size() - Right.size()
+                                                  : Right.size() - Left.size();
+
+  for (size_t Index = 0; Index < MinSize; ++Index) {
+    if (Left[Index] != Right[Index]) {
+      ++Differences;
+    }
+  }
+
+  return Differences;
+}
+
+std::optional<size_t> consumeDnsName(const std::vector<uint8_t> &Packet,
+                                     size_t Offset) {
+  size_t Position = Offset;
+  size_t Remaining = Packet.size();
+
+  while (Position < Packet.size() && Remaining > 0) {
+    const uint8_t Length = Packet[Position];
+    if ((Length & 0xC0) == 0xC0) {
+      if (Position + 1 >= Packet.size()) {
+        return std::nullopt;
+      }
+      return Position + 2;
+    }
+
+    if (Length == 0) {
+      return Position + 1;
+    }
+
+    if (Length > 63 || Position + 1 + Length > Packet.size()) {
+      return std::nullopt;
+    }
+
+    Position += 1 + Length;
+    --Remaining;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<size_t> getQuestionSectionEnd(const std::vector<uint8_t> &Packet) {
+  if (Packet.size() < 12) {
+    return std::nullopt;
+  }
+
+  const uint16_t QuestionCount =
+      (static_cast<uint16_t>(Packet[4]) << 8) | Packet[5];
+  size_t Position = 12;
+
+  for (uint16_t Index = 0; Index < QuestionCount; ++Index) {
+    auto NameEnd = consumeDnsName(Packet, Position);
+    if (!NameEnd || *NameEnd + 4 > Packet.size()) {
+      return std::nullopt;
+    }
+    Position = *NameEnd + 4;
+  }
+
+  return Position;
+}
+
+std::optional<size_t>
+getFirstAnswerRdLengthOffset(const std::vector<uint8_t> &Packet) {
+  if (Packet.size() < 12) {
+    return std::nullopt;
+  }
+
+  const uint16_t AnswerCount = (static_cast<uint16_t>(Packet[6]) << 8) | Packet[7];
+  if (AnswerCount == 0) {
+    return std::nullopt;
+  }
+
+  auto QuestionEnd = getQuestionSectionEnd(Packet);
+  if (!QuestionEnd) {
+    return std::nullopt;
+  }
+
+  auto NameEnd = consumeDnsName(Packet, *QuestionEnd);
+  if (!NameEnd || *NameEnd + 10 > Packet.size()) {
+    return std::nullopt;
+  }
+
+  return *NameEnd + 8;
+}
+
+std::vector<std::vector<uint8_t>>
+generateDNSStructuralMutations(const std::vector<uint8_t> &Packet,
+                               size_t MaxInputLength) {
+  std::vector<std::vector<uint8_t>> Mutations;
+
+  if (Packet.size() < 12) {
+    return Mutations;
+  }
+
+  auto addMutation = [&](std::vector<uint8_t> Mutation) {
+    if (MaxInputLength > 0 && Mutation.size() > MaxInputLength) {
+      return;
+    }
+    if (std::find(Mutations.begin(), Mutations.end(), Mutation) == Mutations.end()) {
+      Mutations.push_back(std::move(Mutation));
+    }
+  };
+
+  if (Packet.size() > 13 && Packet[12] > 0 && (Packet[12] & 0xC0) == 0 &&
+      Packet[12] < 64) {
+    auto IncreasedLabel = Packet;
+    IncreasedLabel[12] = Packet[12] == 63 ? 62 : static_cast<uint8_t>(Packet[12] + 1);
+    addMutation(std::move(IncreasedLabel));
+
+    if (Packet[12] > 1) {
+      auto DecreasedLabel = Packet;
+      DecreasedLabel[12] = static_cast<uint8_t>(Packet[12] - 1);
+      addMutation(std::move(DecreasedLabel));
+    }
+  }
+
+  if (Packet.size() > 14) {
+    auto CompressionPointerMutation = Packet;
+    CompressionPointerMutation[12] = 0xC0;
+    CompressionPointerMutation[13] = 0x0C;
+    addMutation(std::move(CompressionPointerMutation));
+  }
+
+  auto RdLengthOffset = getFirstAnswerRdLengthOffset(Packet);
+  if (RdLengthOffset && *RdLengthOffset + 1 < Packet.size()) {
+    const uint16_t DeclaredLength =
+        (static_cast<uint16_t>(Packet[*RdLengthOffset]) << 8) |
+        Packet[*RdLengthOffset + 1];
+
+    auto LowerLengthMutation = Packet;
+    const uint16_t LowerLength = DeclaredLength == 0 ? 1 : DeclaredLength - 1;
+    LowerLengthMutation[*RdLengthOffset] =
+        static_cast<uint8_t>((LowerLength >> 8) & 0xFF);
+    LowerLengthMutation[*RdLengthOffset + 1] = static_cast<uint8_t>(LowerLength & 0xFF);
+    addMutation(std::move(LowerLengthMutation));
+
+    if (DeclaredLength < 0xFFFF) {
+      auto HigherLengthMutation = Packet;
+      const uint16_t HigherLength = static_cast<uint16_t>(DeclaredLength + 1);
+      HigherLengthMutation[*RdLengthOffset] =
+          static_cast<uint8_t>((HigherLength >> 8) & 0xFF);
+      HigherLengthMutation[*RdLengthOffset + 1] =
+          static_cast<uint8_t>(HigherLength & 0xFF);
+      addMutation(std::move(HigherLengthMutation));
+    }
+  }
+
+  return Mutations;
+}
+
+}
 
 FormatAwareGenerator::FormatAwareGenerator() = default;
 
@@ -38,7 +194,10 @@ void FormatAwareGenerator::addSeed(const std::vector<uint8_t> &Seed) {
     return;
 
   FormatWorkItem Item;
-  Item.Input = std::make_unique<StructuredInput>(*Format_);
+  Item.Input = Format_->parse(Seed);
+  if (!Item.Input) {
+    Item.Input = std::make_unique<StructuredInput>(*Format_);
+  }
   Item.RawBytes = Seed;
   Item.Depth = 0;
   Item.Priority = 100; // High priority for seeds
@@ -98,7 +257,7 @@ FormatGeneratorResult FormatAwareGenerator::run() {
 
   FormatGeneratorResult Result;
   Result.ValidInputs = ValidInputs_;
-  Result.AcceptedInputs = ValidInputs_; // TODO: track separately
+  Result.AcceptedInputs = AcceptedInputs_;
   return Result;
 }
 
@@ -108,30 +267,77 @@ void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
   Stats_.TotalSymCCRuns++;
 
   if (RunResult.Accepted) {
-    addValidInput(Item.RawBytes);
+    addAcceptedInput(Item.RawBytes);
   }
 
   // Process generated test cases
   for (const auto &TestCase : RunResult.GeneratedTestCases) {
-    if (SeenInputs_.count(TestCase) > 0)
+    auto NormalizedTestCase = updateComputedFields(TestCase);
+    if (SeenInputs_.count(NormalizedTestCase) > 0)
       continue;
 
-    // Check if test case conforms to format
-    if (Config_.StrictFormat && !checkFormatConstraints(TestCase)) {
+    const size_t ByteDifference =
+        computeByteDifference(Item.RawBytes, NormalizedTestCase);
+    if (Config_.MaxByteDiff > 0 && ByteDifference > Config_.MaxByteDiff) {
+      continue;
+    }
+
+    if (Config_.StrictFormat && !checkFormatConstraints(NormalizedTestCase)) {
       Stats_.FormatViolations++;
       continue;
     }
 
-    SeenInputs_.insert(TestCase);
+    addValidInput(NormalizedTestCase);
+    SeenInputs_.insert(NormalizedTestCase);
 
     FormatWorkItem NewItem;
-    NewItem.Input = std::make_unique<StructuredInput>(*Format_);
-    NewItem.RawBytes = TestCase;
+    NewItem.Input = Format_->parse(NormalizedTestCase);
+    if (!NewItem.Input) {
+      NewItem.Input = std::make_unique<StructuredInput>(*Format_);
+    }
+    NewItem.RawBytes = std::move(NormalizedTestCase);
     NewItem.Depth = Item.Depth + 1;
-    NewItem.Priority = 50 - static_cast<int>(NewItem.Depth);
+    size_t LocalityBonus = 0;
+    if (Config_.MaxByteDiff > 0) {
+      LocalityBonus = Config_.MaxByteDiff > ByteDifference
+                          ? Config_.MaxByteDiff - ByteDifference
+                          : 0;
+      LocalityBonus = std::min<size_t>(LocalityBonus, 50);
+    }
+    NewItem.Priority = 50 - static_cast<int>(NewItem.Depth) +
+                       static_cast<int>(LocalityBonus);
 
     if (NewItem.Depth <= Config_.MaxRecursionDepth) {
       Queue_.push(std::move(NewItem));
+    }
+  }
+
+  auto DnsMutations = generateDNSStructuralMutations(Item.RawBytes, Config_.MaxInputLength);
+  for (const auto &Mutation : DnsMutations) {
+    auto NormalizedMutation = updateComputedFields(Mutation);
+    if (SeenInputs_.count(NormalizedMutation) > 0) {
+      continue;
+    }
+
+    if (Config_.StrictFormat && !checkFormatConstraints(NormalizedMutation)) {
+      Stats_.FormatViolations++;
+      continue;
+    }
+
+    addValidInput(NormalizedMutation);
+    SeenInputs_.insert(NormalizedMutation);
+
+    FormatWorkItem MutatedItem;
+    MutatedItem.Input = Format_->parse(NormalizedMutation);
+    if (!MutatedItem.Input) {
+      MutatedItem.Input = std::make_unique<StructuredInput>(*Format_);
+    }
+    MutatedItem.RawBytes = std::move(NormalizedMutation);
+    MutatedItem.Depth = Item.Depth + 1;
+    MutatedItem.Priority = 45 - static_cast<int>(MutatedItem.Depth);
+
+    if (MutatedItem.Depth <= Config_.MaxRecursionDepth) {
+      Queue_.push(std::move(MutatedItem));
     }
   }
 
@@ -143,11 +349,25 @@ void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
 
       auto Variants = exploreField(*Item.Input, Field.Name);
       for (auto &Variant : Variants) {
-        if (SeenInputs_.count(Variant.RawBytes) == 0) {
-          SeenInputs_.insert(Variant.RawBytes);
-          Queue_.push(std::move(Variant));
-          Stats_.FieldMutations++;
+        Variant.RawBytes = updateComputedFields(std::move(Variant.RawBytes));
+        if (SeenInputs_.count(Variant.RawBytes) > 0)
+          continue;
+
+        if (Config_.StrictFormat && !checkFormatConstraints(Variant.RawBytes)) {
+          Stats_.FormatViolations++;
+          continue;
         }
+
+        auto ParsedVariant = Format_->parse(Variant.RawBytes);
+        if (!ParsedVariant) {
+          ParsedVariant = std::make_unique<StructuredInput>(*Format_);
+        }
+        Variant.Input = std::move(ParsedVariant);
+
+        addValidInput(Variant.RawBytes);
+        SeenInputs_.insert(Variant.RawBytes);
+        Queue_.push(std::move(Variant));
+        Stats_.FieldMutations++;
       }
     }
   }
@@ -292,31 +512,70 @@ bool FormatAwareGenerator::checkFormatConstraints(const std::vector<uint8_t> &In
   if (!Format_)
     return true;
 
-  // Basic size check
-  size_t MinSize = Format_->getMinSize();
-  if (Input.size() < MinSize)
-    return false;
-
-  auto MaxSize = Format_->getMaxSize();
-  if (MaxSize && Input.size() > *MaxSize)
-    return false;
-
-  return true;
+  return Format_->validate(Input);
 }
 
 std::vector<uint8_t>
 FormatAwareGenerator::updateComputedFields(std::vector<uint8_t> Input) {
-  // TODO: Implement checksum/length field computation
+  if (Input.size() < 12)
+    return Input;
+
+  auto SetU16 = [&Input](size_t Offset, uint16_t Value) {
+    if (Offset + 1 >= Input.size())
+      return;
+    Input[Offset] = static_cast<uint8_t>((Value >> 8) & 0xFF);
+    Input[Offset + 1] = static_cast<uint8_t>(Value & 0xFF);
+  };
+
+  uint16_t QdCount =
+      (static_cast<uint16_t>(Input[4]) << 8) | static_cast<uint16_t>(Input[5]);
+  auto QuestionEnd = getQuestionSectionEnd(Input);
+  bool QuestionValid = QuestionEnd.has_value();
+  if (QdCount > 0 && !QuestionValid) {
+    SetU16(4, 0);
+  } else if (QdCount > 1 && QuestionValid) {
+    SetU16(4, 1);
+  }
+
+  bool HasAnswer = false;
+  auto RdLengthOffset = getFirstAnswerRdLengthOffset(Input);
+  if (RdLengthOffset && (*RdLengthOffset + 1) < Input.size()) {
+    size_t RdataStart = *RdLengthOffset + 2;
+    size_t RdataSize = Input.size() - RdataStart;
+    uint16_t FixedLength =
+        static_cast<uint16_t>(std::min<size_t>(RdataSize, 0xFFFF));
+    SetU16(*RdLengthOffset, FixedLength);
+    HasAnswer = true;
+  }
+
+  SetU16(6, HasAnswer ? 1 : 0);
+  SetU16(8, 0);
+  SetU16(10, 0);
+
   return Input;
 }
 
 void FormatAwareGenerator::addValidInput(const std::vector<uint8_t> &Input) {
+  if (std::find(ValidInputs_.begin(), ValidInputs_.end(), Input) !=
+      ValidInputs_.end()) {
+    return;
+  }
+
   ValidInputs_.push_back(Input);
-  Stats_.AcceptedCount++;
 
   if (InputCb_) {
     InputCb_(Input);
   }
+}
+
+void FormatAwareGenerator::addAcceptedInput(const std::vector<uint8_t> &Input) {
+  if (std::find(AcceptedInputs_.begin(), AcceptedInputs_.end(), Input) ==
+      AcceptedInputs_.end()) {
+    AcceptedInputs_.push_back(Input);
+    Stats_.AcceptedCount++;
+  }
+
+  addValidInput(Input);
 }
 
 bool FormatAwareGenerator::shouldStop() const {
@@ -340,6 +599,7 @@ void FormatAwareGenerator::reset() {
     Queue_.pop();
   SeenInputs_.clear();
   ValidInputs_.clear();
+  AcceptedInputs_.clear();
   Stats_ = FormatGeneratorStats{};
 }
 

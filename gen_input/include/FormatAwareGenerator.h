@@ -43,6 +43,8 @@ struct FormatGeneratorConfig {
   /// Maximum variants per field
   size_t MaxVariantsPerField = 16;
 
+  size_t MaxByteDiff = 32;
+
   /// Enable DNS name compression exploration
   bool EnableDNSCompression = true;
 
@@ -152,8 +154,8 @@ private:
   // Seen inputs (for deduplication)
   std::set<std::vector<uint8_t>> SeenInputs_;
 
-  // Generated valid inputs
   std::vector<std::vector<uint8_t>> ValidInputs_;
+  std::vector<std::vector<uint8_t>> AcceptedInputs_;
 
   // Statistics
   FormatGeneratorStats Stats_;
@@ -184,8 +186,8 @@ private:
   /// Update computed fields (checksums, lengths)
   std::vector<uint8_t> updateComputedFields(std::vector<uint8_t> Input);
 
-  /// Add a valid input to results
   void addValidInput(const std::vector<uint8_t> &Input);
+  void addAcceptedInput(const std::vector<uint8_t> &Input);
 
   /// Check stopping condition
   bool shouldStop() const;

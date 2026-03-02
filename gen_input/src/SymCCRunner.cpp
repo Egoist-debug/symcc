@@ -1,6 +1,8 @@
-#include "SymCCRunner.h"
+#include "../include/SymCCRunner.h"
 
 #include <algorithm>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -8,6 +10,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 namespace geninput {
@@ -115,17 +118,51 @@ RunResult SymCCRunner::run(const std::vector<uint8_t> &Input) {
     _exit(127);
   }
 
-  int Status;
-  waitpid(Pid, &Status, 0);
+  int Status = 0;
+  bool TimedOut = false;
+  if (Config_.TimeoutSec == 0) {
+    waitpid(Pid, &Status, 0);
+  } else {
+    const auto Timeout =
+        std::chrono::seconds(static_cast<int64_t>(Config_.TimeoutSec));
+    const auto StartTime = std::chrono::steady_clock::now();
+
+    while (true) {
+      pid_t WaitResult = waitpid(Pid, &Status, WNOHANG);
+      if (WaitResult == Pid) {
+        break;
+      }
+      if (WaitResult < 0) {
+        break;
+      }
+
+      const auto Elapsed = std::chrono::steady_clock::now() - StartTime;
+      if (Elapsed >= Timeout) {
+        kill(Pid, SIGKILL);
+        waitpid(Pid, &Status, 0);
+        TimedOut = true;
+        Stats_.TimeoutRuns++;
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
 
   unlink(TmpInput);
 
-  if (WIFEXITED(Status)) {
+  if (TimedOut) {
+    Result.ExitCode = -1;
+    Result.Accepted = false;
+  } else if (WIFEXITED(Status)) {
     Result.ExitCode = WEXITSTATUS(Status);
     Result.Accepted = (Result.ExitCode == 0);
     if (Result.Accepted) {
       Stats_.AcceptedRuns++;
     }
+  } else if (WIFSIGNALED(Status)) {
+    Result.ExitCode = -1;
+    Result.Accepted = false;
   }
 
   Result.GeneratedTestCases = collectTestCases(OutputDir);

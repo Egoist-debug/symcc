@@ -1,4 +1,4 @@
-#include "SymCCRunner.h"
+#include "../include/SymCCRunner.h"
 #include "BinaryFormat.h"
 #include "FormatAwareGenerator.h"
 #include "ThreePhaseGenerator.h"
@@ -26,6 +26,7 @@ struct Options {
   size_t MaxLength = 64;
   size_t MaxIterations = 1000;
   unsigned TimeoutSec = 10;
+  size_t MaxByteDiff = 32;
   bool Verbose = false;
   bool PrintableOnly = true;
   size_t PreserveHeaderBytes = 20;
@@ -45,6 +46,7 @@ void printUsage(const char *ProgName) {
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
       << "  -i, --max-iter <n>    Maximum iterations (default: 1000)\n"
       << "  -t, --timeout <s>     SymCC execution timeout per run in seconds (default: 10)\n"
+      << "  --max-byte-diff <n>   Maximum byte difference from parent testcase in format-aware mode (default: 32)\n"
       << "  --three-phase         Use three-phase algorithm (init → expand → complete)\n"
       << "  -a, --all-chars       Allow non-printable characters\n"
       << "  -v, --verbose         Verbose output\n"
@@ -122,6 +124,15 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
         return false;
       }
       Opts.TimeoutSec = std::stoul(Argv[I]);
+      continue;
+    }
+
+    if (Arg == "--max-byte-diff") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.MaxByteDiff = std::stoul(Argv[I]);
       continue;
     }
 
@@ -246,6 +257,8 @@ int main(int Argc, char *Argv[]) {
   std::cerr << "Output directory: " << Opts.OutputDir << "\n";
 
   std::vector<std::vector<uint8_t>> ValidInputs;
+  std::vector<std::vector<uint8_t>> AcceptedInputs;
+  std::vector<std::vector<uint8_t>> GeneratedOnlyInputs;
 
   if (!Opts.Format.empty()) {
     std::unique_ptr<geninput::BinaryFormat> Format;
@@ -307,13 +320,32 @@ int main(int Argc, char *Argv[]) {
       }
 
       ValidInputs = HybridGen.generate();
+      for (const auto &Input : ValidInputs) {
+        if (Runner->isAccepted(Input)) {
+          AcceptedInputs.push_back(Input);
+        } else {
+          GeneratedOnlyInputs.push_back(Input);
+        }
+      }
 
       if (Opts.Verbose) {
         std::cerr << "\n";
       }
 
       std::cerr << "Hybrid generation complete:\n"
-                << "  Valid inputs found: " << ValidInputs.size() << "\n";
+                << "  Total generated: " << ValidInputs.size() << "\n"
+                << "  Accepted inputs: " << AcceptedInputs.size() << "\n"
+                << "  Generated-only inputs: " << GeneratedOnlyInputs.size() << "\n";
+
+      const auto &RunStats = Runner->getStats();
+      const double AcceptanceRate =
+          RunStats.TotalRuns > 0
+              ? (100.0 * static_cast<double>(RunStats.AcceptedRuns) /
+                 static_cast<double>(RunStats.TotalRuns))
+              : 0.0;
+      std::cerr << "  SymCC runs: " << RunStats.TotalRuns << "\n"
+                << "  Timeout runs: " << RunStats.TimeoutRuns << "\n"
+                << "  SymCC acceptance rate: " << AcceptanceRate << "%\n";
     } else if (Opts.ThreePhaseMode) {
       std::cerr << "Using three-phase algorithm (init -> expand -> complete)\n";
 
@@ -344,6 +376,7 @@ int main(int Argc, char *Argv[]) {
       }
 
       ValidInputs = Generator.run();
+      AcceptedInputs = ValidInputs;
 
       if (Opts.Verbose) {
         std::cerr << "\n";
@@ -357,11 +390,22 @@ int main(int Argc, char *Argv[]) {
                 << "  Stems collected: " << Stats.TotalStemsCollected << "\n"
                 << "  Stem injections: " << Stats.StemInjections << "\n"
                 << "  Valid inputs found: " << ValidInputs.size() << "\n";
+
+      const auto &RunStats = Runner->getStats();
+      const double AcceptanceRate =
+          RunStats.TotalRuns > 0
+              ? (100.0 * static_cast<double>(RunStats.AcceptedRuns) /
+                 static_cast<double>(RunStats.TotalRuns))
+              : 0.0;
+      std::cerr << "  SymCC runs: " << RunStats.TotalRuns << "\n"
+                << "  Timeout runs: " << RunStats.TimeoutRuns << "\n"
+                << "  SymCC acceptance rate: " << AcceptanceRate << "%\n";
     } else {
       geninput::FormatGeneratorConfig GenCfg;
       GenCfg.MaxIterations = Opts.MaxIterations;
       GenCfg.MaxInputLength = Opts.MaxLength;
       GenCfg.TimeoutSec = Opts.TimeoutSec;
+      GenCfg.MaxByteDiff = Opts.MaxByteDiff;
 
       geninput::FormatAwareGenerator Generator(*Format, GenCfg);
       Generator.setRunner(Runner);
@@ -381,17 +425,35 @@ int main(int Argc, char *Argv[]) {
 
       auto Result = Generator.run();
       ValidInputs = std::move(Result.ValidInputs);
+      AcceptedInputs = std::move(Result.AcceptedInputs);
 
       if (Opts.Verbose) {
         std::cerr << "\n";
       }
 
       const auto &Stats = Generator.getStats();
+      const auto &RunStats = Runner->getStats();
+      const double AcceptanceRate =
+          Stats.TotalSymCCRuns > 0
+              ? (100.0 * static_cast<double>(AcceptedInputs.size()) /
+                 static_cast<double>(Stats.TotalSymCCRuns))
+              : 0.0;
+      const double SymCCPerAccepted =
+          AcceptedInputs.empty()
+              ? static_cast<double>(Stats.TotalSymCCRuns)
+              : (static_cast<double>(Stats.TotalSymCCRuns) /
+                 static_cast<double>(AcceptedInputs.size()));
+
       std::cerr << "Generation complete:\n"
                 << "  Total iterations: " << Stats.TotalIterations << "\n"
                 << "  Total SymCC runs: " << Stats.TotalSymCCRuns << "\n"
+                << "  Timeout runs: " << RunStats.TimeoutRuns << "\n"
                 << "  Field mutations: " << Stats.FieldMutations << "\n"
                 << "  Format violations: " << Stats.FormatViolations << "\n"
+                << "  Accepted inputs found: " << AcceptedInputs.size() << "\n"
+                << "  Acceptance rate: " << AcceptanceRate << "%\n"
+                << "  SymCC runs per accepted input: " << SymCCPerAccepted
+                << "\n"
                 << "  Valid inputs found: " << ValidInputs.size() << "\n";
     }
   } else {
@@ -458,24 +520,64 @@ int main(int Argc, char *Argv[]) {
     }
 
     const auto &Stats = Runner.getStats();
+    AcceptedInputs = ValidInputs;
+    const double AcceptanceRate =
+        Stats.TotalRuns > 0
+            ? (100.0 * static_cast<double>(Stats.AcceptedRuns) /
+               static_cast<double>(Stats.TotalRuns))
+            : 0.0;
+    const double SymCCPerAccepted =
+        AcceptedInputs.empty()
+            ? static_cast<double>(Stats.TotalRuns)
+            : (static_cast<double>(Stats.TotalRuns) /
+               static_cast<double>(AcceptedInputs.size()));
     std::cerr << "Generation complete:\n"
               << "  Total iterations: " << Iterations << "\n"
               << "  Total SymCC runs: " << Stats.TotalRuns << "\n"
+              << "  Timeout runs: " << Stats.TimeoutRuns << "\n"
+              << "  SymCC acceptance rate: " << AcceptanceRate << "%\n"
+              << "  SymCC runs per accepted input: " << SymCCPerAccepted
+              << "\n"
               << "  Test cases generated: " << Stats.TotalTestCasesGenerated
               << "\n"
               << "  Valid inputs found: " << ValidInputs.size() << "\n";
   }
 
-  size_t Index = 0;
-  for (const auto &Input : ValidInputs) {
-    std::string Filename = Opts.OutputDir + "/valid_" + std::to_string(Index++);
-    std::ofstream Ofs(Filename, std::ios::binary);
-    Ofs.write(reinterpret_cast<const char *>(Input.data()),
-              static_cast<std::streamsize>(Input.size()));
-  }
+  if (Opts.HybridMode && !Opts.Format.empty()) {
+    size_t AcceptedIndex = 0;
+    for (const auto &Input : AcceptedInputs) {
+      std::string Filename =
+          Opts.OutputDir + "/accepted_" + std::to_string(AcceptedIndex++);
+      std::ofstream Ofs(Filename, std::ios::binary);
+      Ofs.write(reinterpret_cast<const char *>(Input.data()),
+                static_cast<std::streamsize>(Input.size()));
+    }
 
-  std::cout << "Generated " << ValidInputs.size() << " valid inputs to "
-            << Opts.OutputDir << "\n";
+    size_t GeneratedIndex = 0;
+    for (const auto &Input : GeneratedOnlyInputs) {
+      std::string Filename =
+          Opts.OutputDir + "/generated_" + std::to_string(GeneratedIndex++);
+      std::ofstream Ofs(Filename, std::ios::binary);
+      Ofs.write(reinterpret_cast<const char *>(Input.data()),
+                static_cast<std::streamsize>(Input.size()));
+    }
+
+    std::cout << "Generated " << ValidInputs.size() << " hybrid inputs ("
+              << AcceptedInputs.size() << " accepted, "
+              << GeneratedOnlyInputs.size() << " generated-only) to "
+              << Opts.OutputDir << "\n";
+  } else {
+    size_t Index = 0;
+    for (const auto &Input : ValidInputs) {
+      std::string Filename = Opts.OutputDir + "/valid_" + std::to_string(Index++);
+      std::ofstream Ofs(Filename, std::ios::binary);
+      Ofs.write(reinterpret_cast<const char *>(Input.data()),
+                static_cast<std::streamsize>(Input.size()));
+    }
+
+    std::cout << "Generated " << ValidInputs.size() << " valid inputs to "
+              << Opts.OutputDir << "\n";
+  }
 
   return 0;
 }

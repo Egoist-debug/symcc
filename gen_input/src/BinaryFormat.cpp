@@ -10,11 +10,62 @@
 #include <unordered_map>
 #include <cassert>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 #include <stdexcept>
 
 namespace geninput {
+
+namespace {
+
+std::optional<size_t> getBoundedFieldSize(const FieldDef &Field);
+
+std::optional<size_t> getBoundedStructSize(const std::vector<FieldDef> &Fields) {
+  size_t TotalSize = 0;
+  for (const auto &Child : Fields) {
+    auto ChildSize = getBoundedFieldSize(Child);
+    if (!ChildSize) {
+      return std::nullopt;
+    }
+    TotalSize += *ChildSize;
+  }
+  return TotalSize;
+}
+
+std::optional<size_t> getBoundedFieldSize(const FieldDef &Field) {
+  switch (Field.Type) {
+  case FieldType::UInt8:
+  case FieldType::Int8:
+    return 1;
+  case FieldType::UInt16:
+  case FieldType::Int16:
+    return 2;
+  case FieldType::UInt32:
+  case FieldType::Int32:
+    return 4;
+  case FieldType::IPv4Addr:
+    return 4;
+  case FieldType::IPv6Addr:
+    return 16;
+  case FieldType::FixedBytes:
+  case FieldType::Padding:
+    return Field.Size;
+  case FieldType::Struct:
+    return getBoundedStructSize(Field.Children);
+  case FieldType::VarBytes:
+  case FieldType::Array:
+  case FieldType::DNSName:
+  case FieldType::DNSRR:
+  case FieldType::Union:
+  case FieldType::LengthPrefix:
+    return std::nullopt;
+  default:
+    if (Field.Size > 0) {
+      return Field.Size;
+    }
+    return std::nullopt;
+  }
+}
+
+}
 
 //===----------------------------------------------------------------------===//
 // FieldConstraint Implementation
@@ -225,35 +276,13 @@ size_t BinaryFormat::getMinSize() const {
 }
 
 std::optional<size_t> BinaryFormat::getMaxSize() const {
-  // If any field is unbounded, return nullopt
-  for (const auto &F : Fields_) {
-    if (F.Type == FieldType::VarBytes || F.Type == FieldType::Array) {
-      return std::nullopt;
-    }
-  }
-
   size_t Size = 0;
   for (const auto &F : Fields_) {
-    switch (F.Type) {
-    case FieldType::UInt8:
-    case FieldType::Int8:
-      Size += 1;
-      break;
-    case FieldType::UInt16:
-    case FieldType::Int16:
-      Size += 2;
-      break;
-    case FieldType::UInt32:
-    case FieldType::Int32:
-      Size += 4;
-      break;
-    case FieldType::FixedBytes:
-    case FieldType::Padding:
-      Size += F.Size;
-      break;
-    default:
-      break;
+    auto FieldSize = getBoundedFieldSize(F);
+    if (!FieldSize) {
+      return std::nullopt;
     }
+    Size += *FieldSize;
   }
   return Size;
 }
@@ -318,6 +347,27 @@ std::vector<uint8_t> BinaryFormat::createSeed() const {
         Result.insert(Result.end(), NestedSeed.begin(), NestedSeed.end());
       }
       break;
+
+    case FieldType::Array: {
+      if (F.Children.empty()) {
+        break;
+      }
+
+      size_t Count = 0;
+      if (F.CountField) {
+        if (const auto *CountField = findField(*F.CountField)) {
+          Count = CountField->DefaultValue.value_or(0);
+        }
+      }
+
+      BinaryFormat ElementFormat;
+      ElementFormat.addField(F.Children.front());
+      auto ElementSeed = ElementFormat.createSeed();
+      for (size_t Index = 0; Index < Count; ++Index) {
+        Result.insert(Result.end(), ElementSeed.begin(), ElementSeed.end());
+      }
+      break;
+    }
 
     case FieldType::DNSName:
       // RFC 1035: length-prefixed labels, null-terminated. Minimum valid = 1-char label "a"
@@ -406,39 +456,11 @@ std::optional<size_t> BinaryFormat::getFieldOffset(const std::string &FieldName)
       return Offset;
     }
 
-    // Skip variable-length fields (can't calculate fixed offset)
-    if (F.Type == FieldType::VarBytes || F.Type == FieldType::Array) {
+    auto FieldSize = getBoundedFieldSize(F);
+    if (!FieldSize) {
       return std::nullopt;
     }
-
-    switch (F.Type) {
-    case FieldType::UInt8:
-    case FieldType::Int8:
-      Offset += 1;
-      break;
-    case FieldType::UInt16:
-    case FieldType::Int16:
-      Offset += 2;
-      break;
-    case FieldType::UInt32:
-    case FieldType::Int32:
-      Offset += 4;
-      break;
-    case FieldType::FixedBytes:
-    case FieldType::Padding:
-      Offset += F.Size;
-      break;
-    case FieldType::Struct: {
-      BinaryFormat Nested;
-      for (const auto &Child : F.Children) {
-        Nested.addField(Child);
-      }
-      Offset += Nested.getMinSize();
-      break;
-    }
-    default:
-      break;
-    }
+    Offset += *FieldSize;
   }
 
   return std::nullopt;
@@ -535,7 +557,134 @@ bool BinaryFormat::validate(const std::vector<uint8_t> &Input) const {
     return false;
   }
 
-  // TODO: Validate field constraints
+  auto ParsedInput = parse(Input);
+  if (!ParsedInput) {
+    return false;
+  }
+
+  auto getNumericValue = [&ParsedInput](const FieldDef &Field)
+      -> std::optional<uint64_t> {
+    switch (Field.Type) {
+    case FieldType::UInt8:
+    case FieldType::Int8:
+    case FieldType::UInt16:
+    case FieldType::Int16:
+    case FieldType::UInt32:
+    case FieldType::Int32:
+      return ParsedInput->getIntField(Field.Name);
+    default:
+      return std::nullopt;
+    }
+  };
+
+  auto checkConstraint = [&ParsedInput](
+                             const FieldConstraint &Constraint,
+                             const std::optional<uint64_t> &CurrentValue) {
+    switch (Constraint.ConstraintType) {
+    case FieldConstraint::Type::Range: {
+      if (!CurrentValue)
+        return false;
+      auto Values = std::get_if<std::vector<uint64_t>>(&Constraint.Value);
+      if (!Values || Values->size() < 2)
+        return true;
+      return *CurrentValue >= (*Values)[0] && *CurrentValue <= (*Values)[1];
+    }
+    case FieldConstraint::Type::Equals: {
+      if (!CurrentValue)
+        return false;
+      auto Value = std::get_if<uint64_t>(&Constraint.Value);
+      if (!Value)
+        return true;
+      return *CurrentValue == *Value;
+    }
+    case FieldConstraint::Type::NotEquals: {
+      if (!CurrentValue)
+        return false;
+      auto Value = std::get_if<uint64_t>(&Constraint.Value);
+      if (!Value)
+        return true;
+      return *CurrentValue != *Value;
+    }
+    case FieldConstraint::Type::OneOf: {
+      if (!CurrentValue)
+        return false;
+      auto Values = std::get_if<std::vector<uint64_t>>(&Constraint.Value);
+      if (!Values)
+        return true;
+      return std::find(Values->begin(), Values->end(), *CurrentValue) !=
+             Values->end();
+    }
+    case FieldConstraint::Type::Bitmask: {
+      if (!CurrentValue)
+        return false;
+      auto Values = std::get_if<std::vector<uint64_t>>(&Constraint.Value);
+      if (!Values || Values->size() < 2)
+        return true;
+      const uint64_t Mask = (*Values)[0];
+      const uint64_t Expected = (*Values)[1];
+      return (*CurrentValue & Mask) == Expected;
+    }
+    case FieldConstraint::Type::LessThan: {
+      if (!CurrentValue || !Constraint.DependentField)
+        return true;
+      auto DependentValue = ParsedInput->getIntField(*Constraint.DependentField);
+      if (!DependentValue)
+        return false;
+      return *CurrentValue < *DependentValue;
+    }
+    case FieldConstraint::Type::GreaterThan: {
+      if (!CurrentValue || !Constraint.DependentField)
+        return true;
+      auto DependentValue = ParsedInput->getIntField(*Constraint.DependentField);
+      if (!DependentValue)
+        return false;
+      return *CurrentValue > *DependentValue;
+    }
+    case FieldConstraint::Type::DependsOn:
+    case FieldConstraint::Type::Custom:
+      return true;
+    }
+    return true;
+  };
+
+  for (const auto &Field : Fields_) {
+    if (!Field.IsOptional && !ParsedInput->hasField(Field.Name)) {
+      return false;
+    }
+
+    if (Field.LengthField) {
+      auto LengthValue = ParsedInput->getIntField(*Field.LengthField);
+      auto BytesValue = ParsedInput->getBytesField(Field.Name);
+      if (!LengthValue || !BytesValue || BytesValue->size() != *LengthValue) {
+        return false;
+      }
+    }
+
+    if (Field.Type == FieldType::Array && Field.CountField) {
+      auto CountValue = ParsedInput->getIntField(*Field.CountField);
+      auto BytesValue = ParsedInput->getBytesField(Field.Name);
+      if (!CountValue || !BytesValue) {
+        return false;
+      }
+
+      if (!Field.Children.empty()) {
+        auto ElementSize = getBoundedFieldSize(Field.Children.front());
+        if (ElementSize && *ElementSize > 0) {
+          if (*CountValue > BytesValue->size() / *ElementSize) {
+            return false;
+          }
+        }
+      }
+    }
+
+    auto CurrentValue = getNumericValue(Field);
+    for (const auto &Constraint : Field.Constraints) {
+      if (!checkConstraint(Constraint, CurrentValue)) {
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 
@@ -543,7 +692,8 @@ std::unique_ptr<StructuredInput> BinaryFormat::parse(const std::vector<uint8_t> 
   auto Result = std::make_unique<StructuredInput>(*this);
   size_t Offset = 0;
 
-  for (const auto &F : Fields_) {
+  for (size_t FieldIndex = 0; FieldIndex < Fields_.size(); ++FieldIndex) {
+    const auto &F = Fields_[FieldIndex];
     if (Offset >= Input.size())
       break;
 
@@ -623,6 +773,48 @@ std::unique_ptr<StructuredInput> BinaryFormat::parse(const std::vector<uint8_t> 
                                         Input.begin() + Offset);
         Result->setField(F.Name, NameBytes);
       }
+      break;
+    }
+
+    case FieldType::Array: {
+      if (F.Children.empty()) {
+        Result->setField(F.Name, std::vector<uint8_t>{});
+        break;
+      }
+
+      size_t Count = 0;
+      if (F.CountField) {
+        if (auto CountValue = Result->getIntField(*F.CountField)) {
+          Count = *CountValue;
+        }
+      }
+
+      std::vector<uint8_t> ArrayBytes;
+      if (Count == 0) {
+        Result->setField(F.Name, ArrayBytes);
+        break;
+      }
+
+      auto ElementSize = getBoundedFieldSize(F.Children.front());
+      if (ElementSize) {
+        size_t Remaining = Input.size() - Offset;
+        if (*ElementSize > 0 && Count > Remaining / *ElementSize) {
+          return nullptr;
+        }
+        size_t TotalSize = Count * *ElementSize;
+        ArrayBytes.assign(Input.begin() + Offset, Input.begin() + Offset + TotalSize);
+        Offset += TotalSize;
+        Result->setField(F.Name, ArrayBytes);
+        break;
+      }
+
+      if (FieldIndex + 1 < Fields_.size()) {
+        return nullptr;
+      }
+
+      ArrayBytes.assign(Input.begin() + Offset, Input.end());
+      Offset = Input.size();
+      Result->setField(F.Name, ArrayBytes);
       break;
     }
 
@@ -745,6 +937,34 @@ std::vector<uint8_t> BinaryFormat::serialize(const StructuredInput &Input) const
       }
       auto NestedBytes = Nested.serialize(Input);
       Result.insert(Result.end(), NestedBytes.begin(), NestedBytes.end());
+      break;
+    }
+
+    case FieldType::Array: {
+      if (auto Bytes = Input.getBytesField(F.Name)) {
+        Result.insert(Result.end(), Bytes->begin(), Bytes->end());
+        break;
+      }
+
+      if (F.Children.empty()) {
+        break;
+      }
+
+      size_t Count = 0;
+      if (F.CountField) {
+        if (auto CountValue = Input.getIntField(*F.CountField)) {
+          Count = *CountValue;
+        } else if (const auto *CountField = findField(*F.CountField)) {
+          Count = CountField->DefaultValue.value_or(0);
+        }
+      }
+
+      BinaryFormat ElementFormat;
+      ElementFormat.addField(F.Children.front());
+      auto ElementSeed = ElementFormat.createSeed();
+      for (size_t Index = 0; Index < Count; ++Index) {
+        Result.insert(Result.end(), ElementSeed.begin(), ElementSeed.end());
+      }
       break;
     }
 
@@ -949,37 +1169,30 @@ BinaryFormat BinaryFormatFactory::createDNSResponse() {
   QCLASS.DefaultValue = 1;
   Format.addField(QCLASS);
 
-  FieldDef AnsName;
-  AnsName.Name = "ans_name";
-  AnsName.Type = FieldType::DNSName;
-  AnsName.Size = 0;
-  Format.addField(AnsName);
+  auto RRNamePtr = FieldDef::U16("rr_name_ptr");
+  RRNamePtr.DefaultValue = 0xC00C;
 
-  auto AnsType = FieldDef::U16("ans_type");
-  AnsType.DefaultValue = 1;
-  AnsType.Constraints.push_back(FieldConstraint::OneOf({
-      1, 2, 5, 6, 12, 15, 16, 28, 33
-  }));
-  Format.addField(AnsType);
+  auto RRType = FieldDef::U16("rr_type");
+  RRType.DefaultValue = 1;
+  RRType.Constraints.push_back(FieldConstraint::OneOf({1, 2, 5, 6, 12, 15, 16, 28, 33}));
 
-  auto AnsClass = FieldDef::U16("ans_class");
-  AnsClass.DefaultValue = 1;
-  Format.addField(AnsClass);
+  auto RRClass = FieldDef::U16("rr_class");
+  RRClass.DefaultValue = 1;
 
-  auto AnsTTL = FieldDef::U32("ans_ttl");
-  AnsTTL.DefaultValue = 300;
-  Format.addField(AnsTTL);
+  auto RRTTL = FieldDef::U32("rr_ttl");
+  RRTTL.DefaultValue = 300;
 
-  auto AnsRDLength = FieldDef::U16("ans_rdlength");
-  AnsRDLength.DefaultValue = 4;
-  Format.addField(AnsRDLength);
+  auto RRDLength = FieldDef::U16("rr_rdlength");
+  RRDLength.DefaultValue = 4;
 
-  FieldDef AnsRData;
-  AnsRData.Name = "ans_rdata";
-  AnsRData.Type = FieldType::FixedBytes;
-  AnsRData.Size = 4;
-  AnsRData.DefaultValue = 0x7F000001;
-  Format.addField(AnsRData);
+  auto RRData = FieldDef::Bytes("rr_rdata", 4);
+
+  auto RRElement =
+      FieldDef::Struct("rr_element", {RRNamePtr, RRType, RRClass, RRTTL, RRDLength, RRData});
+
+  Format.addField(FieldDef::Array("answer_rrs", RRElement, "ancount"));
+  Format.addField(FieldDef::Array("authority_rrs", RRElement, "nscount"));
+  Format.addField(FieldDef::Array("additional_rrs", RRElement, "arcount"));
 
   return Format;
 }

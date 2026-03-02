@@ -44,10 +44,11 @@ gen_input [options] <program>
 |--------|-------------|---------|
 | `-o, --output <dir>` | Directory to store valid inputs | `/tmp/geninput_output` |
 | `-s, --seed <string>` | Initial seed input to start exploration | Empty string |
-| `-f, --format <name>` | Binary format for structured generation (dns, tlv) | None (byte-by-byte) |
+| `-f, --format <name>` | Binary format for structured generation (dns, dns-response, tlv) | None (byte-by-byte) |
 | `-l, --max-length <n>` | Maximum length of generated inputs | 64 bytes |
 | `-i, --max-iter <n>` | Maximum number of exploration iterations | 1000 |
 | `-t, --timeout <s>` | Timeout for each SymCC execution in seconds | 10 |
+| `--max-byte-diff <n>` | Maximum byte difference from parent testcase in format-aware mode | 32 |
 | `-a, --all-chars` | Allow non-printable characters (default: printable only) | Printable only |
 | `-v, --verbose` | Enable verbose output | Disabled |
 | `-h, --help` | Show help message | - |
@@ -61,7 +62,7 @@ gen_input [options] <program>
 
 2. Run `gen_input` to discover valid inputs:
    ```bash
-   ./gen_input -v -l 10 -i 100 -o ./valid_inputs ./simple_parser_sym
+   ./gen_input -v -l 10 -i 100 --max-byte-diff 32 -o ./valid_inputs ./simple_parser_sym
    ```
 
 3. View results:
@@ -213,8 +214,16 @@ auto seed = format.createSeed();
 
 - **Performance**: For complex grammars, the exploration queue can grow very large. Use `-i` to limit iterations.
 - **Disk Usage**: SymCC generates temporary test cases in `/tmp/` during execution. `gen_input` cleans these up automatically.
+- **Timeout Control**: Runs exceeding `--timeout` are terminated and counted as `Timeout runs`.
 - **Symbolic Reachability**: The tool can only discover inputs that are reachable via SymCC's path exploration. If the parser requires complex constraints that SymCC cannot solve, those inputs may be missed.
 - **Format Limitations**: Format-aware mode currently supports DNS, DNS-Response, and TLV. Custom JSON/YAML format specifications are planned but not yet implemented.
+
+## Runtime Metrics
+
+Generation summaries report:
+- `Timeout runs`
+- `SymCC acceptance rate`
+- `SymCC runs per accepted input`
 
 ## Hybrid DNS Fuzzing Mode
 
@@ -235,6 +244,10 @@ This allows:
 ```bash
 ./gen_input --format dns-response --hybrid --preserve 20 -v -i 500 -o ./seeds ./dns_resolver_sym
 ```
+
+Hybrid mode writes two corpora:
+- `accepted_*`: inputs accepted by target program (exit code 0)
+- `generated_*`: generated but not accepted inputs
 
 | Option | Description | Default |
 |--------|-------------|---------|

@@ -35,6 +35,7 @@ public:
   struct Stats {
     size_t TotalRuns = 0;
     size_t AcceptedRuns = 0;
+    size_t TimeoutRuns = 0;
     size_t TotalTestCasesGenerated = 0;
   };
 
