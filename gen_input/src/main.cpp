@@ -4,7 +4,6 @@
 #include "ThreePhaseGenerator.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -12,6 +11,7 @@
 #include <iterator>
 #include <memory>
 #include <queue>
+#include <sstream>
 #include <set>
 #include <string>
 
@@ -32,7 +32,39 @@ struct Options {
   size_t PreserveHeaderBytes = 20;
   bool HybridMode = false;
   bool ThreePhaseMode = false;
+  bool FreezeDNSHeaderQuestion = false;
+  size_t TailFocusLastBytes = 0;
+  double TailFocusRatio = 0.0;
+  std::vector<std::string> TailStrategies;
 };
+
+std::vector<std::string> splitCommaList(const std::string &Input) {
+  std::vector<std::string> Result;
+  std::stringstream Stream(Input);
+  std::string Item;
+  auto trim = [](std::string &Value) {
+    const auto First = Value.find_first_not_of(" \t\n\r");
+    if (First == std::string::npos) {
+      Value.clear();
+      return;
+    }
+    const auto Last = Value.find_last_not_of(" \t\n\r");
+    Value = Value.substr(First, Last - First + 1);
+  };
+  while (std::getline(Stream, Item, ',')) {
+    trim(Item);
+    if (!Item.empty()) {
+      Result.push_back(Item);
+    }
+  }
+  return Result;
+}
+
+bool isSupportedTailStrategy(const std::string &Strategy) {
+  static const std::set<std::string> Supported = {
+      "truncate", "append", "bitflip", "rdlength-mismatch", "count-mismatch"};
+  return Supported.count(Strategy) > 0;
+}
 
 void printUsage(const char *ProgName) {
   std::cerr
@@ -42,7 +74,8 @@ void printUsage(const char *ProgName) {
          "/tmp/geninput_output)\n"
       << "  -s, --seed <string>   Initial seed input\n"
       << "  --seed-file <path>    Initial seed input file (binary)\n"
-      << "  -f, --format <name>   Binary format (dns, dns-response, tlv)\n"
+      << "  -f, --format <name>   Binary format (dns, dns-response, dns-header-question, tlv)\n"
+      << "  --mode <name>         Generation mode (dns-header-question)\n"
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
       << "  -i, --max-iter <n>    Maximum iterations (default: 1000)\n"
       << "  -t, --timeout <s>     SymCC execution timeout per run in seconds (default: 10)\n"
@@ -52,6 +85,9 @@ void printUsage(const char *ProgName) {
       << "  -v, --verbose         Verbose output\n"
       << "  --hybrid              Hybrid mode: preserve header, explore payload\n"
       << "  --preserve <n>        Bytes to preserve in hybrid mode (default: 20)\n"
+      << "  --tail-focus-last <n> Tail-focused mutation window size in bytes\n"
+      << "  --tail-focus-ratio <x> Tail-focused mutation ratio in [0.0,1.0]\n"
+      << "  --tail-strategies <csv> Tail strategies (truncate,append,bitflip,rdlength-mismatch,count-mismatch)\n"
       << "  -h, --help            Show this help\n";
 }
 
@@ -97,6 +133,24 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
         return false;
       }
       Opts.Format = Argv[I];
+      continue;
+    }
+
+    if (Arg == "--mode") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      const std::string Mode = Argv[I];
+      if (Mode == "dns-header-question") {
+        Opts.FreezeDNSHeaderQuestion = true;
+        if (Opts.Format.empty()) {
+          Opts.Format = "dns-response";
+        }
+      } else {
+        std::cerr << "Error: Unknown mode '" << Mode << "'\n";
+        return false;
+      }
       continue;
     }
 
@@ -162,6 +216,43 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
         return false;
       }
       Opts.PreserveHeaderBytes = std::stoul(Argv[I]);
+      continue;
+    }
+
+    if (Arg == "--tail-focus-last") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.TailFocusLastBytes = std::stoul(Argv[I]);
+      continue;
+    }
+
+    if (Arg == "--tail-focus-ratio") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.TailFocusRatio = std::stod(Argv[I]);
+      if (Opts.TailFocusRatio < 0.0 || Opts.TailFocusRatio > 1.0) {
+        std::cerr << "Error: --tail-focus-ratio must be in [0.0, 1.0]\n";
+        return false;
+      }
+      continue;
+    }
+
+    if (Arg == "--tail-strategies") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.TailStrategies = splitCommaList(Argv[I]);
+      for (const auto &Strategy : Opts.TailStrategies) {
+        if (!isSupportedTailStrategy(Strategy)) {
+          std::cerr << "Error: Unsupported tail strategy '" << Strategy << "'\n";
+          return false;
+        }
+      }
       continue;
     }
 
@@ -268,6 +359,12 @@ int main(int Argc, char *Argv[]) {
       Format = std::make_unique<geninput::BinaryFormat>(
           geninput::BinaryFormatFactory::createDNS());
       std::cerr << "Using DNS query format\n";
+    } else if (Opts.Format == "dns-header-question") {
+      Format = std::make_unique<geninput::BinaryFormat>(
+          geninput::BinaryFormatFactory::createDNSResponse());
+      IsResponse = true;
+      Opts.FreezeDNSHeaderQuestion = true;
+      std::cerr << "Using DNS header-question semantic freeze mode\n";
     } else if (Opts.Format == "dns-response") {
       Format = std::make_unique<geninput::BinaryFormat>(
           geninput::BinaryFormatFactory::createDNSResponse());
@@ -279,7 +376,7 @@ int main(int Argc, char *Argv[]) {
       std::cerr << "Using TLV format\n";
     } else {
       std::cerr << "Error: Unknown format '" << Opts.Format << "'\n";
-      std::cerr << "Available formats: dns, dns-response, tlv\n";
+      std::cerr << "Available formats: dns, dns-response, dns-header-question, tlv\n";
       return 1;
     }
 
@@ -406,6 +503,20 @@ int main(int Argc, char *Argv[]) {
       GenCfg.MaxInputLength = Opts.MaxLength;
       GenCfg.TimeoutSec = Opts.TimeoutSec;
       GenCfg.MaxByteDiff = Opts.MaxByteDiff;
+      GenCfg.FreezeDNSHeaderQuestion = Opts.FreezeDNSHeaderQuestion;
+      GenCfg.TailFocusLastBytes = Opts.TailFocusLastBytes;
+      GenCfg.TailFocusRatio = Opts.TailFocusRatio;
+      GenCfg.TailStrategies = Opts.TailStrategies;
+      if (GenCfg.TailFocusLastBytes > 0 && GenCfg.TailStrategies.empty()) {
+        GenCfg.TailStrategies = {
+            "truncate", "append", "bitflip", "rdlength-mismatch", "count-mismatch"};
+      }
+      if (GenCfg.TailFocusLastBytes > 0 && GenCfg.ControlledMalformationBudget == 0) {
+        GenCfg.ControlledMalformationBudget =
+            std::max<size_t>(1, static_cast<size_t>(
+                                   static_cast<double>(Opts.MaxIterations) *
+                                   std::min(GenCfg.TailFocusRatio, 1.0) * 0.5));
+      }
 
       geninput::FormatAwareGenerator Generator(*Format, GenCfg);
       Generator.setRunner(Runner);

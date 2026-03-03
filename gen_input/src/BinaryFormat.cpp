@@ -1184,8 +1184,9 @@ BinaryFormat BinaryFormatFactory::createDNSResponse() {
 
   auto RRDLength = FieldDef::U16("rr_rdlength");
   RRDLength.DefaultValue = 4;
+  RRDLength.Constraints.push_back(FieldConstraint::OneOf({0, 1, 2, 4, 8, 16, 32}));
 
-  auto RRData = FieldDef::Bytes("rr_rdata", 4);
+  auto RRData = FieldDef::VarLen("rr_rdata", "rr_rdlength");
 
   auto RRElement =
       FieldDef::Struct("rr_element", {RRNamePtr, RRType, RRClass, RRTTL, RRDLength, RRData});

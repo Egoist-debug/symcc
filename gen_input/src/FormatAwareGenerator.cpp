@@ -101,6 +101,22 @@ getFirstAnswerRdLengthOffset(const std::vector<uint8_t> &Packet) {
   return *NameEnd + 8;
 }
 
+void setDnsU16(std::vector<uint8_t> &Packet, size_t Offset, uint16_t Value) {
+  if (Offset + 1 >= Packet.size()) {
+    return;
+  }
+  Packet[Offset] = static_cast<uint8_t>((Value >> 8) & 0xFF);
+  Packet[Offset + 1] = static_cast<uint8_t>(Value & 0xFF);
+}
+
+uint16_t getDnsU16(const std::vector<uint8_t> &Packet, size_t Offset) {
+  if (Offset + 1 >= Packet.size()) {
+    return 0;
+  }
+  return (static_cast<uint16_t>(Packet[Offset]) << 8) |
+         static_cast<uint16_t>(Packet[Offset + 1]);
+}
+
 std::vector<std::vector<uint8_t>>
 generateDNSStructuralMutations(const std::vector<uint8_t> &Packet,
                                size_t MaxInputLength) {
@@ -187,6 +203,7 @@ void FormatAwareGenerator::setRunner(std::shared_ptr<SymCCRunner> Runner) {
 
 void FormatAwareGenerator::setConfig(FormatGeneratorConfig Config) {
   Config_ = std::move(Config);
+  RemainingMalformationBudget_ = Config_.ControlledMalformationBudget;
 }
 
 void FormatAwareGenerator::addSeed(const std::vector<uint8_t> &Seed) {
@@ -231,6 +248,7 @@ FormatGeneratorResult FormatAwareGenerator::run() {
   }
 
   auto Start = std::chrono::high_resolution_clock::now();
+  RemainingMalformationBudget_ = Config_.ControlledMalformationBudget;
 
   // If no seeds, create one from format
   if (Queue_.empty()) {
@@ -262,6 +280,8 @@ FormatGeneratorResult FormatAwareGenerator::run() {
 }
 
 void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
+  const bool UseTailFocus = shouldApplyTailFocus();
+
   // Run SymCC on the current input
   auto RunResult = Runner_->run(Item.RawBytes);
   Stats_.TotalSymCCRuns++;
@@ -272,7 +292,9 @@ void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
 
   // Process generated test cases
   for (const auto &TestCase : RunResult.GeneratedTestCases) {
-    auto NormalizedTestCase = updateComputedFields(TestCase);
+    auto NormalizedTestCase =
+        normalizeWithControlledFix(TestCase, UseTailFocus);
+    NormalizedTestCase = applySemanticFreeze(NormalizedTestCase, Item.RawBytes);
     if (SeenInputs_.count(NormalizedTestCase) > 0)
       continue;
 
@@ -314,7 +336,8 @@ void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
 
   auto DnsMutations = generateDNSStructuralMutations(Item.RawBytes, Config_.MaxInputLength);
   for (const auto &Mutation : DnsMutations) {
-    auto NormalizedMutation = updateComputedFields(Mutation);
+    auto NormalizedMutation = normalizeWithControlledFix(Mutation, UseTailFocus);
+    NormalizedMutation = applySemanticFreeze(NormalizedMutation, Item.RawBytes);
     if (SeenInputs_.count(NormalizedMutation) > 0) {
       continue;
     }
@@ -341,6 +364,37 @@ void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
     }
   }
 
+  if (UseTailFocus) {
+    auto TailMutations = generateTailStrategyMutations(Item.RawBytes);
+    for (const auto &Mutation : TailMutations) {
+      auto NormalizedMutation = normalizeWithControlledFix(Mutation, true);
+      if (SeenInputs_.count(NormalizedMutation) > 0) {
+        continue;
+      }
+
+      if (Config_.StrictFormat && !checkFormatConstraints(NormalizedMutation)) {
+        Stats_.FormatViolations++;
+        continue;
+      }
+
+      addValidInput(NormalizedMutation);
+      SeenInputs_.insert(NormalizedMutation);
+
+      FormatWorkItem MutatedItem;
+      MutatedItem.Input = Format_->parse(NormalizedMutation);
+      if (!MutatedItem.Input) {
+        MutatedItem.Input = std::make_unique<StructuredInput>(*Format_);
+      }
+      MutatedItem.RawBytes = std::move(NormalizedMutation);
+      MutatedItem.Depth = Item.Depth + 1;
+      MutatedItem.Priority = 48 - static_cast<int>(MutatedItem.Depth);
+
+      if (MutatedItem.Depth <= Config_.MaxRecursionDepth) {
+        Queue_.push(std::move(MutatedItem));
+      }
+    }
+  }
+
   // Field mutation exploration
   if (Config_.EnableFieldMutation && Item.Depth < Config_.MaxRecursionDepth) {
     for (const auto &Field : Format_->getFields()) {
@@ -350,6 +404,7 @@ void FormatAwareGenerator::processWorkItem(FormatWorkItem &Item) {
       auto Variants = exploreField(*Item.Input, Field.Name);
       for (auto &Variant : Variants) {
         Variant.RawBytes = updateComputedFields(std::move(Variant.RawBytes));
+        Variant.RawBytes = applySemanticFreeze(Variant.RawBytes, Item.RawBytes);
         if (SeenInputs_.count(Variant.RawBytes) > 0)
           continue;
 
@@ -520,21 +575,13 @@ FormatAwareGenerator::updateComputedFields(std::vector<uint8_t> Input) {
   if (Input.size() < 12)
     return Input;
 
-  auto SetU16 = [&Input](size_t Offset, uint16_t Value) {
-    if (Offset + 1 >= Input.size())
-      return;
-    Input[Offset] = static_cast<uint8_t>((Value >> 8) & 0xFF);
-    Input[Offset + 1] = static_cast<uint8_t>(Value & 0xFF);
-  };
-
-  uint16_t QdCount =
-      (static_cast<uint16_t>(Input[4]) << 8) | static_cast<uint16_t>(Input[5]);
+  uint16_t QdCount = getDnsU16(Input, 4);
   auto QuestionEnd = getQuestionSectionEnd(Input);
   bool QuestionValid = QuestionEnd.has_value();
   if (QdCount > 0 && !QuestionValid) {
-    SetU16(4, 0);
+    setDnsU16(Input, 4, 0);
   } else if (QdCount > 1 && QuestionValid) {
-    SetU16(4, 1);
+    setDnsU16(Input, 4, 1);
   }
 
   bool HasAnswer = false;
@@ -544,15 +591,164 @@ FormatAwareGenerator::updateComputedFields(std::vector<uint8_t> Input) {
     size_t RdataSize = Input.size() - RdataStart;
     uint16_t FixedLength =
         static_cast<uint16_t>(std::min<size_t>(RdataSize, 0xFFFF));
-    SetU16(*RdLengthOffset, FixedLength);
+    setDnsU16(Input, *RdLengthOffset, FixedLength);
     HasAnswer = true;
   }
 
-  SetU16(6, HasAnswer ? 1 : 0);
-  SetU16(8, 0);
-  SetU16(10, 0);
+  setDnsU16(Input, 6, HasAnswer ? 1 : 0);
+  setDnsU16(Input, 8, 0);
+  setDnsU16(Input, 10, 0);
 
   return Input;
+}
+
+std::vector<uint8_t> FormatAwareGenerator::applySemanticFreeze(
+    const std::vector<uint8_t> &Candidate,
+    const std::vector<uint8_t> &Reference) {
+  if (!Config_.FreezeDNSHeaderQuestion || Reference.size() < 12) {
+    return Candidate;
+  }
+
+  auto QuestionEnd = getQuestionSectionEnd(Reference);
+  if (!QuestionEnd || *QuestionEnd > Reference.size()) {
+    return Candidate;
+  }
+
+  std::vector<uint8_t> Frozen = Candidate;
+  if (Frozen.size() < *QuestionEnd) {
+    Frozen.resize(*QuestionEnd, 0);
+  }
+
+  if (Frozen.size() >= 4 && Reference.size() >= 4) {
+    std::copy(Reference.begin(), Reference.begin() + 4, Frozen.begin());
+  }
+  if (*QuestionEnd > 12 && Frozen.size() >= *QuestionEnd) {
+    std::copy(Reference.begin() + 12, Reference.begin() + *QuestionEnd,
+              Frozen.begin() + 12);
+  }
+
+  return Frozen;
+}
+
+bool FormatAwareGenerator::shouldApplyTailFocus() const {
+  if (Config_.TailFocusLastBytes == 0 || Config_.TailStrategies.empty()) {
+    return false;
+  }
+  if (Config_.TailFocusRatio <= 0.0) {
+    return false;
+  }
+  if (Config_.TailFocusRatio >= 1.0) {
+    return true;
+  }
+
+  constexpr size_t Window = 1000;
+  const size_t Threshold =
+      static_cast<size_t>(Config_.TailFocusRatio * static_cast<double>(Window));
+  return (Stats_.TotalIterations % Window) < Threshold;
+}
+
+std::vector<std::vector<uint8_t>>
+FormatAwareGenerator::generateTailStrategyMutations(
+    const std::vector<uint8_t> &Packet) {
+  std::vector<std::vector<uint8_t>> Mutations;
+  if (Packet.empty() || Config_.TailFocusLastBytes == 0) {
+    return Mutations;
+  }
+
+  const std::vector<uint8_t> FrozenBase = applySemanticFreeze(Packet, Packet);
+  const size_t TailWindow = std::min(Config_.TailFocusLastBytes, FrozenBase.size());
+  const size_t TailStart = FrozenBase.size() - TailWindow;
+
+  auto addMutation = [&](std::vector<uint8_t> Mutation) {
+    if (Config_.MaxInputLength > 0 && Mutation.size() > Config_.MaxInputLength) {
+      return;
+    }
+    if (std::find(Mutations.begin(), Mutations.end(), Mutation) == Mutations.end()) {
+      Mutations.push_back(std::move(Mutation));
+    }
+  };
+
+  for (const auto &Strategy : Config_.TailStrategies) {
+    if (Strategy == "truncate") {
+      if (FrozenBase.size() > TailStart + 1) {
+        auto Mutation = FrozenBase;
+        const size_t RemoveCount = std::max<size_t>(1, TailWindow / 2);
+        const size_t NewSize =
+            std::max(TailStart, Mutation.size() > RemoveCount
+                                    ? Mutation.size() - RemoveCount
+                                    : TailStart);
+        Mutation.resize(NewSize);
+        addMutation(std::move(Mutation));
+      }
+      continue;
+    }
+
+    if (Strategy == "append") {
+      auto Mutation = FrozenBase;
+      const size_t AppendCount = std::max<size_t>(1, std::min<size_t>(8, TailWindow));
+      for (size_t Index = 0; Index < AppendCount; ++Index) {
+        Mutation.push_back(static_cast<uint8_t>((Index * 17) & 0xFF));
+      }
+      addMutation(std::move(Mutation));
+      continue;
+    }
+
+    if (Strategy == "bitflip") {
+      if (!FrozenBase.empty()) {
+        auto MutationA = FrozenBase;
+        MutationA.back() ^= 0x01;
+        addMutation(std::move(MutationA));
+
+        auto MutationB = FrozenBase;
+        MutationB[TailStart] ^= 0x80;
+        addMutation(std::move(MutationB));
+      }
+      continue;
+    }
+
+    if (Strategy == "rdlength-mismatch") {
+      auto RdLengthOffset = getFirstAnswerRdLengthOffset(FrozenBase);
+      if (RdLengthOffset && *RdLengthOffset + 1 < FrozenBase.size()) {
+        const uint16_t DeclaredLength = getDnsU16(FrozenBase, *RdLengthOffset);
+        auto Mutation = FrozenBase;
+        setDnsU16(Mutation, *RdLengthOffset,
+                  static_cast<uint16_t>(DeclaredLength + 2));
+        addMutation(std::move(Mutation));
+      }
+      continue;
+    }
+
+    if (Strategy == "count-mismatch") {
+      if (FrozenBase.size() >= 12) {
+        auto Mutation = FrozenBase;
+        const uint16_t AnswerCount = getDnsU16(Mutation, 6);
+        setDnsU16(Mutation, 6, static_cast<uint16_t>(AnswerCount + 1));
+        addMutation(std::move(Mutation));
+      }
+      continue;
+    }
+  }
+
+  return Mutations;
+}
+
+std::vector<uint8_t> FormatAwareGenerator::normalizeWithControlledFix(
+    std::vector<uint8_t> Input,
+    bool PreferMalformed,
+    bool *KeptMalformed) {
+  if (KeptMalformed) {
+    *KeptMalformed = false;
+  }
+
+  if (PreferMalformed && RemainingMalformationBudget_ > 0) {
+    --RemainingMalformationBudget_;
+    if (KeptMalformed) {
+      *KeptMalformed = true;
+    }
+    return Input;
+  }
+
+  return updateComputedFields(std::move(Input));
 }
 
 void FormatAwareGenerator::addValidInput(const std::vector<uint8_t> &Input) {
@@ -601,6 +797,7 @@ void FormatAwareGenerator::reset() {
   ValidInputs_.clear();
   AcceptedInputs_.clear();
   Stats_ = FormatGeneratorStats{};
+  RemainingMalformationBudget_ = Config_.ControlledMalformationBudget;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1176,32 +1373,60 @@ HybridDNSGenerator::explorePayload(const std::vector<uint8_t> &Header) {
     return Results;
   }
 
-  std::vector<uint8_t> InitialPayload;
+  std::vector<std::vector<uint8_t>> InitialPayloads;
   if (Config_.IsResponse) {
-    auto EncodedName = DNSNameCodec::encode("a");
-    InitialPayload.insert(InitialPayload.end(), EncodedName.begin(), EncodedName.end());
-    InitialPayload.push_back(0x00); InitialPayload.push_back(0x01);
-    InitialPayload.push_back(0x00); InitialPayload.push_back(0x01);
+    auto buildPayloadWithRDataLen = [](size_t RDataLength) {
+      std::vector<uint8_t> Payload;
+      auto EncodedName = DNSNameCodec::encode("a");
 
-    InitialPayload.insert(InitialPayload.end(), EncodedName.begin(), EncodedName.end());
-    InitialPayload.push_back(0x00); InitialPayload.push_back(0x01);
-    InitialPayload.push_back(0x00); InitialPayload.push_back(0x01);
-    InitialPayload.push_back(0x00); InitialPayload.push_back(0x00);
-    InitialPayload.push_back(0x01); InitialPayload.push_back(0x2C);
-    InitialPayload.push_back(0x00); InitialPayload.push_back(0x04);
-    InitialPayload.push_back(127); InitialPayload.push_back(0);
-    InitialPayload.push_back(0); InitialPayload.push_back(1);
+      Payload.insert(Payload.end(), EncodedName.begin(), EncodedName.end());
+      Payload.push_back(0x00);
+      Payload.push_back(0x01);
+      Payload.push_back(0x00);
+      Payload.push_back(0x01);
+
+      Payload.insert(Payload.end(), EncodedName.begin(), EncodedName.end());
+      Payload.push_back(0x00);
+      Payload.push_back(0x01);
+      Payload.push_back(0x00);
+      Payload.push_back(0x01);
+      Payload.push_back(0x00);
+      Payload.push_back(0x00);
+      Payload.push_back(0x01);
+      Payload.push_back(0x2C);
+      const uint16_t DeclaredLength = static_cast<uint16_t>(std::min<size_t>(RDataLength, 0xFFFF));
+      Payload.push_back(static_cast<uint8_t>((DeclaredLength >> 8) & 0xFF));
+      Payload.push_back(static_cast<uint8_t>(DeclaredLength & 0xFF));
+
+      for (size_t Index = 0; Index < RDataLength; ++Index) {
+        Payload.push_back(static_cast<uint8_t>((Index * 31) & 0xFF));
+      }
+      return Payload;
+    };
+
+    InitialPayloads.push_back(buildPayloadWithRDataLen(0));
+    InitialPayloads.push_back(buildPayloadWithRDataLen(1));
+    InitialPayloads.push_back(buildPayloadWithRDataLen(4));
+    InitialPayloads.push_back(buildPayloadWithRDataLen(16));
+  } else {
+    InitialPayloads.push_back({});
   }
 
   std::set<std::vector<uint8_t>> Seen;
   std::queue<std::vector<uint8_t>> Queue;
 
-  Queue.push(InitialPayload);
-  Seen.insert(InitialPayload);
-
-  std::vector<uint8_t> InitialPacket = Header;
-  InitialPacket.insert(InitialPacket.end(), InitialPayload.begin(), InitialPayload.end());
-  Results.push_back(InitialPacket);
+  for (const auto &InitialPayload : InitialPayloads) {
+    if (InitialPayload.size() > Config_.MaxPayloadLength) {
+      continue;
+    }
+    if (Seen.insert(InitialPayload).second) {
+      Queue.push(InitialPayload);
+      std::vector<uint8_t> InitialPacket = Header;
+      InitialPacket.insert(InitialPacket.end(), InitialPayload.begin(),
+                           InitialPayload.end());
+      Results.push_back(std::move(InitialPacket));
+    }
+  }
 
   size_t Iterations = 0;
   while (!Queue.empty() && Iterations < Config_.MaxIterations) {

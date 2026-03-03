@@ -8,7 +8,6 @@
 #define GENINPUT_FORMATAWAREGENERATOR_H
 
 #include "BinaryFormat.h"
-#include "InputPrefix.h"
 #include "SymCCRunner.h"
 
 #include <functional>
@@ -50,6 +49,16 @@ struct FormatGeneratorConfig {
 
   /// Maximum recursion depth for nested structures
   size_t MaxRecursionDepth = 5;
+
+  bool FreezeDNSHeaderQuestion = false;
+
+  size_t TailFocusLastBytes = 0;
+
+  double TailFocusRatio = 0.0;
+
+  std::vector<std::string> TailStrategies;
+
+  size_t ControlledMalformationBudget = 0;
 };
 
 /// Result of format-aware generation
@@ -160,6 +169,8 @@ private:
   // Statistics
   FormatGeneratorStats Stats_;
 
+  size_t RemainingMalformationBudget_ = 0;
+
   // Callbacks
   ProgressCallback ProgressCb_;
   InputCallback InputCb_;
@@ -185,6 +196,15 @@ private:
 
   /// Update computed fields (checksums, lengths)
   std::vector<uint8_t> updateComputedFields(std::vector<uint8_t> Input);
+
+  std::vector<uint8_t> applySemanticFreeze(const std::vector<uint8_t> &Candidate,
+                                           const std::vector<uint8_t> &Reference);
+  bool shouldApplyTailFocus() const;
+  std::vector<std::vector<uint8_t>> generateTailStrategyMutations(
+      const std::vector<uint8_t> &Packet);
+  std::vector<uint8_t> normalizeWithControlledFix(std::vector<uint8_t> Input,
+                                                  bool PreferMalformed,
+                                                  bool *KeptMalformed = nullptr);
 
   void addValidInput(const std::vector<uint8_t> &Input);
   void addAcceptedInput(const std::vector<uint8_t> &Input);

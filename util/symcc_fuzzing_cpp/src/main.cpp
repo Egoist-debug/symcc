@@ -4,11 +4,13 @@
 #include "util.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <optional>
 #include <unordered_set>
 
 using namespace symcc_fuzzing;
@@ -23,6 +25,9 @@ struct CLI {
   bool stdin_is_filename = false;  // -f: stdin 传入文件名而不是数据
   std::vector<std::string> command;
   std::vector<std::string> afl_target;  // AFL 编译的程序，用于 afl-showmap
+  std::optional<std::filesystem::path> response_tail_dir;
+  std::string response_tail_placeholder = "@@RESP_TAIL@@";
+  std::optional<std::string> response_tail_env;
 };
 
 static void usage() {
@@ -35,6 +40,9 @@ static void usage() {
       << "  -n <name>    Name for this SymCC instance\n"
       << "  -v           Verbose output\n"
       << "  -t <prog>    AFL-compiled target for afl-showmap (default: same as SymCC target)\n"
+      << "  -r <dir>     Optional response-tail corpus directory\n"
+      << "  -p <token>   Response-tail placeholder token in target args (default: @@RESP_TAIL@@)\n"
+      << "  -e <name>    Optional env var name to pass response-tail sample path\n"
       << "  @@           Use @@ in command for file input mode\n";
 }
 
@@ -58,6 +66,20 @@ static CLI parse_args(int argc, char** argv) {
       std::string token;
       while (std::getline(iss, token, ',')) {
         if (!token.empty()) o.afl_target.push_back(token);
+      }
+    } else if (a == "-r" && i + 1 < argc) {
+      o.response_tail_dir = std::filesystem::path(argv[++i]);
+    } else if (a == "-p" && i + 1 < argc) {
+      o.response_tail_placeholder = argv[++i];
+      if (o.response_tail_placeholder.empty()) {
+        usage();
+        throw std::runtime_error("-p requires a non-empty placeholder token");
+      }
+    } else if (a == "-e" && i + 1 < argc) {
+      o.response_tail_env = argv[++i];
+      if (o.response_tail_env->empty()) {
+        usage();
+        throw std::runtime_error("-e requires a non-empty environment variable name");
       }
     } else if (a == "-h" || a == "--help") {
       usage();
@@ -130,6 +152,7 @@ struct State {
   Stats stats;
   std::uint64_t last_stats_ms = 0;
   std::ofstream stats_file;
+  std::uint64_t response_tail_pick_count = 0;
 };
 
 static State init_state(const std::filesystem::path& symcc_dir) {
@@ -145,9 +168,36 @@ static State init_state(const std::filesystem::path& symcc_dir) {
       TestcaseDir::create(symcc_dir / "crashes"),
       {},
       now_ms(),
-      std::ofstream(symcc_dir / "stats")};
+      std::ofstream(symcc_dir / "stats"),
+      0};
   if (!s.stats_file) throw std::runtime_error("Failed to open stats file");
   return s;
+}
+
+static bool has_response_tail_placeholder(const std::vector<std::string>& command,
+                                          const std::string& placeholder) {
+  return std::find(command.begin(), command.end(), placeholder) != command.end();
+}
+
+static std::optional<std::filesystem::path> pick_response_tail_sample(
+    const std::optional<std::filesystem::path>& response_tail_dir,
+    std::uint64_t pick_count) {
+  if (!response_tail_dir.has_value()) return std::nullopt;
+
+  std::vector<std::filesystem::path> candidates;
+  std::error_code ec;
+  for (auto it = std::filesystem::directory_iterator(*response_tail_dir, ec);
+       !ec && it != std::filesystem::directory_iterator();
+       it.increment(ec)) {
+    if (!it->is_regular_file()) continue;
+    candidates.push_back(it->path());
+  }
+
+  if (candidates.empty()) return std::nullopt;
+
+  std::sort(candidates.begin(), candidates.end());
+  const auto idx = static_cast<std::size_t>(pick_count % candidates.size());
+  return candidates[idx];
 }
 
 enum class TestcaseResult { Uninteresting, New, Hang, Crash };
@@ -218,12 +268,15 @@ static TestcaseResult process_new_testcase(const std::filesystem::path& testcase
   return TestcaseResult::Crash;
 }
 
-static void test_input(const std::filesystem::path& input,
+static void test_input(const SymCCInput& input,
                        const SymCC& symcc,
                        const AflConfig& afl,
                        State& state,
                        const Logger& log) {
-  log.info("Running SymCC on input " + input.string());
+  log.info("Running SymCC on request sample " + input.request_sample.string());
+  if (input.response_tail_sample.has_value()) {
+    log.info("Using response-tail sample " + input.response_tail_sample->string());
+  }
 
   const auto tmp_dir = create_temp_dir("symcc_fuzzing");
   const auto output_dir = tmp_dir / "output";
@@ -236,7 +289,7 @@ static void test_input(const std::filesystem::path& input,
     res = symcc.run(input, output_dir);
   } catch (const std::exception& e) {
     log.error("SymCC execution failed: " + std::string(e.what()));
-    state.processed_files.insert(input.string());
+    state.processed_files.insert(input.request_sample.string());
     // 清理临时目录
     std::error_code ec;
     std::filesystem::remove_all(tmp_dir, ec);
@@ -244,7 +297,7 @@ static void test_input(const std::filesystem::path& input,
   }
 
   for (const auto& new_test : res.test_cases) {
-    const auto tr = process_new_testcase(new_test, input, tmp_dir, afl, state, log);
+    const auto tr = process_new_testcase(new_test, input.request_sample, tmp_dir, afl, state, log);
     num_total += 1;
     if (tr == TestcaseResult::New) num_interesting += 1;
   }
@@ -253,10 +306,10 @@ static void test_input(const std::filesystem::path& input,
   if (res.killed) {
     log.info("The target process was killed (probably timeout/OOM); archiving to " + state.hangs.path.string());
     try {
-      copy_testcase(input, state.hangs, input);
+      copy_testcase(input.request_sample, state.hangs, input.request_sample);
     } catch (...) {}
   }
-  state.processed_files.insert(input.string());
+  state.processed_files.insert(input.request_sample.string());
   state.stats.add(res);
 
   // 清理临时目录
@@ -304,7 +357,29 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    auto symcc = SymCC::make(symcc_dir, options.command, options.stdin_is_filename);
+    if (options.response_tail_dir.has_value() && !std::filesystem::is_directory(*options.response_tail_dir)) {
+      log.error("Response-tail corpus directory does not exist: " + options.response_tail_dir->string());
+      return 1;
+    }
+    if (options.response_tail_dir.has_value()) {
+      std::error_code ec;
+      std::filesystem::directory_iterator it(*options.response_tail_dir, ec);
+      if (ec || it == std::filesystem::directory_iterator()) {
+        log.error("Response-tail corpus directory is empty or unreadable: " + options.response_tail_dir->string());
+        return 1;
+      }
+      const bool has_placeholder = has_response_tail_placeholder(options.command, options.response_tail_placeholder);
+      if (!has_placeholder && !options.response_tail_env.has_value()) {
+        log.error("Response-tail corpus requires either placeholder token in command (-p) or env mapping (-e)");
+        return 1;
+      }
+    } else if (options.response_tail_env.has_value()) {
+      log.error("-e requires -r <response_tail_dir>");
+      return 1;
+    }
+
+    auto symcc = SymCC::make(symcc_dir, options.command, options.stdin_is_filename,
+                             options.response_tail_placeholder, options.response_tail_env);
     // log.debug("SymCC config: use_stdin=" + std::string(symcc.use_standard_input ? "yes" : "no") +
     //           ", stdin_is_filename=" + std::string(symcc.stdin_is_filename ? "yes" : "no"));
     
@@ -332,7 +407,14 @@ int main(int argc, char** argv) {
         // log.debug("Waiting for new test cases...");
         std::this_thread::sleep_for(std::chrono::seconds(5));
       } else {
-        test_input(*next, symcc, afl, state, log);
+        SymCCInput symcc_input;
+        symcc_input.request_sample = *next;
+        symcc_input.response_tail_sample =
+            pick_response_tail_sample(options.response_tail_dir, state.response_tail_pick_count);
+        if (symcc_input.response_tail_sample.has_value()) {
+          state.response_tail_pick_count += 1;
+        }
+        test_input(symcc_input, symcc, afl, state, log);
       }
 
       const auto now = now_ms();

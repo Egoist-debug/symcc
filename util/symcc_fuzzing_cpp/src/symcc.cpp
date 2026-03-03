@@ -24,6 +24,19 @@ static std::vector<std::string> insert_input_file(const std::vector<std::string>
   return out;
 }
 
+static std::vector<std::string> insert_response_tail_file(const std::vector<std::string>& cmd,
+                                                          const std::string& placeholder,
+                                                          const std::filesystem::path& response_tail_file) {
+  std::vector<std::string> out = cmd;
+  for (auto& s : out) {
+    if (s == placeholder) {
+      s = response_tail_file.string();
+      break;
+    }
+  }
+  return out;
+}
+
 static std::optional<std::uint64_t> parse_solver_time_us(const std::string& stderr_out) {
   // Match Rust logic: look for lines starting with "[STAT] SMT:" and parse
   // "solving_time": <num>
@@ -56,22 +69,38 @@ static std::optional<std::uint64_t> parse_solver_time_us(const std::string& stde
 
 SymCC SymCC::make(const std::filesystem::path& symcc_dir,
                   const std::vector<std::string>& command_line,
-                  bool stdin_is_filename) {
+                  bool stdin_is_filename,
+                  const std::string& response_tail_placeholder,
+                  const std::optional<std::string>& response_tail_env) {
   SymCC s;
   s.input_file = symcc_dir / ".cur_input";
+  s.response_tail_file = symcc_dir / ".cur_response_tail";
   s.bitmap_file = symcc_dir / "bitmap";
   s.stdin_is_filename = stdin_is_filename;
+  s.response_tail_placeholder = response_tail_placeholder;
+  s.response_tail_env = response_tail_env;
   // 没有 @@ 就是 stdin 模式
   s.use_standard_input = (std::find(command_line.begin(), command_line.end(), "@@") == command_line.end());
+  s.requires_response_tail_sample =
+      (std::find(command_line.begin(), command_line.end(), s.response_tail_placeholder) != command_line.end()) ||
+      s.response_tail_env.has_value();
   s.command = insert_input_file(command_line, s.input_file);
+  s.command = insert_response_tail_file(s.command, s.response_tail_placeholder, s.response_tail_file);
   return s;
 }
 
-SymCCResult SymCC::run(const std::filesystem::path& input,
+SymCCResult SymCC::run(const SymCCInput& input,
                        const std::filesystem::path& output_dir) const {
   std::error_code ec;
-  std::filesystem::copy_file(input, input_file, std::filesystem::copy_options::overwrite_existing, ec);
+  std::filesystem::copy_file(input.request_sample, input_file, std::filesystem::copy_options::overwrite_existing, ec);
   if (ec) throw std::runtime_error("Failed to copy input to workbench: " + ec.message());
+
+  if (input.response_tail_sample.has_value()) {
+    ec.clear();
+    std::filesystem::copy_file(*input.response_tail_sample, response_tail_file,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) throw std::runtime_error("Failed to copy response-tail input to workbench: " + ec.message());
+  }
 
   std::filesystem::create_directory(output_dir, ec);
   if (ec) throw std::runtime_error("Failed to create SymCC output dir: " + ec.message());
@@ -89,6 +118,9 @@ SymCCResult SymCC::run(const std::filesystem::path& input,
   // stdin 模式下不设置，让 SymCC 自动把 stdin 数据符号化
   if (!use_standard_input) {
     env["SYMCC_INPUT_FILE"] = input_file.string();
+  }
+  if (response_tail_env.has_value() && input.response_tail_sample.has_value()) {
+    env[*response_tail_env] = response_tail_file.string();
   }
   
   // 继承并扩展 LD_LIBRARY_PATH，确保能找到 libsymcc-rt.so
