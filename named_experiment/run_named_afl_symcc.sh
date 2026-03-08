@@ -43,7 +43,7 @@ HELPER_PID="$PID_DIR/helper.pid"
 
 MUTATOR_ADDR="${MUTATOR_ADDR:-127.0.0.1:55300}"
 TARGET_ADDR="${TARGET_ADDR:-127.0.0.1:55301}"
-REPLY_TIMEOUT_MS="${REPLY_TIMEOUT_MS:-1000}"
+REPLY_TIMEOUT_MS="${REPLY_TIMEOUT_MS:-50}"
 JOBS="${JOBS:-2}"
 AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-3000+}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-15}"
@@ -86,6 +86,7 @@ usage() {
   JOBS=2
   ENABLE_SECONDARY=1
   AFL_TIMEOUT_MS=3000+
+  REPLY_TIMEOUT_MS=50
   REGEN_SEEDS=0
   REFILTER_QUERIES=0
   RESET_OUTPUT=1
@@ -151,17 +152,28 @@ sync_patch_tree() {
 		cp "$src" "$dst"
 	}
 
-	mkdir -p "$tree/bin/named" "$tree/bin/named/include/named"
+	mkdir -p \
+		"$tree/bin/named" \
+		"$tree/bin/named/include/named" \
+		"$tree/lib/dns" \
+		"$tree/lib/dns/include/dns" \
+		"$tree/lib/ns"
 	copy_if_different "$PATCH_DIR/bin/named/main.c" "$tree/bin/named/main.c"
 	copy_if_different "$PATCH_DIR/bin/named/fuzz.c" "$tree/bin/named/fuzz.c"
 	copy_if_different "$PATCH_DIR/bin/named/resolver_afl_symcc_orchestrator.c" \
 		"$tree/bin/named/resolver_afl_symcc_orchestrator.c"
 	copy_if_different "$PATCH_DIR/bin/named/resolver_afl_symcc_mutator_server.c" \
 		"$tree/bin/named/resolver_afl_symcc_mutator_server.c"
+	copy_if_different "$PATCH_DIR/lib/dns/dispatch.c" \
+		"$tree/lib/dns/dispatch.c"
+	copy_if_different "$PATCH_DIR/lib/ns/client.c" \
+		"$tree/lib/ns/client.c"
 	copy_if_different "$PATCH_DIR/include/named/resolver_afl_symcc_orchestrator.h" \
 		"$tree/bin/named/include/named/resolver_afl_symcc_orchestrator.h"
 	copy_if_different "$PATCH_DIR/include/named/resolver_afl_symcc_mutator_server.h" \
 		"$tree/bin/named/include/named/resolver_afl_symcc_mutator_server.h"
+	copy_if_different "$PATCH_DIR/lib/dns/include/dns/dispatch.h" \
+		"$tree/lib/dns/include/dns/dispatch.h"
 }
 
 sync_patch() {
@@ -169,8 +181,11 @@ sync_patch() {
 	require_file "$PATCH_DIR/bin/named/fuzz.c"
 	require_file "$PATCH_DIR/bin/named/resolver_afl_symcc_orchestrator.c"
 	require_file "$PATCH_DIR/bin/named/resolver_afl_symcc_mutator_server.c"
+	require_file "$PATCH_DIR/lib/dns/dispatch.c"
+	require_file "$PATCH_DIR/lib/ns/client.c"
 	require_file "$PATCH_DIR/include/named/resolver_afl_symcc_orchestrator.h"
 	require_file "$PATCH_DIR/include/named/resolver_afl_symcc_mutator_server.h"
+	require_file "$PATCH_DIR/lib/dns/include/dns/dispatch.h"
 
 	sync_patch_tree "$SRC_TREE"
 	ensure_tree_exists "$AFL_TREE"

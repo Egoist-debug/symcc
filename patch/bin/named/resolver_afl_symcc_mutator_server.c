@@ -11,22 +11,17 @@
  * information regarding copyright ownership.
  */
 
-#include <arpa/inet.h>
 #include <dirent.h>
-#include <errno.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <isc/result.h>
+#include <isc/region.h>
 #include <isc/util.h>
 
 #include <named/resolver_afl_symcc_mutator_server.h>
@@ -44,10 +39,6 @@ typedef struct {
 } dns_header_t;
 
 typedef struct named_resolver_afl_symcc_mutator_server {
-	int sockfd;
-	pthread_t thread_id;
-	volatile int running;
-	pthread_mutex_t mutex;
 	uint64_t tail_pick_count;
 	uint64_t received;
 	uint64_t replied;
@@ -74,31 +65,6 @@ parse_dns_header(const uint8_t *buf, size_t len, dns_header_t *hdr) {
 	hdr->arcount = (buf[10] << 8) | buf[11];
 
 	return 0;
-}
-
-/*
- * Build minimal DNS response: copy header, set QR=1, clear counts.
- * Returns length of response packet, or -1 on error.
- */
-static bool
-parse_port_number(const char *text, int *port) {
-	char *endp = NULL;
-	long value;
-
-	if (text == NULL || *text == '\0' || port == NULL) {
-		return false;
-	}
-
-	errno = 0;
-	value = strtol(text, &endp, 10);
-	if (errno != 0 || endp == text || *endp != '\0' || value <= 0 ||
-	    value > 65535)
-	{
-		return false;
-	}
-
-	*port = (int)value;
-	return true;
 }
 
 static int
@@ -353,178 +319,57 @@ build_dns_response(named_resolver_afl_symcc_mutator_server_t *server,
 	return (int)question_end;
 }
 
-/*
- * UDP server thread function.
- */
-static void *
-mutator_server_thread(void *arg) {
-	named_resolver_afl_symcc_mutator_server_t *server =
-		(named_resolver_afl_symcc_mutator_server_t *)arg;
-	uint8_t buf[65536];
-	uint8_t response[65536];
-	struct sockaddr_in client_addr;
-	socklen_t client_addr_len;
-	int response_len;
-
-	while (server->running) {
-		client_addr_len = sizeof(client_addr);
-		int n = recvfrom(server->sockfd, buf, sizeof(buf), 0,
-				  (struct sockaddr *)&client_addr,
-				  &client_addr_len);
-
-		if (n < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			break;
-		}
-
-		pthread_mutex_lock(&server->mutex);
-		server->received++;
-		pthread_mutex_unlock(&server->mutex);
-
-		/* Try to build response */
-		response_len = build_dns_response(server, buf, (size_t)n, response,
-						  sizeof(response));
-
-		if (response_len < 0) {
-			pthread_mutex_lock(&server->mutex);
-			server->parse_errors++;
-			pthread_mutex_unlock(&server->mutex);
-			continue;
-		}
-
-		/* Send response */
-		if (sendto(server->sockfd, response, response_len, 0,
-			   (struct sockaddr *)&client_addr,
-			   client_addr_len) >= 0) {
-			pthread_mutex_lock(&server->mutex);
-			server->replied++;
-			pthread_mutex_unlock(&server->mutex);
-		}
-	}
-
-	return NULL;
-}
-
 isc_result_t
 named_resolver_afl_symcc_mutator_server_start(const char *config) {
-	struct sockaddr_in addr;
-	const char *host = "127.0.0.1";
-	int port = 5300;
-	int sockfd;
-	int opt = 1;
-	char *config_copy = NULL;
+	UNUSED(config);
 
 	if (g_server != NULL) {
 		return ISC_R_SUCCESS;
 	}
 
-	/* Parse config if provided (format: "host:port") */
-	if (config != NULL) {
-		config_copy = strdup(config);
-		if (config_copy != NULL) {
-			char *comma = strchr(config_copy, ',');
-			char *colon;
-
-			if (comma != NULL) {
-				*comma = '\0';
-			}
-
-			colon = strrchr(config_copy, ':');
-			if (colon != NULL) {
-				*colon = '\0';
-				host = config_copy;
-				if (!parse_port_number(colon + 1, &port)) {
-					free(config_copy);
-					return ISC_R_FAILURE;
-				}
-			}
-		}
-	}
-
-	/* Create UDP socket */
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sockfd < 0) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] socket creation failed: %s\n",
-			strerror(errno));
-		return ISC_R_FAILURE;
-	}
-
-	/* Allow reuse of address */
-	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt,
-		       sizeof(opt)) < 0) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] setsockopt failed: %s\n",
-			strerror(errno));
-		close(sockfd);
-		return ISC_R_FAILURE;
-	}
-
-	/* Bind to address */
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons((uint16_t)port);
-	if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] invalid bind address: %s\n", host);
-		free(config_copy);
-		close(sockfd);
-		return ISC_R_FAILURE;
-	}
-
-	if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] bind failed on %s:%d: %s\n", host,
-			port, strerror(errno));
-		free(config_copy);
-		close(sockfd);
-		return ISC_R_FAILURE;
-	}
-	free(config_copy);
-
-	/* Allocate server structure */
 	g_server = (named_resolver_afl_symcc_mutator_server_t *)malloc(
 		sizeof(named_resolver_afl_symcc_mutator_server_t));
 	if (g_server == NULL) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] server allocation failed\n");
-		close(sockfd);
 		return ISC_R_NOMEMORY;
 	}
 
 	memset(g_server, 0, sizeof(*g_server));
-	g_server->sockfd = sockfd;
-	g_server->running = 1;
 	g_server->tail_pick_count = 0;
-	g_server->received = 0;
-	g_server->replied = 0;
-	g_server->parse_errors = 0;
+	return ISC_R_SUCCESS;
+}
 
-	if (pthread_mutex_init(&g_server->mutex, NULL) != 0) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] mutex init failed: %s\n",
-			strerror(errno));
-		free(g_server);
-		close(sockfd);
-		g_server = NULL;
-		return ISC_R_FAILURE;
+isc_result_t
+named_resolver_afl_symcc_mutator_dispatch_hook(
+	dns_dispentry_t *resp, const isc_region_t *request,
+	unsigned char *response_buf, size_t response_buf_size,
+	isc_region_t *response, void *arg) {
+	int response_len;
+
+	UNUSED(resp);
+	UNUSED(arg);
+
+	if (g_server == NULL) {
+		return ISC_R_NOTFOUND;
+	}
+	if (request == NULL || request->base == NULL || response == NULL ||
+	    response_buf == NULL)
+	{
+		return ISC_R_TIMEDOUT;
 	}
 
-	/* Start server thread */
-	if (pthread_create(&g_server->thread_id, NULL,
-			   mutator_server_thread, g_server) != 0) {
-		fprintf(stderr,
-			"[resolver-afl-symcc] server thread create failed: %s\n",
-			strerror(errno));
-		pthread_mutex_destroy(&g_server->mutex);
-		free(g_server);
-		close(sockfd);
-		g_server = NULL;
-		return ISC_R_FAILURE;
+	g_server->received++;
+
+	response_len = build_dns_response(g_server, request->base,
+					  (size_t)request->length,
+					  response_buf, response_buf_size);
+	if (response_len < 0) {
+		g_server->parse_errors++;
+		return ISC_R_TIMEDOUT;
 	}
 
+	response->base = response_buf;
+	response->length = (unsigned int)response_len;
+	g_server->replied++;
 	return ISC_R_SUCCESS;
 }
 
@@ -534,18 +379,6 @@ named_resolver_afl_symcc_mutator_server_stop(void) {
 		return;
 	}
 
-	g_server->running = 0;
-
-	/* Close socket to unblock recvfrom */
-	if (g_server->sockfd >= 0) {
-		close(g_server->sockfd);
-		g_server->sockfd = -1;
-	}
-
-	/* Wait for thread to finish */
-	pthread_join(g_server->thread_id, NULL);
-
-	pthread_mutex_destroy(&g_server->mutex);
 	free(g_server);
 	g_server = NULL;
 }
@@ -553,27 +386,21 @@ named_resolver_afl_symcc_mutator_server_stop(void) {
 void
 named_resolver_afl_symcc_mutator_server_add_received(uint64_t delta) {
 	if (g_server != NULL) {
-		pthread_mutex_lock(&g_server->mutex);
 		g_server->received += delta;
-		pthread_mutex_unlock(&g_server->mutex);
 	}
 }
 
 void
 named_resolver_afl_symcc_mutator_server_add_replied(uint64_t delta) {
 	if (g_server != NULL) {
-		pthread_mutex_lock(&g_server->mutex);
 		g_server->replied += delta;
-		pthread_mutex_unlock(&g_server->mutex);
 	}
 }
 
 void
 named_resolver_afl_symcc_mutator_server_add_parse_errors(uint64_t delta) {
 	if (g_server != NULL) {
-		pthread_mutex_lock(&g_server->mutex);
 		g_server->parse_errors += delta;
-		pthread_mutex_unlock(&g_server->mutex);
 	}
 }
 
@@ -585,11 +412,9 @@ named_resolver_afl_symcc_mutator_server_get_counters(
 	}
 
 	if (g_server != NULL) {
-		pthread_mutex_lock(&g_server->mutex);
 		counters->received = g_server->received;
 		counters->replied = g_server->replied;
 		counters->parse_errors = g_server->parse_errors;
-		pthread_mutex_unlock(&g_server->mutex);
 	} else {
 		counters->received = 0;
 		counters->replied = 0;

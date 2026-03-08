@@ -16,7 +16,6 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,22 +23,42 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <isc/app.h>
+#include <isc/netmgr.h>
 #include <isc/result.h>
+#include <isc/util.h>
+
+#include <dns/dispatch.h>
+
+#include <ns/client.h>
+#include <ns/interfacemgr.h>
 
 #include <named/globals.h>
 #include <named/resolver_afl_symcc_mutator_server.h>
 #include <named/resolver_afl_symcc_orchestrator.h>
 #include <named/server.h>
 
+typedef struct named_resolver_afl_symcc_request_context {
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	const uint8_t *request;
+	size_t request_len;
+	ns_client_t *client;
+	bool finished;
+	bool reply_sent;
+	isc_result_t result;
+} named_resolver_afl_symcc_request_context_t;
+
 typedef struct named_resolver_afl_symcc_orchestrator {
 	pthread_t injector_thread_id;
 	bool injector_thread_started;
 	char *config;
+	isc_fuzztype_t saved_fuzztype;
+	ns_fuzzcb_t saved_fuzznotify;
+	bool hooks_installed;
 	uint64_t requests_sent;
 	uint64_t replies_received;
 	uint64_t reply_timeouts;
@@ -48,6 +67,25 @@ typedef struct named_resolver_afl_symcc_orchestrator {
 
 static bool g_initialized = false;
 static named_resolver_afl_symcc_orchestrator_t g_orchestrator = { 0 };
+static pthread_mutex_t g_request_context_lock = PTHREAD_MUTEX_INITIALIZER;
+static named_resolver_afl_symcc_request_context_t *g_request_context = NULL;
+
+static named_resolver_afl_symcc_request_context_t *
+get_request_context(void) {
+	named_resolver_afl_symcc_request_context_t *ctx = NULL;
+
+	pthread_mutex_lock(&g_request_context_lock);
+	ctx = g_request_context;
+	pthread_mutex_unlock(&g_request_context_lock);
+	return ctx;
+}
+
+static void
+set_request_context(named_resolver_afl_symcc_request_context_t *ctx) {
+	pthread_mutex_lock(&g_request_context_lock);
+	g_request_context = ctx;
+	pthread_mutex_unlock(&g_request_context_lock);
+}
 
 static bool
 parse_port_number(const char *text, int *port) {
@@ -143,11 +181,13 @@ load_request_input_path(const char *config, char *path, size_t path_size) {
 		}
 
 		if (segment_len > 6 && strncmp(segment, "input=", 6) == 0) {
-			if (segment_len - 6 >= path_size) {
+			size_t path_len = strlen(segment + 6);
+
+			if (path_len >= path_size) {
 				return false;
 			}
-			memcpy(path, segment + 6, segment_len - 6);
-			path[segment_len - 6] = '\0';
+			memcpy(path, segment + 6, path_len);
+			path[path_len] = '\0';
 			return true;
 		}
 	}
@@ -189,6 +229,15 @@ shutdown_named(void) {
 }
 
 static void
+wait_until_named_running(void) {
+#ifdef ENABLE_AFL
+	while (!named_g_run_done) {
+		usleep(10000);
+	}
+#endif /* ifdef ENABLE_AFL */
+}
+
+static void
 print_stats_and_exit(
 	const named_resolver_afl_symcc_orchestrator_t *orchestrator) {
 	named_resolver_afl_symcc_mutator_counters_t counters;
@@ -210,51 +259,182 @@ print_stats_and_exit(
 	_exit(0);
 }
 
+static void
+resolver_afl_symcc_request_done_notify(void) {
+	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->result == ISC_R_UNSET) {
+		ctx->result = ISC_R_SUCCESS;
+	}
+	ctx->finished = true;
+	pthread_cond_signal(&ctx->cond);
+	pthread_mutex_unlock(&ctx->mutex);
+}
+
+static void
+resolver_afl_symcc_client_sendcb(isc_buffer_t *buffer) {
+	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
+
+	UNUSED(buffer);
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	pthread_mutex_lock(&ctx->mutex);
+	ctx->reply_sent = true;
+	pthread_mutex_unlock(&ctx->mutex);
+}
+
+static void
+resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
+					 isc_result_t result, void *arg) {
+	named_resolver_afl_symcc_request_context_t *ctx =
+		(named_resolver_afl_symcc_request_context_t *)arg;
+	ns_interface_t ifp = { 0 };
+	isc_region_t region;
+	ns_client_t *client = NULL;
+	ns_clientmgr_t *clientmgr = NULL;
+
+	if (result != ISC_R_SUCCESS) {
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->result = result;
+		ctx->finished = true;
+		pthread_cond_signal(&ctx->cond);
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+
+	ifp.mgr = named_g_server->interfacemgr;
+	clientmgr = ns_interfacemgr_getclientmgr(ifp.mgr);
+	client = isc_nmhandle_getextra(handle);
+	result = ns__client_setup(client, clientmgr, true);
+	if (result != ISC_R_SUCCESS) {
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->result = result;
+		ctx->finished = true;
+		pthread_cond_signal(&ctx->cond);
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+	client->sendcb = resolver_afl_symcc_client_sendcb;
+	isc_nmhandle_setdata(handle, client, ns__client_reset_cb,
+			     ns__client_put_cb);
+	client->handle = handle;
+	region.base = (unsigned char *)ctx->request;
+	region.length = (unsigned int)ctx->request_len;
+
+	pthread_mutex_lock(&ctx->mutex);
+	ctx->client = client;
+	if (ctx->result == ISC_R_UNSET) {
+		ctx->result = ISC_R_SUCCESS;
+	}
+	pthread_mutex_unlock(&ctx->mutex);
+
+	ns__client_request(handle, ISC_R_SUCCESS, &region, &ifp);
+}
+
+static isc_result_t
+inject_request_bytes(const uint8_t *request, size_t request_len,
+			 long timeout_ms) {
+	named_resolver_afl_symcc_request_context_t ctx;
+	struct timespec deadline;
+	char host[64];
+	int port = 0;
+	isc_sockaddr_t local;
+	isc_sockaddr_t peer;
+	struct sockaddr_in peer4;
+	struct sockaddr_in6 peer6;
+	int rc;
+
+	if (request == NULL || request_len == 0) {
+		return ISC_R_FAILURE;
+	}
+
+	memset(&ctx, 0, sizeof(ctx));
+	pthread_mutex_init(&ctx.mutex, NULL);
+	pthread_cond_init(&ctx.cond, NULL);
+	ctx.request = request;
+	ctx.request_len = request_len;
+	ctx.result = ISC_R_UNSET;
+
+	load_request_target(host, sizeof(host), &port);
+
+	memset(&peer4, 0, sizeof(peer4));
+	peer4.sin_family = AF_INET;
+	peer4.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &peer4.sin_addr) == 1) {
+		isc_sockaddr_fromin(&peer, &peer4.sin_addr,
+				     ntohs(peer4.sin_port));
+		isc_sockaddr_any(&local);
+	} else {
+		memset(&peer6, 0, sizeof(peer6));
+		peer6.sin6_family = AF_INET6;
+		peer6.sin6_port = htons((uint16_t)port);
+		if (inet_pton(AF_INET6, host, &peer6.sin6_addr) != 1) {
+			pthread_cond_destroy(&ctx.cond);
+			pthread_mutex_destroy(&ctx.mutex);
+			return ISC_R_FAILURE;
+		}
+		isc_sockaddr_fromin6(&peer, &peer6.sin6_addr,
+				      ntohs(peer6.sin6_port));
+		isc_sockaddr_any6(&local);
+	}
+
+	set_request_context(&ctx);
+	isc_nm_udpconnect(named_g_netmgr, &local, &peer,
+			  resolver_afl_symcc_request_connected, &ctx,
+			  (unsigned int)timeout_ms, sizeof(ns_client_t));
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += timeout_ms / 1000;
+	deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec += 1;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	pthread_mutex_lock(&ctx.mutex);
+	while (!ctx.finished) {
+		rc = pthread_cond_timedwait(&ctx.cond, &ctx.mutex, &deadline);
+		if (rc == ETIMEDOUT) {
+			ctx.result = ISC_R_TIMEDOUT;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&ctx.mutex);
+
+	set_request_context(NULL);
+
+	pthread_cond_destroy(&ctx.cond);
+	pthread_mutex_destroy(&ctx.mutex);
+
+	if (ctx.result != ISC_R_SUCCESS) {
+		return ctx.result;
+	}
+	return ISC_R_SUCCESS;
+}
+
 static void *
 request_injector_thread(void *arg) {
 	named_resolver_afl_symcc_orchestrator_t *orchestrator =
 		(named_resolver_afl_symcc_orchestrator_t *)arg;
-	struct sockaddr_in server_addr;
-	struct timeval timeout;
 	uint8_t request[65536];
-	uint8_t response[65536];
-	char host[64];
-	int port = 0;
-	int sockfd = -1;
 	long timeout_ms;
 	ssize_t length;
+	isc_result_t result;
 
-	while (!named_g_run_done) {
-		usleep(10000);
-	}
+	wait_until_named_running();
 
-	load_request_target(host, sizeof(host), &port);
 	timeout_ms = load_reply_timeout_ms();
-
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sockfd < 0) {
-		orchestrator->send_failures++;
-		print_stats_and_exit(orchestrator);
-	}
-
-	timeout.tv_sec = timeout_ms / 1000;
-	timeout.tv_usec = (timeout_ms % 1000) * 1000;
-	(void)setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-			 sizeof(timeout));
-
-	memset(&server_addr, 0, sizeof(server_addr));
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons((uint16_t)port);
-	if (inet_pton(AF_INET, host, &server_addr.sin_addr) != 1) {
-		orchestrator->send_failures++;
-		close(sockfd);
-		print_stats_and_exit(orchestrator);
-	}
 
 	if (use_afl_persistent_driver()) {
 		for (int loop = 0; loop < 100000; loop++) {
-			ssize_t sent;
-
 			length = read(STDIN_FILENO, request, sizeof(request));
 			if (length <= 0) {
 				usleep(1000000);
@@ -263,7 +443,6 @@ request_injector_thread(void *arg) {
 
 			if (length > 4096) {
 				if (getenv("AFL_CMIN") != NULL) {
-					close(sockfd);
 					shutdown_named();
 					return NULL;
 				}
@@ -271,20 +450,13 @@ request_injector_thread(void *arg) {
 				continue;
 			}
 
-			sent = sendto(sockfd, request, (size_t)length, 0,
-				      (struct sockaddr *)&server_addr,
-				      sizeof(server_addr));
-			if (sent == length) {
-				orchestrator->requests_sent++;
-				if (recvfrom(sockfd, response, sizeof(response),
-					     0, NULL, NULL) >= 0)
-				{
-					orchestrator->replies_received++;
-				} else if (errno == EAGAIN ||
-					   errno == EWOULDBLOCK)
-				{
-					orchestrator->reply_timeouts++;
-				}
+			orchestrator->requests_sent++;
+			result = inject_request_bytes(request, (size_t)length,
+						      timeout_ms);
+			if (result == ISC_R_SUCCESS) {
+				orchestrator->replies_received++;
+			} else if (result == ISC_R_TIMEDOUT) {
+				orchestrator->reply_timeouts++;
 			} else {
 				orchestrator->send_failures++;
 			}
@@ -292,7 +464,6 @@ request_injector_thread(void *arg) {
 			raise(SIGSTOP);
 		}
 
-		close(sockfd);
 		shutdown_named();
 		return NULL;
 	}
@@ -300,27 +471,20 @@ request_injector_thread(void *arg) {
 	length = read_request_bytes(orchestrator->config, request,
 				      sizeof(request));
 	if (length > 0) {
-		ssize_t sent;
-
-		sent = sendto(sockfd, request, (size_t)length, 0,
-			      (struct sockaddr *)&server_addr,
-			      sizeof(server_addr));
-		if (sent == length) {
-			orchestrator->requests_sent++;
-			if (recvfrom(sockfd, response, sizeof(response), 0, NULL,
-				     NULL) >= 0)
-			{
-				orchestrator->replies_received++;
-			} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				orchestrator->reply_timeouts++;
-			}
+		orchestrator->requests_sent++;
+		result = inject_request_bytes(request, (size_t)length,
+					      timeout_ms);
+		if (result == ISC_R_SUCCESS) {
+			orchestrator->replies_received++;
+		} else if (result == ISC_R_TIMEDOUT) {
+			orchestrator->reply_timeouts++;
 		} else {
 			orchestrator->send_failures++;
 		}
 	}
 
-	close(sockfd);
 	print_stats_and_exit(orchestrator);
+	return NULL;
 }
 
 isc_result_t
@@ -347,12 +511,39 @@ named_resolver_afl_symcc_orchestrator_start(const char *config) {
 			return ISC_R_NOMEMORY;
 		}
 	}
+
+	if (named_g_server != NULL && named_g_server->sctx != NULL) {
+		g_orchestrator.saved_fuzztype = named_g_server->sctx->fuzztype;
+		g_orchestrator.saved_fuzznotify =
+			named_g_server->sctx->fuzznotify;
+		named_g_server->sctx->fuzztype = isc_fuzz_resolver;
+		named_g_server->sctx->fuzznotify =
+			resolver_afl_symcc_request_done_notify;
+		g_orchestrator.hooks_installed = true;
+	}
+
+	if (named_g_dispatchmgr != NULL) {
+		dns_dispatchmgr_setudpresphook(
+			named_g_dispatchmgr,
+			named_resolver_afl_symcc_mutator_dispatch_hook, NULL);
+	}
+
 	if (pthread_create(&g_orchestrator.injector_thread_id, NULL,
 			   request_injector_thread, &g_orchestrator) != 0)
 	{
 		fprintf(stderr,
 			"[resolver-afl-symcc] injector thread create failed: %s\n",
 			strerror(errno));
+		if (named_g_dispatchmgr != NULL) {
+			dns_dispatchmgr_setudpresphook(named_g_dispatchmgr, NULL,
+							 NULL);
+		}
+		if (g_orchestrator.hooks_installed) {
+			named_g_server->sctx->fuzztype =
+				g_orchestrator.saved_fuzztype;
+			named_g_server->sctx->fuzznotify =
+				g_orchestrator.saved_fuzznotify;
+		}
 		free(g_orchestrator.config);
 		g_orchestrator.config = NULL;
 		named_resolver_afl_symcc_mutator_server_stop();
@@ -375,6 +566,18 @@ named_resolver_afl_symcc_orchestrator_stop(void) {
 	if (g_orchestrator.injector_thread_started) {
 		pthread_join(g_orchestrator.injector_thread_id, NULL);
 		g_orchestrator.injector_thread_started = false;
+	}
+
+	if (named_g_dispatchmgr != NULL) {
+		dns_dispatchmgr_setudpresphook(named_g_dispatchmgr, NULL, NULL);
+	}
+	if (g_orchestrator.hooks_installed && named_g_server != NULL &&
+	    named_g_server->sctx != NULL)
+	{
+		named_g_server->sctx->fuzztype = g_orchestrator.saved_fuzztype;
+		named_g_server->sctx->fuzznotify =
+			g_orchestrator.saved_fuzznotify;
+		g_orchestrator.hooks_installed = false;
 	}
 
 	named_resolver_afl_symcc_mutator_server_get_counters(&counters);
