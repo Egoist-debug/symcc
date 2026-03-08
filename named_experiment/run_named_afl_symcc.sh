@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXP_DIR="$ROOT_DIR/named_experiment"
+WORK_DIR="${WORK_DIR:-$EXP_DIR/work}"
 PATCH_DIR="$ROOT_DIR/patch"
 SRC_TREE="$ROOT_DIR/bind-9.18.46"
 AFL_TREE="$ROOT_DIR/bind-9.18.46-afl"
@@ -16,16 +17,22 @@ SYMCC_CC_BIN="${SYMCC_CC_BIN:-$ROOT_DIR/symcc_build_qsym/symcc}"
 SYMCC_CXX_BIN="${SYMCC_CXX_BIN:-$ROOT_DIR/symcc_build_qsym/sym++}"
 
 NAMED_CONF="$EXP_DIR/runtime/named.conf"
-QUERY_CORPUS_DIR="$EXP_DIR/query_corpus"
-STABLE_QUERY_CORPUS_DIR="$EXP_DIR/stable_query_corpus"
-RESPONSE_CORPUS_DIR="$EXP_DIR/response_corpus"
-QUERY_DRIVER="$EXP_DIR/driver_query.bin"
-QUERY_PARSER_BIN="$EXP_DIR/bin/dns_parser_sym"
-RESPONSE_PARSER_BIN="$EXP_DIR/bin/dns_response_parser_sym"
-LOG_DIR="$EXP_DIR/logs"
-PID_DIR="$EXP_DIR/pids"
-AFL_OUT_DIR="$EXP_DIR/afl_out"
-SYMCC_OUTPUT_DIR="$EXP_DIR/symcc_output"
+BIN_DIR="$WORK_DIR/bin"
+RUNTIME_STATE_DIR="$WORK_DIR/runtime"
+QUERY_CORPUS_DIR="$WORK_DIR/query_corpus"
+STABLE_QUERY_CORPUS_DIR="$WORK_DIR/stable_query_corpus"
+RESPONSE_CORPUS_DIR="$WORK_DIR/response_corpus"
+QUERY_DRIVER="$WORK_DIR/driver_query.bin"
+QUERY_PARSER_BIN="$BIN_DIR/dns_parser_sym"
+RESPONSE_PARSER_BIN="$BIN_DIR/dns_response_parser_sym"
+QUERY_PARSER_SRC="$ROOT_DIR/gen_input/test/dns_parser.c"
+RESPONSE_PARSER_SRC="$ROOT_DIR/gen_input/test/dns_response_parser.c"
+LOG_DIR="$WORK_DIR/logs"
+PID_DIR="$WORK_DIR/pids"
+AFL_OUT_DIR="$WORK_DIR/afl_out"
+SYMCC_OUTPUT_DIR="$WORK_DIR/symcc_output"
+QUERY_GEN_LOG="$WORK_DIR/query_gen.log"
+RESPONSE_GEN_LOG="$WORK_DIR/response_gen.log"
 
 MASTER_LOG="$LOG_DIR/afl_master_persistent.log"
 SECONDARY_LOG="$LOG_DIR/afl_secondary_persistent.log"
@@ -48,7 +55,7 @@ QUERY_MAX_ITER="${QUERY_MAX_ITER:-40}"
 RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-500}"
 RESPONSE_PRESERVE="${RESPONSE_PRESERVE:-20}"
 HELPER_NAME="${HELPER_NAME:-symcc}"
-HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$EXP_DIR}"
+HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$WORK_DIR}"
 HELPER_RUN_NAME="${HELPER_RUN_NAME:-$(basename "$AFL_OUT_DIR")}"
 USE_TMUX="${USE_TMUX:-1}"
 MASTER_SESSION="${MASTER_SESSION:-named_afl_master}"
@@ -72,7 +79,8 @@ usage() {
 默认约定:
   1. AFL++ 目标使用 stdin 持久模式，不再依赖 input=@@ 的外部注入线程。
   2. patch/ 作为实验补丁源，会同步到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
-  3. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
+  3. 运行产物统一写入 named_experiment/work/。
+  4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
 
 常用环境变量:
   JOBS=2
@@ -108,7 +116,8 @@ require_file() {
 }
 
 ensure_dirs() {
-	mkdir -p "$LOG_DIR" "$PID_DIR" "$SYMCC_OUTPUT_DIR" "$EXP_DIR/runtime"
+	mkdir -p "$WORK_DIR" "$BIN_DIR" "$LOG_DIR" "$PID_DIR" "$SYMCC_OUTPUT_DIR" \
+		"$RUNTIME_STATE_DIR" "$EXP_DIR/runtime"
 }
 
 afl_ld_library_path() {
@@ -187,6 +196,23 @@ build_helper_and_gen_input() {
 	)
 	require_file "$HELPER_BIN"
 	require_file "$GEN_INPUT_BIN"
+}
+
+build_seed_parsers() {
+	require_file "$SYMCC_CC_BIN"
+	require_file "$QUERY_PARSER_SRC"
+	require_file "$RESPONSE_PARSER_SRC"
+	ensure_dirs
+
+	if [ ! -x "$QUERY_PARSER_BIN" ]; then
+		log "构建 query DNS parser"
+		"$SYMCC_CC_BIN" "$QUERY_PARSER_SRC" -O2 -o "$QUERY_PARSER_BIN"
+	fi
+
+	if [ ! -x "$RESPONSE_PARSER_BIN" ]; then
+		log "构建 response DNS parser"
+		"$SYMCC_CC_BIN" "$RESPONSE_PARSER_SRC" -O2 -o "$RESPONSE_PARSER_BIN"
+	fi
 }
 
 build_afl_named() {
@@ -273,6 +299,7 @@ build_symcc_named() {
 generate_seeds() {
 	ensure_dirs
 	build_helper_and_gen_input
+	build_seed_parsers
 
 	if [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$QUERY_CORPUS_DIR" ] || \
 		[ -z "$(find "$QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]
@@ -287,7 +314,7 @@ generate_seeds() {
 			-i "$QUERY_MAX_ITER" \
 			-o "$QUERY_CORPUS_DIR" \
 			"$QUERY_PARSER_BIN" \
-			>"$EXP_DIR/query_gen.log" 2>&1
+			>"$QUERY_GEN_LOG" 2>&1
 	fi
 
 	if [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$RESPONSE_CORPUS_DIR" ] || \
@@ -305,7 +332,7 @@ generate_seeds() {
 			-i "$RESPONSE_MAX_ITER" \
 			-o "$RESPONSE_CORPUS_DIR" \
 			"$RESPONSE_PARSER_BIN" \
-			>"$EXP_DIR/response_gen.log" 2>&1
+			>"$RESPONSE_GEN_LOG" 2>&1
 	fi
 }
 
@@ -359,7 +386,7 @@ filter_seeds() {
 
 	build_afl_named
 	ensure_dirs
-	tmp_dir="$(mktemp -d "$EXP_DIR/.stable_query_tmp.XXXXXX")"
+	tmp_dir="$(mktemp -d "$WORK_DIR/.stable_query_tmp.XXXXXX")"
 
 	cp "$QUERY_DRIVER" "$tmp_dir/$(printf 'id_%06d_driver' "$next_id")"
 	next_id=$((next_id + 1))

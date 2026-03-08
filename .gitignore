@@ -60,17 +60,4 @@ AGENTS.md
 bind*
 
 # named experiment artifacts
-named_experiment/afl_out/
-named_experiment/manual_afl/
-named_experiment/query_corpus/
-named_experiment/response_corpus/
-named_experiment/stable_query_corpus/
-named_experiment/driver_corpus/
-named_experiment/bin/
-named_experiment/logs/
-named_experiment/*.stdout
-named_experiment/*.stderr
-named_experiment/*.log
-named_experiment/driver_query.bin
-named_experiment/runtime/*.pid
-named_experiment/runtime/session.key
+named_experiment/work/
