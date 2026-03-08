@@ -65,6 +65,162 @@ std::optional<size_t> getBoundedFieldSize(const FieldDef &Field) {
   }
 }
 
+std::optional<uint64_t> parseIntegerFieldValue(const FieldDef &Field,
+                                               const std::vector<uint8_t> &Input,
+                                               size_t Offset) {
+  switch (Field.Type) {
+  case FieldType::UInt8:
+  case FieldType::Int8:
+    if (Offset >= Input.size()) {
+      return std::nullopt;
+    }
+    return static_cast<uint64_t>(Input[Offset]);
+  case FieldType::UInt16:
+  case FieldType::Int16:
+    if (Offset + 1 >= Input.size()) {
+      return std::nullopt;
+    }
+    if (Field.Endian == ByteOrder::Big) {
+      return (static_cast<uint64_t>(Input[Offset]) << 8) |
+             static_cast<uint64_t>(Input[Offset + 1]);
+    }
+    return static_cast<uint64_t>(Input[Offset]) |
+           (static_cast<uint64_t>(Input[Offset + 1]) << 8);
+  case FieldType::UInt32:
+  case FieldType::Int32:
+    if (Offset + 3 >= Input.size()) {
+      return std::nullopt;
+    }
+    if (Field.Endian == ByteOrder::Big) {
+      return (static_cast<uint64_t>(Input[Offset]) << 24) |
+             (static_cast<uint64_t>(Input[Offset + 1]) << 16) |
+             (static_cast<uint64_t>(Input[Offset + 2]) << 8) |
+             static_cast<uint64_t>(Input[Offset + 3]);
+    }
+    return static_cast<uint64_t>(Input[Offset]) |
+           (static_cast<uint64_t>(Input[Offset + 1]) << 8) |
+           (static_cast<uint64_t>(Input[Offset + 2]) << 16) |
+           (static_cast<uint64_t>(Input[Offset + 3]) << 24);
+  default:
+    return std::nullopt;
+  }
+}
+
+std::optional<size_t> consumeDNSNameBytes(const std::vector<uint8_t> &Input,
+                                          size_t Offset) {
+  size_t Cursor = Offset;
+  while (Cursor < Input.size()) {
+    const uint8_t Len = Input[Cursor];
+    if (Len == 0) {
+      return Cursor + 1 - Offset;
+    }
+    if ((Len & 0xC0) == 0xC0) {
+      if (Cursor + 1 >= Input.size()) {
+        return std::nullopt;
+      }
+      return Cursor + 2 - Offset;
+    }
+    if (Cursor + 1 + Len > Input.size()) {
+      return std::nullopt;
+    }
+    Cursor += 1 + Len;
+  }
+  return std::nullopt;
+}
+
+std::optional<size_t>
+consumeFieldBytes(const FieldDef &Field, const std::vector<uint8_t> &Input,
+                  size_t Offset,
+                  std::unordered_map<std::string, uint64_t> &NumericValues) {
+  switch (Field.Type) {
+  case FieldType::UInt8:
+  case FieldType::Int8:
+  case FieldType::UInt16:
+  case FieldType::Int16:
+  case FieldType::UInt32:
+  case FieldType::Int32: {
+    auto Value = parseIntegerFieldValue(Field, Input, Offset);
+    if (!Value) {
+      return std::nullopt;
+    }
+    NumericValues[Field.Name] = *Value;
+    return getBoundedFieldSize(Field);
+  }
+  case FieldType::IPv4Addr:
+    if (Offset + 4 > Input.size()) {
+      return std::nullopt;
+    }
+    return 4;
+  case FieldType::IPv6Addr:
+    if (Offset + 16 > Input.size()) {
+      return std::nullopt;
+    }
+    return 16;
+  case FieldType::FixedBytes:
+  case FieldType::Padding:
+    if (Offset + Field.Size > Input.size()) {
+      return std::nullopt;
+    }
+    return Field.Size;
+  case FieldType::DNSName:
+    return consumeDNSNameBytes(Input, Offset);
+  case FieldType::VarBytes: {
+    if (!Field.LengthField) {
+      return std::nullopt;
+    }
+    const auto It = NumericValues.find(*Field.LengthField);
+    if (It == NumericValues.end()) {
+      return std::nullopt;
+    }
+    const uint64_t Length = It->second;
+    if (Length > static_cast<uint64_t>(Input.size() - Offset)) {
+      return std::nullopt;
+    }
+    return static_cast<size_t>(Length);
+  }
+  case FieldType::Struct: {
+    auto LocalValues = NumericValues;
+    size_t Cursor = Offset;
+    for (const auto &Child : Field.Children) {
+      auto ChildSize = consumeFieldBytes(Child, Input, Cursor, LocalValues);
+      if (!ChildSize) {
+        return std::nullopt;
+      }
+      Cursor += *ChildSize;
+    }
+    return Cursor - Offset;
+  }
+  case FieldType::Array: {
+    if (Field.Children.empty()) {
+      return 0;
+    }
+    if (!Field.CountField) {
+      return std::nullopt;
+    }
+    const auto It = NumericValues.find(*Field.CountField);
+    if (It == NumericValues.end()) {
+      return std::nullopt;
+    }
+    size_t Cursor = Offset;
+    for (uint64_t Index = 0; Index < It->second; ++Index) {
+      auto ElementValues = NumericValues;
+      auto ElementSize =
+          consumeFieldBytes(Field.Children.front(), Input, Cursor, ElementValues);
+      if (!ElementSize) {
+        return std::nullopt;
+      }
+      Cursor += *ElementSize;
+    }
+    return Cursor - Offset;
+  }
+  default:
+    if (Field.Size > 0 && Offset + Field.Size <= Input.size()) {
+      return Field.Size;
+    }
+    return std::nullopt;
+  }
+}
+
 }
 
 //===----------------------------------------------------------------------===//
@@ -347,6 +503,18 @@ std::vector<uint8_t> BinaryFormat::createSeed() const {
         Result.insert(Result.end(), NestedSeed.begin(), NestedSeed.end());
       }
       break;
+
+    case FieldType::VarBytes: {
+      size_t Length = 0;
+      if (F.LengthField) {
+        if (const auto *LengthField = findField(*F.LengthField)) {
+          Length = static_cast<size_t>(
+              LengthField->DefaultValue.value_or(LengthField->FixedValue.value_or(0)));
+        }
+      }
+      Result.insert(Result.end(), Length, 0);
+      break;
+    }
 
     case FieldType::Array: {
       if (F.Children.empty()) {
@@ -694,8 +862,24 @@ std::unique_ptr<StructuredInput> BinaryFormat::parse(const std::vector<uint8_t> 
 
   for (size_t FieldIndex = 0; FieldIndex < Fields_.size(); ++FieldIndex) {
     const auto &F = Fields_[FieldIndex];
-    if (Offset >= Input.size())
-      break;
+    if (Offset >= Input.size()) {
+      if (F.Type == FieldType::Array && F.CountField) {
+        if (auto CountValue = Result->getIntField(*F.CountField); CountValue && *CountValue == 0) {
+          Result->setField(F.Name, std::vector<uint8_t>{});
+          continue;
+        }
+      }
+      if (F.LengthField) {
+        if (auto LenVal = Result->getIntField(*F.LengthField); LenVal && *LenVal == 0) {
+          Result->setField(F.Name, std::vector<uint8_t>{});
+          continue;
+        }
+      }
+      if (F.IsOptional) {
+        continue;
+      }
+      return nullptr;
+    }
 
     switch (F.Type) {
     case FieldType::UInt8:
@@ -753,26 +937,14 @@ std::unique_ptr<StructuredInput> BinaryFormat::parse(const std::vector<uint8_t> 
       break;
 
     case FieldType::DNSName: {
-      // Parse DNS name - read labels until null terminator or compression pointer
-      size_t NameStart = Offset;
-      while (Offset < Input.size()) {
-        uint8_t Len = Input[Offset];
-        if (Len == 0) {
-          Offset++;
-          break;
-        }
-        if ((Len & 0xC0) == 0xC0) {
-          // Compression pointer - 2 bytes total
-          Offset += 2;
-          break;
-        }
-        Offset += 1 + Len;
+      auto NameSize = consumeDNSNameBytes(Input, Offset);
+      if (!NameSize) {
+        return nullptr;
       }
-      if (Offset > NameStart) {
-        std::vector<uint8_t> NameBytes(Input.begin() + NameStart,
-                                        Input.begin() + Offset);
-        Result->setField(F.Name, NameBytes);
-      }
+      std::vector<uint8_t> NameBytes(Input.begin() + Offset,
+                                     Input.begin() + Offset + *NameSize);
+      Result->setField(F.Name, NameBytes);
+      Offset += *NameSize;
       break;
     }
 
@@ -808,12 +980,24 @@ std::unique_ptr<StructuredInput> BinaryFormat::parse(const std::vector<uint8_t> 
         break;
       }
 
-      if (FieldIndex + 1 < Fields_.size()) {
-        return nullptr;
+      std::unordered_map<std::string, uint64_t> ContextValues;
+      for (size_t ParsedIndex = 0; ParsedIndex < FieldIndex; ++ParsedIndex) {
+        const auto &ParsedField = Fields_[ParsedIndex];
+        if (auto ParsedValue = Result->getIntField(ParsedField.Name)) {
+          ContextValues.emplace(ParsedField.Name, *ParsedValue);
+        }
       }
-
-      ArrayBytes.assign(Input.begin() + Offset, Input.end());
-      Offset = Input.size();
+      size_t ArrayStart = Offset;
+      for (size_t Index = 0; Index < Count; ++Index) {
+        auto ElementValues = ContextValues;
+        auto ParsedSize =
+            consumeFieldBytes(F.Children.front(), Input, Offset, ElementValues);
+        if (!ParsedSize) {
+          return nullptr;
+        }
+        Offset += *ParsedSize;
+      }
+      ArrayBytes.assign(Input.begin() + ArrayStart, Input.begin() + Offset);
       Result->setField(F.Name, ArrayBytes);
       break;
     }
@@ -822,12 +1006,13 @@ std::unique_ptr<StructuredInput> BinaryFormat::parse(const std::vector<uint8_t> 
       // Variable length fields need length field reference
       if (F.LengthField) {
         auto LenVal = Result->getIntField(*F.LengthField);
-        if (LenVal && Offset + *LenVal <= Input.size()) {
-          std::vector<uint8_t> Bytes(Input.begin() + Offset,
-                                      Input.begin() + Offset + *LenVal);
-          Result->setField(F.Name, Bytes);
-          Offset += *LenVal;
+        if (!LenVal || Offset + *LenVal > Input.size()) {
+          return nullptr;
         }
+        std::vector<uint8_t> Bytes(Input.begin() + Offset,
+                                   Input.begin() + Offset + *LenVal);
+        Result->setField(F.Name, Bytes);
+        Offset += *LenVal;
       }
       break;
     }
@@ -1169,8 +1354,10 @@ BinaryFormat BinaryFormatFactory::createDNSResponse() {
   QCLASS.DefaultValue = 1;
   Format.addField(QCLASS);
 
-  auto RRNamePtr = FieldDef::U16("rr_name_ptr");
-  RRNamePtr.DefaultValue = 0xC00C;
+  FieldDef RRName;
+  RRName.Name = "rr_name";
+  RRName.Type = FieldType::DNSName;
+  RRName.Size = 0;
 
   auto RRType = FieldDef::U16("rr_type");
   RRType.DefaultValue = 1;
@@ -1189,7 +1376,7 @@ BinaryFormat BinaryFormatFactory::createDNSResponse() {
   auto RRData = FieldDef::VarLen("rr_rdata", "rr_rdlength");
 
   auto RRElement =
-      FieldDef::Struct("rr_element", {RRNamePtr, RRType, RRClass, RRTTL, RRDLength, RRData});
+      FieldDef::Struct("rr_element", {RRName, RRType, RRClass, RRTTL, RRDLength, RRData});
 
   Format.addField(FieldDef::Array("answer_rrs", RRElement, "ancount"));
   Format.addField(FieldDef::Array("authority_rrs", RRElement, "nscount"));

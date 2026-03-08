@@ -49,6 +49,8 @@ struct AflConfig {
   bool use_qemu_mode = false;
   std::filesystem::path queue_dir;
   std::filesystem::path fuzzer_output_dir;  // AFL output directory for this fuzzer
+  std::string response_tail_placeholder = "@@RESP_TAIL@@";
+  std::optional<std::string> response_tail_env;
 
   // AFL++ map size handling.
   std::size_t map_size = 65536;
@@ -59,7 +61,9 @@ struct AflConfig {
       const std::unordered_set<std::string>& seen) const;
 
   AflShowmapResult run_showmap(const std::filesystem::path& bitmap_out,
-                              const std::filesystem::path& testcase) const;
+                              const std::filesystem::path& testcase,
+                              const std::optional<std::filesystem::path>& response_tail_sample =
+                                  std::nullopt) const;
   
   // 将新测试用例复制到 AFL 队列中，让 AFL 也能使用
   void copy_to_afl_queue(const std::filesystem::path& testcase, 

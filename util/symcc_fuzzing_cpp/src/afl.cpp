@@ -230,6 +230,19 @@ static std::vector<std::string> insert_input_file(const std::vector<std::string>
   return out;
 }
 
+static std::vector<std::string> insert_response_tail_file(
+    const std::vector<std::string>& cmd, const std::string& placeholder,
+    const std::filesystem::path& response_tail_file) {
+  std::vector<std::string> out = cmd;
+  for (auto& s : out) {
+    if (s == placeholder) {
+      s = response_tail_file.string();
+      break;
+    }
+  }
+  return out;
+}
+
 static std::vector<std::uint8_t> read_binary(const std::filesystem::path& p) {
   std::ifstream in(p, std::ios::binary);
   if (!in) throw std::runtime_error("Failed to read bitmap file: " + p.string());
@@ -237,20 +250,35 @@ static std::vector<std::uint8_t> read_binary(const std::filesystem::path& p) {
   return buf;
 }
 
-AflShowmapResult AflConfig::run_showmap(const std::filesystem::path& bitmap_out,
-                                       const std::filesystem::path& testcase) const {
+AflShowmapResult AflConfig::run_showmap(
+    const std::filesystem::path& bitmap_out, const std::filesystem::path& testcase,
+    const std::optional<std::filesystem::path>& response_tail_sample) const {
   std::vector<std::string> argv;
   argv.push_back(showmap_path.string());
   if (use_qemu_mode) argv.push_back("-Q");
   argv.insert(argv.end(), {"-t", "5000", "-m", "none", "-b", "-o", bitmap_out.string()});
 
-  const auto target = insert_input_file(target_command, testcase);
+  auto target = insert_input_file(target_command, testcase);
+  if (response_tail_sample.has_value()) {
+    const auto response_tail_file = bitmap_out.parent_path() / ".cur_response_tail";
+    std::error_code ec;
+    std::filesystem::copy_file(*response_tail_sample, response_tail_file,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+      throw std::runtime_error("Failed to prepare response-tail input for afl-showmap: " +
+                               ec.message());
+    }
+    target = insert_response_tail_file(target, response_tail_placeholder, response_tail_file);
+  }
   argv.insert(argv.end(), target.begin(), target.end());
 
   std::map<std::string, std::string> env;
   // Ensure AFL++ tools use the same map size.
   env["AFL_MAP_SIZE"] = std::to_string(map_size);
   env["AFL_MAPSIZE"] = std::to_string(map_size);
+  if (response_tail_env.has_value() && response_tail_sample.has_value()) {
+    env[*response_tail_env] = (bitmap_out.parent_path() / ".cur_response_tail").string();
+  }
 
   // 工作目录设置为 output 目录的父目录（即 AFL 主目录）
   // 这样相对路径（如 ./dist/sbin/named）能正确解析

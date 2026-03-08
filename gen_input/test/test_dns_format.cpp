@@ -173,6 +173,20 @@ void testDNSResponseFormat() {
   std::cout << "ANCOUNT: " << ancount << std::endl;
   assert(ancount == 1);
 
+  assert(format.validate(seed));
+  auto parsed = format.parse(seed);
+  assert(parsed != nullptr);
+
+  auto answer_rrs = parsed->getBytesField("answer_rrs");
+  assert(answer_rrs.has_value());
+  assert(answer_rrs->size() >= 14);
+
+  uint16_t rdlength =
+      (static_cast<uint16_t>((*answer_rrs)[answer_rrs->size() - 6]) << 8) |
+      static_cast<uint16_t>((*answer_rrs)[answer_rrs->size() - 5]);
+  assert(rdlength == 4);
+  assert(answer_rrs->size() >= static_cast<std::size_t>(10 + rdlength));
+
   std::cout << "DNS Response Format tests PASSED" << std::endl << std::endl;
 }
 
@@ -270,6 +284,18 @@ void testDNSResponseWithAuthority() {
   assert(ancount == 1);
   assert(nscount == 1);
   assert(arcount == 1);
+
+  auto format = BinaryFormatFactory::createDNSResponse();
+  assert(format.validate(response));
+  auto parsed = format.parse(response);
+  assert(parsed != nullptr);
+
+  auto answer_rrs = parsed->getBytesField("answer_rrs");
+  auto authority_rrs = parsed->getBytesField("authority_rrs");
+  auto additional_rrs = parsed->getBytesField("additional_rrs");
+  assert(answer_rrs.has_value() && !answer_rrs->empty());
+  assert(authority_rrs.has_value() && !authority_rrs->empty());
+  assert(additional_rrs.has_value() && !additional_rrs->empty());
 
   std::cout << "DNS Response with Authority/Additional tests PASSED" << std::endl << std::endl;
 }

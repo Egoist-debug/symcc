@@ -215,6 +215,7 @@ static std::string extract_parent_id(const std::filesystem::path& parent) {
 static TestcaseResult process_new_testcase(const std::filesystem::path& testcase,
                                            const std::filesystem::path& parent,
                                            const std::filesystem::path& tmp_dir,
+                                           const std::optional<std::filesystem::path>& response_tail_sample,
                                            const AflConfig& afl,
                                            State& state,
                                            const Logger& log) {
@@ -224,7 +225,7 @@ static TestcaseResult process_new_testcase(const std::filesystem::path& testcase
   
   AflShowmapResult r;
   try {
-    r = afl.run_showmap(testcase_bitmap_path, testcase);
+    r = afl.run_showmap(testcase_bitmap_path, testcase, response_tail_sample);
   } catch (const std::exception& e) {
     log.warn("afl-showmap failed: " + std::string(e.what()));
     return TestcaseResult::Uninteresting;
@@ -297,7 +298,8 @@ static void test_input(const SymCCInput& input,
   }
 
   for (const auto& new_test : res.test_cases) {
-    const auto tr = process_new_testcase(new_test, input.request_sample, tmp_dir, afl, state, log);
+    const auto tr = process_new_testcase(new_test, input.request_sample, tmp_dir,
+                                         input.response_tail_sample, afl, state, log);
     num_total += 1;
     if (tr == TestcaseResult::New) num_interesting += 1;
   }
@@ -394,6 +396,8 @@ int main(int argc, char** argv) {
     }
     
     auto afl = AflConfig::load_from_fuzzer_output(fuzzer_dir, afl_target);
+    afl.response_tail_placeholder = options.response_tail_placeholder;
+    afl.response_tail_env = options.response_tail_env;
     log.info("AFL++ map size: " + std::to_string(afl.map_size));
     // log.debug("AFL showmap: " + afl.showmap_path.string());
     // log.debug("Target command: " + (afl.target_command.empty() ? "(empty)" : afl.target_command[0]));

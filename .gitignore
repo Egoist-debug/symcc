@@ -53,6 +53,9 @@ compile_commands.json
 # AGENTS
 AGENTS.md
 .sisyphus
+.ace-tool
+.serena
 
 # bind9 test
 bind*
+
