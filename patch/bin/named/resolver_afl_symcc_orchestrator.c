@@ -35,6 +35,7 @@
 
 #include <ns/client.h>
 #include <ns/interfacemgr.h>
+#include <ns/query.h>
 
 #include <named/globals.h>
 #include <named/resolver_afl_symcc_mutator_server.h>
@@ -49,6 +50,7 @@ typedef struct named_resolver_afl_symcc_request_context {
 	ns_client_t *client;
 	bool finished;
 	bool reply_sent;
+	bool timed_out;
 	isc_result_t result;
 } named_resolver_afl_symcc_request_context_t;
 
@@ -260,20 +262,43 @@ print_stats_and_exit(
 }
 
 static void
-resolver_afl_symcc_request_done_notify(void) {
-	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
-
+finish_request_context(named_resolver_afl_symcc_request_context_t *ctx,
+		       isc_result_t result) {
 	if (ctx == NULL) {
 		return;
 	}
 
 	pthread_mutex_lock(&ctx->mutex);
 	if (ctx->result == ISC_R_UNSET) {
-		ctx->result = ISC_R_SUCCESS;
+		ctx->result = result;
 	}
 	ctx->finished = true;
 	pthread_cond_signal(&ctx->cond);
 	pthread_mutex_unlock(&ctx->mutex);
+}
+
+static void
+cancel_request_client(ns_client_t *client) {
+	if (client == NULL) {
+		return;
+	}
+
+	if (client->state != NS_CLIENTSTATE_WORKING &&
+	    client->state != NS_CLIENTSTATE_RECURSING)
+	{
+		return;
+	}
+
+	client->sendcb = NULL;
+	client->shuttingdown = true;
+	ns_query_cancel(client);
+}
+
+static void
+resolver_afl_symcc_request_done_notify(void) {
+	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
+
+	finish_request_context(ctx, ISC_R_SUCCESS);
 }
 
 static void
@@ -300,13 +325,10 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 	isc_region_t region;
 	ns_client_t *client = NULL;
 	ns_clientmgr_t *clientmgr = NULL;
+	bool timed_out = false;
 
 	if (result != ISC_R_SUCCESS) {
-		pthread_mutex_lock(&ctx->mutex);
-		ctx->result = result;
-		ctx->finished = true;
-		pthread_cond_signal(&ctx->cond);
-		pthread_mutex_unlock(&ctx->mutex);
+		finish_request_context(ctx, result);
 		return;
 	}
 
@@ -315,26 +337,31 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 	client = isc_nmhandle_getextra(handle);
 	result = ns__client_setup(client, clientmgr, true);
 	if (result != ISC_R_SUCCESS) {
-		pthread_mutex_lock(&ctx->mutex);
-		ctx->result = result;
-		ctx->finished = true;
-		pthread_cond_signal(&ctx->cond);
-		pthread_mutex_unlock(&ctx->mutex);
+		finish_request_context(ctx, result);
 		return;
 	}
-	client->sendcb = resolver_afl_symcc_client_sendcb;
 	isc_nmhandle_setdata(handle, client, ns__client_reset_cb,
 			     ns__client_put_cb);
 	client->handle = handle;
-	region.base = (unsigned char *)ctx->request;
-	region.length = (unsigned int)ctx->request_len;
 
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->client = client;
+	timed_out = ctx->timed_out;
 	if (ctx->result == ISC_R_UNSET) {
 		ctx->result = ISC_R_SUCCESS;
 	}
 	pthread_mutex_unlock(&ctx->mutex);
+
+	if (timed_out) {
+		client->shuttingdown = true;
+		isc_nmhandle_detach(&handle);
+		finish_request_context(ctx, ISC_R_TIMEDOUT);
+		return;
+	}
+
+	client->sendcb = resolver_afl_symcc_client_sendcb;
+	region.base = (unsigned char *)ctx->request;
+	region.length = (unsigned int)ctx->request_len;
 
 	ns__client_request(handle, ISC_R_SUCCESS, &region, &ifp);
 }
@@ -342,7 +369,7 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 static isc_result_t
 inject_request_bytes(const uint8_t *request, size_t request_len,
 			 long timeout_ms) {
-	named_resolver_afl_symcc_request_context_t ctx;
+	named_resolver_afl_symcc_request_context_t *ctx = NULL;
 	struct timespec deadline;
 	char host[64];
 	int port = 0;
@@ -350,18 +377,24 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 	isc_sockaddr_t peer;
 	struct sockaddr_in peer4;
 	struct sockaddr_in6 peer6;
+	isc_result_t result;
+	ns_client_t *client = NULL;
 	int rc;
 
 	if (request == NULL || request_len == 0) {
 		return ISC_R_FAILURE;
 	}
 
-	memset(&ctx, 0, sizeof(ctx));
-	pthread_mutex_init(&ctx.mutex, NULL);
-	pthread_cond_init(&ctx.cond, NULL);
-	ctx.request = request;
-	ctx.request_len = request_len;
-	ctx.result = ISC_R_UNSET;
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return ISC_R_NOMEMORY;
+	}
+
+	pthread_mutex_init(&ctx->mutex, NULL);
+	pthread_cond_init(&ctx->cond, NULL);
+	ctx->request = request;
+	ctx->request_len = request_len;
+	ctx->result = ISC_R_UNSET;
 
 	load_request_target(host, sizeof(host), &port);
 
@@ -377,8 +410,9 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 		peer6.sin6_family = AF_INET6;
 		peer6.sin6_port = htons((uint16_t)port);
 		if (inet_pton(AF_INET6, host, &peer6.sin6_addr) != 1) {
-			pthread_cond_destroy(&ctx.cond);
-			pthread_mutex_destroy(&ctx.mutex);
+			pthread_cond_destroy(&ctx->cond);
+			pthread_mutex_destroy(&ctx->mutex);
+			free(ctx);
 			return ISC_R_FAILURE;
 		}
 		isc_sockaddr_fromin6(&peer, &peer6.sin6_addr,
@@ -386,9 +420,9 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 		isc_sockaddr_any6(&local);
 	}
 
-	set_request_context(&ctx);
+	set_request_context(ctx);
 	isc_nm_udpconnect(named_g_netmgr, &local, &peer,
-			  resolver_afl_symcc_request_connected, &ctx,
+			  resolver_afl_symcc_request_connected, ctx,
 			  (unsigned int)timeout_ms, sizeof(ns_client_t));
 
 	clock_gettime(CLOCK_REALTIME, &deadline);
@@ -399,23 +433,35 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 		deadline.tv_nsec -= 1000000000L;
 	}
 
-	pthread_mutex_lock(&ctx.mutex);
-	while (!ctx.finished) {
-		rc = pthread_cond_timedwait(&ctx.cond, &ctx.mutex, &deadline);
+	pthread_mutex_lock(&ctx->mutex);
+	while (!ctx->finished) {
+		rc = pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &deadline);
 		if (rc == ETIMEDOUT) {
-			ctx.result = ISC_R_TIMEDOUT;
+			ctx->timed_out = true;
+			if (ctx->result == ISC_R_UNSET) {
+				ctx->result = ISC_R_TIMEDOUT;
+			}
+			client = ctx->client;
 			break;
 		}
 	}
-	pthread_mutex_unlock(&ctx.mutex);
+	result = ctx->result;
+	pthread_mutex_unlock(&ctx->mutex);
+
+	if (ctx->timed_out) {
+		cancel_request_client(client);
+		set_request_context(NULL);
+		return result;
+	}
 
 	set_request_context(NULL);
 
-	pthread_cond_destroy(&ctx.cond);
-	pthread_mutex_destroy(&ctx.mutex);
+	pthread_cond_destroy(&ctx->cond);
+	pthread_mutex_destroy(&ctx->mutex);
+	free(ctx);
 
-	if (ctx.result != ISC_R_SUCCESS) {
-		return ctx.result;
+	if (result != ISC_R_SUCCESS) {
+		return result;
 	}
 	return ISC_R_SUCCESS;
 }
@@ -457,6 +503,8 @@ request_injector_thread(void *arg) {
 				orchestrator->replies_received++;
 			} else if (result == ISC_R_TIMEDOUT) {
 				orchestrator->reply_timeouts++;
+				shutdown_named();
+				return NULL;
 			} else {
 				orchestrator->send_failures++;
 			}

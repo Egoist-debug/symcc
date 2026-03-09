@@ -16,9 +16,10 @@ AFL_CC_BIN="${AFL_CC_BIN:-/usr/local/bin/afl-clang-fast}"
 SYMCC_CC_BIN="${SYMCC_CC_BIN:-$ROOT_DIR/symcc_build_qsym/symcc}"
 SYMCC_CXX_BIN="${SYMCC_CXX_BIN:-$ROOT_DIR/symcc_build_qsym/sym++}"
 
-NAMED_CONF="$EXP_DIR/runtime/named.conf"
 BIN_DIR="$WORK_DIR/bin"
 RUNTIME_STATE_DIR="$WORK_DIR/runtime"
+NAMED_CONF_TEMPLATE="$EXP_DIR/runtime/named.conf"
+NAMED_CONF="$RUNTIME_STATE_DIR/named.conf"
 QUERY_CORPUS_DIR="$WORK_DIR/query_corpus"
 STABLE_QUERY_CORPUS_DIR="$WORK_DIR/stable_query_corpus"
 RESPONSE_CORPUS_DIR="$WORK_DIR/response_corpus"
@@ -58,6 +59,7 @@ HELPER_NAME="${HELPER_NAME:-symcc}"
 HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$WORK_DIR}"
 HELPER_RUN_NAME="${HELPER_RUN_NAME:-$(basename "$AFL_OUT_DIR")}"
 USE_TMUX="${USE_TMUX:-1}"
+SHOW_AFL_UI="${SHOW_AFL_UI:-1}"
 MASTER_SESSION="${MASTER_SESSION:-named_afl_master}"
 SECONDARY_SESSION="${SECONDARY_SESSION:-named_afl_secondary}"
 HELPER_SESSION="${HELPER_SESSION:-named_symcc_helper}"
@@ -79,7 +81,7 @@ usage() {
 默认约定:
   1. AFL++ 目标使用 stdin 持久模式，不再依赖 input=@@ 的外部注入线程。
   2. patch/ 作为实验补丁源，会同步到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
-  3. 运行产物统一写入 named_experiment/work/。
+  3. 运行产物默认写入 named_experiment/work/，可通过 WORK_DIR 覆盖。
   4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
 
 常用环境变量:
@@ -90,6 +92,7 @@ usage() {
   REGEN_SEEDS=0
   REFILTER_QUERIES=0
   RESET_OUTPUT=1
+  SHOW_AFL_UI=1
   MUTATOR_ADDR=127.0.0.1:55300
   TARGET_ADDR=127.0.0.1:55301
 EOF
@@ -119,6 +122,16 @@ require_file() {
 ensure_dirs() {
 	mkdir -p "$WORK_DIR" "$BIN_DIR" "$LOG_DIR" "$PID_DIR" "$SYMCC_OUTPUT_DIR" \
 		"$RUNTIME_STATE_DIR" "$EXP_DIR/runtime"
+	prepare_named_conf
+}
+
+prepare_named_conf() {
+	local runtime_dir_escaped
+
+	require_file "$NAMED_CONF_TEMPLATE"
+	runtime_dir_escaped="$(printf '%s' "$RUNTIME_STATE_DIR" | sed 's/[&|]/\\&/g')"
+	sed "s|__RUNTIME_STATE_DIR__|$runtime_dir_escaped|g" \
+		"$NAMED_CONF_TEMPLATE" >"$NAMED_CONF"
 }
 
 afl_ld_library_path() {
@@ -560,15 +573,44 @@ launch_shell_in_tmux() {
 	tmux pipe-pane -o -t "${session}:0.0" "cat >>${logfile_quoted}"
 }
 
+attach_master_ui() {
+	[ "$SHOW_AFL_UI" -eq 1 ] || return 0
+
+	if ! tmux_enabled; then
+		warn "SHOW_AFL_UI=1 需要 USE_TMUX=1 且已安装 tmux，当前仅保留日志: $MASTER_LOG"
+		return 0
+	fi
+
+	if ! tmux_session_alive "$MASTER_SESSION"; then
+		warn "AFL master session 未启动，无法显示 UI: $MASTER_SESSION"
+		return 0
+	fi
+
+	if [ -n "${TMUX:-}" ]; then
+		log "切换到 AFL++ UI 页面: $MASTER_SESSION（返回原 session 可执行 tmux switch-client -l）"
+		tmux switch-client -t "$MASTER_SESSION" || \
+			warn "切换到 AFL++ UI 失败，请手动执行: tmux switch-client -t $MASTER_SESSION"
+	else
+		log "附着到 AFL++ UI 页面: $MASTER_SESSION（离开界面可按 Ctrl-b d）"
+		tmux attach-session -t "$MASTER_SESSION" || \
+			warn "附着到 AFL++ UI 失败，请手动执行: tmux attach-session -t $MASTER_SESSION"
+	fi
+}
+
 start_all() {
 	local ld_path
 	local helper_target_csv
+	local -a master_no_ui=()
 
 	prepare_all
 	stop_all
 	cleanup_output
 	ld_path="$(afl_ld_library_path)"
 	helper_target_csv="${AFL_TREE}/bin/named/.libs/named,-g,-c,${NAMED_CONF},-A,resolver-afl-symcc:${MUTATOR_ADDR}"
+
+	if [ "$SHOW_AFL_UI" -ne 1 ] || ! tmux_enabled; then
+		master_no_ui=(AFL_NO_UI=1)
+	fi
 
 	log "启动 AFL master（持久模式）"
 	if tmux_enabled; then
@@ -577,7 +619,7 @@ start_all() {
 			"$MASTER_LOG" \
 			env \
 			LD_LIBRARY_PATH="$ld_path" \
-			AFL_NO_UI=1 \
+			"${master_no_ui[@]}" \
 			AFL_NO_AFFINITY=1 \
 			AFL_SKIP_CPUFREQ=1 \
 			AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
@@ -601,7 +643,7 @@ start_all() {
 			"$MASTER_PID" \
 			env \
 			LD_LIBRARY_PATH="$ld_path" \
-			AFL_NO_UI=1 \
+			"${master_no_ui[@]}" \
 			AFL_NO_AFFINITY=1 \
 			AFL_SKIP_CPUFREQ=1 \
 			AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
@@ -713,6 +755,7 @@ start_all() {
 
 	log "实验已启动"
 	status_all
+	attach_master_ui
 }
 
 show_pid_status() {
@@ -739,6 +782,12 @@ show_fuzzer_stats() {
 		"$stats_file" | sed 's/^/    /'
 }
 
+show_tmux_pane() {
+	local session="$1"
+	tmux_session_alive "$session" || return 0
+	tmux capture-pane -p -t "${session}:0.0" | sed 's/^/    /'
+}
+
 status_all() {
 	printf '进程状态:\n'
 	show_pid_status "afl-master" "$MASTER_PID"
@@ -748,6 +797,14 @@ status_all() {
 	printf '\nAFL 统计:\n'
 	show_fuzzer_stats "$AFL_OUT_DIR/master/fuzzer_stats"
 	show_fuzzer_stats "$AFL_OUT_DIR/secondary/fuzzer_stats"
+
+	if tmux_session_alive "$MASTER_SESSION"; then
+		printf '\nAFL UI:\n'
+		printf '  master session: %s\n' "$MASTER_SESSION"
+		printf '  手动查看: tmux attach-session -t %s\n' "$MASTER_SESSION"
+		printf '  当前页面:\n'
+		show_tmux_pane "$MASTER_SESSION"
+	fi
 
 	printf '\n日志尾部:\n'
 	for log_file in "$MASTER_LOG" "$SECONDARY_LOG" "$HELPER_LOG"; do
@@ -802,6 +859,6 @@ require_cmd grep
 require_cmd sed
 require_cmd find
 require_file "$SRC_TREE"
-require_file "$NAMED_CONF"
+require_file "$NAMED_CONF_TEMPLATE"
 
 main "${1:-}"

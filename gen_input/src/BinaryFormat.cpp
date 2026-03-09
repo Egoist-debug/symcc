@@ -1356,6 +1356,7 @@ BinaryFormat BinaryFormatFactory::createDNSResponse() {
 
   FieldDef RRName;
   RRName.Name = "rr_name";
+  // DNSName 已经支持压缩指针和完整标签编码，两种 RR owner name 形式都要兼容。
   RRName.Type = FieldType::DNSName;
   RRName.Size = 0;
 

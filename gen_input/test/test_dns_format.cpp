@@ -240,6 +240,11 @@ void testBuildResponseFromQuery() {
   assert(qdcount == 1);
   assert(ancount == 1);
 
+  auto format = BinaryFormatFactory::createDNSResponse();
+  assert(format.validate(response));
+  auto parsed = format.parse(response);
+  assert(parsed != nullptr);
+
   std::cout << "buildResponseFromQuery tests PASSED" << std::endl << std::endl;
 }
 
