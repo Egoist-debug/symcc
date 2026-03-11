@@ -20,16 +20,25 @@ FROM ubuntu:22.04 AS builder
 # Install dependencies
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        cargo \
         cmake \
+        curl \
         g++ \
         git \
         libz3-dev \
         ninja-build \
         python3-pip \
         zlib1g-dev \
-        wget  
+        wget \
+        curl \
+        build-essential
+
 RUN pip3 install lit
+
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 && chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
 WORKDIR /
 
@@ -38,9 +47,8 @@ RUN git clone -b v2.56b https://github.com/google/AFL.git afl \
     && cd afl \
     && make
 
-# This is passed along to symcc and qsym backend
-# Version 15 is buggy  https://github.com/eurecom-s3/symcc/issues/164
-arg LLVM_VERSION=12
+# This is passed along to symcc and qsym backend (must match final image).
+ARG LLVM_VERSION=15
 
 # installing/building with the right LLVM version, currently:
 # - no plan to support < 11
@@ -63,7 +71,7 @@ RUN git clone -b llvmorg-$LLVM_VERSION.0.0 --depth 1 https://github.com/llvm/llv
 # Build a version of SymCC with the simple backend to compile libc++
 COPY . /symcc_source
 
-# Init submodules if they are not initialiazed yet
+# Init submodules if they are not initialized yet
 WORKDIR /symcc_source
 RUN git submodule update --init --recursive
 
@@ -116,7 +124,11 @@ RUN cmake -G Ninja \
 #
 # The final image
 #
-FROM ubuntu:22.04 as symcc
+FROM ubuntu:22.04 AS symcc
+
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -127,7 +139,7 @@ RUN apt-get update \
     && useradd -m -s /bin/bash ubuntu \
     && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
 
-arg LLVM_VERSION=15
+ARG LLVM_VERSION=15
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -135,19 +147,24 @@ RUN apt-get update \
     clang-$LLVM_VERSION \
     && rm -rf /var/lib/apt/lists/*
 
+# rust toolchain
+COPY --from=builder_qsym $RUSTUP_HOME $RUSTUP_HOME
+COPY --from=builder_qsym $CARGO_HOME $CARGO_HOME
+
 COPY --from=builder_qsym /symcc_build /symcc_build
-COPY --from=builder_qsym /root/.cargo/bin/symcc_fuzzing_helper /symcc_build/
+COPY --from=builder_qsym $CARGO_HOME/bin/symcc_fuzzing_helper /symcc_build/
 COPY util/pure_concolic_execution.sh /symcc_build/
+COPY test/test_readme_c_smoke.sh /symcc_build/
 COPY --from=builder_qsym /libcxx_symcc_install /libcxx_symcc_install
 COPY --from=builder_qsym /afl /afl
 
 # fix permissions
 RUN chmod -R og+rX /symcc_build
 
-ENV PATH /symcc_build:$PATH
-ENV AFL_PATH /afl
-ENV AFL_CC clang-$LLVM_VERSION
-ENV AFL_CXX clang++-$LLVM_VERSION
+ENV PATH=/symcc_build:$PATH
+ENV AFL_PATH=/afl
+ENV AFL_CC=clang-$LLVM_VERSION
+ENV AFL_CXX=clang++-$LLVM_VERSION
 ENV SYMCC_LIBCXX_PATH=/libcxx_symcc_install
 
 USER ubuntu
