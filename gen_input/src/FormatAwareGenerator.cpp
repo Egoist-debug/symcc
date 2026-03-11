@@ -101,6 +101,289 @@ getFirstAnswerRdLengthOffset(const std::vector<uint8_t> &Packet) {
   return *NameEnd + 8;
 }
 
+struct ParsedDnsQuestion {
+  uint16_t ID = 0;
+  bool RecursionDesired = false;
+  std::string Name;
+  uint16_t Type = 1;
+  uint16_t DnsClass = 1;
+};
+
+std::optional<ParsedDnsQuestion>
+parseDnsQuestionSpec(const std::vector<uint8_t> &Packet) {
+  ParsedDnsQuestion Result;
+  auto NameEnd = getQuestionSectionEnd(Packet);
+
+  if (!NameEnd || *NameEnd < 17 || Packet.size() < *NameEnd) {
+    return std::nullopt;
+  }
+  if (((static_cast<uint16_t>(Packet[4]) << 8) | Packet[5]) == 0) {
+    return std::nullopt;
+  }
+
+  Result.ID = (static_cast<uint16_t>(Packet[0]) << 8) | Packet[1];
+  Result.RecursionDesired = (Packet[2] & 0x01) != 0;
+  Result.Name = DNSNameCodec::decode(Packet, 12);
+  Result.Type = (static_cast<uint16_t>(Packet[*NameEnd - 4]) << 8) |
+                Packet[*NameEnd - 3];
+  Result.DnsClass = (static_cast<uint16_t>(Packet[*NameEnd - 2]) << 8) |
+                    Packet[*NameEnd - 1];
+
+  if (Result.Name.empty()) {
+    return std::nullopt;
+  }
+
+  return Result;
+}
+
+std::string getParentZone(const std::string &Name) {
+  const auto Dot = Name.find('.');
+
+  if (Dot == std::string::npos || Dot + 1 >= Name.size()) {
+    return Name;
+  }
+
+  return Name.substr(Dot + 1);
+}
+
+void appendU16Le(std::vector<uint8_t> &Output, size_t Value) {
+  Output.push_back(static_cast<uint8_t>(Value & 0xFF));
+  Output.push_back(static_cast<uint8_t>((Value >> 8) & 0xFF));
+}
+
+std::vector<uint8_t>
+buildAddressRDataForQuestion(const ParsedDnsQuestion &Question, uint8_t Variant) {
+  switch (Question.Type) {
+  case 1:
+    return {127, 0, 0, Variant};
+  case 28:
+    return {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x10, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, Variant};
+  default:
+    return {127, 0, 0, Variant};
+  }
+}
+
+std::vector<uint8_t>
+buildBenignResponse(const std::vector<uint8_t> &Query,
+                    const ParsedDnsQuestion &Question, uint32_t TTL,
+                    uint8_t VariantOctet) {
+  switch (Question.Type) {
+  case 1:
+  case 28:
+    return DNSPacketBuilder::buildResponseFromQuery(
+        Query, buildAddressRDataForQuestion(Question, VariantOctet), Question.Type,
+        TTL);
+  case 2:
+    return DNSPacketBuilder()
+        .setID(Question.ID)
+        .asResponse()
+        .setRecursionDesired(Question.RecursionDesired)
+        .setRecursionAvailable(true)
+        .addQuestion(Question.Name, Question.Type, Question.DnsClass)
+        .addAnswer(Question.Name, 2, Question.DnsClass, TTL,
+                   DNSNameCodec::encode("ns1." + getParentZone(Question.Name)))
+        .addAdditional("ns1." + getParentZone(Question.Name), 1, Question.DnsClass,
+                       TTL, {127, 0, 0, VariantOctet})
+        .build();
+  case 5:
+    return DNSPacketBuilder()
+        .setID(Question.ID)
+        .asResponse()
+        .setRecursionDesired(Question.RecursionDesired)
+        .setRecursionAvailable(true)
+        .addQuestion(Question.Name, Question.Type, Question.DnsClass)
+        .addAnswer(Question.Name, 5, Question.DnsClass, TTL,
+                   DNSNameCodec::encode("edge." + getParentZone(Question.Name)))
+        .addAdditional("edge." + getParentZone(Question.Name), 1,
+                       Question.DnsClass, TTL, {127, 0, 0, VariantOctet})
+        .build();
+  default:
+    return DNSPacketBuilder()
+        .setID(Question.ID)
+        .asResponse()
+        .setRecursionDesired(Question.RecursionDesired)
+        .setRecursionAvailable(true)
+        .addQuestion(Question.Name, Question.Type, Question.DnsClass)
+        .addAnswer(Question.Name, 5, Question.DnsClass, TTL,
+                   DNSNameCodec::encode("cache." + getParentZone(Question.Name)))
+        .addAdditional("cache." + getParentZone(Question.Name), 1,
+                       Question.DnsClass, TTL, {127, 0, 0, VariantOctet})
+        .build();
+  }
+}
+
+std::vector<uint8_t>
+buildAuthorityPoisonResponse(const ParsedDnsQuestion &Question,
+                             bool InBailiwick, uint32_t TTL = 300,
+                             bool IncludeForgedAnswer = false) {
+  const std::string Zone = getParentZone(Question.Name);
+  const std::string NameServer =
+      InBailiwick ? ("ns1." + Zone) : "ns1.attacker.test";
+
+  DNSPacketBuilder Builder;
+  Builder.setID(Question.ID)
+      .asResponse()
+      .setRecursionDesired(Question.RecursionDesired)
+      .setRecursionAvailable(true)
+      .addQuestion(Question.Name, Question.Type, Question.DnsClass);
+
+  if (IncludeForgedAnswer) {
+    Builder.addAnswer(Question.Name, 5, Question.DnsClass, TTL,
+                      DNSNameCodec::encode("cache." + Zone));
+  }
+
+  return Builder.addAuthority(Zone, 2, Question.DnsClass, TTL,
+                              DNSNameCodec::encode(NameServer))
+      .addAdditional(NameServer, 1, Question.DnsClass, TTL, {6, 6, 6, 6})
+      .build();
+}
+
+std::vector<uint8_t>
+buildCnamePoisonResponse(const ParsedDnsQuestion &Question, uint32_t TTL = 300,
+                         bool IncludeAuthority = false) {
+  const std::string Zone = getParentZone(Question.Name);
+  const std::string Alias = "cache.attacker.test";
+
+  DNSPacketBuilder Builder;
+  Builder.setID(Question.ID)
+      .asResponse()
+      .setRecursionDesired(Question.RecursionDesired)
+      .setRecursionAvailable(true)
+      .addQuestion(Question.Name, Question.Type, Question.DnsClass)
+      .addAnswer(Question.Name, 5, Question.DnsClass, TTL,
+                 DNSNameCodec::encode(Alias))
+      .addAdditional(Alias, 1, Question.DnsClass, TTL, {6, 6, 6, 6});
+
+  if (IncludeAuthority) {
+    Builder.addAuthority(Zone, 2, Question.DnsClass, TTL,
+                         DNSNameCodec::encode("ns1.attacker.test"));
+  }
+
+  return Builder.build();
+}
+
+std::vector<uint8_t>
+buildNxdomainPoisonResponse(const ParsedDnsQuestion &Question, bool InBailiwick,
+                            uint32_t TTL) {
+  const std::string Zone = getParentZone(Question.Name);
+  const std::string NameServer =
+      InBailiwick ? ("ns1." + Zone) : "ns.evil.test";
+
+  return DNSPacketBuilder()
+      .setID(Question.ID)
+      .asResponse()
+      .setRecursionDesired(Question.RecursionDesired)
+      .setRecursionAvailable(true)
+      .setRCode(3)
+      .addQuestion(Question.Name, Question.Type, Question.DnsClass)
+      .addAuthority(Zone, 2, Question.DnsClass, TTL,
+                    DNSNameCodec::encode(NameServer))
+      .addAdditional(NameServer, 1, Question.DnsClass, TTL, {6, 6, 6, 7})
+      .build();
+}
+
+std::vector<uint8_t>
+buildPostCheckQuery(const std::vector<uint8_t> &Query, uint16_t Delta) {
+  if (Query.size() < 2) {
+    return Query;
+  }
+
+  std::vector<uint8_t> PostCheck = Query;
+  uint16_t ID = (static_cast<uint16_t>(PostCheck[0]) << 8) | PostCheck[1];
+  ID = static_cast<uint16_t>(ID + Delta);
+  PostCheck[0] = static_cast<uint8_t>((ID >> 8) & 0xFF);
+  PostCheck[1] = static_cast<uint8_t>(ID & 0xFF);
+  return PostCheck;
+}
+
+std::vector<std::vector<uint8_t>>
+buildPoisonResponseTemplates(const std::vector<uint8_t> &Query,
+                             const ParsedDnsQuestion &Question,
+                             bool IncludeExtendedTemplates) {
+  std::vector<std::vector<uint8_t>> Results;
+
+  Results.push_back(buildBenignResponse(Query, Question, 300, 1));
+  Results.push_back(buildAuthorityPoisonResponse(Question, true));
+  Results.push_back(buildAuthorityPoisonResponse(Question, false));
+  Results.push_back(buildCnamePoisonResponse(Question));
+
+  if (IncludeExtendedTemplates) {
+    Results.push_back(buildBenignResponse(Query, Question, 30, 2));
+    Results.push_back(
+        buildAuthorityPoisonResponse(Question, true, 30, true));
+    Results.push_back(
+        buildAuthorityPoisonResponse(Question, false, 900, true));
+    Results.push_back(buildCnamePoisonResponse(Question, 30, true));
+    Results.push_back(buildNxdomainPoisonResponse(Question, true, 60));
+    Results.push_back(buildNxdomainPoisonResponse(Question, false, 600));
+  }
+
+  return Results;
+}
+
+std::vector<uint8_t>
+buildStatefulTranscriptBlob(const std::vector<uint8_t> &ClientQuery,
+                            const std::vector<std::vector<uint8_t>> &Responses,
+                            const std::vector<uint8_t> &PostCheckQuery) {
+  std::vector<uint8_t> Output;
+
+  if (Responses.size() > 255 || ClientQuery.empty() || ClientQuery.size() > 0xFFFF ||
+      PostCheckQuery.size() > 0xFFFF) {
+    return {};
+  }
+  for (const auto &Response : Responses) {
+    if (Response.empty() || Response.size() > 0xFFFF) {
+      return {};
+    }
+  }
+
+  Output.insert(Output.end(), {'D', 'S', 'T', '1'});
+  Output.push_back(static_cast<uint8_t>(Responses.size()));
+  Output.push_back(0);
+  appendU16Le(Output, ClientQuery.size());
+  appendU16Le(Output, PostCheckQuery.size());
+  for (const auto &Response : Responses) {
+    appendU16Le(Output, Response.size());
+  }
+  Output.insert(Output.end(), ClientQuery.begin(), ClientQuery.end());
+  for (const auto &Response : Responses) {
+    Output.insert(Output.end(), Response.begin(), Response.end());
+  }
+  Output.insert(Output.end(), PostCheckQuery.begin(), PostCheckQuery.end());
+  return Output;
+}
+
+bool addUniquePacket(std::vector<std::vector<uint8_t>> &Results,
+                     std::set<std::vector<uint8_t>> &Seen,
+                     std::vector<uint8_t> Packet,
+                     const std::function<void(const std::vector<uint8_t> &)> &Cb) {
+  if (Packet.empty() || Seen.count(Packet) > 0) {
+    return false;
+  }
+
+  Seen.insert(Packet);
+  Results.push_back(std::move(Packet));
+  if (Cb) {
+    Cb(Results.back());
+  }
+  return true;
+}
+
+bool appendTranscriptVariant(
+    std::vector<std::vector<uint8_t>> &Results, std::set<std::vector<uint8_t>> &Seen,
+    const std::vector<uint8_t> &Query, const std::vector<std::vector<uint8_t>> &Responses,
+    const std::vector<uint8_t> &PostCheckQuery, size_t MaxTranscripts,
+    const std::function<void(const std::vector<uint8_t> &)> &Cb) {
+  if (Results.size() >= MaxTranscripts) {
+    return false;
+  }
+
+  return addUniquePacket(Results, Seen,
+                         buildStatefulTranscriptBlob(Query, Responses, PostCheckQuery),
+                         Cb);
+}
+
 void setDnsU16(std::vector<uint8_t> &Packet, size_t Offset, uint16_t Value) {
   if (Offset + 1 >= Packet.size()) {
     return;
@@ -1459,6 +1742,151 @@ HybridDNSGenerator::explorePayload(const std::vector<uint8_t> &Header) {
         NewPacket.insert(NewPacket.end(), NewPayload.begin(), NewPayload.end());
         Results.push_back(NewPacket);
       }
+    }
+  }
+
+  return Results;
+}
+
+StatefulDNSGenerator::StatefulDNSGenerator() = default;
+
+StatefulDNSGenerator::StatefulDNSGenerator(Config Cfg)
+    : Config_(std::move(Cfg)) {}
+
+void StatefulDNSGenerator::addQuerySeed(const std::vector<uint8_t> &Query) {
+  QuerySeeds_.push_back(Query);
+}
+
+void StatefulDNSGenerator::addResponseSeed(const std::vector<uint8_t> &Response) {
+  ResponseSeeds_.push_back(Response);
+}
+
+std::vector<std::vector<uint8_t>> StatefulDNSGenerator::generatePoisonResponses() {
+  std::vector<std::vector<uint8_t>> Results;
+  std::set<std::vector<uint8_t>> Seen;
+  std::vector<std::vector<uint8_t>> Queries = QuerySeeds_;
+
+  if (Queries.empty()) {
+    Queries.push_back(DNSPacketBuilder::buildQuery("www.example.com", 1));
+    Queries.push_back(DNSPacketBuilder::buildQuery("ns.target.test", 28));
+  }
+
+  for (const auto &ResponseSeed : ResponseSeeds_) {
+    if (Results.size() >= Config_.MaxVariantsPerQuery) {
+      break;
+    }
+    addUniquePacket(Results, Seen, ResponseSeed, InputCb_);
+  }
+
+  for (const auto &Query : Queries) {
+    auto Question = parseDnsQuestionSpec(Query);
+    size_t Before = Results.size();
+
+    if (!Question) {
+      continue;
+    }
+
+    for (const auto &Response : buildPoisonResponseTemplates(
+             Query, *Question, Config_.GenerateExtendedPoisonTemplates)) {
+      if (Results.size() - Before >= Config_.MaxVariantsPerQuery) {
+        break;
+      }
+      addUniquePacket(Results, Seen, Response, InputCb_);
+    }
+
+    if (Results.size() - Before >= Config_.MaxVariantsPerQuery) {
+      continue;
+    }
+  }
+
+  return Results;
+}
+
+std::vector<std::vector<uint8_t>> StatefulDNSGenerator::generateStatefulTranscripts() {
+  std::vector<std::vector<uint8_t>> Results;
+  std::set<std::vector<uint8_t>> Seen;
+  std::vector<std::vector<uint8_t>> Queries = QuerySeeds_;
+
+  if (Queries.empty()) {
+    Queries.push_back(DNSPacketBuilder::buildQuery("www.example.com", 1));
+  }
+
+  for (const auto &Query : Queries) {
+    std::vector<std::vector<uint8_t>> Responses = ResponseSeeds_;
+    auto Question = parseDnsQuestionSpec(Query);
+    std::vector<std::vector<uint8_t>> TemplateResponses;
+    std::vector<uint8_t> BenignResponse;
+    std::vector<std::vector<uint8_t>> PoisonResponses;
+    const std::vector<uint8_t> PostCheckQuery =
+        Config_.IncludePostCheck ? buildPostCheckQuery(Query, 0x0101)
+                                 : std::vector<uint8_t>{};
+
+    if (Question) {
+      TemplateResponses = buildPoisonResponseTemplates(
+          Query, *Question, Config_.GenerateExtendedPoisonTemplates);
+      if (!TemplateResponses.empty()) {
+        BenignResponse = TemplateResponses.front();
+        Responses.insert(Responses.end(), TemplateResponses.begin(),
+                         TemplateResponses.end());
+        PoisonResponses.insert(PoisonResponses.end(), TemplateResponses.begin() + 1,
+                               TemplateResponses.end());
+      }
+    }
+
+    for (const auto &Response : Responses) {
+      if (Results.size() >= Config_.MaxTranscripts) {
+        return Results;
+      }
+      appendTranscriptVariant(Results, Seen, Query, {Response}, PostCheckQuery,
+                              Config_.MaxTranscripts, InputCb_);
+    }
+
+    if (Config_.GenerateResponseRaces && Config_.MaxResponsesPerTranscript > 1 &&
+        !BenignResponse.empty() && !PoisonResponses.empty()) {
+      size_t Permutations = 0;
+      const size_t PoisonLimit =
+          std::min(PoisonResponses.size(), Config_.MaxRacePermutations);
+
+      for (size_t Index = 0; Index < PoisonLimit; ++Index) {
+        const auto &Poison = PoisonResponses[Index];
+
+        if (Results.size() >= Config_.MaxTranscripts ||
+            Permutations >= Config_.MaxRacePermutations) {
+          break;
+        }
+        appendTranscriptVariant(Results, Seen, Query, {Poison, BenignResponse},
+                                PostCheckQuery, Config_.MaxTranscripts, InputCb_);
+        ++Permutations;
+
+        if (Results.size() >= Config_.MaxTranscripts ||
+            Permutations >= Config_.MaxRacePermutations) {
+          break;
+        }
+        appendTranscriptVariant(Results, Seen, Query, {BenignResponse, Poison},
+                                PostCheckQuery, Config_.MaxTranscripts, InputCb_);
+        ++Permutations;
+
+        if (Config_.MaxResponsesPerTranscript > 2 && PoisonLimit > 1 &&
+            Results.size() < Config_.MaxTranscripts &&
+            Permutations < Config_.MaxRacePermutations) {
+          const auto &NextPoison = PoisonResponses[(Index + 1) % PoisonLimit];
+          appendTranscriptVariant(Results, Seen, Query,
+                                  {Poison, BenignResponse, NextPoison},
+                                  PostCheckQuery, Config_.MaxTranscripts, InputCb_);
+          ++Permutations;
+        }
+      }
+    }
+
+    if (Config_.MaxResponsesPerTranscript > 1 && Responses.size() >= 2 &&
+        Results.size() < Config_.MaxTranscripts) {
+      std::vector<std::vector<uint8_t>> Sequence;
+      const size_t Limit =
+          std::min(Config_.MaxResponsesPerTranscript, Responses.size());
+
+      Sequence.insert(Sequence.end(), Responses.begin(), Responses.begin() + Limit);
+      appendTranscriptVariant(Results, Seen, Query, Sequence, PostCheckQuery,
+                              Config_.MaxTranscripts, InputCb_);
     }
   }
 

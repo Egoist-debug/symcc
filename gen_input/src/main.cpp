@@ -66,6 +66,14 @@ bool isSupportedTailStrategy(const std::string &Strategy) {
   return Supported.count(Strategy) > 0;
 }
 
+bool looksLikeDnsPacket(const std::vector<uint8_t> &Input) {
+  return Input.size() >= 12;
+}
+
+bool isDnsResponsePacket(const std::vector<uint8_t> &Input) {
+  return looksLikeDnsPacket(Input) && (Input[2] & 0x80) != 0;
+}
+
 void printUsage(const char *ProgName) {
   std::cerr
       << "Usage: " << ProgName << " [options] <program>\n"
@@ -74,7 +82,7 @@ void printUsage(const char *ProgName) {
          "/tmp/geninput_output)\n"
       << "  -s, --seed <string>   Initial seed input\n"
       << "  --seed-file <path>    Initial seed input file (binary)\n"
-      << "  -f, --format <name>   Binary format (dns, dns-response, dns-header-question, tlv)\n"
+      << "  -f, --format <name>   Binary format (dns, dns-response, dns-poison-response, dns-stateful-transcript, dns-header-question, tlv)\n"
       << "  --mode <name>         Generation mode (dns-header-question)\n"
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
       << "  -i, --max-iter <n>    Maximum iterations (default: 1000)\n"
@@ -352,6 +360,121 @@ int main(int Argc, char *Argv[]) {
   std::vector<std::vector<uint8_t>> GeneratedOnlyInputs;
 
   if (!Opts.Format.empty()) {
+    auto Runner = std::make_shared<geninput::SymCCRunner>(RunCfg);
+
+    if (Opts.Format == "dns-poison-response" ||
+        Opts.Format == "dns-stateful-transcript") {
+      geninput::StatefulDNSGenerator::Config StatefulCfg;
+      size_t GeneratedCount = 0;
+      StatefulCfg.MaxVariantsPerQuery =
+          std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 16));
+      StatefulCfg.MaxTranscripts = std::max<size_t>(1, Opts.MaxIterations);
+      StatefulCfg.MaxResponsesPerTranscript =
+          std::min<size_t>(3, std::max<size_t>(2, Opts.MaxIterations));
+      StatefulCfg.MaxRacePermutations =
+          std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 12));
+      StatefulCfg.IncludePostCheck = true;
+      StatefulCfg.GenerateResponseRaces = true;
+      StatefulCfg.GenerateExtendedPoisonTemplates = true;
+
+      geninput::StatefulDNSGenerator Generator(StatefulCfg);
+      if (!Opts.SeedInput.empty()) {
+        std::vector<uint8_t> Seed(Opts.SeedInput.begin(), Opts.SeedInput.end());
+        if (isDnsResponsePacket(Seed)) {
+          Generator.addResponseSeed(Seed);
+        } else if (looksLikeDnsPacket(Seed)) {
+          Generator.addQuerySeed(Seed);
+        }
+      }
+
+      if (Opts.Verbose) {
+        Generator.setInputCallback([&GeneratedCount](const std::vector<uint8_t> &) {
+          std::cerr << "\rGenerated: " << ++GeneratedCount << std::flush;
+        });
+      }
+
+      if (Opts.Format == "dns-poison-response") {
+        std::cerr << "Using DNS poison response format\n";
+        if (Opts.HybridMode) {
+          geninput::HybridDNSGenerator::Config HybridCfg;
+          HybridCfg.PreserveHeaderBytes = Opts.PreserveHeaderBytes;
+          HybridCfg.MaxPayloadLength = Opts.MaxLength;
+          HybridCfg.MaxIterations = Opts.MaxIterations;
+          HybridCfg.TimeoutSec = Opts.TimeoutSec;
+          HybridCfg.IsResponse = true;
+
+          geninput::HybridDNSGenerator HybridGen(HybridCfg);
+          HybridGen.setRunner(Runner);
+          for (const auto &Seed : Generator.generatePoisonResponses()) {
+            HybridGen.addSeed(ensureResponseSeed(Seed));
+          }
+          if (Opts.Verbose) {
+            HybridGen.setInputCallback([&](const std::vector<uint8_t> &) {});
+          }
+          ValidInputs = HybridGen.generate();
+        } else {
+          ValidInputs = Generator.generatePoisonResponses();
+        }
+      } else {
+        if (Opts.HybridMode) {
+          std::cerr << "Error: dns-stateful-transcript does not support --hybrid\n";
+          return 1;
+        }
+        std::cerr << "Using DNS stateful transcript format\n";
+        ValidInputs = Generator.generateStatefulTranscripts();
+      }
+
+      for (const auto &Input : ValidInputs) {
+        if (Runner->isAccepted(Input)) {
+          AcceptedInputs.push_back(Input);
+        } else {
+          GeneratedOnlyInputs.push_back(Input);
+        }
+      }
+
+      if (Opts.Verbose) {
+        std::cerr << "\n";
+      }
+
+      const auto &RunStats = Runner->getStats();
+      const double AcceptanceRate =
+          RunStats.TotalRuns > 0
+              ? (100.0 * static_cast<double>(RunStats.AcceptedRuns) /
+                 static_cast<double>(RunStats.TotalRuns))
+              : 0.0;
+      std::cerr << "Generation complete:\n"
+                << "  Total generated: " << ValidInputs.size() << "\n"
+                << "  Accepted inputs: " << AcceptedInputs.size() << "\n"
+                << "  Generated-only inputs: " << GeneratedOnlyInputs.size() << "\n"
+                << "  SymCC runs: " << RunStats.TotalRuns << "\n"
+                << "  Timeout runs: " << RunStats.TimeoutRuns << "\n"
+                << "  SymCC acceptance rate: " << AcceptanceRate << "%\n";
+
+      size_t AcceptedIndex = 0;
+      for (const auto &Input : AcceptedInputs) {
+        std::string Filename =
+            Opts.OutputDir + "/accepted_" + std::to_string(AcceptedIndex++);
+        std::ofstream Ofs(Filename, std::ios::binary);
+        Ofs.write(reinterpret_cast<const char *>(Input.data()),
+                  static_cast<std::streamsize>(Input.size()));
+      }
+
+      size_t GeneratedIndex = 0;
+      for (const auto &Input : GeneratedOnlyInputs) {
+        std::string Filename =
+            Opts.OutputDir + "/generated_" + std::to_string(GeneratedIndex++);
+        std::ofstream Ofs(Filename, std::ios::binary);
+        Ofs.write(reinterpret_cast<const char *>(Input.data()),
+                  static_cast<std::streamsize>(Input.size()));
+      }
+
+      std::cout << "Generated " << ValidInputs.size() << " inputs ("
+                << AcceptedInputs.size() << " accepted, "
+                << GeneratedOnlyInputs.size() << " generated-only) to "
+                << Opts.OutputDir << "\n";
+      return 0;
+    }
+
     std::unique_ptr<geninput::BinaryFormat> Format;
     bool IsResponse = false;
 
@@ -376,11 +499,9 @@ int main(int Argc, char *Argv[]) {
       std::cerr << "Using TLV format\n";
     } else {
       std::cerr << "Error: Unknown format '" << Opts.Format << "'\n";
-      std::cerr << "Available formats: dns, dns-response, dns-header-question, tlv\n";
+      std::cerr << "Available formats: dns, dns-response, dns-poison-response, dns-stateful-transcript, dns-header-question, tlv\n";
       return 1;
     }
-
-    auto Runner = std::make_shared<geninput::SymCCRunner>(RunCfg);
 
     if (Opts.HybridMode) {
       std::cerr << "Using hybrid mode (preserve " << Opts.PreserveHeaderBytes

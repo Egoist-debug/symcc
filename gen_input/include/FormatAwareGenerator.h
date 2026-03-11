@@ -406,6 +406,39 @@ private:
       const std::vector<uint8_t> &Header);
 };
 
+/// Stateful DNS generator for poisoning-oriented responses and transcripts
+class StatefulDNSGenerator {
+public:
+  struct Config {
+    size_t MaxVariantsPerQuery = 8;
+    size_t MaxTranscripts = 256;
+    size_t MaxResponsesPerTranscript = 2;
+    size_t MaxRacePermutations = 8;
+    bool IncludePostCheck = true;
+    bool GenerateResponseRaces = true;
+    bool GenerateExtendedPoisonTemplates = true;
+  };
+
+  StatefulDNSGenerator();
+  explicit StatefulDNSGenerator(Config Cfg);
+
+  void setConfig(Config Cfg) { Config_ = Cfg; }
+  void addQuerySeed(const std::vector<uint8_t> &Query);
+  void addResponseSeed(const std::vector<uint8_t> &Response);
+
+  std::vector<std::vector<uint8_t>> generatePoisonResponses();
+  std::vector<std::vector<uint8_t>> generateStatefulTranscripts();
+
+  using InputCallback = std::function<void(const std::vector<uint8_t> &)>;
+  void setInputCallback(InputCallback Cb) { InputCb_ = std::move(Cb); }
+
+private:
+  Config Config_;
+  std::vector<std::vector<uint8_t>> QuerySeeds_;
+  std::vector<std::vector<uint8_t>> ResponseSeeds_;
+  InputCallback InputCb_;
+};
+
 } // namespace geninput
 
 #endif // GENINPUT_FORMATAWAREGENERATOR_H

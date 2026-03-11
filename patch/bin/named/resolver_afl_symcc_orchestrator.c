@@ -42,6 +42,11 @@
 #include <named/resolver_afl_symcc_orchestrator.h>
 #include <named/server.h>
 
+#define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAGIC "DST1"
+#define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES 16
+#define NAMED_RESOLVER_AFL_SYMCC_MAX_LEGACY_INPUT 4096
+#define NAMED_RESOLVER_AFL_SYMCC_MAX_TRANSCRIPT_INPUT 16384
+
 typedef struct named_resolver_afl_symcc_request_context {
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
@@ -54,6 +59,25 @@ typedef struct named_resolver_afl_symcc_request_context {
 	isc_result_t result;
 } named_resolver_afl_symcc_request_context_t;
 
+typedef struct named_resolver_afl_symcc_transcript {
+	const uint8_t *client_query;
+	size_t client_query_len;
+	const uint8_t *post_check_query;
+	size_t post_check_query_len;
+	const uint8_t *responses[NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES];
+	size_t response_lens[NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES];
+	size_t response_count;
+} named_resolver_afl_symcc_transcript_t;
+
+typedef struct named_resolver_afl_symcc_transcript_oracle {
+	bool parse_ok;
+	bool resolver_fetch_started;
+	bool response_accepted;
+	bool second_query_hit;
+	bool cache_entry_created;
+	bool timeout;
+} named_resolver_afl_symcc_transcript_oracle_t;
+
 typedef struct named_resolver_afl_symcc_orchestrator {
 	pthread_t injector_thread_id;
 	bool injector_thread_started;
@@ -65,6 +89,14 @@ typedef struct named_resolver_afl_symcc_orchestrator {
 	uint64_t replies_received;
 	uint64_t reply_timeouts;
 	uint64_t send_failures;
+	uint64_t transcript_cases;
+	uint64_t transcript_parse_errors;
+	uint64_t oracle_parse_ok;
+	uint64_t oracle_fetch_started;
+	uint64_t oracle_response_accepted;
+	uint64_t oracle_second_query_hit;
+	uint64_t oracle_cache_entry_created;
+	uint64_t oracle_timeouts;
 } named_resolver_afl_symcc_orchestrator_t;
 
 static bool g_initialized = false;
@@ -240,6 +272,248 @@ wait_until_named_running(void) {
 }
 
 static void
+restore_env_var(const char *name, char *value) {
+	if (value != NULL) {
+		setenv(name, value, 1);
+		free(value);
+		return;
+	}
+
+	unsetenv(name);
+}
+
+static uint16_t
+read_u16le(const uint8_t *data) {
+	return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static bool
+looks_like_transcript(const uint8_t *input, size_t input_len) {
+	return input_len >= 4 &&
+	       memcmp(input, NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAGIC, 4) == 0;
+}
+
+static bool
+input_length_supported(const uint8_t *input, size_t input_len) {
+	if (looks_like_transcript(input, input_len)) {
+		return input_len <= NAMED_RESOLVER_AFL_SYMCC_MAX_TRANSCRIPT_INPUT;
+	}
+
+	return input_len <= NAMED_RESOLVER_AFL_SYMCC_MAX_LEGACY_INPUT;
+}
+
+static bool
+parse_transcript_input(const uint8_t *input, size_t input_len,
+		       named_resolver_afl_symcc_transcript_t *transcript) {
+	size_t cursor = 0;
+	size_t header_len = 0;
+	size_t index;
+
+	if (input == NULL || transcript == NULL || input_len < 10 ||
+	    !looks_like_transcript(input, input_len))
+	{
+		return false;
+	}
+
+	memset(transcript, 0, sizeof(*transcript));
+	transcript->response_count = input[4];
+	if (transcript->response_count >
+	    NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES)
+	{
+		return false;
+	}
+
+	header_len = 10 + transcript->response_count * 2;
+	if (header_len > input_len) {
+		return false;
+	}
+
+	cursor = header_len;
+	transcript->client_query_len = read_u16le(input + 6);
+	transcript->post_check_query_len = read_u16le(input + 8);
+	if (transcript->client_query_len == 0 ||
+	    cursor + transcript->client_query_len > input_len)
+	{
+		return false;
+	}
+
+	transcript->client_query = input + cursor;
+	cursor += transcript->client_query_len;
+
+	for (index = 0; index < transcript->response_count; index++) {
+		size_t response_len = read_u16le(input + 10 + index * 2);
+
+		if (response_len == 0 || cursor + response_len > input_len) {
+			return false;
+		}
+
+		transcript->responses[index] = input + cursor;
+		transcript->response_lens[index] = response_len;
+		cursor += response_len;
+	}
+
+	if (transcript->post_check_query_len > 0) {
+		if (cursor + transcript->post_check_query_len != input_len) {
+			return false;
+		}
+
+		transcript->post_check_query = input + cursor;
+	} else if (cursor != input_len) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+write_file_bytes(const char *path, const uint8_t *data, size_t data_len) {
+	int fd;
+	ssize_t written;
+
+	if (path == NULL || data == NULL || data_len == 0) {
+		return false;
+	}
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		return false;
+	}
+
+	written = write(fd, data, data_len);
+	close(fd);
+	return written == (ssize_t)data_len;
+}
+
+static bool
+materialize_transcript_responses(
+	const named_resolver_afl_symcc_transcript_t *transcript, char *dir_path,
+	size_t dir_path_size) {
+	const char *tmp_root = getenv("TMPDIR");
+	size_t index;
+	size_t created = 0;
+
+	if (transcript == NULL || dir_path == NULL || dir_path_size == 0) {
+		return false;
+	}
+
+	if (transcript->response_count == 0) {
+		dir_path[0] = '\0';
+		return true;
+	}
+
+	if (tmp_root == NULL || *tmp_root == '\0') {
+		tmp_root = "/tmp";
+	}
+
+	if (snprintf(dir_path, dir_path_size,
+		     "%s/named-resolver-afl-symcc-XXXXXX", tmp_root) >=
+	    (int)dir_path_size)
+	{
+		return false;
+	}
+
+	if (mkdtemp(dir_path) == NULL) {
+		return false;
+	}
+
+	for (index = 0; index < transcript->response_count; index++) {
+		char file_path[PATH_MAX];
+
+		if (snprintf(file_path, sizeof(file_path), "%s/resp-%04zu.bin",
+			     dir_path, index) >= (int)sizeof(file_path))
+		{
+			break;
+		}
+		if (!write_file_bytes(file_path, transcript->responses[index],
+				      transcript->response_lens[index]))
+		{
+			break;
+		}
+		created++;
+	}
+
+	if (created == transcript->response_count) {
+		return true;
+	}
+
+	while (created > 0) {
+		char file_path[PATH_MAX];
+
+		created--;
+		if (snprintf(file_path, sizeof(file_path), "%s/resp-%04zu.bin",
+			     dir_path, created) >= (int)sizeof(file_path))
+		{
+			continue;
+		}
+		(void)unlink(file_path);
+	}
+	(void)rmdir(dir_path);
+	dir_path[0] = '\0';
+	return false;
+}
+
+static void
+cleanup_transcript_responses(const char *dir_path, size_t response_count) {
+	size_t index;
+
+	if (dir_path == NULL || *dir_path == '\0') {
+		return;
+	}
+
+	for (index = 0; index < response_count; index++) {
+		char file_path[PATH_MAX];
+
+		if (snprintf(file_path, sizeof(file_path), "%s/resp-%04zu.bin",
+			     dir_path, index) >= (int)sizeof(file_path))
+		{
+			continue;
+		}
+		(void)unlink(file_path);
+	}
+
+	(void)rmdir(dir_path);
+}
+
+static void
+update_transcript_oracle(
+	named_resolver_afl_symcc_orchestrator_t *orchestrator,
+	const named_resolver_afl_symcc_transcript_oracle_t *oracle) {
+	if (orchestrator == NULL || oracle == NULL) {
+		return;
+	}
+
+	orchestrator->transcript_cases++;
+	if (oracle->parse_ok) {
+		orchestrator->oracle_parse_ok++;
+	}
+	if (oracle->resolver_fetch_started) {
+		orchestrator->oracle_fetch_started++;
+	}
+	if (oracle->response_accepted) {
+		orchestrator->oracle_response_accepted++;
+	}
+	if (oracle->second_query_hit) {
+		orchestrator->oracle_second_query_hit++;
+	}
+	if (oracle->cache_entry_created) {
+		orchestrator->oracle_cache_entry_created++;
+	}
+	if (oracle->timeout) {
+		orchestrator->oracle_timeouts++;
+	}
+
+	if (getenv("NAMED_RESOLVER_AFL_SYMCC_TRACE_ORACLE") != NULL) {
+		fprintf(stderr,
+			"[resolver-afl-symcc] oracle parse_ok=%d fetch_started=%d "
+			"response_accepted=%d second_query_hit=%d "
+			"cache_entry_created=%d timeout=%d\n",
+			oracle->parse_ok, oracle->resolver_fetch_started,
+			oracle->response_accepted, oracle->second_query_hit,
+			oracle->cache_entry_created, oracle->timeout);
+	}
+}
+
+static void
 print_stats_and_exit(
 	const named_resolver_afl_symcc_orchestrator_t *orchestrator) {
 	named_resolver_afl_symcc_mutator_counters_t counters;
@@ -251,11 +525,27 @@ print_stats_and_exit(
 		"  Replies received: %" PRIu64 "\n"
 		"  Reply timeouts: %" PRIu64 "\n"
 		"  Send failures: %" PRIu64 "\n"
+		"  Transcript cases: %" PRIu64 "\n"
+		"  Transcript parse errors: %" PRIu64 "\n"
+		"  Oracle parse_ok: %" PRIu64 "\n"
+		"  Oracle resolver_fetch_started: %" PRIu64 "\n"
+		"  Oracle response_accepted: %" PRIu64 "\n"
+		"  Oracle second_query_hit: %" PRIu64 "\n"
+		"  Oracle cache_entry_created: %" PRIu64 "\n"
+		"  Oracle timeout: %" PRIu64 "\n"
 		"  Received: %" PRIu64 "\n"
 		"  Replied: %" PRIu64 "\n"
 		"  Parse errors: %" PRIu64 "\n",
 		orchestrator->requests_sent, orchestrator->replies_received,
 		orchestrator->reply_timeouts, orchestrator->send_failures,
+		orchestrator->transcript_cases,
+		orchestrator->transcript_parse_errors,
+		orchestrator->oracle_parse_ok,
+		orchestrator->oracle_fetch_started,
+		orchestrator->oracle_response_accepted,
+		orchestrator->oracle_second_query_hit,
+		orchestrator->oracle_cache_entry_created,
+		orchestrator->oracle_timeouts,
 		counters.received, counters.replied, counters.parse_errors);
 	fflush(NULL);
 	_exit(0);
@@ -466,6 +756,138 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 	return ISC_R_SUCCESS;
 }
 
+static isc_result_t
+execute_legacy_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
+		    const uint8_t *input, size_t input_len, long timeout_ms) {
+	isc_result_t result;
+
+	orchestrator->requests_sent++;
+	result = inject_request_bytes(input, input_len, timeout_ms);
+	if (result == ISC_R_SUCCESS) {
+		orchestrator->replies_received++;
+	} else if (result == ISC_R_TIMEDOUT) {
+		orchestrator->reply_timeouts++;
+	} else {
+		orchestrator->send_failures++;
+	}
+
+	return result;
+}
+
+static isc_result_t
+execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
+			const uint8_t *input, size_t input_len, long timeout_ms) {
+	named_resolver_afl_symcc_transcript_t transcript;
+	named_resolver_afl_symcc_transcript_oracle_t oracle = { 0 };
+	named_resolver_afl_symcc_mutator_counters_t counters_before;
+	named_resolver_afl_symcc_mutator_counters_t counters_after_first;
+	named_resolver_afl_symcc_mutator_counters_t counters_after_second;
+	isc_result_t result = ISC_R_FAILURE;
+	char response_dir[PATH_MAX];
+	char *saved_tail = NULL;
+	char *saved_tail_dir = NULL;
+	const char *tail_env = getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
+	const char *tail_dir_env =
+		getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR");
+
+	if (!parse_transcript_input(input, input_len, &transcript)) {
+		orchestrator->transcript_parse_errors++;
+		orchestrator->send_failures++;
+		return ISC_R_FAILURE;
+	}
+
+	oracle.parse_ok = true;
+	response_dir[0] = '\0';
+
+	if (tail_env != NULL) {
+		saved_tail = strdup(tail_env);
+	}
+	if (tail_dir_env != NULL) {
+		saved_tail_dir = strdup(tail_dir_env);
+	}
+
+	if (!materialize_transcript_responses(&transcript, response_dir,
+					      sizeof(response_dir)))
+	{
+		orchestrator->send_failures++;
+		restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL",
+				saved_tail);
+		restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
+				saved_tail_dir);
+		return ISC_R_FAILURE;
+	}
+
+	unsetenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
+	if (transcript.response_count > 0) {
+		setenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR", response_dir,
+		       1);
+	} else {
+		unsetenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR");
+	}
+
+	named_resolver_afl_symcc_mutator_server_reset_response_sequence();
+	named_resolver_afl_symcc_mutator_server_get_counters(&counters_before);
+
+	result = execute_legacy_case(orchestrator, transcript.client_query,
+				     transcript.client_query_len, timeout_ms);
+	named_resolver_afl_symcc_mutator_server_get_counters(
+		&counters_after_first);
+	oracle.resolver_fetch_started =
+		counters_after_first.received > counters_before.received;
+	oracle.response_accepted =
+		result == ISC_R_SUCCESS &&
+		counters_after_first.replied > counters_before.replied;
+	if (result != ISC_R_SUCCESS) {
+		if (result == ISC_R_TIMEDOUT) {
+			oracle.timeout = true;
+		}
+		goto done;
+	}
+
+	counters_after_second = counters_after_first;
+	if (transcript.post_check_query != NULL &&
+	    transcript.post_check_query_len > 0)
+	{
+		result = execute_legacy_case(orchestrator,
+					     transcript.post_check_query,
+					     transcript.post_check_query_len,
+					     timeout_ms);
+		named_resolver_afl_symcc_mutator_server_get_counters(
+			&counters_after_second);
+		if (result == ISC_R_SUCCESS &&
+		    counters_after_second.received == counters_after_first.received &&
+		    counters_after_second.replied == counters_after_first.replied &&
+		    counters_after_second.parse_errors ==
+			    counters_after_first.parse_errors)
+		{
+			oracle.second_query_hit = true;
+			oracle.cache_entry_created = true;
+		}
+		if (result == ISC_R_TIMEDOUT) {
+			oracle.timeout = true;
+		}
+	}
+
+done:
+	update_transcript_oracle(orchestrator, &oracle);
+	restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL", saved_tail);
+	restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
+			saved_tail_dir);
+	cleanup_transcript_responses(response_dir, transcript.response_count);
+	return result;
+}
+
+static isc_result_t
+execute_input_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
+		   const uint8_t *input, size_t input_len, long timeout_ms) {
+	if (looks_like_transcript(input, input_len)) {
+		return execute_transcript_case(orchestrator, input, input_len,
+					       timeout_ms);
+	}
+
+	return execute_legacy_case(orchestrator, input, input_len, timeout_ms);
+}
+
 static void *
 request_injector_thread(void *arg) {
 	named_resolver_afl_symcc_orchestrator_t *orchestrator =
@@ -487,7 +909,7 @@ request_injector_thread(void *arg) {
 				continue;
 			}
 
-			if (length > 4096) {
+			if (!input_length_supported(request, (size_t)length)) {
 				if (getenv("AFL_CMIN") != NULL) {
 					shutdown_named();
 					return NULL;
@@ -496,17 +918,11 @@ request_injector_thread(void *arg) {
 				continue;
 			}
 
-			orchestrator->requests_sent++;
-			result = inject_request_bytes(request, (size_t)length,
-						      timeout_ms);
-			if (result == ISC_R_SUCCESS) {
-				orchestrator->replies_received++;
-			} else if (result == ISC_R_TIMEDOUT) {
-				orchestrator->reply_timeouts++;
+			result = execute_input_case(orchestrator, request,
+						    (size_t)length, timeout_ms);
+			if (result == ISC_R_TIMEDOUT) {
 				shutdown_named();
 				return NULL;
-			} else {
-				orchestrator->send_failures++;
 			}
 
 			raise(SIGSTOP);
@@ -518,17 +934,11 @@ request_injector_thread(void *arg) {
 
 	length = read_request_bytes(orchestrator->config, request,
 				      sizeof(request));
-	if (length > 0) {
-		orchestrator->requests_sent++;
-		result = inject_request_bytes(request, (size_t)length,
-					      timeout_ms);
-		if (result == ISC_R_SUCCESS) {
-			orchestrator->replies_received++;
-		} else if (result == ISC_R_TIMEDOUT) {
-			orchestrator->reply_timeouts++;
-		} else {
-			orchestrator->send_failures++;
-		}
+	if (length > 0 && input_length_supported(request, (size_t)length)) {
+		(void)execute_input_case(orchestrator, request, (size_t)length,
+					 timeout_ms);
+	} else if (length > 0) {
+		orchestrator->send_failures++;
 	}
 
 	print_stats_and_exit(orchestrator);
@@ -636,11 +1046,27 @@ named_resolver_afl_symcc_orchestrator_stop(void) {
 		"  Replies received: %" PRIu64 "\n"
 		"  Reply timeouts: %" PRIu64 "\n"
 		"  Send failures: %" PRIu64 "\n"
+		"  Transcript cases: %" PRIu64 "\n"
+		"  Transcript parse errors: %" PRIu64 "\n"
+		"  Oracle parse_ok: %" PRIu64 "\n"
+		"  Oracle resolver_fetch_started: %" PRIu64 "\n"
+		"  Oracle response_accepted: %" PRIu64 "\n"
+		"  Oracle second_query_hit: %" PRIu64 "\n"
+		"  Oracle cache_entry_created: %" PRIu64 "\n"
+		"  Oracle timeout: %" PRIu64 "\n"
 		"  Received: %" PRIu64 "\n"
 		"  Replied: %" PRIu64 "\n"
 		"  Parse errors: %" PRIu64 "\n",
 		g_orchestrator.requests_sent, g_orchestrator.replies_received,
 		g_orchestrator.reply_timeouts, g_orchestrator.send_failures,
+		g_orchestrator.transcript_cases,
+		g_orchestrator.transcript_parse_errors,
+		g_orchestrator.oracle_parse_ok,
+		g_orchestrator.oracle_fetch_started,
+		g_orchestrator.oracle_response_accepted,
+		g_orchestrator.oracle_second_query_hit,
+		g_orchestrator.oracle_cache_entry_created,
+		g_orchestrator.oracle_timeouts,
 		counters.received, counters.replied, counters.parse_errors);
 
 	named_resolver_afl_symcc_mutator_server_stop();

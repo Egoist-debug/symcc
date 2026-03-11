@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXP_DIR="$ROOT_DIR/named_experiment"
+PROFILE_DIR="$EXP_DIR/profiles"
 WORK_DIR="${WORK_DIR:-$EXP_DIR/work}"
 PATCH_DIR="$ROOT_DIR/patch"
 SRC_TREE="$ROOT_DIR/bind-9.18.46"
@@ -23,6 +24,8 @@ NAMED_CONF="$RUNTIME_STATE_DIR/named.conf"
 QUERY_CORPUS_DIR="$WORK_DIR/query_corpus"
 STABLE_QUERY_CORPUS_DIR="$WORK_DIR/stable_query_corpus"
 RESPONSE_CORPUS_DIR="$WORK_DIR/response_corpus"
+TRANSCRIPT_CORPUS_DIR="$WORK_DIR/transcript_corpus"
+STABLE_TRANSCRIPT_CORPUS_DIR="$WORK_DIR/stable_transcript_corpus"
 QUERY_DRIVER="$WORK_DIR/driver_query.bin"
 QUERY_PARSER_BIN="$BIN_DIR/dns_parser_sym"
 RESPONSE_PARSER_BIN="$BIN_DIR/dns_response_parser_sym"
@@ -34,6 +37,7 @@ AFL_OUT_DIR="$WORK_DIR/afl_out"
 SYMCC_OUTPUT_DIR="$WORK_DIR/symcc_output"
 QUERY_GEN_LOG="$WORK_DIR/query_gen.log"
 RESPONSE_GEN_LOG="$WORK_DIR/response_gen.log"
+TRANSCRIPT_GEN_LOG="$WORK_DIR/transcript_gen.log"
 
 MASTER_LOG="$LOG_DIR/afl_master_persistent.log"
 SECONDARY_LOG="$LOG_DIR/afl_secondary_persistent.log"
@@ -54,7 +58,10 @@ REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
 RESET_OUTPUT="${RESET_OUTPUT:-1}"
 QUERY_MAX_ITER="${QUERY_MAX_ITER:-40}"
 RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-500}"
+TRANSCRIPT_MAX_ITER="${TRANSCRIPT_MAX_ITER:-256}"
 RESPONSE_PRESERVE="${RESPONSE_PRESERVE:-20}"
+FUZZ_PROFILE="${FUZZ_PROFILE:-poison-stateful}"
+TRANSCRIPT_GEN_TARGET="${TRANSCRIPT_GEN_TARGET:-/bin/true}"
 HELPER_NAME="${HELPER_NAME:-symcc}"
 HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$WORK_DIR}"
 HELPER_RUN_NAME="${HELPER_RUN_NAME:-$(basename "$AFL_OUT_DIR")}"
@@ -71,8 +78,8 @@ usage() {
 
 命令:
   build         同步 patch，并构建 helper、AFL 持久模式 named、SymCC named
-  gen-seeds     用 gen_input 生成 query_corpus 和 response_corpus
-  filter-seeds  筛选对 named 稳定的 query 语料，输出 stable_query_corpus
+  gen-seeds     按 profile 生成 query/response/transcript 语料
+  filter-seeds  按 profile 筛选稳定输入语料
   prepare       执行 build + gen-seeds(按需) + filter-seeds
   start         以持久模式启动 AFL++ master/secondary + SymCC helper
   stop          停止当前实验进程
@@ -83,8 +90,10 @@ usage() {
   2. patch/ 作为实验补丁源，会同步到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
   3. 运行产物默认写入 named_experiment/work/，可通过 WORK_DIR 覆盖。
   4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
+  5. FUZZ_PROFILE 支持 legacy-response-tail 与 poison-stateful，默认 poison-stateful。
 
 常用环境变量:
+  FUZZ_PROFILE=poison-stateful
   JOBS=2
   ENABLE_SECONDARY=1
   AFL_TIMEOUT_MS=3000+
@@ -93,6 +102,8 @@ usage() {
   REFILTER_QUERIES=0
   RESET_OUTPUT=1
   SHOW_AFL_UI=1
+  TRANSCRIPT_MAX_ITER=256
+  TRANSCRIPT_GEN_TARGET=/bin/true
   MUTATOR_ADDR=127.0.0.1:55300
   TARGET_ADDR=127.0.0.1:55301
 EOF
@@ -123,6 +134,40 @@ ensure_dirs() {
 	mkdir -p "$WORK_DIR" "$BIN_DIR" "$LOG_DIR" "$PID_DIR" "$SYMCC_OUTPUT_DIR" \
 		"$RUNTIME_STATE_DIR" "$EXP_DIR/runtime"
 	prepare_named_conf
+}
+
+load_profile() {
+	local profile_file
+
+	profile_file="$PROFILE_DIR/${FUZZ_PROFILE}.env"
+	if [ -f "$profile_file" ]; then
+		log "加载 profile: $profile_file"
+		# shellcheck disable=SC1090
+		. "$profile_file"
+	fi
+	case "$FUZZ_PROFILE" in
+	legacy-response-tail|poison-stateful)
+		;;
+	*)
+		die "未知 FUZZ_PROFILE: $FUZZ_PROFILE"
+		;;
+	esac
+}
+
+active_input_corpus_dir() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		printf '%s' "$STABLE_TRANSCRIPT_CORPUS_DIR"
+	else
+		printf '%s' "$STABLE_QUERY_CORPUS_DIR"
+	fi
+}
+
+sample_source_dir() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		printf '%s' "$TRANSCRIPT_CORPUS_DIR"
+	else
+		printf '%s' "$QUERY_CORPUS_DIR"
+	fi
 }
 
 prepare_named_conf() {
@@ -354,13 +399,30 @@ generate_seeds() {
 		log "生成 response-tail 语料"
 		"$GEN_INPUT_BIN" \
 			-v \
-			-f dns-response \
+			-f dns-poison-response \
 			--hybrid \
 			--preserve "$RESPONSE_PRESERVE" \
 			-i "$RESPONSE_MAX_ITER" \
 			-o "$RESPONSE_CORPUS_DIR" \
 			"$RESPONSE_PARSER_BIN" \
 			>"$RESPONSE_GEN_LOG" 2>&1
+	fi
+
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ] && \
+		{ [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$TRANSCRIPT_CORPUS_DIR" ] || \
+			[ -z "$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]; }
+	then
+		require_file "$TRANSCRIPT_GEN_TARGET"
+		rm -rf "$TRANSCRIPT_CORPUS_DIR"
+		mkdir -p "$TRANSCRIPT_CORPUS_DIR"
+		log "生成 stateful transcript 语料"
+		"$GEN_INPUT_BIN" \
+			-v \
+			-f dns-stateful-transcript \
+			-i "$TRANSCRIPT_MAX_ITER" \
+			-o "$TRANSCRIPT_CORPUS_DIR" \
+			"$TRANSCRIPT_GEN_TARGET" \
+			>"$TRANSCRIPT_GEN_LOG" 2>&1
 	fi
 }
 
@@ -396,19 +458,55 @@ sample_is_stable() {
 	return 1
 }
 
+sample_is_stateful_stable() {
+	local sample="$1"
+	local stderr_file
+	local ld_path
+
+	stderr_file="$(mktemp "$LOG_DIR/filter.stateful.XXXXXX.stderr")"
+	ld_path="$(afl_ld_library_path)"
+
+	if env \
+		LD_LIBRARY_PATH="$ld_path" \
+		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
+		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
+		timeout -k 5 "$SEED_TIMEOUT_SEC" \
+		"$AFL_TREE/bin/named/.libs/named" \
+		-g \
+		-c "$NAMED_CONF" \
+		-A "resolver-afl-symcc:${MUTATOR_ADDR},input=$sample" \
+		>/dev/null 2>"$stderr_file"
+	then
+		if grep -q 'Transcript cases: 1' "$stderr_file" && \
+			grep -q 'Oracle parse_ok: 1' "$stderr_file" && \
+			{ grep -q 'Oracle second_query_hit: 1' "$stderr_file" || \
+				grep -q 'Oracle cache_entry_created: 1' "$stderr_file"; }
+		then
+			rm -f "$stderr_file"
+			return 0
+		fi
+	fi
+
+	rm -f "$stderr_file"
+	return 1
+}
+
 filter_seeds() {
 	local tmp_dir
 	local seed_count=0
 	local next_id=0
+	local source_dir
+	local target_dir
 
-	require_file "$QUERY_DRIVER"
-	[ -d "$QUERY_CORPUS_DIR" ] || die "query 语料目录不存在: $QUERY_CORPUS_DIR"
+	source_dir="$(sample_source_dir)"
+	target_dir="$(active_input_corpus_dir)"
+	[ -d "$source_dir" ] || die "输入语料目录不存在: $source_dir"
 	[ -d "$RESPONSE_CORPUS_DIR" ] || die "response 语料目录不存在: $RESPONSE_CORPUS_DIR"
 
-	if [ "$REFILTER_QUERIES" -eq 0 ] && [ -d "$STABLE_QUERY_CORPUS_DIR" ] && \
-		[ -n "$(find "$STABLE_QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]
+	if [ "$REFILTER_QUERIES" -eq 0 ] && [ -d "$target_dir" ] && \
+		[ -n "$(find "$target_dir" -maxdepth 1 -type f 2>/dev/null)" ]
 	then
-		log "复用已有 stable_query_corpus"
+		log "复用已有稳定输入语料: $target_dir"
 		return 0
 	fi
 
@@ -416,14 +514,19 @@ filter_seeds() {
 	ensure_dirs
 	tmp_dir="$(mktemp -d "$WORK_DIR/.stable_query_tmp.XXXXXX")"
 
-	cp "$QUERY_DRIVER" "$tmp_dir/$(printf 'id_%06d_driver' "$next_id")"
-	next_id=$((next_id + 1))
-	seed_count=$((seed_count + 1))
+	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
+		require_file "$QUERY_DRIVER"
+		cp "$QUERY_DRIVER" "$tmp_dir/$(printf 'id_%06d_driver' "$next_id")"
+		next_id=$((next_id + 1))
+		seed_count=$((seed_count + 1))
+	fi
 
-	log "筛选稳定 query 语料"
-	for sample in "$QUERY_CORPUS_DIR"/*; do
+	log "筛选稳定输入语料 ($FUZZ_PROFILE)"
+	for sample in "$source_dir"/*; do
 		[ -f "$sample" ] || continue
-		if sample_is_stable "$sample"; then
+		if { [ "$FUZZ_PROFILE" = "poison-stateful" ] && sample_is_stateful_stable "$sample"; } || \
+			{ [ "$FUZZ_PROFILE" != "poison-stateful" ] && sample_is_stable "$sample"; }
+		then
 			cp "$sample" "$tmp_dir/$(printf 'id_%06d_%s' "$next_id" "$(basename "$sample")")"
 			next_id=$((next_id + 1))
 			seed_count=$((seed_count + 1))
@@ -432,12 +535,12 @@ filter_seeds() {
 
 	if [ "$seed_count" -le 0 ]; then
 		rm -rf "$tmp_dir"
-		die "没有筛出任何稳定 query 语料"
+		die "没有筛出任何稳定输入语料"
 	fi
 
-	rm -rf "$STABLE_QUERY_CORPUS_DIR"
-	mv "$tmp_dir" "$STABLE_QUERY_CORPUS_DIR"
-	log "stable_query_corpus 已生成，样本数: $seed_count"
+	rm -rf "$target_dir"
+	mv "$tmp_dir" "$target_dir"
+	log "稳定输入语料已生成，目录: $target_dir，样本数: $seed_count"
 }
 
 prepare_all() {
@@ -601,12 +704,33 @@ start_all() {
 	local ld_path
 	local helper_target_csv
 	local -a master_no_ui=()
+	local -a afl_env=()
+	local -a helper_extra=()
+	local input_dir
 
 	prepare_all
 	stop_all
 	cleanup_output
 	ld_path="$(afl_ld_library_path)"
+	input_dir="$(active_input_corpus_dir)"
 	helper_target_csv="${AFL_TREE}/bin/named/.libs/named,-g,-c,${NAMED_CONF},-A,resolver-afl-symcc:${MUTATOR_ADDR}"
+	afl_env=(
+		LD_LIBRARY_PATH="$ld_path"
+		AFL_NO_AFFINITY=1
+		AFL_SKIP_CPUFREQ=1
+		AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR"
+		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS"
+	)
+	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
+		afl_env+=(
+			NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR"
+		)
+		helper_extra=(
+			-r "$RESPONSE_CORPUS_DIR"
+			-e NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL
+		)
+	fi
 
 	if [ "$SHOW_AFL_UI" -ne 1 ] || ! tmux_enabled; then
 		master_no_ui=(AFL_NO_UI=1)
@@ -618,17 +742,11 @@ start_all() {
 			"$MASTER_SESSION" \
 			"$MASTER_LOG" \
 			env \
-			LD_LIBRARY_PATH="$ld_path" \
+			"${afl_env[@]}" \
 			"${master_no_ui[@]}" \
-			AFL_NO_AFFINITY=1 \
-			AFL_SKIP_CPUFREQ=1 \
-			AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
-			NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
-			NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
-			NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
 			"$AFL_FUZZ_BIN" \
 			-M master \
-			-i "$STABLE_QUERY_CORPUS_DIR" \
+			-i "$input_dir" \
 			-o "$AFL_OUT_DIR" \
 			-m none \
 			-t "$AFL_TIMEOUT_MS" \
@@ -642,17 +760,11 @@ start_all() {
 			"$MASTER_LOG" \
 			"$MASTER_PID" \
 			env \
-			LD_LIBRARY_PATH="$ld_path" \
+			"${afl_env[@]}" \
 			"${master_no_ui[@]}" \
-			AFL_NO_AFFINITY=1 \
-			AFL_SKIP_CPUFREQ=1 \
-			AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
-			NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
-			NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
-			NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
 			"$AFL_FUZZ_BIN" \
 			-M master \
-			-i "$STABLE_QUERY_CORPUS_DIR" \
+			-i "$input_dir" \
 			-o "$AFL_OUT_DIR" \
 			-m none \
 			-t "$AFL_TIMEOUT_MS" \
@@ -670,17 +782,11 @@ start_all() {
 				"$SECONDARY_SESSION" \
 				"$SECONDARY_LOG" \
 				env \
-				LD_LIBRARY_PATH="$ld_path" \
+				"${afl_env[@]}" \
 				AFL_NO_UI=1 \
-				AFL_NO_AFFINITY=1 \
-				AFL_SKIP_CPUFREQ=1 \
-				AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
-				NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
-				NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
-				NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
 				"$AFL_FUZZ_BIN" \
 				-S secondary \
-				-i "$STABLE_QUERY_CORPUS_DIR" \
+				-i "$input_dir" \
 				-o "$AFL_OUT_DIR" \
 				-m none \
 				-t "$AFL_TIMEOUT_MS" \
@@ -694,17 +800,11 @@ start_all() {
 				"$SECONDARY_LOG" \
 				"$SECONDARY_PID" \
 				env \
-				LD_LIBRARY_PATH="$ld_path" \
+				"${afl_env[@]}" \
 				AFL_NO_UI=1 \
-				AFL_NO_AFFINITY=1 \
-				AFL_SKIP_CPUFREQ=1 \
-				AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
-				NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
-				NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
-				NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
 				"$AFL_FUZZ_BIN" \
 				-S secondary \
-				-i "$STABLE_QUERY_CORPUS_DIR" \
+				-i "$input_dir" \
 				-o "$AFL_OUT_DIR" \
 				-m none \
 				-t "$AFL_TIMEOUT_MS" \
@@ -728,7 +828,7 @@ start_all() {
 		launch_shell_in_tmux \
 			"$HELPER_SESSION" \
 			"$HELPER_LOG" \
-			"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env LD_LIBRARY_PATH="$ld_path" NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v -r "$RESPONSE_CORPUS_DIR" -e NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
+			"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env LD_LIBRARY_PATH="$ld_path" NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}" -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
 	else
 		wait_for_master_queue
 		launch_in_background \
@@ -743,8 +843,7 @@ start_all() {
 			-n "$HELPER_RUN_NAME" \
 			-a master \
 			-v \
-			-r "$RESPONSE_CORPUS_DIR" \
-			-e NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL \
+			"${helper_extra[@]}" \
 			-t "$helper_target_csv" \
 			-- \
 			"$SYMCC_TREE/bin/named/named" \
@@ -790,6 +889,7 @@ show_tmux_pane() {
 
 status_all() {
 	printf '进程状态:\n'
+	printf '  %-14s %s\n' "profile" "$FUZZ_PROFILE"
 	show_pid_status "afl-master" "$MASTER_PID"
 	show_pid_status "afl-secondary" "$SECONDARY_PID"
 	show_pid_status "helper" "$HELPER_PID"
@@ -860,5 +960,6 @@ require_cmd sed
 require_cmd find
 require_file "$SRC_TREE"
 require_file "$NAMED_CONF_TEMPLATE"
+load_profile
 
 main "${1:-}"

@@ -120,6 +120,58 @@ copy_path_string(char *dst, size_t dst_size, const char *src) {
 }
 
 static bool
+pick_sorted_regular_file(const char *dir_path, uint64_t wanted_index, char *path,
+			 size_t path_size) {
+	uint64_t rank;
+	char last_path[PATH_MAX];
+	char candidate[PATH_MAX];
+
+	last_path[0] = '\0';
+
+	for (rank = 0; rank <= wanted_index; rank++) {
+		DIR *dir = opendir(dir_path);
+		struct dirent *entry = NULL;
+		struct stat st;
+		bool found = false;
+		char best_path[PATH_MAX];
+
+		if (dir == NULL) {
+			return false;
+		}
+
+		best_path[0] = '\0';
+		while ((entry = readdir(dir)) != NULL) {
+			if (entry->d_name[0] == '.') {
+				continue;
+			}
+
+			snprintf(candidate, sizeof(candidate), "%s/%s", dir_path,
+				 entry->d_name);
+			if (stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) {
+				continue;
+			}
+			if (last_path[0] != '\0' && strcmp(candidate, last_path) <= 0) {
+				continue;
+			}
+			if (!found || strcmp(candidate, best_path) < 0) {
+				snprintf(best_path, sizeof(best_path), "%s",
+					 candidate);
+				found = true;
+			}
+		}
+
+		closedir(dir);
+		if (!found) {
+			return false;
+		}
+
+		snprintf(last_path, sizeof(last_path), "%s", best_path);
+	}
+
+	return copy_path_string(path, path_size, last_path);
+}
+
+static bool
 pick_response_tail_path(named_resolver_afl_symcc_mutator_server_t *server,
 			char *path, size_t path_size) {
 	const char *direct_path = getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
@@ -130,7 +182,6 @@ pick_response_tail_path(named_resolver_afl_symcc_mutator_server_t *server,
 	struct stat st;
 	uint64_t file_count = 0;
 	uint64_t wanted_index = 0;
-	uint64_t current_index = 0;
 	char candidate[PATH_MAX];
 
 	if (copy_path_string(path, path_size, direct_path)) {
@@ -164,30 +215,13 @@ pick_response_tail_path(named_resolver_afl_symcc_mutator_server_t *server,
 	}
 
 	wanted_index = server->tail_pick_count % file_count;
-	rewinddir(dir);
-
-	while ((entry = readdir(dir)) != NULL) {
-		if (entry->d_name[0] == '.') {
-			continue;
-		}
-
-		snprintf(candidate, sizeof(candidate), "%s/%s", dir_path,
-			 entry->d_name);
-		if (stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) {
-			continue;
-		}
-
-		if (current_index == wanted_index) {
-			server->tail_pick_count++;
-			closedir(dir);
-			return copy_path_string(path, path_size, candidate);
-		}
-
-		current_index++;
+	closedir(dir);
+	if (!pick_sorted_regular_file(dir_path, wanted_index, path, path_size)) {
+		return false;
 	}
 
-	closedir(dir);
-	return false;
+	server->tail_pick_count++;
+	return true;
 }
 
 static int
@@ -419,5 +453,12 @@ named_resolver_afl_symcc_mutator_server_get_counters(
 		counters->received = 0;
 		counters->replied = 0;
 		counters->parse_errors = 0;
+	}
+}
+
+void
+named_resolver_afl_symcc_mutator_server_reset_response_sequence(void) {
+	if (g_server != NULL) {
+		g_server->tail_pick_count = 0;
 	}
 }

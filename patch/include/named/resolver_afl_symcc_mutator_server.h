@@ -39,3 +39,6 @@ named_resolver_afl_symcc_mutator_server_add_parse_errors(uint64_t delta);
 void
 named_resolver_afl_symcc_mutator_server_get_counters(
 	named_resolver_afl_symcc_mutator_counters_t *counters);
+
+void
+named_resolver_afl_symcc_mutator_server_reset_response_sequence(void);
