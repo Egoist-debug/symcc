@@ -1600,7 +1600,9 @@ main(int argc, char *argv[]) {
 	parse_command_line(argc, argv);
 
 #ifdef ENABLE_AFL
-	if (named_g_fuzz_type != isc_fuzz_none) {
+	if (named_g_fuzz_type != isc_fuzz_none &&
+	    !fuzz_resolver_afl_symcc_mode)
+	{
 		named_fuzz_setup();
 	}
 

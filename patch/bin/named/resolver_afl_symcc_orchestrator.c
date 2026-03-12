@@ -42,6 +42,22 @@
 #include <named/resolver_afl_symcc_orchestrator.h>
 #include <named/server.h>
 
+#ifndef __AFL_FUZZ_TESTCASE_LEN
+#define NAMED_AFL_FUZZ_FALLBACK 1
+static ssize_t named_afl_fuzz_len __attribute__((unused));
+static unsigned char named_afl_fuzz_buf[65536];
+#define __AFL_FUZZ_TESTCASE_LEN named_afl_fuzz_len
+#define __AFL_FUZZ_TESTCASE_BUF named_afl_fuzz_buf
+#define __AFL_FUZZ_INIT() void sync(void)
+#define __AFL_LOOP(_max)                                                   \
+	((named_afl_fuzz_len =                                            \
+		  read(STDIN_FILENO, named_afl_fuzz_buf,                  \
+		       sizeof(named_afl_fuzz_buf))) > 0)
+#define __AFL_INIT() sync()
+#endif
+
+__AFL_FUZZ_INIT();
+
 #define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAGIC "DST1"
 #define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES 16
 #define NAMED_RESOLVER_AFL_SYMCC_MAX_LEGACY_INPUT 4096
@@ -231,7 +247,14 @@ load_request_input_path(const char *config, char *path, size_t path_size) {
 
 static bool
 use_afl_persistent_driver(void) {
-	return getenv("__AFL_PERSISTENT") != NULL || getenv("AFL_CMIN") != NULL;
+	return getenv("__AFL_PERSISTENT") != NULL ||
+	       getenv("__AFL_SHM_FUZZ_ID") != NULL ||
+	       getenv("__AFL_SHM_ID") != NULL || getenv("AFL_CMIN") != NULL;
+}
+
+static bool
+persistent_debug_enabled(void) {
+	return getenv("NAMED_RESOLVER_AFL_SYMCC_DEBUG") != NULL;
 }
 
 static ssize_t
@@ -893,6 +916,7 @@ request_injector_thread(void *arg) {
 	named_resolver_afl_symcc_orchestrator_t *orchestrator =
 		(named_resolver_afl_symcc_orchestrator_t *)arg;
 	uint8_t request[65536];
+	const uint8_t *afl_request;
 	long timeout_ms;
 	ssize_t length;
 	isc_result_t result;
@@ -902,29 +926,86 @@ request_injector_thread(void *arg) {
 	timeout_ms = load_reply_timeout_ms();
 
 	if (use_afl_persistent_driver()) {
+		/*
+		 * 这里保留现有的 SIGSTOP 持久化节奏，因为 testcase 注入运行在
+		 * 独立线程里；只把输入来源切换到 AFL shared-memory buffer。
+		 */
+		if (persistent_debug_enabled()) {
+			fprintf(stderr,
+				"[resolver-afl-symcc][debug] persistent branch "
+				"enabled shm_fuzz=%s shm=%s persistent=%s cmin=%s\n",
+				getenv("__AFL_SHM_FUZZ_ID") != NULL ? "1" : "0",
+				getenv("__AFL_SHM_ID") != NULL ? "1" : "0",
+				getenv("__AFL_PERSISTENT") != NULL ? "1" : "0",
+				getenv("AFL_CMIN") != NULL ? "1" : "0");
+		}
+#ifdef __AFL_HAVE_MANUAL_CONTROL
+		if (persistent_debug_enabled()) {
+			fprintf(stderr,
+				"[resolver-afl-symcc][debug] deferred init skipped\n");
+		}
+#endif
+		afl_request = __AFL_FUZZ_TESTCASE_BUF;
+		if (persistent_debug_enabled()) {
+			fprintf(stderr,
+				"[resolver-afl-symcc][debug] testcase buffer ready\n");
+		}
+
 		for (int loop = 0; loop < 100000; loop++) {
-			length = read(STDIN_FILENO, request, sizeof(request));
+#ifdef NAMED_AFL_FUZZ_FALLBACK
+			length = read(STDIN_FILENO, (void *)afl_request, 65536);
+#else
+			length = (ssize_t)__AFL_FUZZ_TESTCASE_LEN;
+#endif
+			if (persistent_debug_enabled()) {
+				fprintf(stderr,
+					"[resolver-afl-symcc][debug] loop=%d len=%zd\n",
+					loop, length);
+			}
 			if (length <= 0) {
+#ifdef NAMED_AFL_FUZZ_FALLBACK
 				usleep(1000000);
+#else
+				if (persistent_debug_enabled()) {
+					fprintf(stderr,
+						"[resolver-afl-symcc][debug] "
+						"empty testcase, SIGSTOP\n");
+				}
+				raise(SIGSTOP);
+#endif
 				continue;
 			}
 
-			if (!input_length_supported(request, (size_t)length)) {
-				if (getenv("AFL_CMIN") != NULL) {
-					shutdown_named();
-					return NULL;
+			if (!input_length_supported(afl_request, (size_t)length)) {
+				orchestrator->send_failures++;
+				if (persistent_debug_enabled()) {
+					fprintf(stderr,
+						"[resolver-afl-symcc][debug] "
+						"unsupported len=%zd, SIGSTOP\n",
+						length);
 				}
 				raise(SIGSTOP);
 				continue;
 			}
 
-			result = execute_input_case(orchestrator, request,
+			result = execute_input_case(orchestrator, afl_request,
 						    (size_t)length, timeout_ms);
+			if (persistent_debug_enabled()) {
+				fprintf(stderr,
+					"[resolver-afl-symcc][debug] execute "
+					"result=%d\n",
+					result);
+			}
 			if (result == ISC_R_TIMEDOUT) {
 				shutdown_named();
 				return NULL;
 			}
 
+			if (persistent_debug_enabled()) {
+				fprintf(stderr,
+					"[resolver-afl-symcc][debug] case done, "
+					"SIGSTOP\n");
+			}
 			raise(SIGSTOP);
 		}
 

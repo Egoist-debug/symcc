@@ -22,6 +22,8 @@ struct Options {
   std::string OutputDir = "/tmp/geninput_output";
   std::string SeedInput;
   std::string SeedFile;
+  std::vector<std::string> SeedDirs;
+  size_t SeedDirLimit = 0;
   std::string Format;
   size_t MaxLength = 64;
   size_t MaxIterations = 1000;
@@ -74,6 +76,167 @@ bool isDnsResponsePacket(const std::vector<uint8_t> &Input) {
   return looksLikeDnsPacket(Input) && (Input[2] & 0x80) != 0;
 }
 
+std::vector<uint8_t> ensureResponseSeed(const std::vector<uint8_t> &Seed);
+
+std::vector<uint8_t> readBinaryFile(const std::filesystem::path &Path) {
+  std::ifstream Stream(Path, std::ios::binary);
+  if (!Stream) {
+    return {};
+  }
+
+  return std::vector<uint8_t>(std::istreambuf_iterator<char>(Stream),
+                              std::istreambuf_iterator<char>());
+}
+
+std::vector<std::vector<uint8_t>> collectSeedInputs(const Options &Opts) {
+  std::vector<std::vector<uint8_t>> Seeds;
+  std::set<std::vector<uint8_t>> Seen;
+  size_t DirSeedCount = 0;
+
+  auto AddSeed = [&](std::vector<uint8_t> Seed) {
+    if (!Seed.empty() && Seen.insert(Seed).second) {
+      Seeds.push_back(std::move(Seed));
+    }
+  };
+
+  if (!Opts.SeedInput.empty()) {
+    AddSeed(std::vector<uint8_t>(Opts.SeedInput.begin(), Opts.SeedInput.end()));
+  }
+
+  for (const auto &Dir : Opts.SeedDirs) {
+    std::vector<std::filesystem::path> Files;
+    for (const auto &Entry : std::filesystem::directory_iterator(Dir)) {
+      if (Entry.is_regular_file()) {
+        Files.push_back(Entry.path());
+      }
+    }
+
+    std::sort(Files.begin(), Files.end());
+    for (const auto &Path : Files) {
+      if (Opts.SeedDirLimit > 0 && DirSeedCount >= Opts.SeedDirLimit) {
+        break;
+      }
+      AddSeed(readBinaryFile(Path));
+      DirSeedCount++;
+    }
+  }
+
+  return Seeds;
+}
+
+void appendUniqueInputs(std::vector<std::vector<uint8_t>> &Dst,
+                        std::set<std::vector<uint8_t>> &Seen,
+                        const std::vector<std::vector<uint8_t>> &Src) {
+  for (const auto &Input : Src) {
+    if (!Input.empty() && Seen.insert(Input).second) {
+      Dst.push_back(Input);
+    }
+  }
+}
+
+geninput::FormatGeneratorConfig
+makeDnsResponseGrammarConfig(const Options &Opts) {
+  geninput::FormatGeneratorConfig GenCfg;
+  GenCfg.MaxIterations = std::max<size_t>(8, std::min<size_t>(Opts.MaxIterations, 128));
+  GenCfg.MaxInputLength = std::max<size_t>(Opts.MaxLength, 128);
+  GenCfg.TimeoutSec = Opts.TimeoutSec;
+  GenCfg.MaxByteDiff = std::max<size_t>(Opts.MaxByteDiff, 48);
+  GenCfg.FreezeDNSHeaderQuestion = true;
+  GenCfg.TailFocusLastBytes =
+      Opts.TailFocusLastBytes > 0 ? Opts.TailFocusLastBytes : 48;
+  GenCfg.TailFocusRatio = Opts.TailFocusRatio > 0.0 ? Opts.TailFocusRatio : 0.35;
+  if (!Opts.TailStrategies.empty()) {
+    GenCfg.TailStrategies = Opts.TailStrategies;
+  } else {
+    GenCfg.TailStrategies = {
+        "truncate", "append", "bitflip", "rdlength-mismatch", "count-mismatch"};
+  }
+  if (GenCfg.ControlledMalformationBudget == 0) {
+    GenCfg.ControlledMalformationBudget =
+        std::max<size_t>(2, GenCfg.MaxIterations / 4);
+  }
+  return GenCfg;
+}
+
+std::vector<std::vector<uint8_t>>
+generateGrammarResponseInputs(const Options &Opts,
+                              const std::shared_ptr<geninput::SymCCRunner> &Runner,
+                              const std::vector<std::vector<uint8_t>> &Seeds) {
+  auto GrammarCfg = makeDnsResponseGrammarConfig(Opts);
+  for (const auto &Seed : Seeds) {
+    GrammarCfg.MaxInputLength = std::max<size_t>(GrammarCfg.MaxInputLength, Seed.size());
+  }
+
+  geninput::BinaryFormat ResponseFormat =
+      geninput::BinaryFormatFactory::createDNSResponse();
+  geninput::FormatAwareGenerator Generator(ResponseFormat, GrammarCfg);
+  Generator.setRunner(Runner);
+
+  if (Seeds.empty()) {
+    Generator.addSeed(ResponseFormat.createSeed());
+  } else {
+    for (const auto &Seed : Seeds) {
+      Generator.addSeed(ensureResponseSeed(Seed));
+    }
+  }
+
+  auto Result = Generator.run();
+  return Result.ValidInputs;
+}
+
+std::vector<std::vector<uint8_t>>
+generateCompositePoisonResponses(
+    const Options &Opts, const std::shared_ptr<geninput::SymCCRunner> &Runner,
+    const std::vector<std::vector<uint8_t>> &SeedInputs,
+    bool EnableHybridPayloadExploration) {
+  geninput::StatefulDNSGenerator::Config StatefulCfg;
+  StatefulCfg.MaxVariantsPerQuery =
+      std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 16));
+  StatefulCfg.MaxTranscripts = std::max<size_t>(1, Opts.MaxIterations);
+  StatefulCfg.MaxResponsesPerTranscript =
+      std::min<size_t>(3, std::max<size_t>(2, Opts.MaxIterations));
+  StatefulCfg.MaxRacePermutations =
+      std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 12));
+  StatefulCfg.IncludePostCheck = true;
+  StatefulCfg.GenerateResponseRaces = true;
+  StatefulCfg.GenerateExtendedPoisonTemplates = true;
+
+  geninput::StatefulDNSGenerator TemplateGenerator(StatefulCfg);
+  for (const auto &Seed : SeedInputs) {
+    if (isDnsResponsePacket(Seed)) {
+      TemplateGenerator.addResponseSeed(Seed);
+    } else if (looksLikeDnsPacket(Seed)) {
+      TemplateGenerator.addQuerySeed(Seed);
+    }
+  }
+
+  std::vector<std::vector<uint8_t>> Results;
+  std::set<std::vector<uint8_t>> Seen;
+  auto TemplateSeeds = TemplateGenerator.generatePoisonResponses();
+  appendUniqueInputs(Results, Seen, TemplateSeeds);
+
+  auto GrammarInputs = generateGrammarResponseInputs(Opts, Runner, Results);
+  appendUniqueInputs(Results, Seen, GrammarInputs);
+
+  if (EnableHybridPayloadExploration) {
+    geninput::HybridDNSGenerator::Config HybridCfg;
+    HybridCfg.PreserveHeaderBytes = Opts.PreserveHeaderBytes;
+    HybridCfg.MaxPayloadLength = std::max<size_t>(Opts.MaxLength, 96);
+    HybridCfg.MaxIterations = std::max<size_t>(16, std::min<size_t>(Opts.MaxIterations, 256));
+    HybridCfg.TimeoutSec = Opts.TimeoutSec;
+    HybridCfg.IsResponse = true;
+
+    geninput::HybridDNSGenerator HybridGen(HybridCfg);
+    HybridGen.setRunner(Runner);
+    for (const auto &Seed : Results) {
+      HybridGen.addSeed(ensureResponseSeed(Seed));
+    }
+    appendUniqueInputs(Results, Seen, HybridGen.generate());
+  }
+
+  return Results;
+}
+
 void printUsage(const char *ProgName) {
   std::cerr
       << "Usage: " << ProgName << " [options] <program>\n"
@@ -82,6 +245,8 @@ void printUsage(const char *ProgName) {
          "/tmp/geninput_output)\n"
       << "  -s, --seed <string>   Initial seed input\n"
       << "  --seed-file <path>    Initial seed input file (binary)\n"
+      << "  --seed-dir <path>     Seed input directory (loads regular files in lexical order)\n"
+      << "  --seed-dir-limit <n>  Maximum number of files loaded from seed directories (0 = unlimited)\n"
       << "  -f, --format <name>   Binary format (dns, dns-response, dns-poison-response, dns-stateful-transcript, dns-header-question, tlv)\n"
       << "  --mode <name>         Generation mode (dns-header-question)\n"
       << "  -l, --max-length <n>  Maximum input length (default: 64)\n"
@@ -132,6 +297,24 @@ bool parseArgs(int Argc, char *Argv[], Options &Opts) {
         return false;
       }
       Opts.SeedFile = Argv[I];
+      continue;
+    }
+
+    if (Arg == "--seed-dir") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.SeedDirs.push_back(Argv[I]);
+      continue;
+    }
+
+    if (Arg == "--seed-dir-limit") {
+      if (++I >= Argc) {
+        std::cerr << "Error: " << Arg << " requires an argument\n";
+        return false;
+      }
+      Opts.SeedDirLimit = std::stoull(Argv[I]);
       continue;
     }
 
@@ -344,6 +527,14 @@ int main(int Argc, char *Argv[]) {
     }
   }
 
+  for (const auto &Dir : Opts.SeedDirs) {
+    if (!std::filesystem::exists(Dir) || !std::filesystem::is_directory(Dir)) {
+      std::cerr << "Error: seed directory '" << Dir
+                << "' does not exist or is not a directory\n";
+      return 1;
+    }
+  }
+
   geninput::RunConfig RunCfg;
   RunCfg.ProgramPath = Opts.ProgramPath;
   RunCfg.OutputDir = Opts.OutputDir;
@@ -361,67 +552,56 @@ int main(int Argc, char *Argv[]) {
 
   if (!Opts.Format.empty()) {
     auto Runner = std::make_shared<geninput::SymCCRunner>(RunCfg);
+    const auto SeedInputs = collectSeedInputs(Opts);
 
     if (Opts.Format == "dns-poison-response" ||
         Opts.Format == "dns-stateful-transcript") {
-      geninput::StatefulDNSGenerator::Config StatefulCfg;
       size_t GeneratedCount = 0;
-      StatefulCfg.MaxVariantsPerQuery =
-          std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 16));
-      StatefulCfg.MaxTranscripts = std::max<size_t>(1, Opts.MaxIterations);
-      StatefulCfg.MaxResponsesPerTranscript =
-          std::min<size_t>(3, std::max<size_t>(2, Opts.MaxIterations));
-      StatefulCfg.MaxRacePermutations =
-          std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 12));
-      StatefulCfg.IncludePostCheck = true;
-      StatefulCfg.GenerateResponseRaces = true;
-      StatefulCfg.GenerateExtendedPoisonTemplates = true;
-
-      geninput::StatefulDNSGenerator Generator(StatefulCfg);
-      if (!Opts.SeedInput.empty()) {
-        std::vector<uint8_t> Seed(Opts.SeedInput.begin(), Opts.SeedInput.end());
-        if (isDnsResponsePacket(Seed)) {
-          Generator.addResponseSeed(Seed);
-        } else if (looksLikeDnsPacket(Seed)) {
-          Generator.addQuerySeed(Seed);
-        }
-      }
 
       if (Opts.Verbose) {
-        Generator.setInputCallback([&GeneratedCount](const std::vector<uint8_t> &) {
-          std::cerr << "\rGenerated: " << ++GeneratedCount << std::flush;
-        });
+        std::cerr << "启用详细输出，统计综合 response/transcript 生成进度\n";
       }
 
       if (Opts.Format == "dns-poison-response") {
-        std::cerr << "Using DNS poison response format\n";
-        if (Opts.HybridMode) {
-          geninput::HybridDNSGenerator::Config HybridCfg;
-          HybridCfg.PreserveHeaderBytes = Opts.PreserveHeaderBytes;
-          HybridCfg.MaxPayloadLength = Opts.MaxLength;
-          HybridCfg.MaxIterations = Opts.MaxIterations;
-          HybridCfg.TimeoutSec = Opts.TimeoutSec;
-          HybridCfg.IsResponse = true;
-
-          geninput::HybridDNSGenerator HybridGen(HybridCfg);
-          HybridGen.setRunner(Runner);
-          for (const auto &Seed : Generator.generatePoisonResponses()) {
-            HybridGen.addSeed(ensureResponseSeed(Seed));
-          }
-          if (Opts.Verbose) {
-            HybridGen.setInputCallback([&](const std::vector<uint8_t> &) {});
-          }
-          ValidInputs = HybridGen.generate();
-        } else {
-          ValidInputs = Generator.generatePoisonResponses();
-        }
+        std::cerr << "Using DNS poison response composite mode"
+                  << " (template + grammar mutation"
+                  << (Opts.HybridMode ? " + hybrid payload exploration" : "")
+                  << ")\n";
+        ValidInputs =
+            generateCompositePoisonResponses(Opts, Runner, SeedInputs,
+                                             Opts.HybridMode);
       } else {
+        geninput::StatefulDNSGenerator::Config StatefulCfg;
+        StatefulCfg.MaxVariantsPerQuery =
+            std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 16));
+        StatefulCfg.MaxTranscripts = std::max<size_t>(1, Opts.MaxIterations);
+        StatefulCfg.MaxResponsesPerTranscript =
+            std::min<size_t>(3, std::max<size_t>(2, Opts.MaxIterations));
+        StatefulCfg.MaxRacePermutations =
+            std::max<size_t>(4, std::min<size_t>(Opts.MaxIterations, 12));
+        StatefulCfg.IncludePostCheck = true;
+        StatefulCfg.GenerateResponseRaces = true;
+        StatefulCfg.GenerateExtendedPoisonTemplates = true;
+
+        geninput::StatefulDNSGenerator Generator(StatefulCfg);
+        for (const auto &Seed : SeedInputs) {
+          if (isDnsResponsePacket(Seed)) {
+            Generator.addResponseSeed(Seed);
+          } else if (looksLikeDnsPacket(Seed)) {
+            Generator.addQuerySeed(Seed);
+          }
+        }
         if (Opts.HybridMode) {
           std::cerr << "Error: dns-stateful-transcript does not support --hybrid\n";
           return 1;
         }
         std::cerr << "Using DNS stateful transcript format\n";
         ValidInputs = Generator.generateStatefulTranscripts();
+      }
+
+      if (Opts.Verbose) {
+        GeneratedCount = ValidInputs.size();
+        std::cerr << "Generated composite candidates: " << GeneratedCount << "\n";
       }
 
       for (const auto &Input : ValidInputs) {

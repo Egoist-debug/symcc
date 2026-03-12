@@ -61,3 +61,7 @@ bind*
 
 # named experiment artifacts
 named_experiment/work/
+
+# unbound test
+unbound-*
+unbound_experiment/work/

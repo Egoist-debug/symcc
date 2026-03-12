@@ -18,7 +18,10 @@ namespace geninput {
 SymCCRunner::SymCCRunner(RunConfig Config) : Config_(std::move(Config)) {}
 
 std::string SymCCRunner::prepareOutputDir() {
-  std::string Dir = Config_.OutputDir + "/run_" + std::to_string(RunCounter_++);
+  std::string Root = Config_.OutputDir + "/.symcc_runner";
+  mkdir(Root.c_str(), 0755);
+
+  std::string Dir = Root + "/run_" + std::to_string(RunCounter_++);
   mkdir(Dir.c_str(), 0755);
   return Dir;
 }

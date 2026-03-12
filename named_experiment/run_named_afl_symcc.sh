@@ -26,6 +26,7 @@ STABLE_QUERY_CORPUS_DIR="$WORK_DIR/stable_query_corpus"
 RESPONSE_CORPUS_DIR="$WORK_DIR/response_corpus"
 TRANSCRIPT_CORPUS_DIR="$WORK_DIR/transcript_corpus"
 STABLE_TRANSCRIPT_CORPUS_DIR="$WORK_DIR/stable_transcript_corpus"
+TRANSCRIPT_SEED_MIX_DIR="$WORK_DIR/transcript_seed_mix"
 QUERY_DRIVER="$WORK_DIR/driver_query.bin"
 QUERY_PARSER_BIN="$BIN_DIR/dns_parser_sym"
 RESPONSE_PARSER_BIN="$BIN_DIR/dns_response_parser_sym"
@@ -58,8 +59,11 @@ REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
 RESET_OUTPUT="${RESET_OUTPUT:-1}"
 QUERY_MAX_ITER="${QUERY_MAX_ITER:-40}"
 RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-500}"
+RESPONSE_QUERY_SEEDS="${RESPONSE_QUERY_SEEDS:-8}"
 TRANSCRIPT_MAX_ITER="${TRANSCRIPT_MAX_ITER:-256}"
+TRANSCRIPT_RESPONSE_SEEDS="${TRANSCRIPT_RESPONSE_SEEDS:-24}"
 RESPONSE_PRESERVE="${RESPONSE_PRESERVE:-20}"
+RUN_DURATION_SEC="${RUN_DURATION_SEC:-180}"
 FUZZ_PROFILE="${FUZZ_PROFILE:-poison-stateful}"
 TRANSCRIPT_GEN_TARGET="${TRANSCRIPT_GEN_TARGET:-/bin/true}"
 HELPER_NAME="${HELPER_NAME:-symcc}"
@@ -82,11 +86,12 @@ usage() {
   filter-seeds  按 profile 筛选稳定输入语料
   prepare       执行 build + gen-seeds(按需) + filter-seeds
   start         以持久模式启动 AFL++ master/secondary + SymCC helper
+  run [秒数]    启动实验并持续运行指定秒数，结束后自动输出状态并停止
   stop          停止当前实验进程
   status        查看当前实验状态与关键统计
 
 默认约定:
-  1. AFL++ 目标使用 stdin 持久模式，不再依赖 input=@@ 的外部注入线程。
+  1. AFL++ 目标使用 shared-memory testcase 持久模式，仍由 target 内部注入线程驱动执行。
   2. patch/ 作为实验补丁源，会同步到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
   3. 运行产物默认写入 named_experiment/work/，可通过 WORK_DIR 覆盖。
   4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
@@ -96,14 +101,17 @@ usage() {
   FUZZ_PROFILE=poison-stateful
   JOBS=2
   ENABLE_SECONDARY=1
-  AFL_TIMEOUT_MS=3000+
-  REPLY_TIMEOUT_MS=50
+  AFL_TIMEOUT_MS=7000+
+  REPLY_TIMEOUT_MS=80
   REGEN_SEEDS=0
   REFILTER_QUERIES=0
   RESET_OUTPUT=1
   SHOW_AFL_UI=1
+  RESPONSE_QUERY_SEEDS=8
   TRANSCRIPT_MAX_ITER=256
+  TRANSCRIPT_RESPONSE_SEEDS=24
   TRANSCRIPT_GEN_TARGET=/bin/true
+  RUN_DURATION_SEC=180
   MUTATOR_ADDR=127.0.0.1:55300
   TARGET_ADDR=127.0.0.1:55301
 EOF
@@ -128,6 +136,32 @@ require_cmd() {
 
 require_file() {
 	[ -e "$1" ] || die "缺少文件: $1"
+}
+
+prepare_transcript_seed_mix() {
+	local seed_index
+	local sample
+
+	rm -rf "$TRANSCRIPT_SEED_MIX_DIR"
+	mkdir -p "$TRANSCRIPT_SEED_MIX_DIR"
+
+	seed_index=0
+	for sample in "$QUERY_CORPUS_DIR"/*; do
+		[ -f "$sample" ] || continue
+		cp "$sample" \
+			"$TRANSCRIPT_SEED_MIX_DIR/query_$(printf '%04d' "$seed_index")_$(basename "$sample")"
+		seed_index=$((seed_index + 1))
+	done
+
+	seed_index=0
+	while IFS= read -r sample; do
+		[ -f "$sample" ] || continue
+		cp "$sample" \
+			"$TRANSCRIPT_SEED_MIX_DIR/response_$(printf '%04d' "$seed_index")_$(basename "$sample")"
+		seed_index=$((seed_index + 1))
+	done <<EOF
+$(find "$RESPONSE_CORPUS_DIR" -maxdepth 1 -type f | LC_ALL=C sort | head -n "$TRANSCRIPT_RESPONSE_SEEDS")
+EOF
 }
 
 ensure_dirs() {
@@ -396,13 +430,15 @@ generate_seeds() {
 		require_file "$RESPONSE_PARSER_BIN"
 		rm -rf "$RESPONSE_CORPUS_DIR"
 		mkdir -p "$RESPONSE_CORPUS_DIR"
-		log "生成 response-tail 语料"
+		log "生成 response 综合语料（模板 + 语法变异 + hybrid payload）"
 		"$GEN_INPUT_BIN" \
 			-v \
 			-f dns-poison-response \
 			--hybrid \
 			--preserve "$RESPONSE_PRESERVE" \
 			-i "$RESPONSE_MAX_ITER" \
+			--seed-dir "$QUERY_CORPUS_DIR" \
+			--seed-dir-limit "$RESPONSE_QUERY_SEEDS" \
 			-o "$RESPONSE_CORPUS_DIR" \
 			"$RESPONSE_PARSER_BIN" \
 			>"$RESPONSE_GEN_LOG" 2>&1
@@ -415,10 +451,12 @@ generate_seeds() {
 		require_file "$TRANSCRIPT_GEN_TARGET"
 		rm -rf "$TRANSCRIPT_CORPUS_DIR"
 		mkdir -p "$TRANSCRIPT_CORPUS_DIR"
+		prepare_transcript_seed_mix
 		log "生成 stateful transcript 语料"
 		"$GEN_INPUT_BIN" \
 			-v \
 			-f dns-stateful-transcript \
+			--seed-dir "$TRANSCRIPT_SEED_MIX_DIR" \
 			-i "$TRANSCRIPT_MAX_ITER" \
 			-o "$TRANSCRIPT_CORPUS_DIR" \
 			"$TRANSCRIPT_GEN_TARGET" \
@@ -875,10 +913,19 @@ show_pid_status() {
 
 show_fuzzer_stats() {
 	local stats_file="$1"
+	local edges_found=""
+	local total_edges=""
 	[ -f "$stats_file" ] || return 0
 	printf '  %s\n' "$stats_file"
-	grep -E '^(execs_done|cycles_done|corpus_count|saved_crashes|saved_hangs|bitmap_cvg|pending_total|last_find)' \
+	grep -E '^(execs_done|cycles_done|corpus_count|saved_crashes|saved_hangs|bitmap_cvg|pending_total|last_find|edges_found|total_edges)' \
 		"$stats_file" | sed 's/^/    /'
+
+	edges_found="$(awk -F: '$1 ~ /^edges_found/ { gsub(/ /, "", $2); print $2 }' "$stats_file")"
+	total_edges="$(awk -F: '$1 ~ /^total_edges/ { gsub(/ /, "", $2); print $2 }' "$stats_file")"
+	if [ -n "$edges_found" ] && [ -n "$total_edges" ] && [ "$total_edges" -gt 0 ]; then
+		awk -v found="$edges_found" -v total="$total_edges" \
+			'BEGIN { printf "    edge_coverage    : %d/%d (%.2f%%)\n", found, total, (found * 100.0) / total }'
+	fi
 }
 
 show_tmux_pane() {
@@ -914,8 +961,35 @@ status_all() {
 	done
 }
 
+run_for_duration() {
+	local duration="${1:-$RUN_DURATION_SEC}"
+
+	case "$duration" in
+	""|*[!0-9]*)
+		die "run 持续时间必须是正整数秒: $duration"
+		;;
+	esac
+	[ "$duration" -gt 0 ] || die "run 持续时间必须大于 0: $duration"
+
+	cleanup_run_for_duration() {
+		stop_all >/dev/null 2>&1 || true
+	}
+
+	trap cleanup_run_for_duration EXIT INT TERM
+
+	start_all
+	log "开始定时运行: ${duration}s"
+	sleep "$duration"
+	log "定时运行结束，输出当前状态"
+	status_all
+
+	trap - EXIT INT TERM
+	stop_all
+}
+
 main() {
 	local cmd="${1:-}"
+	local arg="${2:-}"
 
 	case "$cmd" in
 	build)
@@ -936,6 +1010,9 @@ main() {
 		;;
 	start)
 		start_all
+		;;
+	run)
+		run_for_duration "$arg"
 		;;
 	stop)
 		stop_all
@@ -958,6 +1035,7 @@ require_cmd make
 require_cmd grep
 require_cmd sed
 require_cmd find
+require_cmd awk
 require_file "$SRC_TREE"
 require_file "$NAMED_CONF_TEMPLATE"
 load_profile
