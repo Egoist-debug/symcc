@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXP_DIR="$ROOT_DIR/unbound_experiment"
-PATCH_DIR="$ROOT_DIR/unbound_patch"
+PATCH_DIR="$ROOT_DIR/patch/unbound"
 WORK_DIR="${WORK_DIR:-$EXP_DIR/work}"
 SRC_TREE="${SRC_TREE:-$ROOT_DIR/unbound-1.24.2}"
 AFL_TREE="${AFL_TREE:-$ROOT_DIR/unbound-1.24.2-afl}"
@@ -15,6 +15,15 @@ AFL_FUZZ_BIN="${AFL_FUZZ_BIN:-/usr/local/bin/afl-fuzz}"
 AFL_CC_BIN="${AFL_CC_BIN:-/usr/local/bin/afl-clang-fast}"
 SYMCC_CC_BIN="${SYMCC_CC_BIN:-$ROOT_DIR/symcc_build_qsym/symcc}"
 SYMCC_CXX_BIN="${SYMCC_CXX_BIN:-$ROOT_DIR/symcc_build_qsym/sym++}"
+
+# --- BIND9 差分测试路径 ---
+BIND9_AFL_TREE="${BIND9_AFL_TREE:-$ROOT_DIR/bind-9.18.46-afl}"
+BIND9_NAMED_EXP="$ROOT_DIR/named_experiment"
+BIND9_NAMED_CONF_TEMPLATE="$BIND9_NAMED_EXP/runtime/named.conf"
+BIND9_RUNTIME_DIR="$WORK_DIR/bind9_runtime"
+BIND9_NAMED_CONF="$BIND9_RUNTIME_DIR/named.conf"
+BIND9_MUTATOR_ADDR="${BIND9_MUTATOR_ADDR:-127.0.0.1:55300}"
+DIFF_RESULT_DIR="$WORK_DIR/diff_results"
 
 BIN_DIR="$WORK_DIR/bin"
 QUERY_PARSER_SRC="$ROOT_DIR/gen_input/test/dns_parser.c"
@@ -49,6 +58,8 @@ REGEN_SEEDS="${REGEN_SEEDS:-0}"
 REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
 RESET_OUTPUT="${RESET_OUTPUT:-1}"
 ENABLE_HELPER="${ENABLE_HELPER:-1}"
+EXPLORE_ITER="${EXPLORE_ITER:-256}"
+EXPLORE_PRESERVE="${EXPLORE_PRESERVE:-20}"
 UNBOUND_TAG="${UNBOUND_TAG:-release-1.24.2}"
 HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$WORK_DIR}"
 HELPER_RUN_NAME="${HELPER_RUN_NAME:-$(basename "$AFL_OUT_DIR")}"
@@ -59,21 +70,23 @@ usage() {
 		'  unbound_experiment/run_unbound_afl_symcc.sh <命令>' \
 		'' \
 		'命令:' \
-		'  fetch         拉取 Unbound release-1.24.2 源码树' \
-		'  build         同步 unbound_patch，并构建 helper、AFL 与 SymCC 目标' \
-		'  gen-seeds     生成 query/response 语料' \
-		'  filter-seeds  筛选 legacy-response-tail 稳定 query 语料' \
-		'  smoke         对 AFL / SymCC 目标执行最小 smoke' \
-		'  prepare       执行 build + gen-seeds + filter-seeds + smoke' \
-		'  start         启动 AFL master 与 SymCC helper' \
-		'  run [秒数]    启动实验并持续运行指定秒数，结束后自动输出状态并停止' \
-		'  stop          停止当前实验进程' \
-		'  status        查看当前实验状态与关键统计' \
+		'  fetch              拉取 Unbound release-1.24.2 源码树' \
+		'  build              同步 patch/unbound，并构建 helper、AFL 与 SymCC 目标' \
+		'  gen-seeds          生成 query/response 语料' \
+		'  explore-response   用 gen_input 探索 response 包 20 字节后内容（尾部探索）' \
+		'  filter-seeds       筛选 legacy-response-tail 稳定 query 语料' \
+		'  smoke              对 AFL / SymCC 目标执行最小 smoke' \
+		'  prepare            执行 build + gen-seeds + explore-response + filter-seeds + smoke' \
+		'  diff-test          差分测试：同一套种子分别喂 BIND9 与 Unbound，比较 oracle 差异' \
+		'  start              启动 AFL master 与 SymCC helper' \
+		'  run [秒数]         启动实验并持续运行指定秒数，结束后自动输出状态并停止' \
+		'  stop               停止当前实验进程' \
+		'  status             查看当前实验状态与关键统计' \
 		'' \
-		'默认约定:' \
-		'  1. 当前阶段目标是 legacy-response-tail，对齐 BIND9 的第一阶段对照线。' \
-		'  2. query 继续复用 gen_input 生成，response 使用 dns-poison-response 综合语料。' \
-		'  3. AFL 主跑 stable_query_corpus，SymCC helper 跟进 AFL 队列补洞。'
+		'差分测试说明:' \
+		'  diff-test 使用同一套种子（query + response），分别喂给 BIND9 named 和' \
+		'  Unbound unbound-fuzzme，比较两者的 oracle 输出差异。差异样本即为潜在的' \
+		'  缓存投毒漏洞候选。需要 BIND9 已构建（named_experiment/run_named_afl_symcc.sh build）。'
 }
 
 log() {
@@ -107,7 +120,9 @@ ensure_dirs() {
 		"$SYMCC_OUTPUT_DIR/build" \
 		"$SYMCC_OUTPUT_DIR/smoke" \
 		"$LOG_DIR" \
-		"$PID_DIR"
+		"$PID_DIR" \
+		"$DIFF_RESULT_DIR" \
+		"$BIND9_RUNTIME_DIR"
 }
 
 tree_ld_library_path() {
@@ -527,6 +542,273 @@ filter_seeds() {
 	log "稳定 query 语料: $seed_count"
 }
 
+# ---------------------------------------------------------------------------
+# explore_response: 后台持续运行，从 AFL queue 提取新 query，
+#   用 gen_input 探索 response 包 20 字节后的内容，结果回灌 response_corpus。
+#   在 start_all 中作为后台进程启动，与 AFL + SymCC helper 协同工作。
+# ---------------------------------------------------------------------------
+EXPLORE_PID="$PID_DIR/explore.pid"
+EXPLORE_LOG="$LOG_DIR/explore.log"
+EXPLORE_INTERVAL="${EXPLORE_INTERVAL:-60}"
+
+explore_response_loop() {
+	local afl_queue_dir="$AFL_OUT_DIR/master/queue"
+	local explore_dir="$WORK_DIR/explore_response"
+	local seen_file="$WORK_DIR/.explore_seen"
+	local round=0
+
+	mkdir -p "$explore_dir"
+	touch "$seen_file"
+
+	log "explore-response 后台循环启动（间隔 ${EXPLORE_INTERVAL}s）"
+
+	while true; do
+		# 等待 AFL queue 出现
+		if [ ! -d "$afl_queue_dir" ]; then
+			sleep 5
+			continue
+		fi
+
+		# 收集 AFL queue 中的新 query 样本（排除已处理的）
+		local new_seeds_dir
+		new_seeds_dir="$(mktemp -d "$WORK_DIR/.explore_new.XXXXXX")"
+		local new_count=0
+		for f in "$afl_queue_dir"/id:*; do
+			[ -f "$f" ] || continue
+			local fname
+			fname="$(basename "$f")"
+			if ! grep -qxF "$fname" "$seen_file" 2>/dev/null; then
+				cp "$f" "$new_seeds_dir/$fname"
+				echo "$fname" >>"$seen_file"
+				new_count=$((new_count + 1))
+			fi
+		done
+
+		if [ "$new_count" -gt 0 ]; then
+			round=$((round + 1))
+			log "explore round $round: $new_count 个新 query，开始尾部探索"
+
+			rm -rf "$explore_dir"
+			mkdir -p "$explore_dir"
+
+			"$GEN_INPUT_BIN" \
+				-v \
+				-f dns-poison-response \
+				--hybrid \
+				--preserve "$EXPLORE_PRESERVE" \
+				-i "$EXPLORE_ITER" \
+				--seed-dir "$new_seeds_dir" \
+				--seed-dir-limit "$RESPONSE_QUERY_SEEDS" \
+				-o "$explore_dir" \
+				"$RESPONSE_PARSER_BIN" \
+				>>"$EXPLORE_LOG" 2>&1 || true
+
+			# 合并到 response_corpus
+			local merged=0
+			for f in "$explore_dir"/*; do
+				[ -f "$f" ] || continue
+				local dst="$RESPONSE_CORPUS_DIR/explore_r${round}_$(basename "$f")"
+				if [ ! -f "$dst" ] || ! cmp -s "$f" "$dst"; then
+					cp "$f" "$dst"
+					merged=$((merged + 1))
+				fi
+			done
+			log "explore round $round: 新增 $merged 个 response 样本"
+		fi
+
+		rm -rf "$new_seeds_dir"
+		sleep "$EXPLORE_INTERVAL"
+	done
+}
+
+# 单次探索（手动调用 explore-response 命令时使用）
+explore_response_once() {
+	local source_dir="$STABLE_QUERY_CORPUS_DIR"
+	local explore_dir="$WORK_DIR/explore_response"
+	local merged_count=0
+
+	build_helper_and_gen_input
+	build_seed_parsers
+
+	if [ ! -d "$source_dir" ] || \
+		[ -z "$(find "$source_dir" -maxdepth 1 -type f 2>/dev/null)" ]
+	then
+		source_dir="$QUERY_CORPUS_DIR"
+	fi
+	[ -d "$source_dir" ] || die "缺少 query 语料，请先执行 gen-seeds"
+
+	rm -rf "$explore_dir"
+	mkdir -p "$explore_dir"
+
+	log "探索 response 尾部（20 字节后），迭代 $EXPLORE_ITER 次"
+	"$GEN_INPUT_BIN" \
+		-v \
+		-f dns-poison-response \
+		--hybrid \
+		--preserve "$EXPLORE_PRESERVE" \
+		-i "$EXPLORE_ITER" \
+		--seed-dir "$source_dir" \
+		--seed-dir-limit "$RESPONSE_QUERY_SEEDS" \
+		-o "$explore_dir" \
+		"$RESPONSE_PARSER_BIN" \
+		>"$WORK_DIR/explore_response.log" 2>&1
+
+	for f in "$explore_dir"/*; do
+		[ -f "$f" ] || continue
+		local dst="$RESPONSE_CORPUS_DIR/explore_$(basename "$f")"
+		if [ ! -f "$dst" ] || ! cmp -s "$f" "$dst"; then
+			cp "$f" "$dst"
+			merged_count=$((merged_count + 1))
+		fi
+	done
+
+	log "尾部探索完成，新增 $merged_count 个 response 样本到 response_corpus"
+}
+
+# ---------------------------------------------------------------------------
+# 差分测试：同一套种子分别喂 BIND9 named 和 Unbound unbound-fuzzme
+# ---------------------------------------------------------------------------
+prepare_bind9_conf() {
+	require_file "$BIND9_NAMED_CONF_TEMPLATE"
+	local runtime_escaped
+	runtime_escaped="$(printf '%s' "$BIND9_RUNTIME_DIR" | sed 's/[&|]/\\&/g')"
+	sed "s|__RUNTIME_STATE_DIR__|$runtime_escaped|g" \
+		"$BIND9_NAMED_CONF_TEMPLATE" >"$BIND9_NAMED_CONF"
+}
+
+bind9_ld_library_path() {
+	local dirs=()
+	mapfile -t dirs < <(find "$BIND9_AFL_TREE" -type d -path '*/.libs' | sort)
+	[ "${#dirs[@]}" -gt 0 ] || die "未找到 $BIND9_AFL_TREE 下的 .libs 目录"
+	(
+		IFS=:
+		printf '%s' "${dirs[*]}"
+	)
+}
+
+extract_oracle() {
+	local stderr_file="$1"
+	local -a keys=(
+		parse_ok
+		resolver_fetch_started
+		response_accepted
+		second_query_hit
+		cache_entry_created
+		timeout
+	)
+	local key
+	for key in "${keys[@]}"; do
+		local val
+		val="$(grep -oP "Oracle ${key}: \K[0-9]+" "$stderr_file" 2>/dev/null || echo "0")"
+		printf '%s=%s ' "$key" "$val"
+	done
+	printf '\n'
+}
+
+run_unbound_sample() {
+	local sample="$1"
+	local stderr_file="$2"
+	env \
+		LD_LIBRARY_PATH="$(tree_ld_library_path "$AFL_TREE")" \
+		UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
+		UNBOUND_RESOLVER_AFL_SYMCC_LOG=1 \
+		timeout -k 2 "$SEED_TIMEOUT_SEC" \
+		"$(afl_target_bin)" \
+		<"$sample" \
+		>/dev/null 2>"$stderr_file" || true
+}
+
+run_bind9_sample() {
+	local sample="$1"
+	local stderr_file="$2"
+	env \
+		LD_LIBRARY_PATH="$(bind9_ld_library_path)" \
+		NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
+		NAMED_RESOLVER_AFL_SYMCC_LOG=1 \
+		timeout -k 2 "$SEED_TIMEOUT_SEC" \
+		"$BIND9_AFL_TREE/bin/named/.libs/named" \
+		-g \
+		-c "$BIND9_NAMED_CONF" \
+		-A "resolver-afl-symcc:${BIND9_MUTATOR_ADDR},input=$sample" \
+		>/dev/null 2>"$stderr_file" || true
+}
+
+diff_test() {
+	local sample
+	local total=0
+	local diff_count=0
+	local ub_stderr bind9_stderr
+	local ub_oracle bind9_oracle
+	local source_dir="$STABLE_QUERY_CORPUS_DIR"
+	local summary_file="$DIFF_RESULT_DIR/summary.txt"
+
+	# 前置检查
+	require_file "$BIND9_AFL_TREE/bin/named/.libs/named"
+	require_file "$(afl_target_bin)"
+	[ -d "$RESPONSE_CORPUS_DIR" ] || die "缺少 response 语料，请先执行 gen-seeds"
+
+	if [ ! -d "$source_dir" ] || \
+		[ -z "$(find "$source_dir" -maxdepth 1 -type f 2>/dev/null)" ]
+	then
+		source_dir="$QUERY_CORPUS_DIR"
+	fi
+	[ -d "$source_dir" ] || die "缺少 query 语料"
+
+	prepare_bind9_conf
+	rm -rf "$DIFF_RESULT_DIR"
+	mkdir -p "$DIFF_RESULT_DIR"
+
+	log "差分测试开始 — 种子目录: $source_dir"
+	printf '%-40s %-50s %-50s %s\n' "SAMPLE" "UNBOUND_ORACLE" "BIND9_ORACLE" "DIFF" \
+		>"$summary_file"
+	printf '%s\n' "$(printf '=%.0s' {1..160})" >>"$summary_file"
+
+	for sample in "$source_dir"/*; do
+		[ -f "$sample" ] || continue
+		total=$((total + 1))
+
+		ub_stderr="$(mktemp "$LOG_DIR/diff_ub.XXXXXX")"
+		bind9_stderr="$(mktemp "$LOG_DIR/diff_b9.XXXXXX")"
+
+		run_unbound_sample "$sample" "$ub_stderr"
+		run_bind9_sample "$sample" "$bind9_stderr"
+
+		ub_oracle="$(extract_oracle "$ub_stderr")"
+		bind9_oracle="$(extract_oracle "$bind9_stderr")"
+
+		local is_diff="NO"
+		if [ "$ub_oracle" != "$bind9_oracle" ]; then
+			is_diff="YES"
+			diff_count=$((diff_count + 1))
+			# 保存差异样本和 oracle 详情
+			local base
+			base="$(basename "$sample")"
+			cp "$sample" "$DIFF_RESULT_DIR/$base"
+			{
+				printf 'sample: %s\n' "$base"
+				printf 'unbound: %s\n' "$ub_oracle"
+				printf 'bind9:   %s\n' "$bind9_oracle"
+				printf '\n--- unbound stderr ---\n'
+				cat "$ub_stderr"
+				printf '\n--- bind9 stderr ---\n'
+				cat "$bind9_stderr"
+			} >"$DIFF_RESULT_DIR/${base}.detail"
+		fi
+
+		printf '%-40s %-50s %-50s %s\n' \
+			"$(basename "$sample")" "$ub_oracle" "$bind9_oracle" "$is_diff" \
+			>>"$summary_file"
+
+		rm -f "$ub_stderr" "$bind9_stderr"
+	done
+
+	log "差分测试完成: 共 $total 个样本，$diff_count 个存在 oracle 差异"
+	log "详情: $summary_file"
+	if [ "$diff_count" -gt 0 ]; then
+		log "差异样本保存在: $DIFF_RESULT_DIR/"
+	fi
+}
+
 pick_sample() {
 	local source_dir="$1"
 	local listing
@@ -597,7 +879,8 @@ smoke_all() {
 cleanup_output() {
 	if [ "$RESET_OUTPUT" -eq 1 ]; then
 		rm -rf "$AFL_OUT_DIR"
-		rm -f "$MASTER_LOG" "$HELPER_LOG"
+		rm -f "$MASTER_LOG" "$HELPER_LOG" "$EXPLORE_LOG"
+		rm -f "$WORK_DIR/.explore_seen"
 	fi
 }
 
@@ -696,7 +979,12 @@ start_all() {
 			"$(symcc_target_bin)"
 	fi
 
-	log "实验已启动"
+	# 启动 explore-response 后台循环：持续从 AFL queue 提取新 query，探索 response 尾部
+	log "启动 explore-response 后台循环（间隔 ${EXPLORE_INTERVAL}s）"
+	explore_response_loop >>"$EXPLORE_LOG" 2>&1 &
+	echo "$!" >"$EXPLORE_PID"
+
+	log "实验已启动（AFL master + SymCC helper + explore-response）"
 	status_all
 }
 
@@ -711,6 +999,7 @@ run_for_duration() {
 }
 
 stop_all() {
+	stop_pid_file "$EXPLORE_PID"
 	stop_pid_file "$HELPER_PID"
 	stop_pid_file "$MASTER_PID"
 }
@@ -748,6 +1037,8 @@ status_all() {
 		"$(find "$QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
 	printf '  %-16s %s\n' "response-corpus" \
 		"$(find "$RESPONSE_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
+	printf '  %-16s %s\n' "  (from explore)" \
+		"$(find "$RESPONSE_CORPUS_DIR" -maxdepth 1 -name 'explore_*' -type f 2>/dev/null | wc -l) files"
 	printf '  %-16s %s\n' "stable-query" \
 		"$(find "$STABLE_QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
 
@@ -761,6 +1052,11 @@ status_all() {
 		printf '  %-16s running (%s)\n' "symcc-helper" "$(cat "$HELPER_PID")"
 	else
 		printf '  %-16s stopped\n' "symcc-helper"
+	fi
+	if [ -f "$EXPLORE_PID" ] && kill -0 "$(cat "$EXPLORE_PID")" >/dev/null 2>&1; then
+		printf '  %-16s running (%s)\n' "explore-resp" "$(cat "$EXPLORE_PID")"
+	else
+		printf '  %-16s stopped\n' "explore-resp"
 	fi
 
 	if [ -f "$AFL_OUT_DIR/master/fuzzer_stats" ]; then
@@ -795,6 +1091,9 @@ main() {
 	gen-seeds)
 		generate_seeds
 		;;
+	explore-response)
+		explore_response_once
+		;;
 	filter-seeds)
 		filter_seeds
 		;;
@@ -803,6 +1102,9 @@ main() {
 		;;
 	prepare)
 		prepare_all
+		;;
+	diff-test)
+		diff_test
 		;;
 	start)
 		start_all

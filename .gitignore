@@ -63,5 +63,5 @@ bind*
 named_experiment/work/
 
 # unbound test
-unbound-*
+unbound-1.24*
 unbound_experiment/work/
