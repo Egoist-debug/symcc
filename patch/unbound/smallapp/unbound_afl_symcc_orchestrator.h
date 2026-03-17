@@ -8,6 +8,8 @@ typedef struct unbound_afl_symcc_oracle {
 	bool parse_ok;
 	bool resolver_fetch_started;
 	bool response_accepted;
+	bool second_query_hit;
+	bool cache_entry_created;
 	bool timeout;
 } unbound_afl_symcc_oracle_t;
 

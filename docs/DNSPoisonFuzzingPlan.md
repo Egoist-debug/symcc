@@ -1,404 +1,579 @@
-# DNS Resolver 缓存投毒联合模糊测试方案
+# DNS Resolver 缓存投毒 Differential Fuzzing 计划
 
 ## 摘要
 
-本方案面向具有状态的 DNS resolver，目标不是只覆盖单包解析，而是覆盖缓存投毒所依赖的多步状态演化过程。整体采用“两层实验线、统一输入模型”的设计，但当前阶段先收敛到“单 BIND9 深测”：
+本项目的当前目标，不再是单独把某一个 resolver 跑通，而是建立一条面向多个 DNS resolver 的缓存投毒差异模糊测试主线。
 
-- 当前主线使用 BIND9 状态化 transcript harness，先把单 resolver 的实验目标、oracle 与语料回流打稳。
-- 补线保留当前 BIND9 `resolver-afl-symcc` 系统态方案，作为真实 daemon 行为验证。
-- AFL++ 负责高吞吐率覆盖增长与常规指标采集。
-- SymCC 负责突破事务匹配、缓存写入等强约束。
-- `gen_input` 负责对上游 `response` 包进行结构化变异，重点探索 authority、additional、glue 和响应尾部区域。
+核心思路如下：
 
-## 目标与范围
+1. 对多个 resolver 输入同一批种子。
+2. 结合 AFL++、SymCC 与 `gen_input` 生成和放大高价值输入。
+3. 统一抽取缓存相关 oracle。
+4. 通过 resolver 之间的行为差异筛出可疑样本。
+5. 对差异样本再做强语义复核，判断其是否对应真实缓存投毒漏洞。
 
-### 目标
+当前仓库已经具备这条主线的一部分基础能力，但整体状态仍处于“单 BIND9 深测 + 第二 resolver 接入中 + 差分骨架已出现”的阶段，尚未形成完整的多 resolver stateful differential 实验闭环。
 
-1. 覆盖缓存投毒相关的有状态逻辑，而不仅仅是 DNS 报文解析。
-2. 先在单 BIND9 上建立可重复、可解释的状态化缓存投毒实验基线。
-3. 同时兼顾 AFL++ 的执行效率与 SymCC 的约束突破能力。
-4. 将 `gen_input` 集成到响应包生成与变异链路中，提升复杂响应路径可达性。
+配套执行清单见：
 
-### 当前阶段边界
+- [DNSPoisonFuzzingChecklist.md](./DNSPoisonFuzzingChecklist.md)
 
-当前阶段默认只承诺以下事项：
+## 目标重述
 
-- 目标 resolver 为 BIND9。
-- transcript 输入可以稳定驱动 `client_query -> upstream_response_seq -> post_check_query`。
-- oracle 可以给出“是否发起上游抓取”“是否接受过伪造响应”“第二次查询是否未再次触发上游交互”等代理信号。
-- AFL++ 与 SymCC 在同一 transcript 模型上协同工作。
-- BIND9 system-mode 结果可作为同一 resolver 上的对照组。
+### 总目标
 
-当前阶段不默认承诺以下事项：
+构建一个面向多个 DNS resolver 的缓存投毒 differential fuzzing 框架，用统一输入、统一 oracle 和统一筛选逻辑来发现可疑缓存投毒行为。
 
-- 多 resolver 横向对比已经完成。
-- differential testing 已经接入。
-- `cache_entry_created`、`poison_success` 等指标已经由强语义 oracle 直接证明。
+### 具体目标
 
-### 研究重点
+1. 不只覆盖 DNS 报文解析，而是覆盖缓存投毒相关的状态演化过程。
+2. 让 AFL++、SymCC 和 `gen_input` 在同一条实验链路上协同工作。
+3. 对多个 resolver 使用同一批 query、response 或 transcript 语料。
+4. 用缓存相关 oracle 差异而不是单一崩溃作为主要发现信号。
+5. 将“差异样本”与“漏洞证据”明确区分，避免过早下结论。
 
-- query 与 response 的事务匹配关系
-- 伪造响应的接受条件
-- cache entry 的创建、更新与二次命中
-- bailiwick、glue、authority/additional 相关安全边界
-- timeout、重试、竞争响应等状态相关行为
+### 当前目标 resolver
 
-## 总体架构
+- 第一主线：BIND9
+- 第二目标：Unbound
+- 后续可扩展到更多 resolver，但当前文档不预设第三个实现
 
-### 主线：状态化 transcript harness（当前先落地到 BIND9）
+## 判定原则
 
-主线使用统一的 transcript 输入模型，每个测试用例描述一次有界状态交互，而不是单个 DNS 包。当前实现先服务于 BIND9，后续若要接入第二个 resolver，再抽象公共 adapter。
+本项目的核心判定逻辑是：
 
-每个测试用例至少包含以下逻辑步骤：
+- 同一输入在不同 resolver 上应尽量产生同口径、可比较的结果。
+- 一旦出现稳定的 oracle 差异，就将该样本视为候选异常样本。
+- 候选异常样本需要进入复现、归因和强语义复核流程。
+- 差异本身不直接等价于漏洞成立。
 
-1. `client_query`
-   - 客户端向 resolver 发起查询。
-2. `upstream_response_seq`
-   - 注入一到多个上游响应，可用于模拟合法响应、伪造响应和竞争响应。
-3. `post_check_query`
-   - 再次发起查询，用于验证缓存是否被污染以及命中行为是否异常。
-4. `oracle`
-   - 记录本轮是否发生缓存写入、错误接受、异常命中、崩溃或超时。
+换句话说，本项目的主发现信号不是“是否 crash”，而是“同样的输入是否导致 resolver 在缓存相关行为上出现不一致”。
 
-### 补线：BIND9 system-mode
+## 当前仓库状态
 
-保留当前 BIND9 `named` 主流程内建 orchestrator 的方案，作为真实 daemon 级网络行为验证路径：
+### 已落地能力
 
-- 保留真实 socket、事件循环、timeout 与重试语义。
-- 用于验证 ACL、view、peer 地址、调度行为等 harness 可能弱化的路径。
-- 不作为多 resolver 主基线，而作为 BIND9 深测与结果校验的对照组。
+#### 1. BIND9 的 stateful 主线已经存在
+
+当前 BIND9 已经具备 `poison-stateful` 实验线，核心能力包括：
+
+- `client_query -> upstream_response_seq -> post_check_query` 的 transcript 驱动方式
+- `named_experiment/run_named_afl_symcc.sh` 的 build、gen-seeds、filter-seeds、prepare、start、status、stop 流程
+- AFL++ persistent 模式 + SymCC helper 的协同执行
+- 稳定语料筛选与实验运行脚本
+
+这意味着 BIND9 已经不只是 parser fuzz，而是能承载“缓存影响路径”的主实验线。
+
+#### 2. `gen_input` 已具备 DNS response 和 transcript 生成能力
+
+当前 `gen_input` 已支持以下格式能力：
+
+- `dns`
+- `dns-response`
+- `dns-poison-response`
+- `dns-stateful-transcript`
+
+其中与本项目最直接相关的是：
+
+- `dns-poison-response`：生成面向缓存投毒场景的 response 种子
+- `dns-stateful-transcript`：生成状态化 transcript 语料
+
+此外，`--hybrid --preserve 20` 已经可用。这里的含义需要明确：
+
+- 默认保留前 20 字节前缀
+- 之后的 response 区域交给 SymCC 辅助探索
+- 重点放在 authority、additional、glue 和更深的 payload 结构
+
+因此，`gen_input` 在当前项目中的定位不是“附属工具”，而是 response 生成链路的核心组成部分。
+
+#### 3. Unbound 已经接入第二 resolver 的工程入口
+
+当前 `unbound_experiment/run_unbound_afl_symcc.sh` 已具备以下基础能力：
+
+- 获取与构建 Unbound 本地源码树
+- 构建 AFL 版本与 SymCC 版本目标
+- 生成 query corpus
+- 做 smoke 验证
+- 做 response tail 探索并回灌 `response_corpus`
+
+这说明第二 resolver 的编译链、输入链和基础实验脚本已经出现，不再是纯计划状态。
+
+#### 4. 差分测试脚本骨架已经存在
+
+`unbound_experiment/run_unbound_afl_symcc.sh` 中已经包含 `diff-test`，其核心逻辑是：
+
+- 取同一批种子
+- 分别喂给 Unbound 与 BIND9
+- 提取 oracle
+- 比较两边输出
+- 保存差异样本与详情
+
+这非常接近项目最终目标，但当前仍属于“骨架已在、主线未成”的状态。
+
+### 部分落地、但还不完整的能力
+
+#### 1. 多 resolver 差分已经出现，但还不是 stateful 主线
+
+当前差分测试更多是：
+
+- BIND9 system-mode
+- Unbound parser-lite 或最小入口
+- 基于 query 与 response 语料的外部比较
+
+它还不是完整的“同一 transcript 同时驱动多个 resolver”的统一 stateful differential 主线。
+
+#### 2. oracle 已经能比较，但语义层级还不统一
+
+当前仓库中，BIND9 侧较稳定的 oracle 包括：
+
+- `parse_ok`
+- `resolver_fetch_started`
+- `response_accepted`
+- `second_query_hit`
+- `cache_entry_created`
+- `timeout`
+
+Unbound 侧当前更稳定的主要是：
+
+- `parse_ok`
+- `resolver_fetch_started`
+- `response_accepted`
+
+这意味着跨 resolver 的 oracle 对齐仍未完成。
+
+#### 3. `cache_entry_created` 仍是代理信号
+
+当前 BIND9 线里的 `cache_entry_created` 仍然主要来自：
+
+- post-check 阶段没有再次观察到新的上游交互
+
+它当前更适合作为：
+
+- 语料筛选信号
+- 差异比较信号
+- 值得复核的缓存影响路径信号
+
+而不应直接写成“缓存投毒已被严格证明”。
+
+### 尚未完成的关键缺口
+
+1. Unbound 还没有接入完整的 stateful transcript 执行模型。
+2. 多 resolver 还没有完全共享同一种 transcript 语义。
+3. 统一 oracle 结果格式还没有在所有 resolver 上补齐。
+4. 差异样本还没有形成稳定的聚类、复现与归因流程。
+5. 还没有强语义缓存证明机制来确认真正的 poison success。
+
+## 实验总架构
+
+### 总体分层
+
+建议把实验主线拆成三层：
+
+#### A. 单 resolver 基线层
+
+目标是先把单个 resolver 的输入模型、稳定性、oracle 与样本回流打稳。
+
+当前主承担者：
+
+- BIND9 poison-stateful 主线
+
+#### B. 多 resolver 可比层
+
+目标是让多个 resolver 在同一批语料上输出同口径结果。
+
+核心要求：
+
+- 输入模型一致
+- oracle 字段一致
+- 日志与结果结构一致
+
+当前推进状态：
+
+- 已有 BIND9 与 Unbound 的双目标骨架
+- 但还未完全对齐到 stateful transcript 级别
+
+#### C. 差异判定与复核层
+
+目标是从行为差异中筛出可疑样本，并将其送入更强的验证流程。
+
+核心输出：
+
+- 差异样本集
+- 差异详情
+- 可复现脚本
+- 最终漏洞判定结果
 
 ## 统一输入模型
 
-### transcript 格式
+### 输入层级
 
-默认每个测试用例由以下部分组成：
+建议把输入明确分成三层：
 
-- 文件头
-  - 版本号
-  - profile 类型
-  - 传输类型
-  - step 数量
-  - 标志位
-- step 数组
-  - `step_type`
-  - `ordering_or_delay`
-  - `packet_length`
-  - `packet_bytes`
-- 可选元数据
-  - 是否允许多响应竞争
-  - 是否允许乱序响应
-  - 是否启用 TCP fallback
+#### 1. query corpus
+
+用于：
+
+- 快速起量
+- parser 路径探索
+- 生成 response 骨架
+- 供第二 resolver 早期 smoke 与 parser-lite 使用
+
+#### 2. response corpus
+
+用于：
+
+- 构造合法或近合法的上游响应
+- 覆盖 authority、additional、glue、compression 等高约束区域
+- 作为缓存投毒导向的上游注入素材
+
+其生成策略应保持为：
+
+- `gen_input` 负责结构化生成
+- AFL++ 负责后续字节级扩散
+- SymCC 负责突破强约束字段
+
+#### 3. transcript corpus
+
+用于：
+
+- 表达一次完整的缓存投毒实验交互
+- 统一描述 query、多个 response 与 post-check
+- 承载真正的 stateful differential 主线
 
 ### 默认 profile
 
 #### `parser-lite`
 
-仅包含：
+适用场景：
 
-- 一个 query
-- 一个 response
-
-用于：
-
-- 快速起量
-- parser 与基础事务路径探索
-- 生成初始高质量 corpus
+- 第二 resolver 接入初期
+- 构建链路和输入链路验证
+- 快速 smoke
 
 #### `poison-stateful`
 
-默认主 profile，包含：
-
-- 一个 query
-- 多个 response
-- 一次 post-check query
-
-用于：
+适用场景：
 
 - 缓存投毒主实验
-- 竞争响应与错误接受场景
-- cache 污染验证
+- 多响应竞争
+- post-check 命中验证
+- 长时间 campaign
 
-## AFL++ 集成方案
+### `gen_input` 的职责边界
 
-### 执行模式
+在当前项目中，`gen_input` 的职责建议固定为：
 
-默认使用：
+1. 负责生成高质量 DNS query 和 response 语料。
+2. 负责维护 response 内部字段耦合关系。
+3. 负责对 authority、additional、glue 等高价值区域做结构化放大。
+4. 负责生成 transcript 原材料，而不是直接承担最终漏洞判定。
 
-- `persistent mode`
-- 共享内存输入
+需要强调的是，当前 hybrid 模式的默认策略应表述为：
 
-约束如下：
+- 保留前 20 字节前缀
+- 将其后的 response 区域作为主要探索对象
 
-- 单个 `__AFL_LOOP` 对应一个完整 transcript。
-- AFL 迭代之间必须完全重置 resolver 状态。
-- 若某 resolver 无法稳定 reset，则降级为 forkserver 模式。
+不要把它表述成“只探索最后 20 字节”。
 
-### AFL++ 指标
+## AFL++、SymCC 与 `gen_input` 的分工
 
-需要持续采集并纳入实验记录的指标包括：
+### AFL++
 
-- `execs/sec`
-- `stability`
-- `map density`
-- `count coverage`
-- `corpus size`
-- `unique crashes`
-- `unique hangs`
-- `favored paths`
-- `timeout ratio`
-- `new edges over time`
+职责：
 
-### 领域指标
+- 提供主吞吐
+- 拉高覆盖
+- 维护主语料池
+- 长时间运行 campaign
 
-除 AFL++ 常规指标外，还必须增加缓存投毒相关领域指标：
+默认模式：
 
-- `accepted_forged_responses`
-- `cache_entry_created`
-- `cache_entry_updated`
-- `poison_success`
-- `unexpected_second_query_hit`
-- `bailiwick_violation_accepted`
-- `mismatch_but_accepted`
+- 对单 resolver 主线优先使用 persistent mode
+- 无法稳定 reset 的 resolver 可临时降级到 forkserver
 
-## SymCC 集成方案
+### SymCC
 
-### 角色定位
+职责：
 
-SymCC 不承担全量状态空间搜索，而是作为 AFL++ 的补洞器，用于突破 AFL++ 难以满足的强约束路径。
+- 补 AFL++ 很难命中的强约束路径
+- 重点突破事务匹配、RR 计数、压缩指针、authority/additional 合法性
+- 生成高价值样本并回流 AFL++ 语料库
 
-### 默认符号化范围
+不建议做的事：
 
-默认只将以下字段或区域符号化：
+- 对整个 transcript 做无差别全量符号化
 
-- response 头部中的事务匹配关键字段
-- authority 与 additional 中的结构性字段
-- glue、referral、CNAME 等高约束部分
-- 少量 query 头字段
+### `gen_input`
 
-不默认将整个 transcript 全量符号化，以避免路径爆炸和求解开销失控。
+职责：
 
-### 重点求解目标
+- 负责语法感知和格式感知生成
+- 为 response 与 transcript 提供高质量 seed
+- 作为多 resolver 共享输入的上游生成器
 
-- QID 与事务匹配约束
-- RR count 与长度场一致性
-- DNS name compression 约束
-- authority/additional 中的结构合法性
-- cache 写入前的接受条件
-- 二次查询命中的前置约束
+## Resolver 角色规划
 
-### 与 AFL++ 协同
+### BIND9
 
-- SymCC 运行在与 AFL++ 相同的 transcript 模型上。
-- SymCC 生成的高价值样本必须回流 AFL++ 语料库。
-- 对 stateful profile，SymCC 重点服务于深状态样本生成，而不是替代 AFL++ 常规变异。
+当前角色：
 
-## gen_input 集成方案
+- 第一条完整 stateful 基线
+- oracle 设计的先行者
+- `poison-stateful` 主实验线承载者
 
-### 职责
+短期目标：
 
-`gen_input` 主要负责 response 包的结构化生成与变异。
+- 收紧 oracle 语义
+- 区分 `second_query_hit` 与 `cache_entry_created`
+- 为后续跨 resolver 对齐提供参照口径
 
-重点包括：
+### Unbound
 
-- 合法或近合法 DNS response 生成
-- authority / additional / glue 区域的结构化探索
-- 自动维护长度、压缩与字段耦合关系
-- 生成适合 AFL++ 继续字节级变异的高质量响应种子
-- 将投毒模板、DNS response 语法变异与 hybrid payload 探索综合到同一条 response 生成链路
+当前角色：
 
-### 默认变异分工
+- 第二 resolver 接入对象
+- parser-lite 与差分骨架承载者
+- BIND9 之外的第一个横向对照目标
 
-- query：以 AFL++ 变异为主
-- response header、RR 计数与 sections：由 `gen_input` 的语法/结构化变异负责
-- response tail：由 `gen_input` 的 hybrid payload 探索继续放大
-- 深层约束突破：由 SymCC 补充
+短期目标：
 
-### 需要新增的格式能力
+- 从 parser-lite 过渡到最小可比 oracle
+- 接入更贴近真实递归路径的执行方式
+- 为后续 transcript 级别对齐做准备
 
-建议新增以下格式模式：
+### 后续其他 resolver
 
-- `dns-poison-response`
-- `dns-stateful-transcript`
+只有在以下条件满足后，才建议接入第三个 resolver：
 
-并支持以下能力：
-
-- 多响应竞争组生成
-- 二次查询验证场景生成
-- response tail 冻结与局部探索
-- response 语料反哺 transcript 生成
-
-## adapter 设计
-
-### 公共逻辑接口
-
-所有 resolver adapter 统一实现以下逻辑接口：
-
-- `init_context(profile, options)`
-- `run_client_query(packet, transport)`
-- `run_upstream_response(packet, metadata)`
-- `run_post_check(packet)`
-- `collect_oracle()`
-- `reset_context()`
-
-### 主线 adapter 的最低能力要求
-
-每个 resolver adapter 至少必须具备：
-
-- 初始化最小运行上下文
-- 注入一条 client query
-- 注入一到多个 upstream responses
-- 观测 cache 结果或等价的命中结果
-- 在一次 AFL 迭代后清理状态
-
-### BIND9 适配策略
-
-对 BIND9 采用双线策略：
-
-1. 保留当前 `named` system-mode 方案。
-2. 额外实现一个 BIND9 stateful harness adapter，作为主线的一部分。
-
-该 adapter 的目标不是只调用纯 parser，而是尽量靠近现有 resolver 请求与响应处理主链，以减少语义遗漏。
+1. BIND9 与 Unbound 已完成同口径 oracle 对齐。
+2. 差异样本已有稳定复现流程。
+3. transcript 主线已经可跨实现复用。
 
 ## oracle 设计
 
-所有实验线统一输出以下结果：
+### 统一输出目标
+
+所有 resolver 最终都应输出统一字段：
 
 - `parse_ok`
 - `resolver_fetch_started`
 - `response_accepted`
+- `second_query_hit`
 - `cache_entry_created`
 - `cache_entry_updated`
-- `second_query_hit`
 - `bailiwick_rejected`
 - `mismatch_rejected`
+- `timeout`
 - `crash`
 - `hang`
-- `timeout`
 - `nondeterministic_state_detected`
 
-这些 oracle 同时用于：
+### 语义分层
 
-- 实验成功判定
-- 语料优先级判断
-- 论文统计与结果对比
+建议把 oracle 分成四层来理解：
 
-### 当前单 BIND9 线已落地的 oracle 边界
-
-当前分支中，单 BIND9 线已经稳定输出的主要是以下代理信号：
+#### L0. 输入被成功解析
 
 - `parse_ok`
+
+#### L1. resolver 确实进入了上游取数路径
+
 - `resolver_fetch_started`
+
+#### L2. 伪造响应进入了接受判定路径
+
 - `response_accepted`
+
+#### L3. 出现了可能影响缓存的后续行为
+
 - `second_query_hit`
 - `cache_entry_created`
-- `timeout`
+- `cache_entry_updated`
 
-需要明确的是，当前 `cache_entry_created` 仍是近似信号：它来自 post-check 阶段“未再次观察到新的上游交互”的推断，而不是直接读取 BIND9 内部 cache 状态后的强证明。因此，它更适合当前阶段的语料筛选与回归比较，不应在文档或后续论文中直接等价表述为“缓存投毒已严格成立”。
+#### L4. 强语义缓存证明
 
-## 测试与验收
+这一层当前仍未落地，后续可通过：
+
+- 更强日志钩子
+- cache dump
+- resolver 内部状态观测
+
+来补齐。
+
+### 当前文档中的使用约束
+
+在当前阶段，文档和实验记录中应遵守以下约束：
+
+1. `response_accepted` 只能表述为“伪造响应进入接受路径”。
+2. `second_query_hit` 只能表述为“post-check 未再次触发上游抓取”。
+3. `cache_entry_created` 当前默认仍视为代理信号，不直接等价于“缓存已被污染”。
+
+## 统一实验流程
+
+### 当前推荐主链
+
+1. 生成 query corpus。
+2. 基于 query corpus 生成或扩展 response corpus。
+3. 用 response corpus 组装 transcript corpus。
+4. 在单 resolver 上先做稳定性筛选。
+5. 将同一批稳定样本输入多个 resolver。
+6. 提取统一 oracle。
+7. 对差异样本做保存、分类和复现。
+8. 对高价值差异样本做强语义复核。
+
+### 当前脚本分工
+
+#### BIND9 主线
+
+- `named_experiment/run_named_afl_symcc.sh`
+
+负责：
+
+- build
+- gen-seeds
+- filter-seeds
+- prepare
+- start
+- run
+- status
+- stop
+
+#### Unbound 与差分辅助线
+
+- `unbound_experiment/run_unbound_afl_symcc.sh`
+
+当前负责：
+
+- fetch
+- build
+- gen-seeds
+- explore-response
+- filter-seeds
+- smoke
+- diff-test
+
+需要注意的是：
+
+- 当前 `diff-test` 已经能比较同一批种子在 BIND9 和 Unbound 上的 oracle 差异
+- 但它还不是完整 transcript differential 主线的终态
+
+## 分阶段计划
+
+### 第一阶段：稳固单 BIND9 基线
+
+目标：
+
+- 保持 `poison-stateful` 可稳定运行
+- 稳定 query、response、transcript 三层语料链路
+- 收紧当前 oracle 语义
+
+交付物：
+
+- 稳定的 BIND9 campaign
+- 明确的稳定性筛选规则
+- 文档化的 oracle 边界说明
+
+完成标准：
+
+- `prepare` 与 `start` 可稳定执行
+- `response_accepted` 与 `second_query_hit` 能稳定出现
+- `cache_entry_created` 的代理语义被明确记录
+
+### 第二阶段：补齐 Unbound 的可比能力
+
+目标：
+
+- 让 Unbound 不再只停留在 parser-lite
+- 逐步补齐与 BIND9 同口径的 oracle
+- 把第二 resolver 从“工程接入”推进到“行为对比”
+
+交付物：
+
+- 更完整的 Unbound oracle 输出
+- 至少一种贴近真实 resolver 路径的执行模式
+- 可与 BIND9 共享的语料输入方式
+
+完成标准：
+
+- `diff-test` 不再只比较低层 parser 行为
+- Unbound 至少能稳定产出 `second_query_hit` 或同等语义字段
+
+### 第三阶段：建立多 resolver differential 主线
+
+目标：
+
+- 将“同一批种子输入多个 resolver”升级为主实验流程
+- 优先推进 transcript 级别的跨 resolver 对齐
+
+交付物：
+
+- 统一 oracle 结果文件格式
+- 差异样本目录结构
+- 差异详情与复现脚本
+
+完成标准：
+
+- 同一批语料能稳定重放到 BIND9 与 Unbound
+- 差异样本能够自动落盘
+- 差异统计能够用于长期实验记录
+
+### 第四阶段：强语义复核与漏洞确认
+
+目标：
+
+- 把“行为差异”转换成“漏洞证据”
+
+交付物：
+
+- 更强的 cache 观测手段
+- 差异样本归因记录
+- 最终漏洞确认结论
+
+完成标准：
+
+- 至少一类差异样本能被强语义方法确认
+- 实验记录中能够明确区分“候选样本”和“已确认漏洞”
+
+## 验收标准
 
 ### 功能验收
 
-1. `parser-lite` 模式下，AFL++ 可稳定运行，`stability` 不低于现有 BIND9 持久模式基线。
-2. `poison-stateful` 模式下，单个测试用例能够完成 query、多个 response 注入与 post-check query。
-3. SymCC 能生成 AFL++ 难以直接命中的深状态样本，并被 AFL++ 成功回收利用。
-4. `gen_input` 能稳定生成复杂但结构合法的 response 种子。
-5. BIND9 system-mode 与主线 harness 对同一 poisoning transcript 的接受/拒绝结论基本一致。
+1. BIND9 `poison-stateful` 主线可长期稳定运行。
+2. `gen_input` 能稳定生成对缓存投毒有意义的 response 种子。
+3. Unbound 能作为第二 resolver 参与同口径行为比较。
+4. `diff-test` 或其后继流程能自动筛出跨 resolver 差异样本。
+5. 差异样本能进入复现与复核流程。
 
-### 场景测试
+### 指标验收
 
-必须覆盖以下典型场景：
+- `stability` 保持在可接受区间
+- `timeout ratio` 不持续恶化
+- 长时间运行中仍能看到 `new edges` 增长
+- 至少存在非零的差异样本数量
+- 差异样本中能区分低层解析差异与缓存相关差异
 
-- 正常 query + 正常 response
-- QID 不匹配 response
-- 源地址或端口不匹配 response
-- authority/additional 携带恶意 glue
-- referral / CNAME / NXDOMAIN / negative cache
-- 多响应竞争，合法响应与伪造响应顺序互换
-- 二次查询命中验证
-- name compression 与长度场异常
-- timeout、重试、空响应、截断响应
-- persistent 模式下状态泄漏检测
+### 研究验收
 
-### AFL++ 指标门槛
+本项目达到阶段性成功时，应满足以下条件：
 
-默认验收门槛如下：
+1. 已经形成“同种子、多 resolver、统一 oracle、自动比较”的基本闭环。
+2. 已能稳定输出缓存相关候选差异样本。
+3. 已建立从差异样本到强语义复核的工作流。
 
-- `execs/sec` 显著高于真网络 system-mode
-- `stability >= 90%`
-- `timeout ratio` 可控且不持续上升
-- 首轮 24 小时内 `new edges` 持续增长
-- `poison-stateful` lane 能产出非零的 `response_accepted` 与 `cache_entry_created`
-- 至少一类 oracle 能区分“解析成功但拒绝缓存”与“真正缓存污染成功”
+## 当前优先级排序
 
-## 与论文的差距
+按当前仓库状态，建议优先级固定为：
 
-当前方案与 ResolverFuzz、BGF-DR 的方向一致，但仍存在若干明确差距，需要在文档中持续显式记录。
+1. 收紧 BIND9 oracle 语义。
+2. 补齐 Unbound 的可比 oracle。
+3. 把现有 `diff-test` 从辅助脚本升级成正式实验链路。
+4. 再去扩展更多 resolver。
+5. 最后再补强语义缓存证明与论文级统计流程。
 
-### 1. 仍缺少 differential testing 主线
+## 不应再混淆的几点
 
-- ResolverFuzz 与 BGF-DR 都依赖实现间差异来帮助判定语义漏洞。
-- 当前阶段仍是单 BIND9 目标，尚未接入第二个 resolver，也没有差异聚类与 triage 流程。
-- 因此当前实验更适合定位“值得深挖的 BIND9 异常样本”，还不适合直接声称具备论文级的跨实现判真能力。
-
-### 2. 仍缺少 branch + state 的联合反馈
-
-- BGF-DR 强调 branch coverage 与 state coverage 联合引导。
-- 当前分支主要依赖 AFL++ 的覆盖反馈，加上少量 BIND9 特定代理 oracle。
-- 尚未建立可复用的状态变量抽取、状态去重或状态指纹聚类机制。
-
-### 3. transcript 模型仍是精简版
-
-- 论文中的关键场景包括竞争响应、超时、重试、不同方向交互、以及更复杂的状态迁移。
-- 当前 transcript 已能表达短序列的 query/response/post-check，但还没有完整覆盖 transport、delay、乱序、TCP fallback 等元数据。
-- 因此当前更适合作为“短序列缓存影响路径”的实验载体，而不是完整的网络时序模型。
-
-### 4. oracle 仍以代理信号为主
-
-- 当前 `response_accepted`、`second_query_hit`、`cache_entry_created` 都是从外部可观察行为推断得到。
-- 还没有做到对 bailiwick、glue 接受、negative cache、cache update、poison success 等结果进行细粒度、强语义分类。
-- 这会限制后续实验统计与论文表述的严谨性。
-
-### 5. 尚未形成多 resolver 的统一 adapter
-
-- 当前文档中保留了统一 adapter 设计，但实现仍以 BIND9 patch 为中心。
-- 后续只有在第二个 resolver 接入并完成同口径 oracle 对齐后，才能真正开始横向比较。
-
-## 后续改进优先级
-
-建议按以下顺序推进：
-
-1. 先把单 BIND9 线的 oracle 语义收紧，区分“未再次发起上游请求”和“确实命中被污染 cache”。
-2. 为 transcript 增加最小必要的时序/传输元数据，而不是一开始追求完整网络建模。
-3. 引入第二个 resolver，优先建立最小 differential testing 闭环。
-4. 再考虑状态覆盖、状态聚类和论文级 triage 流程。
-
-## 实施顺序
-
-### 第一阶段
-
-- 固化 transcript 输入模型
-- 建立公共 oracle 结果格式
-- 为 BIND9 增加 transcript 支持
-- 打通 AFL++ persistent 路线
-
-### 第二阶段
-
-- 接入 SymCC 到 transcript 模型
-- 为 `gen_input` 增加 response 定向变异能力
-- 建立 AFL++ 与 SymCC 样本回流机制
-
-### 第三阶段
-
-- 实现通用 resolver adapter
-- 接入第二个 resolver 作为验证目标
-- 开始横向实验与指标对比
-
-## 默认假设
-
-- 研究目标明确包含缓存投毒，而不仅仅是报文解析鲁棒性。
-- 通用主线默认使用 `poison-stateful` profile。
-- 当前 BIND9 system-mode 路线不废弃，作为真实行为对照。
-- `preeny` 或 socket 符号化不作为主路线，仅作为特殊场景备选。
-- `gen_input` 默认专注 response 结构化变异，query 仍以 AFL++ 为主。
+1. 当前项目的主目标是多 resolver differential fuzzing，不是单 BIND9 深测本身。
+2. 当前 `gen_input --hybrid --preserve 20` 的重点是保留前 20 字节前缀后继续探索，不是“只看末尾 20 字节”。
+3. 当前 `cache_entry_created` 仍主要是代理信号，不是强证明。
+4. 当前差分能力已经出现，但尚未完成 transcript 级统一。
+5. 只有在统一 oracle 与统一输入都成立后，resolver 之间的差异才有较强解释力。

@@ -120,6 +120,16 @@ static named_resolver_afl_symcc_orchestrator_t g_orchestrator = { 0 };
 static pthread_mutex_t g_request_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static named_resolver_afl_symcc_request_context_t *g_request_context = NULL;
 
+static void
+install_dispatch_hook_if_ready(dns_dispatchmgr_t *mgr) {
+	if (!g_initialized || mgr == NULL) {
+		return;
+	}
+
+	dns_dispatchmgr_setudpresphook(
+		mgr, named_resolver_afl_symcc_mutator_dispatch_hook, NULL);
+}
+
 static named_resolver_afl_symcc_request_context_t *
 get_request_context(void) {
 	named_resolver_afl_symcc_request_context_t *ctx = NULL;
@@ -498,6 +508,37 @@ cleanup_transcript_responses(const char *dir_path, size_t response_count) {
 }
 
 static void
+update_basic_oracle_counters(named_resolver_afl_symcc_orchestrator_t *orchestrator,
+			     bool parse_ok, bool resolver_fetch_started,
+			     bool response_accepted, bool timeout) {
+	if (orchestrator == NULL) {
+		return;
+	}
+
+	if (parse_ok) {
+		orchestrator->oracle_parse_ok++;
+	}
+	if (resolver_fetch_started) {
+		orchestrator->oracle_fetch_started++;
+	}
+	if (response_accepted) {
+		orchestrator->oracle_response_accepted++;
+	}
+	if (timeout) {
+		orchestrator->oracle_timeouts++;
+	}
+
+	if (getenv("NAMED_RESOLVER_AFL_SYMCC_TRACE_ORACLE") != NULL) {
+		fprintf(stderr,
+			"[resolver-afl-symcc] oracle parse_ok=%d fetch_started=%d "
+			"response_accepted=%d second_query_hit=0 "
+			"cache_entry_created=0 timeout=%d\n",
+			parse_ok, resolver_fetch_started, response_accepted,
+			timeout);
+	}
+}
+
+static void
 update_transcript_oracle(
 	named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	const named_resolver_afl_symcc_transcript_oracle_t *oracle) {
@@ -506,23 +547,15 @@ update_transcript_oracle(
 	}
 
 	orchestrator->transcript_cases++;
-	if (oracle->parse_ok) {
-		orchestrator->oracle_parse_ok++;
-	}
-	if (oracle->resolver_fetch_started) {
-		orchestrator->oracle_fetch_started++;
-	}
-	if (oracle->response_accepted) {
-		orchestrator->oracle_response_accepted++;
-	}
+	update_basic_oracle_counters(orchestrator, oracle->parse_ok,
+				     oracle->resolver_fetch_started,
+				     oracle->response_accepted,
+				     oracle->timeout);
 	if (oracle->second_query_hit) {
 		orchestrator->oracle_second_query_hit++;
 	}
 	if (oracle->cache_entry_created) {
 		orchestrator->oracle_cache_entry_created++;
-	}
-	if (oracle->timeout) {
-		orchestrator->oracle_timeouts++;
 	}
 
 	if (getenv("NAMED_RESOLVER_AFL_SYMCC_TRACE_ORACLE") != NULL) {
@@ -617,11 +650,34 @@ resolver_afl_symcc_request_done_notify(void) {
 static void
 resolver_afl_symcc_client_sendcb(isc_buffer_t *buffer) {
 	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
+	isc_region_t region;
 
 	UNUSED(buffer);
 
 	if (ctx == NULL) {
 		return;
+	}
+
+	if (getenv("NAMED_RESOLVER_AFL_SYMCC_DEBUG") != NULL && buffer != NULL) {
+		isc_buffer_usedregion(buffer, &region);
+		if (region.length >= 12) {
+			uint16_t flags = ((uint16_t)region.base[2] << 8) | region.base[3];
+			uint16_t ancount =
+				((uint16_t)region.base[6] << 8) | region.base[7];
+			uint16_t nscount =
+				((uint16_t)region.base[8] << 8) | region.base[9];
+			uint16_t arcount =
+				((uint16_t)region.base[10] << 8) | region.base[11];
+			fprintf(stderr,
+				"[resolver-afl-symcc][debug] client reply len=%u "
+				"flags=0x%04x rcode=%u an=%u ns=%u ar=%u\n",
+				region.length, flags, flags & 0x000f, ancount,
+				nscount, arcount);
+		} else {
+			fprintf(stderr,
+				"[resolver-afl-symcc][debug] client reply len=%u\n",
+				region.length);
+		}
 	}
 
 	pthread_mutex_lock(&ctx->mutex);
@@ -780,8 +836,8 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 }
 
 static isc_result_t
-execute_legacy_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
-		    const uint8_t *input, size_t input_len, long timeout_ms) {
+execute_legacy_request(named_resolver_afl_symcc_orchestrator_t *orchestrator,
+		       const uint8_t *input, size_t input_len, long timeout_ms) {
 	isc_result_t result;
 
 	orchestrator->requests_sent++;
@@ -794,6 +850,34 @@ execute_legacy_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 		orchestrator->send_failures++;
 	}
 
+	return result;
+}
+
+static isc_result_t
+execute_legacy_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
+		    const uint8_t *input, size_t input_len, long timeout_ms) {
+	named_resolver_afl_symcc_mutator_counters_t counters_before;
+	named_resolver_afl_symcc_mutator_counters_t counters_after;
+	isc_result_t result;
+	bool parse_ok = false;
+	bool resolver_fetch_started = false;
+	bool response_accepted = false;
+	bool timeout = false;
+
+	named_resolver_afl_symcc_mutator_server_get_counters(&counters_before);
+	result = execute_legacy_request(orchestrator, input, input_len, timeout_ms);
+	named_resolver_afl_symcc_mutator_server_get_counters(&counters_after);
+
+	resolver_fetch_started =
+		counters_after.received > counters_before.received;
+	parse_ok = resolver_fetch_started;
+	response_accepted =
+		result == ISC_R_SUCCESS &&
+		counters_after.replied > counters_before.replied;
+	timeout = result == ISC_R_TIMEDOUT;
+	update_basic_oracle_counters(orchestrator, parse_ok,
+				     resolver_fetch_started,
+				     response_accepted, timeout);
 	return result;
 }
 
@@ -851,8 +935,8 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	named_resolver_afl_symcc_mutator_server_reset_response_sequence();
 	named_resolver_afl_symcc_mutator_server_get_counters(&counters_before);
 
-	result = execute_legacy_case(orchestrator, transcript.client_query,
-				     transcript.client_query_len, timeout_ms);
+	result = execute_legacy_request(orchestrator, transcript.client_query,
+					transcript.client_query_len, timeout_ms);
 	named_resolver_afl_symcc_mutator_server_get_counters(
 		&counters_after_first);
 	oracle.resolver_fetch_started =
@@ -871,20 +955,34 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	if (transcript.post_check_query != NULL &&
 	    transcript.post_check_query_len > 0)
 	{
-		result = execute_legacy_case(orchestrator,
-					     transcript.post_check_query,
-					     transcript.post_check_query_len,
-					     timeout_ms);
+		bool post_check_hit = false;
+
+		result = execute_legacy_request(orchestrator,
+						transcript.post_check_query,
+						transcript.post_check_query_len,
+						timeout_ms);
 		named_resolver_afl_symcc_mutator_server_get_counters(
 			&counters_after_second);
-		if (result == ISC_R_SUCCESS &&
-		    counters_after_second.received == counters_after_first.received &&
-		    counters_after_second.replied == counters_after_first.replied &&
-		    counters_after_second.parse_errors ==
-			    counters_after_first.parse_errors)
-		{
-			oracle.second_query_hit = true;
-			oracle.cache_entry_created = true;
+		post_check_hit =
+			result == ISC_R_SUCCESS &&
+			counters_after_second.received ==
+				counters_after_first.received &&
+			counters_after_second.replied ==
+				counters_after_first.replied &&
+			counters_after_second.parse_errors ==
+				counters_after_first.parse_errors;
+		if (post_check_hit) {
+			/*
+			 * second_query_hit 现在要求第一轮 query 至少发生过一次
+			 * 上游抓取，避免把“从未进入 fetch 路径”误标成
+			 * post-check 命中代理；cache_entry_created 则进一步要求
+			 * 第一轮已接受过伪造响应。
+			 */
+			oracle.second_query_hit =
+				oracle.resolver_fetch_started;
+			oracle.cache_entry_created =
+				oracle.second_query_hit &&
+				oracle.response_accepted;
 		}
 		if (result == ISC_R_TIMEDOUT) {
 			oracle.timeout = true;
@@ -1061,12 +1159,6 @@ named_resolver_afl_symcc_orchestrator_start(const char *config) {
 		g_orchestrator.hooks_installed = true;
 	}
 
-	if (named_g_dispatchmgr != NULL) {
-		dns_dispatchmgr_setudpresphook(
-			named_g_dispatchmgr,
-			named_resolver_afl_symcc_mutator_dispatch_hook, NULL);
-	}
-
 	if (pthread_create(&g_orchestrator.injector_thread_id, NULL,
 			   request_injector_thread, &g_orchestrator) != 0)
 	{
@@ -1091,7 +1183,13 @@ named_resolver_afl_symcc_orchestrator_start(const char *config) {
 
 	g_orchestrator.injector_thread_started = true;
 	g_initialized = true;
+	install_dispatch_hook_if_ready(named_g_dispatchmgr);
 	return ISC_R_SUCCESS;
+}
+
+void
+named_resolver_afl_symcc_orchestrator_dispatchmgr_ready(dns_dispatchmgr_t *mgr) {
+	install_dispatch_hook_if_ready(mgr);
 }
 
 void

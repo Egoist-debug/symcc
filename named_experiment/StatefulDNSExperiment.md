@@ -92,13 +92,14 @@ named_experiment/work/stable_transcript_corpus
 
 - `Transcript cases: 1`
 - `Oracle parse_ok: 1`
-- `Oracle second_query_hit: 1` 或 `Oracle cache_entry_created: 1`
+- `Oracle resolver_fetch_started: 1`
+- `Oracle response_accepted: 1`
+- `Oracle second_query_hit: 1`
 
 补充说明：
 
-- 当前脚本中的稳定性过滤以“post-check 后未再次触发上游交互”为核心代理条件。
-- `Oracle response_accepted` 仍会被记录，但当前不是过滤必需条件。
-- 这意味着当前 `stable_transcript_corpus` 更偏向“可能走到缓存影响路径的样本”，而不是“已经严格证明伪造响应被接受的样本”。
+- 当前脚本中的稳定性过滤要求第一轮 query 确实触发过上游抓取并接受过伪造响应，且 post-check 后未再次触发新的上游交互。
+- 这意味着当前 `stable_transcript_corpus` 更偏向“已经走到伪造响应接受 + post-check 命中代理”的样本，而不是“只要看起来可能影响缓存状态就保留”。
 
 4. 一键准备：
 
@@ -195,7 +196,7 @@ named_experiment/run_named_afl_symcc.sh stop
 
 - `Oracle response_accepted` 表示第一轮 query 后，mutator 确实向 resolver 返回过伪造上游响应。
 - `Oracle second_query_hit` 表示 post-check 阶段没有再观察到新的上游取数行为。
-- `Oracle cache_entry_created` 当前与 `Oracle second_query_hit` 使用同一代理判据，不能直接等价为“cache 中已新增恶意条目”。
+- `Oracle cache_entry_created` 现在比 `Oracle second_query_hit` 更严格：它要求第一轮 query 已触发上游抓取并接受过伪造响应，同时 post-check 阶段没有再观察到新的上游交互；它仍然只是更强的代理信号，不能直接等价为“cache 中已新增恶意条目”。
 
 ## 复现实验建议
 

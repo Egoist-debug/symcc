@@ -390,6 +390,11 @@ named_resolver_afl_symcc_mutator_dispatch_hook(
 	{
 		return ISC_R_TIMEDOUT;
 	}
+	if (getenv("NAMED_RESOLVER_AFL_SYMCC_DEBUG") != NULL) {
+		fprintf(stderr,
+			"[resolver-afl-symcc][debug] mutator hook request_len=%u\n",
+			request->length);
+	}
 
 	g_server->received++;
 

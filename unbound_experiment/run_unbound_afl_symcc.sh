@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXP_DIR="$ROOT_DIR/unbound_experiment"
+PROFILE_DIR="$EXP_DIR/profiles"
 PATCH_DIR="$ROOT_DIR/patch/unbound"
 WORK_DIR="${WORK_DIR:-$EXP_DIR/work}"
 SRC_TREE="${SRC_TREE:-$ROOT_DIR/unbound-1.24.2}"
@@ -22,6 +23,7 @@ BIND9_NAMED_EXP="$ROOT_DIR/named_experiment"
 BIND9_NAMED_CONF_TEMPLATE="$BIND9_NAMED_EXP/runtime/named.conf"
 BIND9_RUNTIME_DIR="$WORK_DIR/bind9_runtime"
 BIND9_NAMED_CONF="$BIND9_RUNTIME_DIR/named.conf"
+BIND9_TARGET_ADDR="${BIND9_TARGET_ADDR:-127.0.0.1:55301}"
 BIND9_MUTATOR_ADDR="${BIND9_MUTATOR_ADDR:-127.0.0.1:55300}"
 DIFF_RESULT_DIR="$WORK_DIR/diff_results"
 
@@ -32,13 +34,17 @@ QUERY_PARSER_BIN="$BIN_DIR/dns_parser_sym"
 RESPONSE_PARSER_BIN="$BIN_DIR/dns_response_parser_sym"
 QUERY_CORPUS_DIR="$WORK_DIR/query_corpus"
 RESPONSE_CORPUS_DIR="$WORK_DIR/response_corpus"
+TRANSCRIPT_CORPUS_DIR="$WORK_DIR/transcript_corpus"
+TRANSCRIPT_SEED_MIX_DIR="$WORK_DIR/transcript_seed_mix"
 STABLE_QUERY_CORPUS_DIR="$WORK_DIR/stable_query_corpus"
+STABLE_TRANSCRIPT_CORPUS_DIR="$WORK_DIR/stable_transcript_corpus"
 SYMCC_OUTPUT_DIR="$WORK_DIR/symcc_output"
 LOG_DIR="$WORK_DIR/logs"
 PID_DIR="$WORK_DIR/pids"
 AFL_OUT_DIR="$WORK_DIR/afl_out"
 QUERY_GEN_LOG="$WORK_DIR/query_gen.log"
 RESPONSE_GEN_LOG="$WORK_DIR/response_gen.log"
+TRANSCRIPT_GEN_LOG="$WORK_DIR/transcript_gen.log"
 
 MASTER_LOG="$LOG_DIR/afl_master.log"
 HELPER_LOG="$LOG_DIR/helper.log"
@@ -46,13 +52,18 @@ MASTER_PID="$PID_DIR/afl_master.pid"
 HELPER_PID="$PID_DIR/helper.pid"
 
 JOBS="${JOBS:-2}"
+FUZZ_PROFILE="${FUZZ_PROFILE:-legacy-response-tail}"
 QUERY_MAX_ITER="${QUERY_MAX_ITER:-128}"
 RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-64}"
 RESPONSE_QUERY_SEEDS="${RESPONSE_QUERY_SEEDS:-8}"
+TRANSCRIPT_MAX_ITER="${TRANSCRIPT_MAX_ITER:-256}"
+TRANSCRIPT_RESPONSE_SEEDS="${TRANSCRIPT_RESPONSE_SEEDS:-24}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-5}"
 SMOKE_TIMEOUT_SEC="${SMOKE_TIMEOUT_SEC:-5}"
+SYMCC_SMOKE_TIMEOUT_SEC="${SYMCC_SMOKE_TIMEOUT_SEC:-120}"
 # libunbound 初始化与本地 mutator server 启动有固定开销，1000ms 容易被 AFL 误判超时
 AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-3000+}"
+AFL_START_TIMEOUT_SEC="${AFL_START_TIMEOUT_SEC:-300}"
 RUN_DURATION_SEC="${RUN_DURATION_SEC:-180}"
 REGEN_SEEDS="${REGEN_SEEDS:-0}"
 REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
@@ -63,6 +74,7 @@ EXPLORE_PRESERVE="${EXPLORE_PRESERVE:-20}"
 UNBOUND_TAG="${UNBOUND_TAG:-release-1.24.2}"
 HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$WORK_DIR}"
 HELPER_RUN_NAME="${HELPER_RUN_NAME:-$(basename "$AFL_OUT_DIR")}"
+TRANSCRIPT_GEN_TARGET="${TRANSCRIPT_GEN_TARGET:-/bin/true}"
 
 usage() {
 	printf '%s\n' \
@@ -83,8 +95,12 @@ usage() {
 		'  stop               停止当前实验进程' \
 		'  status             查看当前实验状态与关键统计' \
 		'' \
+		'默认约定:' \
+		'  1. FUZZ_PROFILE 支持 legacy-response-tail 与 poison-stateful，默认 legacy-response-tail。' \
+		'  2. poison-stateful 会额外生成 transcript_corpus / stable_transcript_corpus，并优先用于 smoke、diff-test 和 AFL 输入。' \
+		'' \
 		'差分测试说明:' \
-		'  diff-test 使用同一套种子（query + response），分别喂给 BIND9 named 和' \
+		'  diff-test 使用同一套输入（legacy query 或 stateful transcript），分别喂给 BIND9 named 和' \
 		'  Unbound unbound-fuzzme，比较两者的 oracle 输出差异。差异样本即为潜在的' \
 		'  缓存投毒漏洞候选。需要 BIND9 已构建（named_experiment/run_named_afl_symcc.sh build）。'
 }
@@ -115,7 +131,10 @@ ensure_dirs() {
 		"$BIN_DIR" \
 		"$QUERY_CORPUS_DIR" \
 		"$RESPONSE_CORPUS_DIR" \
+		"$TRANSCRIPT_CORPUS_DIR" \
+		"$TRANSCRIPT_SEED_MIX_DIR" \
 		"$STABLE_QUERY_CORPUS_DIR" \
+		"$STABLE_TRANSCRIPT_CORPUS_DIR" \
 		"$SYMCC_OUTPUT_DIR" \
 		"$SYMCC_OUTPUT_DIR/build" \
 		"$SYMCC_OUTPUT_DIR/smoke" \
@@ -123,6 +142,41 @@ ensure_dirs() {
 		"$PID_DIR" \
 		"$DIFF_RESULT_DIR" \
 		"$BIND9_RUNTIME_DIR"
+}
+
+load_profile() {
+	local profile_file
+
+	profile_file="$PROFILE_DIR/${FUZZ_PROFILE}.env"
+	if [ -f "$profile_file" ]; then
+		log "加载 profile: $profile_file"
+		# shellcheck disable=SC1090
+		. "$profile_file"
+	fi
+
+	case "$FUZZ_PROFILE" in
+	legacy-response-tail|poison-stateful)
+		;;
+	*)
+		die "未知 FUZZ_PROFILE: $FUZZ_PROFILE"
+		;;
+	esac
+}
+
+sample_source_dir() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		printf '%s' "$TRANSCRIPT_CORPUS_DIR"
+	else
+		printf '%s' "$QUERY_CORPUS_DIR"
+	fi
+}
+
+active_input_corpus_dir() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		printf '%s' "$STABLE_TRANSCRIPT_CORPUS_DIR"
+	else
+		printf '%s' "$STABLE_QUERY_CORPUS_DIR"
+	fi
 }
 
 tree_ld_library_path() {
@@ -439,6 +493,44 @@ build_all() {
 	build_symcc_unbound
 }
 
+prepare_transcript_seed_mix() {
+	local seed_index
+	local sample
+	local query_seed_dir="$STABLE_QUERY_CORPUS_DIR"
+
+	if [ ! -d "$query_seed_dir" ] || \
+		[ -z "$(find "$query_seed_dir" -maxdepth 1 -type f 2>/dev/null | head -n 1)" ]
+	then
+		query_seed_dir="$QUERY_CORPUS_DIR"
+	fi
+
+	rm -rf "$TRANSCRIPT_SEED_MIX_DIR"
+	mkdir -p "$TRANSCRIPT_SEED_MIX_DIR"
+
+	seed_index=0
+	for sample in "$query_seed_dir"/*; do
+		local dst
+		[ -f "$sample" ] || continue
+		dst="$TRANSCRIPT_SEED_MIX_DIR/query_$(printf '%04d' "$seed_index")_$(basename "$sample")"
+		cp "$sample" "$dst"
+		# poison-stateful 需要递归查询语义；这里在组装 transcript 时强制置 RD=1，
+		# 避免把 parser-lite 里接受的非递归 query 带进缓存投毒主线。
+		perl -0777 -i -pe 'substr($_, 2, 1) = chr(ord(substr($_, 2, 1)) | 0x01) if length($_) >= 4' \
+			"$dst"
+		seed_index=$((seed_index + 1))
+	done
+
+	seed_index=0
+	while IFS= read -r sample; do
+		[ -f "$sample" ] || continue
+		cp "$sample" \
+			"$TRANSCRIPT_SEED_MIX_DIR/response_$(printf '%04d' "$seed_index")_$(basename "$sample")"
+		seed_index=$((seed_index + 1))
+	done <<EOF
+$(find "$RESPONSE_CORPUS_DIR" -maxdepth 1 -type f | LC_ALL=C sort | head -n "$TRANSCRIPT_RESPONSE_SEEDS")
+EOF
+}
+
 generate_seeds() {
 	build_helper_and_gen_input
 	build_seed_parsers
@@ -474,6 +566,25 @@ generate_seeds() {
 			"$RESPONSE_PARSER_BIN" \
 			>"$RESPONSE_GEN_LOG" 2>&1
 	fi
+
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ] && \
+		{ [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$TRANSCRIPT_CORPUS_DIR" ] || \
+			[ -z "$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]; }
+	then
+		require_file "$TRANSCRIPT_GEN_TARGET"
+		rm -rf "$TRANSCRIPT_CORPUS_DIR"
+		mkdir -p "$TRANSCRIPT_CORPUS_DIR"
+		prepare_transcript_seed_mix
+		log "生成 stateful transcript 语料"
+		"$GEN_INPUT_BIN" \
+			-v \
+			-f dns-stateful-transcript \
+			--seed-dir "$TRANSCRIPT_SEED_MIX_DIR" \
+			-i "$TRANSCRIPT_MAX_ITER" \
+			-o "$TRANSCRIPT_CORPUS_DIR" \
+			"$TRANSCRIPT_GEN_TARGET" \
+			>"$TRANSCRIPT_GEN_LOG" 2>&1
+	fi
 }
 
 sample_is_stable() {
@@ -503,17 +614,49 @@ sample_is_stable() {
 	return 1
 }
 
+sample_is_stateful_stable() {
+	local sample="$1"
+	local stderr_file
+
+	stderr_file="$(mktemp "$LOG_DIR/filter.stateful.XXXXXX.stderr")"
+	if env \
+		LD_LIBRARY_PATH="$(tree_ld_library_path "$AFL_TREE")" \
+		UNBOUND_RESOLVER_AFL_SYMCC_LOG=1 \
+		timeout -k 2 "$SEED_TIMEOUT_SEC" \
+		"$(afl_target_bin)" \
+		<"$sample" \
+		>/dev/null 2>"$stderr_file"
+	then
+		if grep -q 'Oracle parse_ok: 1' "$stderr_file" && \
+			grep -q 'Oracle resolver_fetch_started: 1' "$stderr_file" && \
+			grep -q 'Oracle response_accepted: 1' "$stderr_file" && \
+			grep -q 'Oracle second_query_hit: 1' "$stderr_file"
+		then
+			rm -f "$stderr_file"
+			return 0
+		fi
+	fi
+
+	rm -f "$stderr_file"
+	return 1
+}
+
 filter_seeds() {
 	local tmp_dir
 	local next_id=0
 	local seed_count=0
 	local sample
+	local source_dir
+	local target_dir
+
+	source_dir="$(sample_source_dir)"
+	target_dir="$(active_input_corpus_dir)"
 
 	if [ "$REFILTER_QUERIES" -ne 1 ] && \
-		[ -d "$STABLE_QUERY_CORPUS_DIR" ] && \
-		[ -n "$(find "$STABLE_QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | head -n 1)" ]
+		[ -d "$target_dir" ] && \
+		[ -n "$(find "$target_dir" -maxdepth 1 -type f 2>/dev/null | head -n 1)" ]
 	then
-		log "稳定 query 语料已存在，跳过筛选（REFILTER_QUERIES=0）"
+		log "稳定输入语料已存在，跳过筛选（REFILTER_QUERIES=0）"
 		return 0
 	fi
 
@@ -521,10 +664,12 @@ filter_seeds() {
 	generate_seeds
 	tmp_dir="$(mktemp -d "$WORK_DIR/.stable_query_tmp.XXXXXX")"
 
-	log "筛选稳定 query 语料"
-	for sample in "$QUERY_CORPUS_DIR"/*; do
+	log "筛选稳定输入语料"
+	for sample in "$source_dir"/*; do
 		[ -f "$sample" ] || continue
-		if sample_is_stable "$sample"; then
+		if { [ "$FUZZ_PROFILE" = "poison-stateful" ] && sample_is_stateful_stable "$sample"; } || \
+			{ [ "$FUZZ_PROFILE" != "poison-stateful" ] && sample_is_stable "$sample"; }
+		then
 			cp "$sample" "$tmp_dir/$(printf 'id_%06d_%s' "$next_id" \
 				"$(basename "$sample")")"
 			next_id=$((next_id + 1))
@@ -534,12 +679,12 @@ filter_seeds() {
 
 	if [ "$seed_count" -eq 0 ]; then
 		rm -rf "$tmp_dir"
-		die "没有筛出稳定 query 语料，请检查 response-tail 语料或 harness"
+		die "没有筛出稳定输入语料，请检查 response 语料、transcript 语料或 harness"
 	fi
 
-	rm -rf "$STABLE_QUERY_CORPUS_DIR"
-	mv "$tmp_dir" "$STABLE_QUERY_CORPUS_DIR"
-	log "稳定 query 语料: $seed_count"
+	rm -rf "$target_dir"
+	mv "$tmp_dir" "$target_dir"
+	log "稳定输入语料: $seed_count"
 }
 
 # ---------------------------------------------------------------------------
@@ -705,6 +850,83 @@ extract_oracle() {
 	printf '\n'
 }
 
+oracle_value() {
+	local oracle="$1"
+	local key="$2"
+	local token
+
+	for token in $oracle; do
+		case "$token" in
+		"$key="*)
+			printf '%s' "${token#*=}"
+			return 0
+			;;
+		esac
+	done
+
+	printf '0'
+}
+
+classify_oracle_diff() {
+	local ub_oracle="$1"
+	local bind9_oracle="$2"
+
+	if [ "$ub_oracle" = "$bind9_oracle" ]; then
+		printf '%s' "same"
+		return 0
+	fi
+
+	if [ "$(oracle_value "$ub_oracle" timeout)" != \
+		"$(oracle_value "$bind9_oracle" timeout)" ]; then
+		printf '%s' "timeout_diff"
+		return 0
+	fi
+
+	if [ "$(oracle_value "$ub_oracle" resolver_fetch_started)" != \
+		"$(oracle_value "$bind9_oracle" resolver_fetch_started)" ]; then
+		printf '%s' "fetch_diff"
+		return 0
+	fi
+
+	if [ "$(oracle_value "$ub_oracle" response_accepted)" != \
+		"$(oracle_value "$bind9_oracle" response_accepted)" ]; then
+		printf '%s' "response_accept_diff"
+		return 0
+	fi
+
+	if [ "$(oracle_value "$ub_oracle" second_query_hit)" != \
+		"$(oracle_value "$bind9_oracle" second_query_hit)" ] || \
+		[ "$(oracle_value "$ub_oracle" cache_entry_created)" != \
+			"$(oracle_value "$bind9_oracle" cache_entry_created)" ]; then
+		printf '%s' "cache_behavior_diff"
+		return 0
+	fi
+
+	if [ "$(oracle_value "$ub_oracle" parse_ok)" != \
+		"$(oracle_value "$bind9_oracle" parse_ok)" ]; then
+		printf '%s' "parse_diff"
+		return 0
+	fi
+
+	printf '%s' "oracle_diff"
+}
+
+diff_source_dir() {
+	local stable_dir
+	local source_dir
+
+	stable_dir="$(active_input_corpus_dir)"
+	source_dir="$(sample_source_dir)"
+	if [ -d "$stable_dir" ] && \
+		[ -n "$(find "$stable_dir" -maxdepth 1 -type f 2>/dev/null)" ]
+	then
+		printf '%s' "$stable_dir"
+		return 0
+	fi
+
+	printf '%s' "$source_dir"
+}
+
 run_unbound_sample() {
 	local sample="$1"
 	local stderr_file="$2"
@@ -723,6 +945,7 @@ run_bind9_sample() {
 	local stderr_file="$2"
 	env \
 		LD_LIBRARY_PATH="$(bind9_ld_library_path)" \
+		NAMED_RESOLVER_AFL_SYMCC_TARGET="$BIND9_TARGET_ADDR" \
 		NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
 		NAMED_RESOLVER_AFL_SYMCC_LOG=1 \
 		timeout -k 2 "$SEED_TIMEOUT_SEC" \
@@ -739,19 +962,16 @@ diff_test() {
 	local diff_count=0
 	local ub_stderr bind9_stderr
 	local ub_oracle bind9_oracle
-	local source_dir="$STABLE_QUERY_CORPUS_DIR"
-	local summary_file="$DIFF_RESULT_DIR/summary.txt"
+	local diff_type="same"
+	local source_dir
+	local summary_file="$DIFF_RESULT_DIR/summary.tsv"
 
 	# 前置检查
 	require_file "$BIND9_AFL_TREE/bin/named/.libs/named"
 	require_file "$(afl_target_bin)"
 	[ -d "$RESPONSE_CORPUS_DIR" ] || die "缺少 response 语料，请先执行 gen-seeds"
 
-	if [ ! -d "$source_dir" ] || \
-		[ -z "$(find "$source_dir" -maxdepth 1 -type f 2>/dev/null)" ]
-	then
-		source_dir="$QUERY_CORPUS_DIR"
-	fi
+	source_dir="$(diff_source_dir)"
 	[ -d "$source_dir" ] || die "缺少 query 语料"
 
 	prepare_bind9_conf
@@ -759,9 +979,8 @@ diff_test() {
 	mkdir -p "$DIFF_RESULT_DIR"
 
 	log "差分测试开始 — 种子目录: $source_dir"
-	printf '%-40s %-50s %-50s %s\n' "SAMPLE" "UNBOUND_ORACLE" "BIND9_ORACLE" "DIFF" \
+	printf 'sample\tdiff\tdiff_type\tunbound_oracle\tbind9_oracle\n' \
 		>"$summary_file"
-	printf '%s\n' "$(printf '=%.0s' {1..160})" >>"$summary_file"
 
 	for sample in "$source_dir"/*; do
 		[ -f "$sample" ] || continue
@@ -775,28 +994,39 @@ diff_test() {
 
 		ub_oracle="$(extract_oracle "$ub_stderr")"
 		bind9_oracle="$(extract_oracle "$bind9_stderr")"
+		diff_type="$(classify_oracle_diff "$ub_oracle" "$bind9_oracle")"
 
 		local is_diff="NO"
 		if [ "$ub_oracle" != "$bind9_oracle" ]; then
+			local base
+			local ub_saved_stderr
+			local bind9_saved_stderr
+
 			is_diff="YES"
 			diff_count=$((diff_count + 1))
 			# 保存差异样本和 oracle 详情
-			local base
 			base="$(basename "$sample")"
+			ub_saved_stderr="$DIFF_RESULT_DIR/${base}.unbound.stderr"
+			bind9_saved_stderr="$DIFF_RESULT_DIR/${base}.bind9.stderr"
 			cp "$sample" "$DIFF_RESULT_DIR/$base"
+			cp "$ub_stderr" "$ub_saved_stderr"
+			cp "$bind9_stderr" "$bind9_saved_stderr"
 			{
 				printf 'sample: %s\n' "$base"
+				printf 'sample_path: %s\n' "$sample"
+				printf 'source_dir: %s\n' "$source_dir"
+				printf 'diff: %s\n' "$is_diff"
+				printf 'diff_type: %s\n' "$diff_type"
 				printf 'unbound: %s\n' "$ub_oracle"
 				printf 'bind9:   %s\n' "$bind9_oracle"
-				printf '\n--- unbound stderr ---\n'
-				cat "$ub_stderr"
-				printf '\n--- bind9 stderr ---\n'
-				cat "$bind9_stderr"
+				printf 'unbound_stderr: %s\n' "$(basename "$ub_saved_stderr")"
+				printf 'bind9_stderr: %s\n' "$(basename "$bind9_saved_stderr")"
 			} >"$DIFF_RESULT_DIR/${base}.detail"
 		fi
 
-		printf '%-40s %-50s %-50s %s\n' \
-			"$(basename "$sample")" "$ub_oracle" "$bind9_oracle" "$is_diff" \
+		printf '%s\t%s\t%s\t%s\t%s\n' \
+			"$(basename "$sample")" "$is_diff" "$diff_type" \
+			"$ub_oracle" "$bind9_oracle" \
 			>>"$summary_file"
 
 		rm -f "$ub_stderr" "$bind9_stderr"
@@ -825,24 +1055,26 @@ run_smoke_once() {
 	local sample="$3"
 	local ld_path=""
 	local rc=0
+	local timeout_sec="$SMOKE_TIMEOUT_SEC"
 
 	log "smoke: $name <- $(basename "$sample")"
 	if [ "$name" = "afl" ]; then
 		ld_path="$(tree_ld_library_path "$AFL_TREE")"
 	else
 		ld_path="$(tree_ld_library_path "$SYMCC_TREE")"
+		timeout_sec="$SYMCC_SMOKE_TIMEOUT_SEC"
 	fi
-	if ! env \
+	set +e
+	env \
 		LD_LIBRARY_PATH="$ld_path" \
 		SYMCC_OUTPUT_DIR="$SYMCC_OUTPUT_DIR/smoke" \
 		UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
 		UNBOUND_RESOLVER_AFL_SYMCC_LOG=1 \
-		timeout -k 1 "$SMOKE_TIMEOUT_SEC" "$bin" \
+		timeout -k 1 "$timeout_sec" "$bin" \
 		<"$sample" \
 		>/dev/null 2>"$WORK_DIR/${name}.stderr"
-	then
-		rc=$?
-	fi
+	rc=$?
+	set -e
 
 	case "$rc" in
 	0|1)
@@ -859,18 +1091,14 @@ run_smoke_once() {
 
 smoke_all() {
 	local sample
-	local sample_dir="$STABLE_QUERY_CORPUS_DIR"
+	local sample_dir
 
-	if [ ! -d "$sample_dir" ] || \
-		[ -z "$(find "$sample_dir" -maxdepth 1 -type f 2>/dev/null)" ]
-	then
-		sample_dir="$QUERY_CORPUS_DIR"
-	fi
+	sample_dir="$(diff_source_dir)"
 	require_file "$(afl_target_bin)"
 	require_file "$(symcc_target_bin)"
 	[ -d "$RESPONSE_CORPUS_DIR" ] || die "缺少 response 语料，请先执行 gen-seeds"
 	sample="$(pick_sample "$sample_dir")"
-	[ -n "$sample" ] || die "query 语料为空，请先执行 gen-seeds 或 filter-seeds"
+	[ -n "$sample" ] || die "输入语料为空，请先执行 gen-seeds 或 filter-seeds"
 
 	run_smoke_once "afl" "$(afl_target_bin)" "$sample"
 	run_smoke_once "symcc" "$(symcc_target_bin)" "$sample"
@@ -899,7 +1127,7 @@ wait_for_master_queue() {
 	while [ ! -f "$AFL_OUT_DIR/master/fuzzer_stats" ]; do
 		sleep 1
 		waited=$((waited + 1))
-		if [ "$waited" -ge 30 ]; then
+		if [ "$waited" -ge "$AFL_START_TIMEOUT_SEC" ]; then
 			die "等待 AFL master 启动超时"
 		fi
 	done
@@ -920,7 +1148,7 @@ stop_pid_file() {
 }
 
 start_all() {
-	local input_dir="$STABLE_QUERY_CORPUS_DIR"
+	local input_dir
 	local ld_path_afl
 	local ld_path_symcc
 	local ld_path_helper
@@ -928,12 +1156,7 @@ start_all() {
 	prepare_all
 	stop_all
 	cleanup_output
-
-	if [ ! -d "$input_dir" ] || \
-		[ -z "$(find "$input_dir" -maxdepth 1 -type f 2>/dev/null)" ]
-	then
-		input_dir="$QUERY_CORPUS_DIR"
-	fi
+	input_dir="$(diff_source_dir)"
 
 	log "启动 AFL master"
 	ld_path_afl="$(tree_ld_library_path "$AFL_TREE")"
@@ -979,12 +1202,15 @@ start_all() {
 			"$(symcc_target_bin)"
 	fi
 
-	# 启动 explore-response 后台循环：持续从 AFL queue 提取新 query，探索 response 尾部
-	log "启动 explore-response 后台循环（间隔 ${EXPLORE_INTERVAL}s）"
-	explore_response_loop >>"$EXPLORE_LOG" 2>&1 &
-	echo "$!" >"$EXPLORE_PID"
-
-	log "实验已启动（AFL master + SymCC helper + explore-response）"
+	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
+		# poison-stateful 下 AFL queue 中是 transcript，不再直接复用为 query seeds。
+		log "启动 explore-response 后台循环（间隔 ${EXPLORE_INTERVAL}s）"
+		explore_response_loop >>"$EXPLORE_LOG" 2>&1 &
+		echo "$!" >"$EXPLORE_PID"
+		log "实验已启动（AFL master + SymCC helper + explore-response）"
+	else
+		log "实验已启动（AFL master + SymCC helper）"
+	fi
 	status_all
 }
 
@@ -1033,6 +1259,7 @@ status_all() {
 	fi
 
 	printf '\n语料状态:\n'
+	printf '  %-16s %s\n' "profile" "$FUZZ_PROFILE"
 	printf '  %-16s %s\n' "query-corpus" \
 		"$(find "$QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
 	printf '  %-16s %s\n' "response-corpus" \
@@ -1041,6 +1268,10 @@ status_all() {
 		"$(find "$RESPONSE_CORPUS_DIR" -maxdepth 1 -name 'explore_*' -type f 2>/dev/null | wc -l) files"
 	printf '  %-16s %s\n' "stable-query" \
 		"$(find "$STABLE_QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
+	printf '  %-16s %s\n' "transcript" \
+		"$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
+	printf '  %-16s %s\n' "stable-transcript" \
+		"$(find "$STABLE_TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l) files"
 
 	printf '\n运行状态:\n'
 	if [ -f "$MASTER_PID" ] && kill -0 "$(cat "$MASTER_PID")" >/dev/null 2>&1; then
@@ -1135,5 +1366,6 @@ require_cmd sed
 require_cmd find
 require_cmd awk
 require_file "$SRC_TREE"
+load_profile
 ensure_dirs
 main "${1:-}" "${2:-}"

@@ -39,6 +39,9 @@
 #include <dns/stats.h>
 #include <dns/types.h>
 
+extern void named_resolver_afl_symcc_orchestrator_dispatchmgr_ready(
+	dns_dispatchmgr_t *mgr) __attribute__((weak));
+
 typedef ISC_LIST(dns_dispentry_t) dns_displist_t;
 
 typedef struct dns_qid {
@@ -1028,6 +1031,9 @@ dns_dispatchmgr_create(isc_mem_t *mctx, isc_nm_t *nm,
 	mgr->magic = DNS_DISPATCHMGR_MAGIC;
 
 	*mgrp = mgr;
+	if (named_resolver_afl_symcc_orchestrator_dispatchmgr_ready != NULL) {
+		named_resolver_afl_symcc_orchestrator_dispatchmgr_ready(mgr);
+	}
 	return ISC_R_SUCCESS;
 }
 
@@ -2187,10 +2193,22 @@ dns_dispatch_send(dns_dispentry_t *resp, isc_region_t *r) {
 	dispentry_log(resp, LVL(90), "sending");
 	switch (disp->socktype) {
 	case isc_socktype_udp:
+		if (getenv("NAMED_RESOLVER_AFL_SYMCC_DEBUG") != NULL) {
+			fprintf(stderr,
+				"[resolver-afl-symcc][debug] dns_dispatch_send udp "
+				"hook=%p request_len=%u\n",
+				disp->mgr->udpresphook, r->length);
+		}
 		if (disp->mgr->udpresphook != NULL) {
 			hookresult = disp->mgr->udpresphook(
 				resp, r, response_buf, sizeof(response_buf),
 				&response, disp->mgr->udpresphookarg);
+			if (getenv("NAMED_RESOLVER_AFL_SYMCC_DEBUG") != NULL) {
+				fprintf(stderr,
+					"[resolver-afl-symcc][debug] udp hookresult=%d "
+					"response_len=%u\n",
+					hookresult, response.length);
+			}
 			if (hookresult != ISC_R_NOTFOUND) {
 				dispentry_log(resp, LVL(90),
 					      "synthetic UDP send: %s",

@@ -517,8 +517,9 @@ sample_is_stateful_stable() {
 	then
 		if grep -q 'Transcript cases: 1' "$stderr_file" && \
 			grep -q 'Oracle parse_ok: 1' "$stderr_file" && \
-			{ grep -q 'Oracle second_query_hit: 1' "$stderr_file" || \
-				grep -q 'Oracle cache_entry_created: 1' "$stderr_file"; }
+			grep -q 'Oracle resolver_fetch_started: 1' "$stderr_file" && \
+			grep -q 'Oracle response_accepted: 1' "$stderr_file" && \
+			grep -q 'Oracle second_query_hit: 1' "$stderr_file"
 		then
 			rm -f "$stderr_file"
 			return 0
