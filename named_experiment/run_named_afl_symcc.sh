@@ -36,6 +36,7 @@ LOG_DIR="$WORK_DIR/logs"
 PID_DIR="$WORK_DIR/pids"
 AFL_OUT_DIR="$WORK_DIR/afl_out"
 SYMCC_OUTPUT_DIR="$WORK_DIR/symcc_output"
+CACHE_DUMP_DIR="$WORK_DIR/cache_dumps"
 QUERY_GEN_LOG="$WORK_DIR/query_gen.log"
 RESPONSE_GEN_LOG="$WORK_DIR/response_gen.log"
 TRANSCRIPT_GEN_LOG="$WORK_DIR/transcript_gen.log"
@@ -86,6 +87,7 @@ usage() {
   filter-seeds  按 profile 筛选稳定输入语料
   prepare       执行 build + gen-seeds(按需) + filter-seeds
   start         以持久模式启动 AFL++ master/secondary + SymCC helper
+  dump-cache <样本> [输出文件] 以干净实例回放单个样本并导出 BIND9 cache dump
   run [秒数]    启动实验并持续运行指定秒数，结束后自动输出状态并停止
   stop          停止当前实验进程
   status        查看当前实验状态与关键统计
@@ -166,7 +168,7 @@ EOF
 
 ensure_dirs() {
 	mkdir -p "$WORK_DIR" "$BIN_DIR" "$LOG_DIR" "$PID_DIR" "$SYMCC_OUTPUT_DIR" \
-		"$RUNTIME_STATE_DIR" "$EXP_DIR/runtime"
+		"$RUNTIME_STATE_DIR" "$EXP_DIR/runtime" "$CACHE_DUMP_DIR"
 	prepare_named_conf
 }
 
@@ -962,6 +964,70 @@ status_all() {
 	done
 }
 
+dump_named_cache() {
+	local sample="$1"
+	local output_path="${2:-$CACHE_DUMP_DIR/$(basename "$sample").named.cache.txt}"
+	local stderr_file="$WORK_DIR/named_dump_cache.stderr"
+	local ld_path
+	local rc=0
+	local -a named_args=()
+
+	require_file "$AFL_TREE/bin/named/.libs/named"
+	[ -d "$RESPONSE_CORPUS_DIR" ] || die "response 语料目录不存在: $RESPONSE_CORPUS_DIR"
+	if [ -n "$sample" ]; then
+		require_file "$sample"
+	fi
+
+	ensure_dirs
+	ld_path="$(afl_ld_library_path)"
+	mkdir -p "$(dirname "$output_path")"
+	rm -f "$output_path" "$stderr_file"
+
+	if [ -n "$sample" ]; then
+		log "dump-cache: 回放 $(basename "$sample")"
+		named_args=(
+			-g
+			-c "$NAMED_CONF"
+			-A "resolver-afl-symcc:${MUTATOR_ADDR},input=$sample"
+		)
+	else
+		log "dump-cache: 导出空实例 cache"
+		named_args=(
+			-g
+			-c "$NAMED_CONF"
+			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+		)
+	fi
+	set +e
+	env \
+		LD_LIBRARY_PATH="$ld_path" \
+		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
+		NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
+		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
+		NAMED_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH="$output_path" \
+		timeout -k 2 "$SEED_TIMEOUT_SEC" \
+		"$AFL_TREE/bin/named/.libs/named" \
+		"${named_args[@]}" \
+		< /dev/null \
+		>/dev/null 2>"$stderr_file"
+	rc=$?
+	set -e
+
+	case "$rc" in
+	0)
+		;;
+	124|137)
+		die "dump-cache 超时: rc=$rc"
+		;;
+	*)
+		die "dump-cache 异常退出: rc=$rc"
+		;;
+	esac
+
+	[ -s "$output_path" ] || die "cache dump 为空，stderr: $stderr_file"
+	log "cache dump 已写出: $output_path"
+}
+
 run_for_duration() {
 	local duration="${1:-$RUN_DURATION_SEC}"
 
@@ -991,6 +1057,7 @@ run_for_duration() {
 main() {
 	local cmd="${1:-}"
 	local arg="${2:-}"
+	local extra="${3:-}"
 
 	case "$cmd" in
 	build)
@@ -1011,6 +1078,9 @@ main() {
 		;;
 	start)
 		start_all
+		;;
+	dump-cache)
+		dump_named_cache "$arg" "$extra"
 		;;
 	run)
 		run_for_duration "$arg"
@@ -1041,4 +1111,4 @@ require_file "$SRC_TREE"
 require_file "$NAMED_CONF_TEMPLATE"
 load_profile
 
-main "${1:-}"
+main "${1:-}" "${2:-}" "${3:-}"

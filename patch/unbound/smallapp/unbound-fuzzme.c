@@ -33,6 +33,9 @@ main(void)
 		return 1;
 	}
 	if (input_len == 0) {
+		if (getenv("UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH") != NULL) {
+			return unbound_afl_symcc_dump_empty_cache();
+		}
 		return 1;
 	}
 	if (debug != NULL && strcmp(debug, "0") != 0) {

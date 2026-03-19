@@ -530,8 +530,16 @@ FormatGeneratorResult FormatAwareGenerator::run() {
     return {};
   }
 
-  auto Start = std::chrono::high_resolution_clock::now();
+  auto Start = std::chrono::steady_clock::now();
+  auto UpdateElapsed = [&]() {
+    Stats_.TotalTimeMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  Start)
+            .count();
+  };
+
   RemainingMalformationBudget_ = Config_.ControlledMalformationBudget;
+  Stats_.TotalTimeMs = 0.0;
 
   // If no seeds, create one from format
   if (Queue_.empty()) {
@@ -539,22 +547,26 @@ FormatGeneratorResult FormatAwareGenerator::run() {
     addSeed(DefaultSeed);
   }
 
-  while (!Queue_.empty() && !shouldStop()) {
+  while (!Queue_.empty()) {
+    UpdateElapsed();
+    if (shouldStop()) {
+      break;
+    }
+
     FormatWorkItem Item = std::move(const_cast<FormatWorkItem &>(Queue_.top()));
     Queue_.pop();
 
     processWorkItem(Item);
 
     Stats_.TotalIterations++;
+    UpdateElapsed();
 
     if (ProgressCb_) {
       ProgressCb_(Stats_.TotalIterations, Queue_.size(), ValidInputs_.size());
     }
   }
 
-  auto End = std::chrono::high_resolution_clock::now();
-  Stats_.TotalTimeMs =
-      std::chrono::duration<double, std::milli>(End - Start).count();
+  UpdateElapsed();
 
   FormatGeneratorResult Result;
   Result.ValidInputs = ValidInputs_;

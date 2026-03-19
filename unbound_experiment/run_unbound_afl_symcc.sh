@@ -25,7 +25,9 @@ BIND9_RUNTIME_DIR="$WORK_DIR/bind9_runtime"
 BIND9_NAMED_CONF="$BIND9_RUNTIME_DIR/named.conf"
 BIND9_TARGET_ADDR="${BIND9_TARGET_ADDR:-127.0.0.1:55301}"
 BIND9_MUTATOR_ADDR="${BIND9_MUTATOR_ADDR:-127.0.0.1:55300}"
+BIND9_WORK_DIR="${BIND9_WORK_DIR:-$ROOT_DIR/named_experiment/work}"
 DIFF_RESULT_DIR="$WORK_DIR/diff_results"
+CACHE_DUMP_DIR="$WORK_DIR/cache_dumps"
 
 BIN_DIR="$WORK_DIR/bin"
 QUERY_PARSER_SRC="$ROOT_DIR/gen_input/test/dns_parser.c"
@@ -86,11 +88,14 @@ usage() {
 		'  build              同步 patch/unbound，并构建 helper、AFL 与 SymCC 目标' \
 		'  gen-seeds          生成 query/response 语料' \
 		'  explore-response   用 gen_input 探索 response 包 20 字节后内容（尾部探索）' \
-		'  filter-seeds       筛选 legacy-response-tail 稳定 query 语料' \
-		'  smoke              对 AFL / SymCC 目标执行最小 smoke' \
-		'  prepare            执行 build + gen-seeds + explore-response + filter-seeds + smoke' \
-		'  diff-test          差分测试：同一套种子分别喂 BIND9 与 Unbound，比较 oracle 差异' \
-		'  start              启动 AFL master 与 SymCC helper' \
+			'  filter-seeds       筛选 legacy-response-tail 稳定 query 语料' \
+			'  smoke              对 AFL / SymCC 目标执行最小 smoke' \
+			'  dump-cache <样本> [输出文件] 以干净实例回放单个样本并导出 Unbound cache dump' \
+			'  parse-cache <resolver> <dump文件> [输出文件] 解析 cache dump 为统一 TSV' \
+			'  replay-diff-cache <样本> [输出目录] 导出前后 cache dump 并做统一对比' \
+			'  prepare            执行 build + gen-seeds + explore-response + filter-seeds + smoke' \
+			'  diff-test          差分测试：同一套种子分别喂 BIND9 与 Unbound，比较 oracle 差异' \
+			'  start              启动 AFL master 与 SymCC helper' \
 		'  run [秒数]         启动实验并持续运行指定秒数，结束后自动输出状态并停止' \
 		'  stop               停止当前实验进程' \
 		'  status             查看当前实验状态与关键统计' \
@@ -137,11 +142,12 @@ ensure_dirs() {
 		"$STABLE_TRANSCRIPT_CORPUS_DIR" \
 		"$SYMCC_OUTPUT_DIR" \
 		"$SYMCC_OUTPUT_DIR/build" \
-		"$SYMCC_OUTPUT_DIR/smoke" \
-		"$LOG_DIR" \
-		"$PID_DIR" \
-		"$DIFF_RESULT_DIR" \
-		"$BIND9_RUNTIME_DIR"
+			"$SYMCC_OUTPUT_DIR/smoke" \
+			"$LOG_DIR" \
+			"$PID_DIR" \
+			"$DIFF_RESULT_DIR" \
+			"$CACHE_DUMP_DIR" \
+			"$BIND9_RUNTIME_DIR"
 }
 
 load_profile() {
@@ -161,6 +167,30 @@ load_profile() {
 		die "未知 FUZZ_PROFILE: $FUZZ_PROFILE"
 		;;
 	esac
+}
+
+require_profile_cmds() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		require_cmd dd
+		require_cmd od
+	fi
+}
+
+force_dns_query_rd_bit() {
+	local path="$1"
+	local byte_value
+	local new_byte_value
+	local octal_byte
+
+	byte_value="$(od -An -j2 -N1 -tu1 "$path" 2>/dev/null | tr -d '[:space:]')"
+	if [ -z "$byte_value" ]; then
+		return 0
+	fi
+
+	new_byte_value=$((byte_value | 1))
+	printf -v octal_byte '%03o' "$new_byte_value"
+	printf "\\$octal_byte" | dd of="$path" bs=1 seek=2 count=1 conv=notrunc \
+		status=none 2>/dev/null
 }
 
 sample_source_dir() {
@@ -288,7 +318,7 @@ UNBOUND_AFL_SYMCC_ORCH_SRC=smallapp/unbound_afl_symcc_orchestrator.c\
 UNBOUND_AFL_SYMCC_MUTATOR_SRC=smallapp/unbound_afl_symcc_mutator_server.c\
 FUZZME_OBJ=unbound-fuzzme.lo\
 UNBOUND_AFL_SYMCC_OBJ=unbound_afl_symcc_orchestrator.lo unbound_afl_symcc_mutator_server.lo\
-FUZZME_OBJ_LINK=$(FUZZME_OBJ) $(UNBOUND_AFL_SYMCC_OBJ) worker_cb.lo $(COMMON_OBJ_ALL_SYMBOLS) $(SLDNS_OBJ) \\\
+FUZZME_OBJ_LINK=$(FUZZME_OBJ) $(UNBOUND_AFL_SYMCC_OBJ) worker_cb.lo cachedump.lo $(COMMON_OBJ_ALL_SYMBOLS) $(SLDNS_OBJ) \\\
 $(COMPAT_OBJ)' "$makefile"
 		else
 			if ! rg -q '^UNBOUND_AFL_SYMCC_ORCH_SRC=' "$makefile"; then
@@ -303,7 +333,7 @@ UNBOUND_AFL_SYMCC_OBJ=unbound_afl_symcc_orchestrator.lo unbound_afl_symcc_mutato
 					"$makefile"
 			fi
 			sed -i '/^FUZZME_OBJ_LINK=/,+1c\
-FUZZME_OBJ_LINK=$(FUZZME_OBJ) $(UNBOUND_AFL_SYMCC_OBJ) worker_cb.lo $(COMMON_OBJ_ALL_SYMBOLS) $(SLDNS_OBJ) \\\
+FUZZME_OBJ_LINK=$(FUZZME_OBJ) $(UNBOUND_AFL_SYMCC_OBJ) worker_cb.lo cachedump.lo $(COMMON_OBJ_ALL_SYMBOLS) $(SLDNS_OBJ) \\\
 $(COMPAT_OBJ)' "$makefile"
 		fi
 
@@ -515,8 +545,7 @@ prepare_transcript_seed_mix() {
 		cp "$sample" "$dst"
 		# poison-stateful 需要递归查询语义；这里在组装 transcript 时强制置 RD=1，
 		# 避免把 parser-lite 里接受的非递归 query 带进缓存投毒主线。
-		perl -0777 -i -pe 'substr($_, 2, 1) = chr(ord(substr($_, 2, 1)) | 0x01) if length($_) >= 4' \
-			"$dst"
+		force_dns_query_rd_bit "$dst"
 		seed_index=$((seed_index + 1))
 	done
 
@@ -532,6 +561,7 @@ EOF
 }
 
 generate_seeds() {
+	require_profile_cmds
 	build_helper_and_gen_input
 	build_seed_parsers
 
@@ -1104,6 +1134,492 @@ smoke_all() {
 	run_smoke_once "symcc" "$(symcc_target_bin)" "$sample"
 }
 
+dump_unbound_cache() {
+	local sample="$1"
+	local base_name="empty"
+	local output_path
+	local stderr_file="$WORK_DIR/unbound_dump_cache.stderr"
+	local rc=0
+
+	require_file "$(afl_target_bin)"
+	[ -d "$RESPONSE_CORPUS_DIR" ] || die "缺少 response 语料，请先执行 gen-seeds"
+	if [ -n "$sample" ]; then
+		require_file "$sample"
+		base_name="$(basename "$sample")"
+	fi
+
+	output_path="${2:-$CACHE_DUMP_DIR/${base_name}.unbound.cache.txt}"
+	mkdir -p "$(dirname "$output_path")"
+	rm -f "$output_path" "$stderr_file"
+
+	if [ -n "$sample" ]; then
+		log "dump-cache: 回放 $(basename "$sample")"
+	else
+		log "dump-cache: 导出空实例 cache"
+	fi
+	set +e
+	if [ -n "$sample" ]; then
+		env \
+			LD_LIBRARY_PATH="$(tree_ld_library_path "$AFL_TREE")" \
+			UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
+			UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH="$output_path" \
+			UNBOUND_RESOLVER_AFL_SYMCC_LOG=1 \
+			timeout -k 2 "$SEED_TIMEOUT_SEC" \
+			"$(afl_target_bin)" \
+			<"$sample" \
+			>/dev/null 2>"$stderr_file"
+	else
+		env \
+			LD_LIBRARY_PATH="$(tree_ld_library_path "$AFL_TREE")" \
+			UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH="$output_path" \
+			timeout -k 2 "$SEED_TIMEOUT_SEC" \
+			"$(afl_target_bin)" \
+			</dev/null \
+			>/dev/null 2>"$stderr_file"
+	fi
+	rc=$?
+	set -e
+
+	case "$rc" in
+	0|1)
+		;;
+	124|137)
+		die "dump-cache 超时: rc=$rc"
+		;;
+	*)
+		die "dump-cache 异常退出: rc=$rc"
+		;;
+	esac
+
+	[ -s "$output_path" ] || die "cache dump 为空，stderr: $stderr_file"
+	log "cache dump 已写出: $output_path"
+}
+
+normalize_unbound_cache_dump() {
+	local dump_file="$1"
+	local output_path="$2"
+
+	awk '
+		function trim(text) {
+			sub(/^[[:space:]]+/, "", text);
+			sub(/[[:space:]]+$/, "", text);
+			return text;
+		}
+
+		function join_tokens(tokens, start, count, text, i) {
+			text = "";
+			for (i = start; i <= count; i++) {
+				if (tokens[i] == "") {
+					continue;
+				}
+				text = text (text == "" ? "" : " ") tokens[i];
+			}
+			return text == "" ? "_" : text;
+		}
+
+		function is_class_token(token) {
+			return token ~ /^(IN|CH|HS|CLASS[0-9]+)$/;
+		}
+
+		function is_type_token(token) {
+			return token == "\\-" || token ~ /^\\-(TYPE[0-9]+|[A-Z0-9-]+)$/ || token ~ /^(TYPE[0-9]+|[A-Z0-9-]+)$/;
+		}
+
+		function looks_like_rr_header(line, tokens, count, i, ttl_idx, type_idx) {
+			line = trim(line);
+			if (line == "" || line ~ /^;/ || line ~ /^msg /) {
+				return 0;
+			}
+			count = split(line, tokens, /[[:space:]]+/);
+			ttl_idx = 0;
+			for (i = 1; i <= count; i++) {
+				if (tokens[i] ~ /^[0-9]+$/) {
+					ttl_idx = i;
+					break;
+				}
+			}
+			if (ttl_idx == 0 || ttl_idx > 2) {
+				return 0;
+			}
+			type_idx = ttl_idx + 1;
+			if (type_idx <= count && is_class_token(tokens[type_idx])) {
+				type_idx++;
+			}
+			return type_idx <= count && is_type_token(tokens[type_idx]);
+		}
+
+		function emit_msg_record(line, tokens, count, reason_text) {
+			line = trim(line);
+			count = split(line, tokens, /[[:space:]]+/);
+			if (count < 12) {
+				return;
+			}
+			reason_text = join_tokens(tokens, 13, count);
+			printf "MSG\t_\t%s\t%s\t%s\tflags=%s qd=%s sec=%s an=%s ns=%s ar=%s bogus=%s reason=%s\n",
+				tokens[2], tokens[3], tokens[4], tokens[5], tokens[6],
+				tokens[8], tokens[9], tokens[10], tokens[11], tokens[12],
+				reason_text;
+		}
+
+		function emit_rrset_record(line, tokens, count, i, ttl_idx, owner, class_token, type_idx, type_token, detail_text) {
+			if (pending_rrset == "") {
+				return;
+			}
+			line = trim(pending_rrset);
+			count = split(line, tokens, /[[:space:]]+/);
+			ttl_idx = 0;
+			for (i = 1; i <= count; i++) {
+				if (tokens[i] ~ /^[0-9]+$/) {
+					ttl_idx = i;
+					break;
+				}
+			}
+			if (ttl_idx == 0 || ttl_idx > 2) {
+				pending_rrset = "";
+				return;
+			}
+			owner = "_";
+			class_token = "_";
+			type_token = "_";
+			if (ttl_idx > 1) {
+				owner = tokens[1];
+			} else if (last_owner != "") {
+				owner = last_owner;
+			}
+			type_idx = ttl_idx + 1;
+			if (type_idx <= count && is_class_token(tokens[type_idx])) {
+				class_token = tokens[type_idx];
+				type_idx++;
+			} else if (last_class != "") {
+				class_token = last_class;
+			}
+			if (type_idx <= count && is_type_token(tokens[type_idx])) {
+				type_token = tokens[type_idx];
+			}
+			detail_text = join_tokens(tokens, type_idx + 1, count);
+			if (owner != "_") {
+				last_owner = owner;
+			}
+			if (class_token != "_") {
+				last_class = class_token;
+			}
+			printf "RRSET\t_\t%s\t%s\t%s\t%s\n", owner, class_token, type_token, detail_text;
+			pending_rrset = "";
+		}
+
+		/^START_RRSET_CACHE$/ {
+			section = "RRSET";
+			last_owner = "";
+			last_class = "";
+			next;
+		}
+		/^START_MSG_CACHE$/ {
+			emit_rrset_record();
+			section = "MSG";
+			next;
+		}
+		/^END_/ || /^EOF$/ || /^$/ {
+			emit_rrset_record();
+			next;
+		}
+		section == "MSG" && /^msg / {
+			emit_msg_record($0);
+			next;
+		}
+		section == "MSG" {
+			next;
+		}
+		section == "RRSET" && /^;rrset/ {
+			emit_rrset_record();
+			last_owner = "";
+			last_class = "";
+			next;
+		}
+		section == "RRSET" && /^;/ {
+			emit_rrset_record();
+			next;
+		}
+		section == "RRSET" && looks_like_rr_header($0) {
+			emit_rrset_record();
+			pending_rrset = $0;
+			next;
+		}
+		section == "RRSET" && pending_rrset != "" {
+			pending_rrset = pending_rrset " " trim($0);
+			next;
+		}
+		END {
+			emit_rrset_record();
+		}
+	' "$dump_file" >"$output_path"
+}
+
+normalize_named_cache_dump() {
+	local dump_file="$1"
+	local output_path="$2"
+
+	awk '
+		function trim(text) {
+			sub(/^[[:space:]]+/, "", text);
+			sub(/[[:space:]]+$/, "", text);
+			return text;
+		}
+
+		function join_tokens(tokens, start, count, text, i) {
+			text = "";
+			for (i = start; i <= count; i++) {
+				if (tokens[i] == "") {
+					continue;
+				}
+				text = text (text == "" ? "" : " ") tokens[i];
+			}
+			return text == "" ? "_" : text;
+		}
+
+		function is_class_token(token) {
+			return token ~ /^(IN|CH|HS|CLASS[0-9]+)$/;
+		}
+
+		function is_type_token(token) {
+			return token == "\\-" || token ~ /^\\-(TYPE[0-9]+|[A-Z0-9-]+)$/ || token ~ /^(TYPE[0-9]+|[A-Z0-9-]+)$/;
+		}
+
+		function looks_like_rr_header(line, tokens, count, i, ttl_idx, type_idx) {
+			line = trim(line);
+			if (line == "" || line ~ /^;/ || line ~ /^\$/) {
+				return 0;
+			}
+			count = split(line, tokens, /[[:space:]]+/);
+			ttl_idx = 0;
+			for (i = 1; i <= count; i++) {
+				if (tokens[i] ~ /^[0-9]+$/) {
+					ttl_idx = i;
+					break;
+				}
+			}
+			if (ttl_idx == 0 || ttl_idx > 2) {
+				return 0;
+			}
+			type_idx = ttl_idx + 1;
+			if (type_idx <= count && is_class_token(tokens[type_idx])) {
+				type_idx++;
+			}
+			return type_idx <= count && is_type_token(tokens[type_idx]);
+		}
+
+		function emit_cache_entry(kind, raw_line, line) {
+			line = substr(raw_line, 3);
+			if (match(line, /^([^\/]+)\/([^ ]+) \[ttl [0-9]+\]$/, m)) {
+				printf "%s\t%s\t%s\t_\t%s\t_\n", kind, current_view, m[1], m[2];
+			}
+		}
+
+		function emit_rrset_record(line, tokens, count, i, ttl_idx, owner, class_token, type_idx, type_token, out_section, detail_text) {
+			if (pending_rrset == "") {
+				return;
+			}
+			line = trim(pending_rrset);
+			count = split(line, tokens, /[[:space:]]+/);
+			ttl_idx = 0;
+			for (i = 1; i <= count; i++) {
+				if (tokens[i] ~ /^[0-9]+$/) {
+					ttl_idx = i;
+					break;
+				}
+			}
+			if (ttl_idx == 0 || ttl_idx > 2) {
+				pending_rrset = "";
+				return;
+			}
+			owner = "_";
+			class_token = "_";
+			type_token = "_";
+			if (ttl_idx > 1) {
+				owner = tokens[1];
+			} else if (last_owner != "") {
+				owner = last_owner;
+			}
+			type_idx = ttl_idx + 1;
+			if (type_idx <= count && is_class_token(tokens[type_idx])) {
+				class_token = tokens[type_idx];
+				type_idx++;
+			} else if (last_class != "") {
+				class_token = last_class;
+			}
+			if (type_idx <= count && is_type_token(tokens[type_idx])) {
+				type_token = tokens[type_idx];
+			}
+			detail_text = join_tokens(tokens, type_idx + 1, count);
+			if (owner != "_") {
+				last_owner = owner;
+			}
+			if (class_token != "_") {
+				last_class = class_token;
+			}
+			out_section = (current_section == "" ? "RRSET" : current_section);
+			if (out_section != "ADB") {
+				printf "%s\t%s\t%s\t%s\t%s\t%s\n", out_section, current_view, owner, class_token, type_token, detail_text;
+			}
+			pending_rrset = "";
+		}
+
+		BEGIN {
+			current_view = "_";
+			current_section = "RRSET";
+		}
+		/^; Cache dump of view / {
+			emit_rrset_record();
+			if (match($0, /'\''([^'\'']+)'\''/, m)) {
+				current_view = m[1];
+			} else {
+				current_view = "_";
+			}
+			current_section = "RRSET";
+			last_owner = "";
+			last_class = "";
+			next;
+		}
+		/^; Address database dump$/ {
+			emit_rrset_record();
+			current_section = "ADB";
+			last_owner = "";
+			last_class = "";
+			next;
+		}
+		/^; Bad cache$/ {
+			emit_rrset_record();
+			current_section = "BADCACHE";
+			next;
+		}
+		/^; SERVFAIL cache$/ {
+			emit_rrset_record();
+			current_section = "SERVFAIL";
+			next;
+		}
+		/^\$DATE/ || /^; using / || /^; \[edns success\/timeout\]/ || /^; \[plain success\/timeout\]/ || /^;$/ || /^$/ {
+			emit_rrset_record();
+			next;
+		}
+		current_section == "SERVFAIL" && /^; / {
+			emit_rrset_record();
+			emit_cache_entry("SERVFAIL", $0);
+			next;
+		}
+		current_section == "BADCACHE" && /^; / {
+			emit_rrset_record();
+			emit_cache_entry("BADCACHE", $0);
+			next;
+		}
+		/^;/ {
+			emit_rrset_record();
+			next;
+		}
+		looks_like_rr_header($0) {
+			emit_rrset_record();
+			pending_rrset = $0;
+			next;
+		}
+		pending_rrset != "" {
+			pending_rrset = pending_rrset " " trim($0);
+			next;
+		}
+		END {
+			emit_rrset_record();
+		}
+	' "$dump_file" >"$output_path"
+}
+
+parse_cache_dump() {
+	local resolver="$1"
+	local dump_file="$2"
+	local output_path="${3:-${dump_file}.norm.tsv}"
+
+	[ -n "$resolver" ] || die "parse-cache 需要 resolver 参数"
+	require_file "$dump_file"
+
+	case "$resolver" in
+	unbound)
+		normalize_unbound_cache_dump "$dump_file" "$output_path"
+		;;
+	bind9|named)
+		normalize_named_cache_dump "$dump_file" "$output_path"
+		;;
+	*)
+		die "未知 resolver: $resolver"
+		;;
+	esac
+
+	log "解析结果已写出: $output_path"
+}
+
+compare_normalized_cache_dumps() {
+	local before_file="$1"
+	local after_file="$2"
+	local added_file="$3"
+	local removed_file="$4"
+	local before_sorted="$5"
+	local after_sorted="$6"
+
+	LC_ALL=C sort -u "$before_file" >"$before_sorted"
+	LC_ALL=C sort -u "$after_file" >"$after_sorted"
+	comm -13 "$before_sorted" "$after_sorted" >"$added_file"
+	comm -23 "$before_sorted" "$after_sorted" >"$removed_file"
+}
+
+replay_diff_cache() {
+	local sample="$1"
+	local out_dir="${2:-$CACHE_DUMP_DIR/$(basename "$sample").replay_diff}"
+	local unbound_before="$out_dir/unbound.before.cache.txt"
+	local unbound_after="$out_dir/unbound.after.cache.txt"
+	local bind9_before="$out_dir/bind9.before.cache.txt"
+	local bind9_after="$out_dir/bind9.after.cache.txt"
+	local unbound_before_norm="$out_dir/unbound.before.norm.tsv"
+	local unbound_after_norm="$out_dir/unbound.after.norm.tsv"
+	local bind9_before_norm="$out_dir/bind9.before.norm.tsv"
+	local bind9_after_norm="$out_dir/bind9.after.norm.tsv"
+	local unbound_before_sorted="$out_dir/unbound.before.sorted.tsv"
+	local unbound_after_sorted="$out_dir/unbound.after.sorted.tsv"
+	local bind9_before_sorted="$out_dir/bind9.before.sorted.tsv"
+	local bind9_after_sorted="$out_dir/bind9.after.sorted.tsv"
+	local unbound_added="$out_dir/unbound.added.tsv"
+	local unbound_removed="$out_dir/unbound.removed.tsv"
+	local bind9_added="$out_dir/bind9.added.tsv"
+	local bind9_removed="$out_dir/bind9.removed.tsv"
+	local summary_file="$out_dir/summary.txt"
+
+	[ -n "$sample" ] || die "replay-diff-cache 需要提供样本路径"
+	require_file "$sample"
+	mkdir -p "$out_dir"
+
+	dump_unbound_cache "" "$unbound_before"
+	dump_unbound_cache "$sample" "$unbound_after"
+	WORK_DIR="$BIND9_WORK_DIR" FUZZ_PROFILE="${FUZZ_PROFILE:-poison-stateful}" \
+		"$ROOT_DIR/named_experiment/run_named_afl_symcc.sh" dump-cache "" "$bind9_before"
+	WORK_DIR="$BIND9_WORK_DIR" FUZZ_PROFILE="${FUZZ_PROFILE:-poison-stateful}" \
+		"$ROOT_DIR/named_experiment/run_named_afl_symcc.sh" dump-cache "$sample" "$bind9_after"
+
+	parse_cache_dump unbound "$unbound_before" "$unbound_before_norm"
+	parse_cache_dump unbound "$unbound_after" "$unbound_after_norm"
+	parse_cache_dump bind9 "$bind9_before" "$bind9_before_norm"
+	parse_cache_dump bind9 "$bind9_after" "$bind9_after_norm"
+
+	compare_normalized_cache_dumps "$unbound_before_norm" "$unbound_after_norm" \
+		"$unbound_added" "$unbound_removed" "$unbound_before_sorted" "$unbound_after_sorted"
+	compare_normalized_cache_dumps "$bind9_before_norm" "$bind9_after_norm" \
+		"$bind9_added" "$bind9_removed" "$bind9_before_sorted" "$bind9_after_sorted"
+
+	{
+		printf 'sample: %s\n' "$sample"
+		printf 'out_dir: %s\n' "$out_dir"
+		printf 'unbound_added: %s\n' "$(wc -l < "$unbound_added")"
+		printf 'unbound_removed: %s\n' "$(wc -l < "$unbound_removed")"
+		printf 'bind9_added: %s\n' "$(wc -l < "$bind9_added")"
+		printf 'bind9_removed: %s\n' "$(wc -l < "$bind9_removed")"
+	} >"$summary_file"
+
+	log "replay-diff-cache 完成: $out_dir"
+}
+
 cleanup_output() {
 	if [ "$RESET_OUTPUT" -eq 1 ]; then
 		rm -rf "$AFL_OUT_DIR"
@@ -1311,6 +1827,8 @@ prepare_all() {
 main() {
 	local cmd="${1:-}"
 	local arg="${2:-}"
+	local extra="${3:-}"
+	local more="${4:-}"
 
 	case "$cmd" in
 	fetch)
@@ -1330,6 +1848,15 @@ main() {
 		;;
 	smoke)
 		smoke_all
+		;;
+	dump-cache)
+		dump_unbound_cache "$arg" "$extra"
+		;;
+	parse-cache)
+		parse_cache_dump "$arg" "$extra" "$more"
+		;;
+	replay-diff-cache)
+		replay_diff_cache "$arg" "$extra"
 		;;
 	prepare)
 		prepare_all
@@ -1368,4 +1895,4 @@ require_cmd awk
 require_file "$SRC_TREE"
 load_profile
 ensure_dirs
-main "${1:-}" "${2:-}"
+main "${1:-}" "${2:-}" "${3:-}" "${4:-}"

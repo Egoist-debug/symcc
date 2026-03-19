@@ -28,3 +28,6 @@ unbound_afl_symcc_oracle_note_timeout(void);
 int
 unbound_afl_symcc_run_case(const uint8_t *input, size_t input_len,
 	unbound_afl_symcc_oracle_t *oracle);
+
+int
+unbound_afl_symcc_dump_empty_cache(void);

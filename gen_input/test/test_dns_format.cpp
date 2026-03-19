@@ -2,11 +2,16 @@
 #include "FormatAwareGenerator.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace geninput;
 
@@ -19,6 +24,32 @@ std::string hexDump(const std::vector<uint8_t> &data) {
       oss << " ";
   }
   return oss.str();
+}
+
+std::string createTempExecutableScript(unsigned SleepSec) {
+  char pathTemplate[] = "/tmp/gen_input_timeout_runnerXXXXXX";
+  int fd = mkstemp(pathTemplate);
+  assert(fd >= 0);
+  close(fd);
+
+  std::ofstream script(pathTemplate);
+  assert(script.is_open());
+  script << "#!/bin/sh\n";
+  script << "sleep " << SleepSec << "\n";
+  script << "exit 1\n";
+  script.close();
+
+  if (chmod(pathTemplate, 0755) != 0) {
+    assert(false);
+  }
+  return pathTemplate;
+}
+
+std::string createTempDirectory() {
+  char pathTemplate[] = "/tmp/gen_input_timeout_outputXXXXXX";
+  char *dirPath = mkdtemp(pathTemplate);
+  assert(dirPath != nullptr);
+  return dirPath;
 }
 
 void testDNSNameCodec() {
@@ -402,6 +433,57 @@ void testSerializeParseRoundtrip() {
   std::cout << "Roundtrip tests PASSED" << std::endl << std::endl;
 }
 
+void testFormatAwareGeneratorTimeoutStop() {
+  std::cout << "=== Testing FormatAwareGenerator Timeout Stop ===" << std::endl;
+
+  auto format = BinaryFormatFactory::createDNS();
+  FormatGeneratorConfig config;
+  config.MaxIterations = 10;
+  config.TimeoutSec = 1;
+  config.MaxRecursionDepth = 0;
+  config.EnableFieldMutation = false;
+
+  const std::string programPath = createTempExecutableScript(2);
+  const std::string outputDir = createTempDirectory();
+
+  RunConfig runConfig;
+  runConfig.ProgramPath = programPath;
+  runConfig.OutputDir = outputDir;
+  runConfig.TimeoutSec = 1;
+  runConfig.UseStdin = true;
+
+  auto runner = std::make_shared<SymCCRunner>(runConfig);
+  FormatAwareGenerator generator(format, config);
+  generator.setRunner(runner);
+  generator.addSeed(DNSPacketBuilder::buildQuery("a.example.com", 1));
+  generator.addSeed(DNSPacketBuilder::buildQuery("b.example.com", 1));
+  generator.addSeed(DNSPacketBuilder::buildQuery("c.example.com", 1));
+
+  const auto start = std::chrono::steady_clock::now();
+  auto result = generator.run();
+  const auto elapsedMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+  const auto &stats = generator.getStats();
+
+  std::cout << "Elapsed: " << elapsedMs << " ms" << std::endl;
+  std::cout << "Iterations: " << stats.TotalIterations << std::endl;
+  std::cout << "SymCC runs: " << stats.TotalSymCCRuns << std::endl;
+  std::cout << "Valid inputs: " << result.ValidInputs.size() << std::endl;
+
+  assert(stats.TotalIterations == 1);
+  assert(stats.TotalSymCCRuns == 1);
+  assert(stats.TotalTimeMs >= 1000.0);
+  assert(elapsedMs < 2500);
+
+  std::filesystem::remove(programPath);
+  std::filesystem::remove_all(outputDir);
+
+  std::cout << "FormatAwareGenerator timeout stop tests PASSED" << std::endl
+            << std::endl;
+}
+
 int main() {
   std::cout << "gen_input DNS Format Tests" << std::endl;
   std::cout << "==========================" << std::endl << std::endl;
@@ -410,6 +492,7 @@ int main() {
   testDNSPacketBuilder();
   testBinaryFormat();
   testSerializeParseRoundtrip();
+  testFormatAwareGeneratorTimeoutStop();
   testDNSParserValidation();
   testInvalidDNSPackets();
   

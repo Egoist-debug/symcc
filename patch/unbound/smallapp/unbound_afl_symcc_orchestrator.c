@@ -3,13 +3,18 @@
 #include "smallapp/unbound_afl_symcc_orchestrator.h"
 #include "smallapp/unbound_afl_symcc_mutator_server.h"
 
+#include "daemon/cachedump.h"
+#include "daemon/worker.h"
+#include "libunbound/context.h"
 #include "libunbound/unbound.h"
 #include "sldns/sbuffer.h"
 #include "sldns/wire2str.h"
 #include "util/data/msgparse.h"
 #include "util/regional.h"
 
+#include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +38,60 @@ typedef struct unbound_afl_symcc_transcript {
 } unbound_afl_symcc_transcript_t;
 
 static unbound_afl_symcc_oracle_t *g_active_oracle = NULL;
+
+int
+ssl_printf(RES *stream, const char *format, ...)
+{
+	char buffer[4096];
+	va_list args;
+	int written = 0;
+
+	if (stream == NULL || stream->fd < 0 || format == NULL) {
+		return 0;
+	}
+
+	va_start(args, format);
+	written = vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	if (written < 0) {
+		return 0;
+	}
+	if (written >= (int)sizeof(buffer)) {
+		written = (int)sizeof(buffer) - 1;
+	}
+
+	return write(stream->fd, buffer, (size_t)written) == written;
+}
+
+int
+ssl_read_line(RES *stream, char *buffer, size_t max)
+{
+	size_t len = 0;
+
+	if (stream == NULL || stream->fd < 0 || buffer == NULL || max == 0) {
+		return 0;
+	}
+
+	while (len + 1 < max) {
+		ssize_t n = read(stream->fd, buffer + len, 1);
+		if (n == 0) {
+			buffer[len] = '\0';
+			return 1;
+		}
+		if (n < 0) {
+			return 0;
+		}
+		if (buffer[len] == '\n') {
+			len++;
+			buffer[len] = '\0';
+			return 1;
+		}
+		len++;
+	}
+
+	buffer[len] = '\0';
+	return 1;
+}
 
 static bool
 logging_enabled(void)
@@ -318,6 +377,53 @@ restore_env_var(const char *name, char *value)
 	unsetenv(name);
 }
 
+static void
+maybe_dump_cache(struct ub_ctx *ctx)
+{
+	const char *dump_path = getenv("UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH");
+	struct worker dump_worker;
+	struct remote_stream stream;
+	struct timeval now_tv;
+	time_t now = 0;
+	int fd = -1;
+
+	if (ctx == NULL || ctx->env == NULL || dump_path == NULL || *dump_path == '\0') {
+		return;
+	}
+
+	fd = open(dump_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if (fd < 0) {
+		log_stage_failure("open_cache_dump");
+		return;
+	}
+
+	memset(&dump_worker, 0, sizeof(dump_worker));
+	dump_worker.scratchpad = regional_create();
+	if (dump_worker.scratchpad == NULL) {
+		close(fd);
+		(void)unlink(dump_path);
+		log_stage_failure("alloc_cache_dump_scratch");
+		return;
+	}
+	dump_worker.env = *ctx->env;
+	dump_worker.env.worker = &dump_worker;
+	(void)gettimeofday(&now_tv, NULL);
+	now = now_tv.tv_sec;
+	dump_worker.env.now = &now;
+	dump_worker.env.now_tv = &now_tv;
+
+	memset(&stream, 0, sizeof(stream));
+	stream.fd = fd;
+
+	if (!dump_cache(&stream, &dump_worker)) {
+		(void)unlink(dump_path);
+		log_stage_failure("dump_cache");
+	}
+
+	regional_destroy(dump_worker.scratchpad);
+	close(fd);
+}
+
 static bool
 parse_query_packet(const uint8_t *input, size_t input_len,
 	const char *parse_stage, const char *qname_stage, char **qname_out,
@@ -463,6 +569,7 @@ cleanup:
 	unbound_afl_symcc_oracle_clear_active();
 	unbound_afl_symcc_mutator_server_stop();
 	if (ctx != NULL) {
+		maybe_dump_cache(ctx);
 		ub_ctx_delete(ctx);
 	}
 	return rc;
@@ -607,6 +714,7 @@ cleanup:
 		saved_tail_dir);
 	cleanup_transcript_responses(response_dir, transcript.response_count);
 	if (ctx != NULL) {
+		maybe_dump_cache(ctx);
 		ub_ctx_delete(ctx);
 	}
 	return rc;
@@ -676,4 +784,29 @@ unbound_afl_symcc_run_case(const uint8_t *input, size_t input_len,
 
 	log_result(oracle);
 	return rc;
+}
+
+int
+unbound_afl_symcc_dump_empty_cache(void)
+{
+	const char *dump_path = getenv("UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH");
+	FILE *fp = NULL;
+
+	if (dump_path == NULL || *dump_path == '\0') {
+		return 1;
+	}
+
+	fp = fopen(dump_path, "w");
+	if (fp == NULL) {
+		log_stage_failure("open_empty_cache_dump");
+		return 1;
+	}
+
+	fputs("START_RRSET_CACHE\n", fp);
+	fputs("END_RRSET_CACHE\n", fp);
+	fputs("START_MSG_CACHE\n", fp);
+	fputs("END_MSG_CACHE\n", fp);
+	fputs("EOF\n", fp);
+	fclose(fp);
+	return 0;
 }

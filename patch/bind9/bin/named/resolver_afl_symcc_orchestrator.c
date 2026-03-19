@@ -32,6 +32,7 @@
 #include <isc/util.h>
 
 #include <dns/dispatch.h>
+#include <dns/view.h>
 
 #include <ns/client.h>
 #include <ns/interfacemgr.h>
@@ -119,6 +120,52 @@ static bool g_initialized = false;
 static named_resolver_afl_symcc_orchestrator_t g_orchestrator = { 0 };
 static pthread_mutex_t g_request_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static named_resolver_afl_symcc_request_context_t *g_request_context = NULL;
+
+static void
+maybe_dump_cache(void) {
+	const char *dump_path = getenv("NAMED_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH");
+	FILE *fp = NULL;
+	dns_view_t *view = NULL;
+	bool dumped_shared_cache = false;
+
+	if (dump_path == NULL || *dump_path == '\0' || named_g_server == NULL) {
+		return;
+	}
+
+	fp = fopen(dump_path, "w");
+	if (fp == NULL) {
+		fprintf(stderr,
+			"[resolver-afl-symcc] cache dump open failed: %s\n",
+			dump_path);
+		return;
+	}
+
+	for (view = ISC_LIST_HEAD(named_g_server->viewlist); view != NULL;
+	     view = ISC_LIST_NEXT(view, link))
+	{
+		isc_result_t result;
+
+		if (view->cachedb == NULL) {
+			continue;
+		}
+		if (dns_view_iscacheshared(view)) {
+			if (dumped_shared_cache) {
+				continue;
+			}
+			dumped_shared_cache = true;
+		}
+
+		result = dns_view_dumpdbtostream(view, fp);
+		if (result != ISC_R_SUCCESS) {
+			fprintf(stderr,
+				"[resolver-afl-symcc] cache dump failed: %s\n",
+				isc_result_totext(result));
+			break;
+		}
+	}
+
+	fclose(fp);
+}
 
 static void
 install_dispatch_hook_if_ready(dns_dispatchmgr_t *mgr) {
@@ -1116,13 +1163,14 @@ request_injector_thread(void *arg) {
 	if (length > 0 && input_length_supported(request, (size_t)length)) {
 		(void)execute_input_case(orchestrator, request, (size_t)length,
 					 timeout_ms);
-	} else if (length > 0) {
-		orchestrator->send_failures++;
-	}
+		} else if (length > 0) {
+			orchestrator->send_failures++;
+		}
 
-	print_stats_and_exit(orchestrator);
-	return NULL;
-}
+		maybe_dump_cache();
+		print_stats_and_exit(orchestrator);
+		return NULL;
+	}
 
 isc_result_t
 named_resolver_afl_symcc_orchestrator_start(const char *config) {
