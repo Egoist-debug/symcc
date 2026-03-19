@@ -10,272 +10,232 @@
 
 使用原则：
 
-1. 先收紧单 resolver 基线，再做横向比较。
-2. 先统一 oracle 口径，再扩大 resolver 数量。
-3. 先让差异样本稳定落盘，再做强语义漏洞确认。
-4. 单轮并行最多保持 3 条工作线，避免互相踩文件和脚本。
+1. 单轮并行最多保持 3 条工作线。
+2. 先建立共享样本链路，再做更强的语义复核。
+3. 先统一 cache / oracle / 指纹输出，再扩大 resolver 数量。
+4. 先过滤和聚类，再人工分析差异样本。
 
 ## 当前入口
 
-### BIND9 主线
+### BIND9 producer
 
 入口脚本：
 
 - `named_experiment/run_named_afl_symcc.sh`
 
-关键命令：
+当前职责：
 
-```bash
-export FUZZ_PROFILE=poison-stateful
-. named_experiment/profiles/poison-stateful.env
-named_experiment/run_named_afl_symcc.sh prepare
-named_experiment/run_named_afl_symcc.sh start
-named_experiment/run_named_afl_symcc.sh status
-named_experiment/run_named_afl_symcc.sh stop
-```
+- 构建与运行 `poison-stateful` 主 campaign
+- 维护主队列
+- 提供后续 follower 消费的样本来源
 
-当前主语料目录：
-
-- `named_experiment/work/query_corpus`
-- `named_experiment/work/response_corpus`
-- `named_experiment/work/transcript_corpus`
-- `named_experiment/work/stable_transcript_corpus`
-
-### Unbound 辅助线
+### Unbound adapter
 
 入口脚本：
 
 - `unbound_experiment/run_unbound_afl_symcc.sh`
 
-关键命令：
+当前职责：
 
-```bash
-unbound_experiment/run_unbound_afl_symcc.sh prepare
-unbound_experiment/run_unbound_afl_symcc.sh smoke
-unbound_experiment/run_unbound_afl_symcc.sh diff-test
-```
+- 作为第二 resolver replay 目标
+- 提供 `dump-cache`
+- 提供 `parse-cache`
+- 提供 `replay-diff-cache`
 
-当前主语料目录：
+## 当前主问题
 
-- `unbound_experiment/work/query_corpus`
-- `unbound_experiment/work/response_corpus`
-- `unbound_experiment/work/stable_query_corpus`
-- `unbound_experiment/work/diff_results`
+1. BIND9 与 Unbound 还没有基于同一样本自动成对 replay。
+2. `diff-test` 仍然偏离线辅助工具，不是长期实验主入口。
+3. 还没有 AFL++ transcript custom mutator。
+4. SymCC 还没有被限制在高价值样本与局部符号化模式。
+5. 还没有统一状态指纹与差异聚类。
 
 ## 里程碑拆解
 
-### M1. 收紧 BIND9 oracle 语义
+### M1. 为 transcript 增加 AFL++ custom mutator
 
 目标：
 
-- 让 BIND9 输出的缓存相关 oracle 语义更稳定、更不混淆。
+- 让 AFL++ 主变异器更贴合当前 `DST1` transcript 输入模型
 
-涉及文件：
+涉及范围：
+
+- AFL++ 运行脚本
+- transcript 输入格式适配代码
+- 相关 mutator 代码
+
+任务：
+
+- 固定 `DST1` transcript 的字段边界和变异点
+- 实现 query / response / post-check 分段变异
+- 保持长度、计数和包装头一致
+
+交付物：
+
+- 一版 transcript custom mutator
+- 一组最小回归样本
+
+验收标准：
+
+- AFL++ 可直接以 custom mutator 方式运行
+- 变异后样本不会大面积退化为格式损坏输入
+
+### M2. 建立单 producer + 双 resolver replay 主线
+
+目标：
+
+- 保证同一样本在 BIND9 与 Unbound 上一一对应
+
+涉及范围：
 
 - `named_experiment/run_named_afl_symcc.sh`
-- `patch/bind9/bin/named/resolver_afl_symcc_orchestrator.c`
-- `patch/bind9/include/named/resolver_afl_symcc_orchestrator.h`
-
-任务：
-
-- 明确 `response_accepted` 的触发条件与日志语义。
-- 拆开 `second_query_hit` 与 `cache_entry_created`，不再默认把两者当同义词使用。
-- 重新审视 `filter-seeds` 的稳定性筛选条件，避免把“未再次发起上游请求”直接写成“缓存已创建”。
-- 统一 BIND9 输出字段顺序和默认值，方便后续差分脚本直接解析。
-
-交付物：
-
-- 一版更清晰的 BIND9 oracle 输出格式。
-- 更新后的稳定性筛选逻辑。
-- 一组最小回归样本，能分别覆盖：
-  - `parse_ok`
-  - `response_accepted`
-  - `second_query_hit`
-  - `cache_entry_created`
-
-验收标准：
-
-- `named_experiment/run_named_afl_symcc.sh prepare` 仍能稳定完成。
-- BIND9 日志中可以明确区分“命中缓存代理”与“进入缓存创建代理”的不同阶段。
-- 文档不再把 `cache_entry_created` 直接当成强语义结论。
-
-### M2. 补齐 Unbound 的可比 oracle
-
-目标：
-
-- 让 Unbound 至少具备与 BIND9 同口径的基础 oracle 输出。
-
-涉及文件：
-
-- `unbound_experiment/run_unbound_afl_symcc.sh`
-- `patch/unbound/smallapp/unbound_afl_symcc_orchestrator.c`
-- `patch/unbound/smallapp/unbound_afl_symcc_orchestrator.h`
-- `patch/unbound/smallapp/unbound_afl_symcc_mutator_server.c`
-
-任务：
-
-- 统一 Unbound 侧的 oracle 键名与字段顺序。
-- 为暂时还做不到强语义判断的字段输出显式默认值，而不是缺失字段。
-- 明确 Unbound 当前哪些字段是真实观测，哪些字段只是占位或代理信号。
-- 让 Unbound 侧也能表达最小 post-check 语义，至少为后续 `second_query_hit` 对齐预留接口。
-
-交付物：
-
-- 一版与 BIND9 同口径的 Unbound oracle 输出。
-- 一份 Unbound oracle 语义对照表。
-
-验收标准：
-
-- `unbound_experiment/run_unbound_afl_symcc.sh smoke` 稳定通过。
-- `diff-test` 不再因为字段缺失而只能比较低层 parser 行为。
-- 至少能稳定比较以下键：
-  - `parse_ok`
-  - `resolver_fetch_started`
-  - `response_accepted`
-  - `timeout`
-
-### M3. 把 `diff-test` 升级成正式差分入口
-
-目标：
-
-- 把现有差分骨架从“辅助检查脚本”升级成标准实验入口。
-
-涉及文件：
-
 - `unbound_experiment/run_unbound_afl_symcc.sh`
 
 任务：
 
-- 固定差分输入来源优先级，例如优先使用稳定语料，其次退回原始语料。
-- 为差分结果增加更稳定的输出结构，至少包含：
-  - 样本名
-  - resolver A oracle
-  - resolver B oracle
-  - 差异类型
-  - 原始 stderr 路径或摘要
-- 把差异分成层级：
-  - 解析差异
-  - 上游交互差异
-  - 缓存相关差异
-  - 超时/异常差异
-- 明确哪些差异直接丢弃，哪些差异进入人工复核。
+- 增加 queue follower 或 broker
+- 监听 BIND9 producer 队列中的新样本
+- 对每个样本触发 BIND9 与 Unbound 成对 replay
+- 保证样本只在 producer 侧变异一次，再 fan-out 给多个 resolver，而不是让多个 resolver 各自独立变异
 
 交付物：
 
-- 稳定的 `diff_results` 目录结构。
-- 一份差异分类规则。
-- 一组样例差异报告。
+- 一版共享样本调度入口
+- 一版成对 replay 目录结构
 
 验收标准：
 
-- 连续多次运行 `diff-test`，输出结构保持一致。
-- 差异样本可以自动落盘并带有上下文信息。
-- 结果可直接用于后续 triage，而不是只能人工翻日志。
+- 新样本能自动在两个 resolver 上 replay
+- 样本路径、样本名和结果目录可稳定对应
 
-### M4. 建立 transcript 级别的多 resolver 对齐
+### M3. 收敛 SymCC 为局部符号探索器
 
 目标：
 
-- 让“同一 transcript 输入多个 resolver”成为主实验路径。
+- 让 SymCC 与当前 AFL++ 变异机制协同，而不是另起一套主线
 
 涉及范围：
 
-- `named_experiment/`
-- `unbound_experiment/`
-- `gen_input/`
+- `named_experiment/run_named_afl_symcc.sh`
+- `unbound_experiment/run_unbound_afl_symcc.sh`
+- `symcc_fuzzing_helper`
 
 任务：
 
-- 明确 transcript 在跨 resolver 场景下的最小公共语义。
-- 为 Unbound 补一个最小 stateful adapter，而不是一直停留在 parser-lite。
-- 让 query、response、post-check 的语义顺序在两个 resolver 上尽量一致。
-- 保证 transcript replay 后，两边都能输出统一 oracle。
+- 只对 producer 队列中的高价值样本触发 SymCC
+- 固定分段符号化范围
+- 增加“覆盖新增 + 语义新增”的双重准入规则
 
 交付物：
 
-- 一版跨 resolver 复用的最小 transcript 语义约定。
-- 一组能同时重放到 BIND9 和 Unbound 的 transcript 样本。
+- 一版高价值样本筛选规则
+- 一版局部符号化字段清单
 
 验收标准：
 
-- 同一 transcript 能在两个 resolver 上稳定执行。
-- 两边都能产出统一字段的 oracle。
-- 差异样本开始从 query/response 层上升到 transcript 层。
+- SymCC 新样本明显减少无效回流
+- 回流样本中 cache / oracle 新差异占比提升
 
-### M5. 强语义复核与漏洞确认
+### M4. 统一 cache / oracle / 指纹输出
 
 目标：
 
-- 把“候选差异样本”变成“可证明的漏洞证据”。
+- 把当前输出收敛成稳定的结构化结果
 
 涉及范围：
 
-- BIND9 和 Unbound 的实验 patch
-- 差异复现脚本
-- 日志与缓存观测辅助工具
+- `unbound_experiment/run_unbound_afl_symcc.sh`
+- 相关 resolver adapter patch
 
 任务：
 
-- 引入更强的 cache 观测机制，例如更细的日志钩子、cache dump 或状态检查。
-- 形成差异样本复现脚本，保证可稳定重放。
-- 建立候选样本分类模板，区分：
-  - parser 差异
-  - 事务匹配差异
-  - bailiwick / glue 差异
-  - 真正疑似缓存投毒差异
+- 固定统一 oracle 键集合
+- 固定统一 cache fingerprint 格式
+- 为每个样本生成结构化结果文件
 
 交付物：
 
-- 一套差异样本复现模板。
-- 一套强语义复核记录模板。
+- 统一结果文件格式
+- BIND9 / Unbound cache 指纹对照说明
 
 验收标准：
 
-- 至少一类高价值差异样本能被稳定复现。
-- 复核记录中能明确写出“为何是候选漏洞”或“为何只是实现差异”。
+- 同一样本在两边的输出可直接比较
+- TTL 等纯噪声不再主导 diff
+
+### M5. 过滤与聚类
+
+目标：
+
+- 降低差异分析成本
+
+任务：
+
+- 引入启发式规则过滤 benign 差异
+- 为剩余差异生成 fingerprint
+- 按 fingerprint 聚类样本
+
+交付物：
+
+- 一组过滤规则
+- 一组 fingerprint 字段定义
+- 一版 cluster 结果目录
+
+验收标准：
+
+- 差异结果能自动标记类别
+- 分析入口从“原始样本列表”变成“cluster 列表”
+
+### M6. 强语义复核
+
+目标：
+
+- 把候选差异样本变成可解释的证据
+
+任务：
+
+- 为高价值样本形成固定 replay 模板
+- 结合 cache 前后对比、post-check 和日志做复核
+- 明确“实现差异”和“疑似漏洞”的分界
+
+交付物：
+
+- 一套复现模板
+- 一套复核记录模板
+
+验收标准：
+
+- 至少一类高价值样本能被稳定复现
+- 复核记录中能明确写出结论与原因
 
 ## 近期三条工作线
 
-建议下一轮工作只保留以下 3 条并行线：
-
-### 工作线 A：BIND9 oracle 收紧
+### 工作线 A：AFL++ transcript mutator
 
 优先级：最高
 
-原因：
+本轮完成标准：
 
-- 它决定后续所有差分结果是否有解释力。
+- transcript 结构化变异落地
+- 线上样本质量优于纯字节变异
+
+### 工作线 B：共享样本调度
+
+优先级：最高
 
 本轮完成标准：
 
-- `second_query_hit` 与 `cache_entry_created` 语义分离
-- `filter-seeds` 不再混淆二者
+- producer queue 可以被 follower 稳定消费
+- BIND9 与 Unbound 输出目录一一对应
 
-### 工作线 B：Unbound oracle 对齐
+### 工作线 C：SymCC 局部符号探索
 
 优先级：高
 
-原因：
-
-- 没有统一字段，差分结果很难做自动化处理。
-
 本轮完成标准：
 
-- Unbound 输出字段与 BIND9 至少同构
-- 缺失能力使用显式默认值
-
-### 工作线 C：`diff-test` 结构化
-
-优先级：高
-
-原因：
-
-- 差异主线必须先有稳定输出，后面才能做 triage 和聚类。
-
-本轮完成标准：
-
-- `diff_results` 结构稳定
-- 差异类别能自动标记
+- SymCC 仅消费高价值 producer 样本
+- 回流规则与 cache / oracle 目标一致
 
 ## 串行依赖关系
 
@@ -283,39 +243,45 @@ unbound_experiment/run_unbound_afl_symcc.sh diff-test
 
 1. 先完成 M1。
 2. 再推进 M2。
-3. M1 与 M2 基本完成后，升级 M3。
-4. 只有在 M3 稳定后，再做 M4。
-5. M5 始终放在差异主线稳定之后。
+3. M1 与 M2 基本完成后，推进 M3。
+4. 之后做 M4。
+5. 再推进 M5。
+6. 最后做 M6。
 
 原因：
 
-- 如果先做 transcript 级多 resolver 对齐，而 oracle 语义仍混乱，后续所有差异都会难以解释。
+- 如果没有共享样本主线，后续所有 cache 比较都缺少解释力。
+- 如果 SymCC 没有先被约束在局部高价值探索，它会过早放大噪声。
 
 ## 本轮建议直接产出的结果
 
 如果按最小闭环推进，下一轮最值得直接落地的是：
 
-1. 一版统一 oracle 键集合。
-2. 一版 BIND9 / Unbound oracle 对照表。
-3. 一版结构化 `diff_results` 输出规范。
+1. 一版 transcript custom mutator。
+2. 一版 queue follower。
+3. 一版 SymCC 局部符号化字段清单。
 
 ## 风险提示
 
 ### 风险 1
 
-Unbound 长期停留在 parser-lite，会导致“第二 resolver 已接入”这个结论缺少实验价值。
+继续让两个 resolver 各跑各的 campaign，会让 cache 比较失去样本对应关系。
 
 ### 风险 2
 
-如果继续把 `cache_entry_created` 当强结论使用，后续论文和实验结论会失真。
+如果 SymCC 对整个 transcript 做全量符号化，会显著放大无效样本和运行成本。
 
 ### 风险 3
 
-如果 `diff-test` 只输出文本日志而没有稳定结构，后面很难做批量 triage。
+如果差异结果没有过滤和聚类，后续人工分析成本会快速失控。
+
+### 风险 4
+
+如果继续把 cache dump 直接当成漏洞证明，实验结论会失真。
 
 ## 备注
 
 这份清单是执行层文档，不替代总方案文档。
 
 总方案负责回答“为什么这样做”和“整体架构是什么”；
-本清单负责回答“下一步具体做什么、改哪些脚本、以什么标准算完成”。
+本清单负责回答“下一步具体做什么、改哪些入口、以什么标准算完成”。
