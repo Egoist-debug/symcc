@@ -555,6 +555,28 @@ cleanup_transcript_responses(const char *dir_path, size_t response_count) {
 }
 
 static void
+emit_oracle_summary(bool parse_ok, bool resolver_fetch_started,
+		    bool response_accepted, bool second_query_hit,
+		    bool cache_entry_created, bool timeout) {
+	const char *log_env = getenv("NAMED_RESOLVER_AFL_SYMCC_LOG");
+
+	if (log_env == NULL || strcmp(log_env, "0") == 0) {
+		return;
+	}
+
+	fprintf(stderr,
+		"ORACLE_SUMMARY parse_ok=%u resolver_fetch_started=%u "
+		"response_accepted=%u second_query_hit=%u "
+		"cache_entry_created=%u timeout=%u\n",
+		parse_ok ? 1U : 0U,
+		resolver_fetch_started ? 1U : 0U,
+		response_accepted ? 1U : 0U,
+		second_query_hit ? 1U : 0U,
+		cache_entry_created ? 1U : 0U,
+		timeout ? 1U : 0U);
+}
+
+static void
 update_basic_oracle_counters(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 			     bool parse_ok, bool resolver_fetch_started,
 			     bool response_accepted, bool timeout) {
@@ -574,6 +596,9 @@ update_basic_oracle_counters(named_resolver_afl_symcc_orchestrator_t *orchestrat
 	if (timeout) {
 		orchestrator->oracle_timeouts++;
 	}
+
+	emit_oracle_summary(parse_ok, resolver_fetch_started, response_accepted,
+			   false, false, timeout);
 
 	if (getenv("NAMED_RESOLVER_AFL_SYMCC_TRACE_ORACLE") != NULL) {
 		fprintf(stderr,
@@ -604,6 +629,11 @@ update_transcript_oracle(
 	if (oracle->cache_entry_created) {
 		orchestrator->oracle_cache_entry_created++;
 	}
+
+	emit_oracle_summary(oracle->parse_ok, oracle->resolver_fetch_started,
+			   oracle->response_accepted,
+			   oracle->second_query_hit,
+			   oracle->cache_entry_created, oracle->timeout);
 
 	if (getenv("NAMED_RESOLVER_AFL_SYMCC_TRACE_ORACLE") != NULL) {
 		fprintf(stderr,

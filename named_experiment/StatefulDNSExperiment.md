@@ -197,6 +197,14 @@ named_experiment/run_named_afl_symcc.sh stop
 - `Oracle response_accepted` 表示第一轮 query 后，mutator 确实向 resolver 返回过伪造上游响应。
 - `Oracle second_query_hit` 表示 post-check 阶段没有再观察到新的上游取数行为。
 - `Oracle cache_entry_created` 现在比 `Oracle second_query_hit` 更严格：它要求第一轮 query 已触发上游抓取并接受过伪造响应，同时 post-check 阶段没有再观察到新的上游交互；它仍然只是更强的代理信号，不能直接等价为“cache 中已新增恶意条目”。
+- **BIND9 Replay 隔离性**：在 differential 模式下，BIND9 replay 必须与 producer 实例隔离，禁止复用 `WORK_DIR` 或 55300/55301 端口。
+- **Python-first Ownership**：`tools/dns_diff/` 承担核心 follower 调度与样本分发；shell 仅用于 `timeout -k` 包装与外部环境配置。
+- **Sample Identity**：遵循 `queue_event_id`, `sample_sha1`, `sample_id` 标识约定。
+- **Timeout Budget (Strict)**：
+  | 环节 | Timeout (软) | Kill (硬) |
+  | :--- | :--- | :--- |
+  | Pair Replay | 180s | 185s |
+  | Single Resolver | 15s | 18s |
 
 ## 复现实验建议
 
@@ -224,6 +232,34 @@ named_experiment/run_named_afl_symcc.sh prepare
 named_experiment/run_named_afl_symcc.sh start
 ```
 
+### 实验总结与消融报告
+
+在实验运行结束后，使用以下命令生成汇总报告：
+
+```bash
+# 生成包含时间戳的 campaign 报告目录
+./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+# 或直接使用 Python 工具
+python3 -m tools.dns_diff.cli campaign-report
+```
+
+报告产物说明：
+- `summary.json`: 核心计数、消融模块状态与复现成功率汇总
+- `ablation_matrix.tsv`: 记录当前实验开启的模块 (Mutator/Cache-Delta/Triage/SymCC)
+- `cluster_counts.tsv`: 各 Fingerprint 聚类下的样本分布
+- `repro_rate.tsv`: 高价值样本在当前 Campaign 中的复现达成度
+
+### 消融实验开关
+
+可以通过环境变量在启动实验前控制各增强模块：
+
+```bash
+# 示例：关闭 SymCC 进行对比实验
+export ENABLE_SYMCC=0
+# 启动实验
+./named_experiment/run_named_afl_symcc.sh start
+```
+
 ## 当前限制
 
 - transcript 目前主要覆盖单 query、1 到 2 个 response、以及一次 post-check。
@@ -246,6 +282,8 @@ named_experiment/run_named_afl_symcc.sh start
 建议优先推进以下事项：
 
 1. 把 `second_query_hit` 和 `cache_entry_created` 拆成不同层级的指标，避免语义混淆。
+   - `cache_entry_created` 语义边界：目前仅作为“更强代理信号”，表示第一轮 query 触发抓取、接受伪造响应且 post-check 命中；这**不代表**缓存中已新增恶意条目的最终漏洞证据。
 2. 为 BIND9 增加更强的 cache 观测或日志钩子，用于校验当前代理 oracle。
+   - BIND9 Replay 隔离：必须与 producer 进程完全隔离，使用独立的 `WORK_DIR`、非竞争端口（避免 55300/55301 冲突）及独立的运行时环境。
 3. 在不破坏当前吞吐的前提下，为 transcript 增加最小必要的时序与传输元数据。
 4. 等单 BIND9 线稳定后，再引入第二个 resolver 做 differential baseline。

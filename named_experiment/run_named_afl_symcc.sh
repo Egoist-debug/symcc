@@ -12,6 +12,7 @@ SYMCC_TREE="$ROOT_DIR/bind-9.18.46-symcc"
 
 HELPER_BIN="$ROOT_DIR/build/linux/x86_64/release/symcc_fuzzing_helper"
 GEN_INPUT_BIN="$ROOT_DIR/build/linux/x86_64/release/gen_input"
+DST1_MUTATOR_LIBRARY="${DST1_MUTATOR_LIBRARY:-$ROOT_DIR/build/linux/x86_64/release/libafl_dst1_mutator.so}"
 AFL_FUZZ_BIN="${AFL_FUZZ_BIN:-/usr/local/bin/afl-fuzz}"
 AFL_CC_BIN="${AFL_CC_BIN:-/usr/local/bin/afl-clang-fast}"
 SYMCC_CC_BIN="${SYMCC_CC_BIN:-$ROOT_DIR/symcc_build_qsym/symcc}"
@@ -55,6 +56,8 @@ JOBS="${JOBS:-2}"
 AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-3000+}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-15}"
 ENABLE_SECONDARY="${ENABLE_SECONDARY:-1}"
+ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-0}"
+DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-0}"
 REGEN_SEEDS="${REGEN_SEEDS:-0}"
 REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
 RESET_OUTPUT="${RESET_OUTPUT:-1}"
@@ -75,6 +78,8 @@ SHOW_AFL_UI="${SHOW_AFL_UI:-1}"
 MASTER_SESSION="${MASTER_SESSION:-named_afl_master}"
 SECONDARY_SESSION="${SECONDARY_SESSION:-named_afl_secondary}"
 HELPER_SESSION="${HELPER_SESSION:-named_symcc_helper}"
+SYMCC_HIGH_VALUE_MANIFEST="${SYMCC_HIGH_VALUE_MANIFEST:-$WORK_DIR/high_value_samples.txt}"
+export SYMCC_HIGH_VALUE_MANIFEST
 
 usage() {
 	cat <<'EOF'
@@ -98,6 +103,7 @@ usage() {
   3. 运行产物默认写入 named_experiment/work/，可通过 WORK_DIR 覆盖。
   4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
   5. FUZZ_PROFILE 支持 legacy-response-tail 与 poison-stateful，默认 poison-stateful。
+  6. 本脚本保持 producer-only；差分跟随、解析与汇总入口统一留在 unbound 外壳 / Python CLI。
 
 常用环境变量:
   FUZZ_PROFILE=poison-stateful
@@ -109,6 +115,9 @@ usage() {
   REFILTER_QUERIES=0
   RESET_OUTPUT=1
   SHOW_AFL_UI=1
+  ENABLE_DST1_MUTATOR=0
+  DST1_MUTATOR_LIBRARY=build/linux/x86_64/release/libafl_dst1_mutator.so
+  DST1_MUTATOR_ONLY=0
   RESPONSE_QUERY_SEEDS=8
   TRANSCRIPT_MAX_ITER=256
   TRANSCRIPT_RESPONSE_SEEDS=24
@@ -290,6 +299,14 @@ sync_patch() {
 
 build_helper_and_gen_input() {
 	require_cmd xmake
+	case "$ENABLE_DST1_MUTATOR" in
+	0|1) ;;
+	*) die "ENABLE_DST1_MUTATOR 仅允许 0 或 1" ;;
+	esac
+	case "$DST1_MUTATOR_ONLY" in
+	0|1) ;;
+	*) die "DST1_MUTATOR_ONLY 仅允许 0 或 1" ;;
+	esac
 	log "构建 helper 与 gen_input"
 	(
 		cd "$ROOT_DIR"
@@ -302,9 +319,18 @@ build_helper_and_gen_input() {
 		HOME="$ROOT_DIR/.xmake-home" \
 		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
 		xmake b gen_input
+		if [ "$ENABLE_DST1_MUTATOR" = "1" ] && \
+		   [ "$DST1_MUTATOR_LIBRARY" = "$ROOT_DIR/build/linux/x86_64/release/libafl_dst1_mutator.so" ]; then
+			HOME="$ROOT_DIR/.xmake-home" \
+			XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
+			xmake b afl_dst1_mutator
+		fi
 	)
 	require_file "$HELPER_BIN"
 	require_file "$GEN_INPUT_BIN"
+	if [ "$ENABLE_DST1_MUTATOR" = "1" ]; then
+		require_file "$DST1_MUTATOR_LIBRARY"
+	fi
 }
 
 build_seed_parsers() {
@@ -763,6 +789,14 @@ start_all() {
 		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR"
 		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS"
 	)
+	if [ "$ENABLE_DST1_MUTATOR" = "1" ]; then
+		afl_env+=(
+			AFL_CUSTOM_MUTATOR_LIBRARY="$DST1_MUTATOR_LIBRARY"
+		)
+		if [ "$DST1_MUTATOR_ONLY" = "1" ]; then
+			afl_env+=(AFL_CUSTOM_MUTATOR_ONLY=1)
+		fi
+	fi
 	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
 		afl_env+=(
 			NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR"
@@ -1056,8 +1090,10 @@ run_for_duration() {
 
 main() {
 	local cmd="${1:-}"
-	local arg="${2:-}"
-	local extra="${3:-}"
+
+	if [ "$#" -gt 0 ]; then
+		shift
+	fi
 
 	case "$cmd" in
 	build)
@@ -1080,10 +1116,10 @@ main() {
 		start_all
 		;;
 	dump-cache)
-		dump_named_cache "$arg" "$extra"
+		dump_named_cache "${1:-}" "${2:-}"
 		;;
 	run)
-		run_for_duration "$arg"
+		run_for_duration "${1:-}"
 		;;
 	stop)
 		stop_all
@@ -1111,4 +1147,4 @@ require_file "$SRC_TREE"
 require_file "$NAMED_CONF_TEMPLATE"
 load_profile
 
-main "${1:-}" "${2:-}" "${3:-}"
+main "$@"

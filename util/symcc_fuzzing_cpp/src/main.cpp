@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -110,6 +111,10 @@ struct Stats {
   std::optional<std::uint64_t> solver_time_us;
   std::uint64_t fail_count = 0;
   std::uint64_t fail_time_ms = 0;
+  std::uint64_t high_value_candidates = 0;
+  std::uint64_t high_value_processed = 0;
+  std::uint64_t high_value_new_coverage = 0;
+  std::uint64_t high_value_new_interesting = 0;
 
   void add(const SymCCResult& r) {
     if (r.killed) {
@@ -139,6 +144,10 @@ struct Stats {
     out << "Failed executions: " << fail_count << "\n";
     out << "Time spent on failed executions: " << fail_time_ms << "ms\n";
     if (fail_count) out << "Avg time in failed executions: " << (fail_time_ms / fail_count) << "ms\n";
+    out << "high_value_candidates: " << high_value_candidates << "\n";
+    out << "high_value_processed: " << high_value_processed << "\n";
+    out << "high_value_new_coverage: " << high_value_new_coverage << "\n";
+    out << "high_value_new_interesting: " << high_value_new_interesting << "\n";
     out << "--------------------------------------------------------------------------------\n";
   }
 };
@@ -198,6 +207,35 @@ static std::optional<std::filesystem::path> pick_response_tail_sample(
   std::sort(candidates.begin(), candidates.end());
   const auto idx = static_cast<std::size_t>(pick_count % candidates.size());
   return candidates[idx];
+}
+
+static std::string normalize_manifest_path(const std::filesystem::path& p) {
+  std::error_code ec;
+  const auto abs = std::filesystem::absolute(p, ec);
+  if (ec) return p.lexically_normal().string();
+  return abs.lexically_normal().string();
+}
+
+static std::unordered_set<std::string> load_high_value_manifest(
+    const std::optional<std::filesystem::path>& manifest_path,
+    const Logger& log) {
+  std::unordered_set<std::string> entries;
+  if (!manifest_path.has_value()) return entries;
+
+  std::ifstream in(*manifest_path);
+  if (!in) {
+    log.warn("Cannot read SYMCC_HIGH_VALUE_MANIFEST at " + manifest_path->string() + "; fallback to coverage-first only");
+    return entries;
+  }
+
+  std::string line;
+  while (std::getline(in, line)) {
+    line = trim(std::move(line));
+    if (line.empty() || line[0] == '#') continue;
+    entries.insert(normalize_manifest_path(std::filesystem::path(line)));
+  }
+  log.info("Loaded " + std::to_string(entries.size()) + " high-value sample entries from manifest");
+  return entries;
 }
 
 enum class TestcaseResult { Uninteresting, New, Hang, Crash };
@@ -273,7 +311,8 @@ static void test_input(const SymCCInput& input,
                        const SymCC& symcc,
                        const AflConfig& afl,
                        State& state,
-                       const Logger& log) {
+                       const Logger& log,
+                       bool request_is_high_value) {
   log.info("Running SymCC on request sample " + input.request_sample.string());
   if (input.response_tail_sample.has_value()) {
     log.info("Using response-tail sample " + input.response_tail_sample->string());
@@ -284,6 +323,7 @@ static void test_input(const SymCCInput& input,
 
   std::uint64_t num_interesting = 0;
   std::uint64_t num_total = 0;
+  std::uint64_t num_new_coverage = 0;
 
   SymCCResult res;
   try {
@@ -301,7 +341,13 @@ static void test_input(const SymCCInput& input,
     const auto tr = process_new_testcase(new_test, input.request_sample, tmp_dir,
                                          input.response_tail_sample, afl, state, log);
     num_total += 1;
-    if (tr == TestcaseResult::New) num_interesting += 1;
+    if (tr == TestcaseResult::New) {
+      num_new_coverage += 1;
+      num_interesting += 1;
+    }
+    if (tr == TestcaseResult::Crash) {
+      num_interesting += 1;
+    }
   }
   log.info("Generated " + std::to_string(num_total) + " test cases, copied " + std::to_string(num_interesting) + " to AFL queue");
 
@@ -313,6 +359,10 @@ static void test_input(const SymCCInput& input,
   }
   state.processed_files.insert(input.request_sample.string());
   state.stats.add(res);
+  if (request_is_high_value) {
+    state.stats.high_value_new_coverage += num_new_coverage;
+    state.stats.high_value_new_interesting += num_interesting;
+  }
 
   // 清理临时目录
   std::error_code ec;
@@ -405,12 +455,32 @@ int main(int argc, char** argv) {
     State state = init_state(symcc_dir);
     log.info("SymCC directory created: " + symcc_dir.string());
 
+    std::optional<std::filesystem::path> high_value_manifest_path;
+    if (const char* manifest_env = std::getenv("SYMCC_HIGH_VALUE_MANIFEST")) {
+      std::string manifest_value = trim(manifest_env);
+      if (!manifest_value.empty()) {
+        high_value_manifest_path = std::filesystem::path(manifest_value);
+        log.info("SYMCC_HIGH_VALUE_MANIFEST set: " + high_value_manifest_path->string());
+      }
+    }
+    const auto high_value_manifest = load_high_value_manifest(high_value_manifest_path, log);
+
     while (true) {
-      auto next = afl.best_new_testcase(state.processed_files);
+      bool picked_high_value = false;
+      std::uint64_t high_value_candidates = 0;
+      auto next = afl.best_new_testcase(state.processed_files,
+                                        high_value_manifest.empty() ? nullptr : &high_value_manifest,
+                                        &picked_high_value,
+                                        &high_value_candidates);
+      state.stats.high_value_candidates += high_value_candidates;
       if (!next.has_value()) {
         // log.debug("Waiting for new test cases...");
         std::this_thread::sleep_for(std::chrono::seconds(5));
       } else {
+        if (picked_high_value) {
+          state.stats.high_value_processed += 1;
+          log.info("Picked high-value request sample from manifest: " + next->string());
+        }
         SymCCInput symcc_input;
         symcc_input.request_sample = *next;
         symcc_input.response_tail_sample =
@@ -418,7 +488,7 @@ int main(int argc, char** argv) {
         if (symcc_input.response_tail_sample.has_value()) {
           state.response_tail_pick_count += 1;
         }
-        test_input(symcc_input, symcc, afl, state, log);
+        test_input(symcc_input, symcc, afl, state, log, picked_high_value);
       }
 
       const auto now = now_ms();
@@ -430,6 +500,9 @@ int main(int argc, char** argv) {
         // 控制台输出简要统计
         log.info("Stats: ok=" + std::to_string(state.stats.ok_count) +
                  " fail=" + std::to_string(state.stats.fail_count) +
+                 " high_value_processed=" + std::to_string(state.stats.high_value_processed) +
+                 " high_value_new_coverage=" + std::to_string(state.stats.high_value_new_coverage) +
+                 " high_value_new_interesting=" + std::to_string(state.stats.high_value_new_interesting) +
                  " processed=" + std::to_string(state.processed_files.size()));
       }
     }

@@ -58,7 +58,10 @@ struct AflConfig {
   static AflConfig load_from_fuzzer_output(const std::filesystem::path& fuzzer_output_dir,
                                            const std::vector<std::string>& custom_target = {});
   std::optional<std::filesystem::path> best_new_testcase(
-      const std::unordered_set<std::string>& seen) const;
+      const std::unordered_set<std::string>& seen,
+      const std::unordered_set<std::string>* high_value_manifest = nullptr,
+      bool* picked_high_value = nullptr,
+      std::uint64_t* high_value_candidates = nullptr) const;
 
   AflShowmapResult run_showmap(const std::filesystem::path& bitmap_out,
                               const std::filesystem::path& testcase,

@@ -90,10 +90,30 @@
 
 - `named_experiment/run_named_afl_symcc.sh`
 - `unbound_experiment/run_unbound_afl_symcc.sh`
+- `tools/dns_diff/cli.py` (Python-first 逻辑入口)
+
+阶段 0 默认口径 (Frozen)：
+
+- **Ownership**: Python-first。`tools/dns_diff/` 负责所有 follower 状态机、样本分发与 diff 逻辑；shell 只保留环境变量注入、路径初始化、`timeout -k` 封装以及外部二进制调用。
+- **Producer Queue**: `named_experiment/work/afl_out/master/queue` (样本唯一来源)
+- **Follower Root**: `unbound_experiment/work_stateful/` (结果输出根目录)
+- **Isolation**: BIND9 Follower Replay 必须与 Producer 实例完全隔离，禁止复用 `WORK_DIR` 或端口 `55300/55301`。
+- **Sample Identity**: 必须遵循 `queue_event_id`, `sample_sha1`, `sample_id` 三元组标识约定。
+- **Timeout Budget**: 必须强制执行以下矩阵 (通过 `timeout -k` 验证)：
+  | 环节 | 软限制 (Timeout) | 硬限制 (Kill) | 备注 |
+  | :--- | :--- | :--- | :--- |
+  | Single Replay | 15s | 18s | 单 resolver 执行 |
+  | Pair Replay | 40s | 45s | 双 resolver + 基础分析 |
+  | Full Logic | 180s | 185s | `timeout -k 5 180` |
+- **Replay 稳定性判据**: 同一批 smoke 样本连续 3 次 replay 得到一致 oracle 结果与非空 cache dump
+- **Smoke 证据约定**: 每个 smoke 样本必须包含：
+  1. `transcript` 原始输入
+  2. BIND9 / Unbound 的 `oracle.json` (包含 `parse_ok`, `response_accepted` 等)
+  3. `cache_dump` 文本快照
 
 任务：
 
-- 增加 queue follower 或 broker
+- 增加 queue follower (基于 `tools.dns_diff.cli`)
 - 监听 BIND9 producer 队列中的新样本
 - 对每个样本触发 BIND9 与 Unbound 成对 replay
 - 保证样本只在 producer 侧变异一次，再 fan-out 给多个 resolver，而不是让多个 resolver 各自独立变异
@@ -118,11 +138,12 @@
 
 - `named_experiment/run_named_afl_symcc.sh`
 - `unbound_experiment/run_unbound_afl_symcc.sh`
-- `symcc_fuzzing_helper`
+- `util/symcc_fuzzing_cpp/` (xmake-built C++ `symcc_fuzzing_helper` 为当前默认 helper)
 
 任务：
 
-- 只对 producer 队列中的高价值样本触发 SymCC
+- 只对 producer 队列中的高价值样本触发 SymCC (通过 `SYMCC_HIGH_VALUE_MANIFEST` 环境传递)
+- 由 Python triage/report 主链产出 `high_value_samples.txt` manifest
 - 固定分段符号化范围
 - 增加“覆盖新增 + 语义新增”的双重准入规则
 
@@ -279,9 +300,49 @@
 
 如果继续把 cache dump 直接当成漏洞证明，实验结论会失真。
 
-## 备注
+### M7. 长期 Campaign 与消融实验
 
-这份清单是执行层文档，不替代总方案文档。
+目标：
 
-总方案负责回答“为什么这样做”和“整体架构是什么”；
-本清单负责回答“下一步具体做什么、改哪些入口、以什么标准算完成”。
+- 评估系统各模块贡献，产出可对比的实验数据
+
+任务：
+
+- 执行 `campaign-report` 汇总长期运行指标
+- 通过环境变量控制消融开关（`ENABLE_MUTATOR`, `ENABLE_CACHE_DELTA`, `ENABLE_TRIAGE`, `ENABLE_SYMCC`）
+- 统计高价值样本复现率，验证 SymCC 与 Triage 的端到端有效性
+
+交付物：
+
+- 时间戳命名的 `campaign_reports` 目录
+- 包含 `summary.json`, `ablation_matrix.tsv`, `cluster_counts.tsv`, `repro_rate.tsv` 的完整报告
+
+验收标准：
+
+- `campaign-report` 稳定落盘，且包含消融状态与复现率统计
+- 文档给出明确的长期运行、消融与复现实验命令
+
+## 实验运行命令指南
+
+### 长期运行 (Campaign)
+```bash
+# 启动 24 小时实验
+env RUN_DURATION_SEC=86400 ./unbound_experiment/run_unbound_afl_symcc.sh run
+# 生成实验总结报告
+./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+```
+
+### 消融实验 (Ablation Study)
+```bash
+# 关闭 SymCC 模块运行实验
+env ENABLE_SYMCC=0 ./unbound_experiment/run_unbound_afl_symcc.sh run
+# 生成带消融标记的报告
+./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+```
+
+### 复现率验证 (Reproduction Rate)
+```bash
+# 基于 triage 产出的高价值 manifest 进行复现统计
+# 自动读取 named_experiment/work/high_value_samples.txt
+./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+```

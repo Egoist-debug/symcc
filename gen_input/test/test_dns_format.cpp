@@ -1,9 +1,12 @@
 #include "BinaryFormat.h"
+#include "DST1Mutator.h"
+#include "DST1Transcript.h"
 #include "FormatAwareGenerator.h"
 
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +17,8 @@
 #include <unistd.h>
 
 using namespace geninput;
+
+#include "../src/DST1Mutator.cpp"
 
 std::string hexDump(const std::vector<uint8_t> &data) {
   std::ostringstream oss;
@@ -212,11 +217,13 @@ void testDNSResponseFormat() {
   assert(answer_rrs.has_value());
   assert(answer_rrs->size() >= 14);
 
-  uint16_t rdlength =
+  const uint16_t rdlength =
       (static_cast<uint16_t>((*answer_rrs)[answer_rrs->size() - 6]) << 8) |
       static_cast<uint16_t>((*answer_rrs)[answer_rrs->size() - 5]);
-  assert(rdlength == 4);
-  assert(answer_rrs->size() >= static_cast<std::size_t>(10 + rdlength));
+  if (rdlength != 4 ||
+      answer_rrs->size() < static_cast<std::size_t>(10 + rdlength)) {
+    std::abort();
+  }
 
   std::cout << "DNS Response Format tests PASSED" << std::endl << std::endl;
 }
@@ -484,6 +491,231 @@ void testFormatAwareGeneratorTimeoutStop() {
             << std::endl;
 }
 
+void testDST1TranscriptProtocol() {
+  std::cout << "=== Testing DST1 Transcript Protocol ===" << std::endl;
+
+  const std::vector<uint8_t> query = {0x11, 0x22, 0x33};
+  const std::vector<std::vector<uint8_t>> responses = {{0xAA, 0xBB}, {0xCC}};
+  const std::vector<uint8_t> postCheck = {0x44, 0x55};
+
+  auto transcript = dst1::buildTranscript(query, responses, postCheck);
+  assert(!transcript.empty());
+
+  assert(transcript.size() == dst1::computePrefixSize(responses.size()) +
+                                 query.size() + postCheck.size() +
+                                 responses[0].size() + responses[1].size());
+  assert(transcript[0] == dst1::MAGIC[0]);
+  assert(transcript[1] == dst1::MAGIC[1]);
+  assert(transcript[2] == dst1::MAGIC[2]);
+  assert(transcript[3] == dst1::MAGIC[3]);
+  assert(transcript[dst1::RESPONSE_COUNT_OFFSET] == responses.size());
+  assert(transcript[dst1::RESERVED_OFFSET] == dst1::RESERVED_VALUE);
+
+  auto queryLen = dst1::readU16Le(transcript, dst1::QUERY_LENGTH_OFFSET);
+  auto postLen = dst1::readU16Le(transcript, dst1::POST_CHECK_LENGTH_OFFSET);
+  auto firstResponseLen = dst1::readU16Le(transcript, dst1::RESPONSE_LENGTHS_OFFSET);
+  auto secondResponseLen =
+      dst1::readU16Le(transcript, dst1::RESPONSE_LENGTHS_OFFSET + dst1::LENGTH_FIELD_SIZE);
+  if (!queryLen || *queryLen != query.size() || !postLen ||
+      *postLen != postCheck.size() || !firstResponseLen ||
+      *firstResponseLen != responses[0].size() || !secondResponseLen ||
+      *secondResponseLen != responses[1].size()) {
+    std::abort();
+  }
+
+  const size_t payloadOffset = dst1::computePrefixSize(responses.size());
+  assert(std::equal(query.begin(), query.end(), transcript.begin() + payloadOffset));
+
+  const size_t firstResponseOffset = payloadOffset + query.size();
+  assert(std::equal(responses[0].begin(), responses[0].end(),
+                    transcript.begin() + firstResponseOffset));
+
+  const size_t secondResponseOffset = firstResponseOffset + responses[0].size();
+  assert(std::equal(responses[1].begin(), responses[1].end(),
+                    transcript.begin() + secondResponseOffset));
+
+  if (!std::equal(postCheck.begin(), postCheck.end(),
+                  transcript.begin() + secondResponseOffset +
+                      responses[1].size())) {
+    std::abort();
+  }
+
+  std::vector<std::vector<uint8_t>> tooManyResponses(dst1::MAX_RESPONSES + 1,
+                                                     std::vector<uint8_t>{0x01});
+  assert(dst1::buildTranscript(query, tooManyResponses, postCheck).empty());
+
+  std::vector<std::vector<uint8_t>> oversizedResponses(
+      dst1::MAX_RESPONSES, std::vector<uint8_t>(1024, 0x7F));
+  assert(dst1::buildTranscript(query, oversizedResponses, postCheck).empty());
+
+  std::cout << "DST1 Transcript protocol tests PASSED" << std::endl << std::endl;
+}
+
+std::vector<uint8_t> buildDnsRR(const std::string &name, uint16_t type,
+                                uint16_t dnsClass, uint32_t ttl,
+                                const std::vector<uint8_t> &rdata) {
+  auto owner = DNSNameCodec::encode(name);
+  std::vector<uint8_t> rr;
+  rr.reserve(owner.size() + 10 + rdata.size());
+  rr.insert(rr.end(), owner.begin(), owner.end());
+  rr.push_back(static_cast<uint8_t>((type >> 8) & 0xFF));
+  rr.push_back(static_cast<uint8_t>(type & 0xFF));
+  rr.push_back(static_cast<uint8_t>((dnsClass >> 8) & 0xFF));
+  rr.push_back(static_cast<uint8_t>(dnsClass & 0xFF));
+  rr.push_back(static_cast<uint8_t>((ttl >> 24) & 0xFF));
+  rr.push_back(static_cast<uint8_t>((ttl >> 16) & 0xFF));
+  rr.push_back(static_cast<uint8_t>((ttl >> 8) & 0xFF));
+  rr.push_back(static_cast<uint8_t>(ttl & 0xFF));
+  const uint16_t rdlength = static_cast<uint16_t>(rdata.size());
+  rr.push_back(static_cast<uint8_t>((rdlength >> 8) & 0xFF));
+  rr.push_back(static_cast<uint8_t>(rdlength & 0xFF));
+  rr.insert(rr.end(), rdata.begin(), rdata.end());
+  return rr;
+}
+
+std::vector<uint8_t> buildSampleDst1Transcript() {
+  auto query = DNSPacketBuilder::buildQuery("www.example.com", 1);
+
+  auto responseA = DNSPacketBuilder()
+                       .setID(0x1234)
+                       .asResponse()
+                       .setRecursionDesired(true)
+                       .setRecursionAvailable(true)
+                       .addQuestion("www.example.com", 1, 1)
+                       .addAnswer("www.example.com", 1, 1, 300, {1, 2, 3, 4})
+                       .build();
+
+  auto responseB = DNSPacketBuilder()
+                       .setID(0x1234)
+                       .asResponse()
+                       .setRecursionDesired(true)
+                       .setRecursionAvailable(true)
+                       .addQuestion("www.example.com", 1, 1)
+                       .addAnswer("www.example.com", 1, 1, 300, {5, 6, 7, 8})
+                       .build();
+
+  auto postCheck = DNSPacketBuilder::buildQuery("www.example.com", 1);
+  auto transcript =
+      dst1::buildTranscript(query, {responseA, responseB}, postCheck);
+  assert(!transcript.empty());
+  return transcript;
+}
+
+void testDST1MutatorRoundtrip() {
+  std::cout << "=== Testing DST1Mutator Roundtrip ===" << std::endl;
+
+  auto transcript = buildSampleDst1Transcript();
+  auto parsed = DST1Mutator::parse(transcript);
+  assert(parsed.has_value());
+
+  auto serialized = DST1Mutator::serialize(*parsed);
+  assert(serialized.has_value());
+
+  auto reparsed = DST1Mutator::parse(*serialized);
+  assert(reparsed.has_value());
+
+  const uint8_t originalResponseCount = transcript[dst1::RESPONSE_COUNT_OFFSET];
+  const uint8_t roundtripResponseCount =
+      (*serialized)[dst1::RESPONSE_COUNT_OFFSET];
+  if (originalResponseCount != roundtripResponseCount) {
+    std::abort();
+  }
+
+  auto originalQueryLen = dst1::readU16Le(transcript, dst1::QUERY_LENGTH_OFFSET);
+  auto roundtripQueryLen =
+      dst1::readU16Le(*serialized, dst1::QUERY_LENGTH_OFFSET);
+  auto originalPostLen =
+      dst1::readU16Le(transcript, dst1::POST_CHECK_LENGTH_OFFSET);
+  auto roundtripPostLen =
+      dst1::readU16Le(*serialized, dst1::POST_CHECK_LENGTH_OFFSET);
+  if (!originalQueryLen.has_value() || !roundtripQueryLen.has_value() ||
+      !originalPostLen.has_value() || !roundtripPostLen.has_value() ||
+      *originalQueryLen != *roundtripQueryLen ||
+      *originalPostLen != *roundtripPostLen) {
+    std::abort();
+  }
+
+  for (size_t i = 0; i < originalResponseCount; ++i) {
+    const size_t off = dst1::RESPONSE_LENGTHS_OFFSET +
+                       i * dst1::LENGTH_FIELD_SIZE;
+    auto lhs = dst1::readU16Le(transcript, off);
+    auto rhs = dst1::readU16Le(*serialized, off);
+    if (!lhs.has_value() || !rhs.has_value() || *lhs != *rhs) {
+      std::abort();
+    }
+  }
+
+  std::cout << "DST1Mutator roundtrip tests PASSED" << std::endl << std::endl;
+}
+
+void testDST1MutatorMutationSafety() {
+  std::cout << "=== Testing DST1Mutator Mutation Safety ===" << std::endl;
+
+  auto transcript = buildSampleDst1Transcript();
+
+  DST1Mutator::MutationRequest validRequest;
+  validRequest.Query = DST1Mutator::QueryMutation{
+      std::string("www.target.test"), static_cast<uint16_t>(28), false, true,
+      true};
+
+  auto nsRData = DNSNameCodec::encode("ns1.target.test");
+  auto glueA = std::vector<uint8_t>{10, 10, 10, 10};
+  auto glueAAAA =
+      std::vector<uint8_t>{0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+                           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42};
+
+  DST1Mutator::ResponseMutation responseMutation;
+  responseMutation.AA = true;
+  responseMutation.RA = true;
+  responseMutation.RCODE = 3;
+  responseMutation.ANCOUNT = 1;
+  responseMutation.NSCOUNT = 1;
+  responseMutation.ARCOUNT = 2;
+  responseMutation.AuthorityRRs = std::vector<std::vector<uint8_t>>{
+      buildDnsRR("target.test", 2, 1, 600, nsRData)};
+  responseMutation.AdditionalRRs = std::vector<std::vector<uint8_t>>{
+      buildDnsRR("ns1.target.test", 1, 1, 600, glueA)};
+  responseMutation.GlueRRs = std::vector<std::vector<uint8_t>>{
+      buildDnsRR("ns1.target.test", 28, 1, 600, glueAAAA)};
+
+  validRequest.Response = responseMutation;
+  validRequest.ResponseIndex = 0;
+
+  DST1Mutator::TranscriptMutation transcriptMutation;
+  transcriptMutation.ResponseCount = 1;
+  transcriptMutation.PostCheckName = std::string("www.target.test");
+  transcriptMutation.PostCheckType = static_cast<uint16_t>(28);
+  validRequest.Transcript = transcriptMutation;
+
+  auto mutated = DST1Mutator::mutate(transcript, validRequest);
+  assert(mutated.has_value());
+
+  auto parsedMutated = DST1Mutator::parse(*mutated);
+  assert(parsedMutated.has_value());
+  assert(parsedMutated->Responses.size() == 1);
+
+  DST1Mutator::MutationRequest invalidRRRequest;
+  DST1Mutator::ResponseMutation invalidResponseMutation;
+  invalidResponseMutation.AuthorityRRs =
+      std::vector<std::vector<uint8_t>>{{0xC0}};
+  invalidRRRequest.Response = invalidResponseMutation;
+  invalidRRRequest.ResponseIndex = 0;
+
+  auto rejectedByRR = DST1Mutator::mutate(transcript, invalidRRRequest);
+  assert(!rejectedByRR.has_value());
+
+  DST1Mutator::MutationRequest invalidCountRequest;
+  DST1Mutator::TranscriptMutation invalidTranscriptMutation;
+  invalidTranscriptMutation.ResponseCount = 3;
+  invalidCountRequest.Transcript = invalidTranscriptMutation;
+
+  auto rejectedByCount = DST1Mutator::mutate(transcript, invalidCountRequest);
+  assert(!rejectedByCount.has_value());
+
+  std::cout << "DST1Mutator mutation safety tests PASSED" << std::endl
+            << std::endl;
+}
+
 int main() {
   std::cout << "gen_input DNS Format Tests" << std::endl;
   std::cout << "==========================" << std::endl << std::endl;
@@ -492,6 +724,9 @@ int main() {
   testDNSPacketBuilder();
   testBinaryFormat();
   testSerializeParseRoundtrip();
+  testDST1TranscriptProtocol();
+  testDST1MutatorRoundtrip();
+  testDST1MutatorMutationSafety();
   testFormatAwareGeneratorTimeoutStop();
   testDNSParserValidation();
   testInvalidDNSPackets();

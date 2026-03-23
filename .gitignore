@@ -48,6 +48,9 @@ compile_commands.json
 # xmake cache
 .xmake*
 
+# python cache
+*__pycache__*
+
 *paper*
 
 # AGENTS

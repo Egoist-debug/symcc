@@ -195,9 +195,17 @@ AflConfig AflConfig::load_from_fuzzer_output(const std::filesystem::path& fuzzer
 }
 
 std::optional<std::filesystem::path> AflConfig::best_new_testcase(
-    const std::unordered_set<std::string>& seen) const {
-  std::optional<std::filesystem::path> best;
-  std::optional<TestcaseScore> best_score;
+    const std::unordered_set<std::string>& seen,
+    const std::unordered_set<std::string>* high_value_manifest,
+    bool* picked_high_value,
+    std::uint64_t* high_value_candidates) const {
+  if (picked_high_value != nullptr) *picked_high_value = false;
+  if (high_value_candidates != nullptr) *high_value_candidates = 0;
+
+  std::optional<std::filesystem::path> best_high_value;
+  std::optional<TestcaseScore> best_high_value_score;
+  std::optional<std::filesystem::path> best_normal;
+  std::optional<TestcaseScore> best_normal_score;
 
   std::error_code ec;
   for (auto it = std::filesystem::directory_iterator(queue_dir, ec);
@@ -209,13 +217,29 @@ std::optional<std::filesystem::path> AflConfig::best_new_testcase(
     if (seen.find(key) != seen.end()) continue;
 
     auto sc = score_testcase(p);
-    if (!best.has_value() || sc > *best_score) {
-      best = p;
-      best_score = sc;
+    const bool in_high_value_manifest =
+        high_value_manifest != nullptr && (high_value_manifest->find(key) != high_value_manifest->end());
+
+    if (in_high_value_manifest) {
+      if (high_value_candidates != nullptr) *high_value_candidates += 1;
+      if (!best_high_value.has_value() || sc > *best_high_value_score) {
+        best_high_value = p;
+        best_high_value_score = sc;
+      }
+      continue;
+    }
+
+    if (!best_normal.has_value() || sc > *best_normal_score) {
+      best_normal = p;
+      best_normal_score = sc;
     }
   }
 
-  return best;
+  if (best_high_value.has_value()) {
+    if (picked_high_value != nullptr) *picked_high_value = true;
+    return best_high_value;
+  }
+  return best_normal;
 }
 
 static std::vector<std::string> insert_input_file(const std::vector<std::string>& cmd,

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "../include/FormatAwareGenerator.h"
+#include "../include/DST1Transcript.h"
 
 #include <algorithm>
 #include <chrono>
@@ -144,11 +145,6 @@ std::string getParentZone(const std::string &Name) {
   }
 
   return Name.substr(Dot + 1);
-}
-
-void appendU16Le(std::vector<uint8_t> &Output, size_t Value) {
-  Output.push_back(static_cast<uint8_t>(Value & 0xFF));
-  Output.push_back(static_cast<uint8_t>((Value >> 8) & 0xFF));
 }
 
 std::vector<uint8_t>
@@ -326,32 +322,7 @@ std::vector<uint8_t>
 buildStatefulTranscriptBlob(const std::vector<uint8_t> &ClientQuery,
                             const std::vector<std::vector<uint8_t>> &Responses,
                             const std::vector<uint8_t> &PostCheckQuery) {
-  std::vector<uint8_t> Output;
-
-  if (Responses.size() > 255 || ClientQuery.empty() || ClientQuery.size() > 0xFFFF ||
-      PostCheckQuery.size() > 0xFFFF) {
-    return {};
-  }
-  for (const auto &Response : Responses) {
-    if (Response.empty() || Response.size() > 0xFFFF) {
-      return {};
-    }
-  }
-
-  Output.insert(Output.end(), {'D', 'S', 'T', '1'});
-  Output.push_back(static_cast<uint8_t>(Responses.size()));
-  Output.push_back(0);
-  appendU16Le(Output, ClientQuery.size());
-  appendU16Le(Output, PostCheckQuery.size());
-  for (const auto &Response : Responses) {
-    appendU16Le(Output, Response.size());
-  }
-  Output.insert(Output.end(), ClientQuery.begin(), ClientQuery.end());
-  for (const auto &Response : Responses) {
-    Output.insert(Output.end(), Response.begin(), Response.end());
-  }
-  Output.insert(Output.end(), PostCheckQuery.begin(), PostCheckQuery.end());
-  return Output;
+  return dst1::buildTranscript(ClientQuery, Responses, PostCheckQuery);
 }
 
 bool addUniquePacket(std::vector<std::vector<uint8_t>> &Results,

@@ -114,6 +114,17 @@ log_result(const unbound_afl_symcc_oracle_t *oracle)
 		return;
 	}
 
+	fprintf(stderr,
+		"ORACLE_SUMMARY parse_ok=%u resolver_fetch_started=%u "
+		"response_accepted=%u second_query_hit=%u "
+		"cache_entry_created=%u timeout=%u\n",
+		oracle->parse_ok ? 1U : 0U,
+		oracle->resolver_fetch_started ? 1U : 0U,
+		oracle->response_accepted ? 1U : 0U,
+		oracle->second_query_hit ? 1U : 0U,
+		oracle->cache_entry_created ? 1U : 0U,
+		oracle->timeout ? 1U : 0U);
+
 	fprintf(stderr, "Requests sent: %u\n",
 		oracle->resolver_fetch_started ? 1U : 0U);
 	fprintf(stderr, "Replies received: %u\n",

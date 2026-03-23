@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PARSER_SCRIPT="$ROOT_DIR/unbound_experiment/run_unbound_afl_symcc.sh"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-cache-parser.XXXXXX")"
+export PYTHONDONTWRITEBYTECODE=1
 
 cleanup() {
 	rm -rf "$WORKDIR"
@@ -48,13 +49,32 @@ compare_tsv() {
 	local after_file="$2"
 	local added_file="$3"
 	local removed_file="$4"
-	local before_sorted="$WORKDIR/$(basename "$before_file").sorted"
-	local after_sorted="$WORKDIR/$(basename "$after_file").sorted"
+	python3 - "$before_file" "$after_file" "$added_file" "$removed_file" <<'PY'
+from pathlib import Path
+import sys
 
-	LC_ALL=C sort -u "$before_file" >"$before_sorted"
-	LC_ALL=C sort -u "$after_file" >"$after_sorted"
-	comm -13 "$before_sorted" "$after_sorted" >"$added_file"
-	comm -23 "$before_sorted" "$after_sorted" >"$removed_file"
+
+def load(path_str: str) -> dict[tuple[str, ...], str]:
+    mapping: dict[tuple[str, ...], str] = {}
+    path = Path(path_str)
+    for lineno, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw_line:
+            continue
+        fields = raw_line.split("\t")
+        if len(fields) != 10:
+            raise SystemExit(f"ASSERT FAIL: {path}:{lineno} 列数不是 10，而是 {len(fields)}")
+        key = tuple(fields[:7] + fields[8:])
+        mapping.setdefault(key, raw_line)
+    return mapping
+
+
+before = load(sys.argv[1])
+after = load(sys.argv[2])
+added = [after[key] for key in sorted(after.keys() - before.keys())]
+removed = [before[key] for key in sorted(before.keys() - after.keys())]
+Path(sys.argv[3]).write_text("\n".join(added) + ("\n" if added else ""), encoding="utf-8")
+Path(sys.argv[4]).write_text("\n".join(removed) + ("\n" if removed else ""), encoding="utf-8")
+PY
 }
 
 bind_negative_dump="$WORKDIR/bind_negative.cache.txt"
@@ -66,8 +86,8 @@ write_lines "$bind_negative_dump" \
 	"example.com. 300 IN \\-A ;-\$NXDOMAIN" \
 	"300 NSEC example.com. A NS SOA RRSIG NSEC DNSKEY"
 "$PARSER_SCRIPT" parse-cache bind9 "$bind_negative_dump" "$bind_negative_norm" >/dev/null
-assert_has_line "$bind_negative_norm" $'RRSET\t_default\texample.com.\tIN\t\\-A\t;-$NXDOMAIN'
-assert_has_line "$bind_negative_norm" $'RRSET\t_default\texample.com.\tIN\tNSEC\texample.com. A NS SOA RRSIG NSEC DNSKEY'
+assert_has_line "$bind_negative_norm" $'bind9\t_default\texample.com.\t\\-A\t\\-A\tRRSET\tnegative\t300\t;-$NXDOMAIN\tclass=IN'
+assert_has_line "$bind_negative_norm" $'bind9\t_default\texample.com.\tNSEC\tNSEC\tRRSET\trrset\t300\texample.com. A NS SOA RRSIG NSEC DNSKEY\tclass=IN'
 
 bind_before_dump="$WORKDIR/bind_before.cache.txt"
 bind_after_dump="$WORKDIR/bind_after.cache.txt"
@@ -119,9 +139,9 @@ write_lines "$unbound_after_dump" \
 	"EOF"
 "$PARSER_SCRIPT" parse-cache unbound "$unbound_before_dump" "$unbound_before_norm" >/dev/null
 "$PARSER_SCRIPT" parse-cache unbound "$unbound_after_dump" "$unbound_after_norm" >/dev/null
-assert_has_line "$unbound_before_norm" $'RRSET\t_\texample.com.\tIN\tA\t1.2.3.4'
-assert_has_line "$unbound_before_norm" $'RRSET\t_\texample.com.\tIN\tAAAA\t2001:db8::1'
-assert_has_line "$unbound_before_norm" $'MSG\t_\texample.com.\tIN\tA\tflags=33152 qd=1 sec=0 an=1 ns=0 ar=0 bogus=-1 reason=_'
+assert_has_line "$unbound_before_norm" $'unbound\t_\texample.com.\tA\tA\tRRSET\trrset\t300\t1.2.3.4\tclass=IN'
+assert_has_line "$unbound_before_norm" $'unbound\t_\texample.com.\tAAAA\tAAAA\tRRSET\trrset\t300\t2001:db8::1\tclass=IN'
+assert_has_line "$unbound_before_norm" $'unbound\t_\texample.com.\tA\t_\tMSG\tmessage\t300\t_\tclass=IN flags=33152 qd=1 sec=0 an=1 ns=0 ar=0 bogus=-1 reason=_'
 compare_tsv "$unbound_before_norm" "$unbound_after_norm" "$unbound_added" "$unbound_removed"
 assert_empty_file "$unbound_added"
 assert_empty_file "$unbound_removed"

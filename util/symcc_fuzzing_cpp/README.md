@@ -14,6 +14,11 @@
 示例：
 - `./build/linux/x86_64/release/symcc_fuzzing_helper -a fuzzer01 -o /path/to/afl_out -n symcc -- ./target @@`
 
+**所有权与默认执行面**
+- 当前系统默认 helper 是由 xmake 构建的 C++ `symcc_fuzzing_helper`（即本目录代码）。
+- `named_experiment/` 与 `unbound_experiment/` 脚本默认调用此二进制文件。
+- 高价值样本 manifest (`SYMCC_HIGH_VALUE_MANIFEST`) 由 Python `triage.py` / `report.py` 生成并传递给此 helper。
+
 **AFL++ bitmap 识别**
 - 自动从 `fuzzer_stats` 解析 `map_size/afl_map_size/real_map_size`，并在调用 `afl-showmap` 时设置 `AFL_MAP_SIZE/AFL_MAPSIZE`。
 - 在合并覆盖率时对 hitcount 做 AFL++ 风格的 bucket 归一化（避免把“同一边的更高命中次数”误当成新覆盖）。
