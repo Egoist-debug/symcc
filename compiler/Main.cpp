@@ -13,7 +13,7 @@
 // SymCC. If not, see <https://www.gnu.org/licenses/>.
 
 #include <llvm/IR/LegacyPassManager.h>
-#if LLVM_VERSION_MAJOR <= 15
+#if LLVM_VERSION_MAJOR < 13
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #endif
 #include <llvm/Transforms/Scalar.h>
@@ -44,7 +44,7 @@ using namespace llvm;
 // Legacy pass registration (up to LLVM 13)
 //
 
-#if LLVM_VERSION_MAJOR <= 15
+#if LLVM_VERSION_MAJOR < 13
 
 void addSymbolizeLegacyPass(const PassManagerBuilder & /* unused */,
                             legacy::PassManagerBase &PM) {
@@ -72,15 +72,11 @@ static struct RegisterStandardPasses
 PassPluginLibraryInfo getSymbolizePluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "Symbolization Pass", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
-            // We need to act on the entire module as well as on each function.
-            // Those actions are independent from each other, so we register a
-            // module pass at the start of the pipeline and a function pass just
-            // before the vectorizer. (There doesn't seem to be a way to run
-            // module passes at the start of the vectorizer, hence the split.)
             PB.registerPipelineStartEPCallback(
                 [](ModulePassManager &PM, OptimizationLevel) {
                   PM.addPass(SymbolizePass());
                 });
+
             PB.registerVectorizerStartEPCallback(
                 [](FunctionPassManager &PM, OptimizationLevel) {
                   PM.addPass(ScalarizerPass());

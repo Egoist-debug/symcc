@@ -309,7 +309,7 @@
 任务：
 
 - 执行 `campaign-report` 汇总长期运行指标
-- 通过环境变量控制消融开关（`ENABLE_MUTATOR`, `ENABLE_CACHE_DELTA`, `ENABLE_TRIAGE`, `ENABLE_SYMCC`）
+- 通过环境变量控制消融开关（`ENABLE_DST1_MUTATOR`, `ENABLE_CACHE_DELTA`, `ENABLE_TRIAGE`, `ENABLE_SYMCC`）
 - 统计高价值样本复现率，验证 SymCC 与 Triage 的端到端有效性
 
 交付物：
@@ -324,25 +324,52 @@
 
 ## 实验运行命令指南
 
-### 长期运行 (Campaign)
+命令面冻结说明（当前实现）：
+
+- shell wrapper 主线命令：`parse-cache`、`replay-diff-cache`、`follow-diff`、`follow-diff-once`、`triage-report`、`campaign-report`
+- `triage`、`report` 仅通过 Python CLI 直调：`python3 -m tools.dns_diff.cli triage|report`
+- 不再使用 `run/start/stop/status` 作为 unbound wrapper 现行命令
+
+### 单轮采样与 triage 汇总（推荐最小闭环）
 ```bash
-# 启动 24 小时实验
-env RUN_DURATION_SEC=86400 ./unbound_experiment/run_unbound_afl_symcc.sh run
-# 生成实验总结报告
+# 默认消费 named producer queue 并执行一次 paired replay
+./unbound_experiment/run_unbound_afl_symcc.sh follow-diff-once
+
+# 重写 triage 并生成 report 四件套
+./unbound_experiment/run_unbound_afl_symcc.sh triage-report
+```
+
+### 长期跟随与活动级汇总（Campaign）
+```bash
+# 长期跟随新样本（持续模式）
+./unbound_experiment/run_unbound_afl_symcc.sh follow-diff
+
+# 输出 campaign 四件套（按时间戳落盘）
 ./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
 ```
 
 ### 消融实验 (Ablation Study)
 ```bash
-# 关闭 SymCC 模块运行实验
-env ENABLE_SYMCC=0 ./unbound_experiment/run_unbound_afl_symcc.sh run
-# 生成带消融标记的报告
+# 通过 follow-diff-once 执行单轮样本处理，并关闭 SymCC 标记
+env ENABLE_SYMCC=0 ./unbound_experiment/run_unbound_afl_symcc.sh follow-diff-once
+
+# 生成带消融状态的 campaign 报告
 ./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
 ```
 
-### 复现率验证 (Reproduction Rate)
+### 路径与产物默认值（用于对齐实现）
+
+- producer queue 默认：`named_experiment/work/afl_out/master/queue`
+- follow_diff root 默认：`unbound_experiment/work_stateful/follow_diff`
+- report 侧 high-value manifest 默认：`WORK_DIR/high_value_samples.txt`（默认即 `unbound_experiment/work_stateful/high_value_samples.txt`）
+- campaign 输出目录默认：`WORK_DIR/campaign_reports/<timestamp>/`
+- named 消费侧默认 manifest：优先 `named_experiment/work/high_value_samples.txt`；若本地不存在则桥接到 `unbound_experiment/work_stateful/high_value_samples.txt`
+
+### Python CLI 直调示例（仅 triage/report）
 ```bash
-# 基于 triage 产出的高价值 manifest 进行复现统计
-# 自动读取 named_experiment/work/high_value_samples.txt
-./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+# triage 直调（非 wrapper 别名）
+python3 -m tools.dns_diff.cli triage --root unbound_experiment/work_stateful/follow_diff --rewrite
+
+# report 直调（非 wrapper 别名）
+python3 -m tools.dns_diff.cli report --root unbound_experiment/work_stateful/follow_diff
 ```

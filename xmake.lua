@@ -1,17 +1,54 @@
 add_rules("mode.debug", "mode.release")
 
+local DEFAULT_SYMCC_LLVM_PREFIX = os.getenv("SYMCC_LLVM_PREFIX") or "/usr/lib/llvm-18"
+local DEFAULT_SYMCC_LLVM_MAJOR = os.getenv("SYMCC_LLVM_MAJOR") or "18"
+
+option("symcc_llvm_prefix")
+    set_default(DEFAULT_SYMCC_LLVM_PREFIX)
+    set_description("LLVM installation prefix for SymCC build/runtime alignment.")
+option_end()
+
+option("symcc_llvm_major")
+    set_default(DEFAULT_SYMCC_LLVM_MAJOR)
+    set_description("LLVM major version for SymCC build/runtime alignment.")
+option_end()
+
+local function symcc_llvm_prefix()
+    return get_config("symcc_llvm_prefix") or DEFAULT_SYMCC_LLVM_PREFIX
+end
+
+local function symcc_llvm_major()
+    return tonumber(get_config("symcc_llvm_major") or DEFAULT_SYMCC_LLVM_MAJOR) or tonumber(DEFAULT_SYMCC_LLVM_MAJOR)
+end
+
+local function symcc_llvm_bindir()
+    return path.join(symcc_llvm_prefix(), "bin")
+end
+
+local function symcc_llvm_clang()
+    return path.join(symcc_llvm_bindir(), "clang")
+end
+
+local function symcc_llvm_clangxx()
+    return path.join(symcc_llvm_bindir(), "clang++")
+end
+
+set_toolset("cc", symcc_llvm_clang())
+set_toolset("cxx", symcc_llvm_clangxx())
+set_toolset("ld", symcc_llvm_clangxx())
+set_toolset("sh", symcc_llvm_clangxx())
+
 package("llvm")
     on_fetch(function (package, opt)
-        import("lib.detect.find_package")
-        -- Use cmake to find LLVM
-        return find_package("cmake::LLVM", {
-            version = "14.x",
-            paths = {
-                "/usr/lib/llvm-14/lib/cmake/llvm",
-                "/usr/lib/llvm-14/share/llvm/cmake",
-                "/usr/lib/llvm-14"
-            }
-        })
+        local llvm_prefix = symcc_llvm_prefix()
+        local llvm_major = symcc_llvm_major()
+        return {
+            version = tostring(llvm_major) .. ".x",
+            sysincludedirs = path.join(llvm_prefix, "include"),
+            includedirs = path.join(llvm_prefix, "include"),
+            linkdirs = path.join(llvm_prefix, "lib"),
+            links = "LLVM-" .. tostring(llvm_major)
+        }
     end)
 package_end()
 
@@ -64,39 +101,8 @@ target("SymCC")
 
     after_build(function (target)
         import("core.project.config")
-        import("lib.detect.find_tool")
-        local llvm = target:pkg("llvm")
-        local llvm_version_major = 0
-
-        -- Prefer llvm-config (matches the actual toolchain) over the package's
-        -- version/installdir metadata, which can be incomplete for system
-        -- packages.
-        local llvm_config = find_tool("llvm-config")
-            or find_tool("llvm-config-14")
-            or find_tool("llvm-config-13")
-            or find_tool("llvm-config-12")
-
-        local llvm_bindir = nil
-        if llvm_config and llvm_config.program then
-            local version = os.iorunv(llvm_config.program, {"--version"})
-            if version then
-                local major = tostring(version):match("^(%d+)")
-                if major then
-                    llvm_version_major = tonumber(major) or 0
-                end
-            end
-
-            local bindir = os.iorunv(llvm_config.program, {"--bindir"})
-            if bindir then
-                llvm_bindir = tostring(bindir):gsub("%s+$", "")
-            end
-        elseif llvm then
-            local version = llvm:version()
-            if version then
-                llvm_version_major = version:major()
-            end
-        end
-        
+        local llvm_version_major = symcc_llvm_major()
+         
         local clang_load_pass = ""
         if llvm_version_major < 13 then
             clang_load_pass = "-Xclang -load -Xclang "
@@ -104,32 +110,8 @@ target("SymCC")
             clang_load_pass = "-fpass-plugin="
         end
 
-        local clang_binary = "clang"
-        local clangpp_binary = "clang++"
-        -- Try to find clang in the corresponding LLVM bindir.
-        if llvm_bindir and #llvm_bindir > 0 then
-            local cand_clang = path.join(llvm_bindir, "clang")
-            local cand_clangpp = path.join(llvm_bindir, "clang++")
-            if os.isfile(cand_clang) then
-                clang_binary = cand_clang
-            elseif os.isfile(path.join(llvm_bindir, "clang-" .. tostring(llvm_version_major))) then
-                clang_binary = path.join(llvm_bindir, "clang-" .. tostring(llvm_version_major))
-            end
-
-            if os.isfile(cand_clangpp) then
-                clangpp_binary = cand_clangpp
-            elseif os.isfile(path.join(llvm_bindir, "clang++-" .. tostring(llvm_version_major))) then
-                clangpp_binary = path.join(llvm_bindir, "clang++-" .. tostring(llvm_version_major))
-            end
-        else
-            -- Fallback for distros that only provide version-suffixed binaries.
-            if llvm_version_major > 0 and os.isfile("/usr/bin/clang-" .. tostring(llvm_version_major)) then
-                clang_binary = "/usr/bin/clang-" .. tostring(llvm_version_major)
-            end
-            if llvm_version_major > 0 and os.isfile("/usr/bin/clang++-" .. tostring(llvm_version_major)) then
-                clangpp_binary = "/usr/bin/clang++-" .. tostring(llvm_version_major)
-            end
-        end
+        local clang_binary = symcc_llvm_clang()
+        local clangpp_binary = symcc_llvm_clangxx()
 
         local runtime_32bit_dir = ""
         if target:dep("SymCCRuntime32_shared") then
@@ -216,20 +198,7 @@ target("check")
         end
 
         -- Determine LLVM major version for FileCheck prefix behavior (LLVM >= 14).
-        local llvm_major = 0
-        do
-            local llvm = symcc_target:pkg("llvm")
-            if llvm and llvm:version() then
-                llvm_major = llvm:version():major() or 0
-            end
-            if llvm_major == 0 then
-                local llvmconfig = find_tool("llvm-config") or find_tool("llvm-config-14")
-                if llvmconfig then
-                    local out = os.iorunv(llvmconfig.program, {"--version"})
-                    llvm_major = tonumber(out:match("^(%d+)")) or 0
-                end
-            end
-        end
+        local llvm_major = symcc_llvm_major()
         if llvm_major >= 14 then
             filecheck_args = filecheck_args .. " --allow-unused-prefixes"
         end
@@ -258,46 +227,39 @@ target("check")
                 os.vrunv("chmod", {"755", p})
             end
         end
-        local function _write_shim(name, toolnames)
-            local found = nil
-            for _, tname in ipairs(toolnames) do
-                found = find_tool(tname)
-                if found then
-                    break
+        local function _write_shim(name, explicit_program, toolnames)
+            local program = nil
+            if explicit_program and os.isfile(explicit_program) then
+                program = explicit_program
+            end
+            if not program then
+                local found = nil
+                for _, tname in ipairs(toolnames) do
+                    found = find_tool(tname)
+                    if found then
+                        break
+                    end
+                end
+                if found and found.program then
+                    program = found.program
                 end
             end
-            if not found then
+            if not program then
                 return
             end
             local shim_path = path.join(tools_dir, name)
-            local script = "#!/bin/sh\nexec \"" .. found.program .. "\" \"$@\"\n"
+            local script = "#!/bin/sh\nexec \"" .. program .. "\" \"$@\"\n"
             io.writefile(shim_path, script)
             _chmod_755(shim_path)
         end
-        _write_shim("llc", {"llc", "llc-14"})
-        _write_shim("opt", {"opt", "opt-14"})
-        _write_shim("FileCheck", {"FileCheck", "FileCheck-14"})
+        _write_shim("llc", path.join(symcc_llvm_bindir(), "llc"), {"llc-" .. tostring(llvm_major), "llc"})
+        _write_shim("opt", path.join(symcc_llvm_bindir(), "opt"), {"opt-" .. tostring(llvm_major), "opt"})
+        _write_shim("FileCheck", path.join(symcc_llvm_bindir(), "FileCheck"), {"FileCheck-" .. tostring(llvm_major), "FileCheck"})
 
         -- Ensure our shims take precedence.
         table.insert(lit_args, "--path=" .. tools_dir)
         do
-            local llvm_bindir = nil
-            local llvm = symcc_target:pkg("llvm")
-            if llvm and llvm:installdir() then
-                local candidate = path.join(llvm:installdir(), "bin")
-                if os.isdir(candidate) then
-                    llvm_bindir = candidate
-                end
-            end
-            if not llvm_bindir then
-                local llvmconfig = find_tool("llvm-config") or find_tool("llvm-config-14")
-                if llvmconfig then
-                    local out = os.iorunv(llvmconfig.program, {"--bindir"}):gsub("%s+$", "")
-                    if #out > 0 and os.isdir(out) then
-                        llvm_bindir = out
-                    end
-                end
-            end
+            local llvm_bindir = symcc_llvm_bindir()
             if llvm_bindir then
                 table.insert(lit_args, "--path=" .. llvm_bindir)
             end

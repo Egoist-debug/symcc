@@ -4,16 +4,37 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 from .schema import stamp_with_shared_meta
 
 CacheRow = Tuple[str, str, str, str, str, str, str, str, str, str]
+CACHE_ROW_FIELD_COUNT = 10
+
+
+def _coerce_row_fields(row: Any) -> Tuple[Any, ...]:
+    if hasattr(row, "to_fields"):
+        return tuple(getattr(row, "to_fields")())
+    if isinstance(row, (str, bytes, bytearray, Mapping)):
+        return (row,)
+    try:
+        return tuple(row)
+    except TypeError:
+        return (row,)
 
 
 def _normalize_row(row: Any) -> CacheRow:
-    if hasattr(row, "to_fields"):
-        fields = tuple(getattr(row, "to_fields")())
-    else:
-        fields = tuple(row)
-    if len(fields) != 10:
-        raise ValueError(f"cache 行列数必须是 10，当前为 {len(fields)}")
+    fields = _coerce_row_fields(row)
+    if len(fields) != CACHE_ROW_FIELD_COUNT:
+        raise ValueError(
+            f"cache 行列数必须是 {CACHE_ROW_FIELD_COUNT} 列，当前为 {len(fields)} 列"
+        )
     return tuple(str(field) for field in fields)  # type: ignore[return-value]
+
+
+def _normalize_rows(rows: Sequence[Any], *, source: str) -> List[CacheRow]:
+    normalized: List[CacheRow] = []
+    for index, row in enumerate(rows, start=1):
+        try:
+            normalized.append(_normalize_row(row))
+        except ValueError as exc:
+            raise ValueError(f"{source}[{index}] 非法: {exc}") from exc
+    return normalized
 
 
 def _structural_key(row: CacheRow) -> Tuple[str, ...]:
@@ -92,10 +113,10 @@ def build_cache_diff(
     unbound_after: list,
     triggered: bool,
 ) -> dict:
-    bind9_before_rows = [_normalize_row(row) for row in bind9_before]
-    bind9_after_rows = [_normalize_row(row) for row in bind9_after]
-    unbound_before_rows = [_normalize_row(row) for row in unbound_before]
-    unbound_after_rows = [_normalize_row(row) for row in unbound_after]
+    bind9_before_rows = _normalize_rows(bind9_before, source="bind9_before")
+    bind9_after_rows = _normalize_rows(bind9_after, source="bind9_after")
+    unbound_before_rows = _normalize_rows(unbound_before, source="unbound_before")
+    unbound_after_rows = _normalize_rows(unbound_after, source="unbound_after")
 
     payload: Mapping[str, Any] = {
         "cache_delta_triggered": bool(triggered),

@@ -97,6 +97,73 @@ def _oracle_parse_incomplete(statuses: Mapping[str, Optional[str]]) -> bool:
     return any(status != "ok" for status in statuses.values())
 
 
+def _sample_failure(sample_meta: Mapping[str, Any]) -> Mapping[str, Any]:
+    failure = sample_meta.get("failure")
+    if isinstance(failure, Mapping):
+        return failure
+    return {}
+
+
+def _failure_text_field(failure: Mapping[str, Any], field: str) -> Optional[str]:
+    value = failure.get(field)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _replay_failure_reason(failure: Mapping[str, Any]) -> Optional[str]:
+    reason = _failure_text_field(failure, "reason")
+    if reason:
+        return reason
+
+    message = _failure_text_field(failure, "message") or ""
+    returncode = failure.get("returncode")
+    if returncode in (124, 137) or "超时" in message:
+        return "timeout"
+    if _failure_text_field(failure, "artifact_path") or "未生成有效文件" in message:
+        return "missing_artifact"
+    if _failure_text_field(failure, "executable_path") or any(
+        token in message for token in ("不可执行", "缺少可执行文件")
+    ):
+        return "missing_executable"
+    return None
+
+
+def _replay_failure_label(failure: Mapping[str, Any]) -> Optional[str]:
+    reason = _replay_failure_reason(failure)
+    if reason is None:
+        return None
+    return {
+        "timeout": "replay_timeout",
+        "missing_artifact": "replay_missing_artifact",
+        "missing_executable": "replay_missing_executable",
+        "subprocess_failed": "replay_subprocess_failed",
+        "subprocess_launch_error": "replay_subprocess_launch_error",
+    }.get(reason)
+
+
+def _replay_failure_note(failure: Mapping[str, Any]) -> Optional[str]:
+    reason = _replay_failure_reason(failure)
+    if reason is None:
+        return None
+
+    parts: List[str] = [f"reason={reason}"]
+    for field in (
+        "stage",
+        "resolver",
+        "artifact_path",
+        "stderr_path",
+        "executable_path",
+    ):
+        value = _failure_text_field(failure, field)
+        if value is not None:
+            parts.append(f"{field}={value}")
+    returncode = failure.get("returncode")
+    if isinstance(returncode, int):
+        parts.append(f"returncode={returncode}")
+    return "replay 失败证据: " + ", ".join(parts)
+
+
 def _oracle_diff_fields(oracle: Mapping[str, Any]) -> List[str]:
     differing_fields: List[str] = []
     for field in ORACLE_FIELDS:
@@ -176,6 +243,7 @@ def _rewrite_filter_labels(
     oracle: Mapping[str, Any],
     cache_diff: Mapping[str, Any],
     fingerprint: Mapping[str, Any],
+    sample_meta: Mapping[str, Any],
 ) -> List[str]:
     labels: List[str] = []
     triage_branch = _classify_triage_branch(
@@ -187,9 +255,12 @@ def _rewrite_filter_labels(
     cache_delta_triggered = bool(cache_diff.get("cache_delta_triggered"))
     interesting_delta_count = _cache_interesting_delta_count(cache_diff)
     bind9_forwarding_path, unbound_forwarding_path = _forwarding_pair(fingerprint)
+    replay_failure_label = _replay_failure_label(_sample_failure(sample_meta))
 
     if triage_branch == "oracle_missing":
         _append_filter_label(labels, "oracle_missing")
+        if replay_failure_label is not None:
+            _append_filter_label(labels, replay_failure_label)
     elif triage_branch == "oracle_parse_incomplete":
         _append_filter_label(labels, "oracle_parse_incomplete")
     elif triage_branch == "oracle_diff":
@@ -259,12 +330,14 @@ def build_triage(
     oracle: dict,
     cache_diff: dict,
     fingerprint: dict,
+    sample_meta: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     statuses = _oracle_statuses(oracle)
     cache_delta_triggered = bool(cache_diff.get("cache_delta_triggered"))
     cache_has_diff = _cache_has_diff(cache_diff)
     interesting_delta_count = _cache_interesting_delta_count(cache_diff)
     bind9_forwarding_path, unbound_forwarding_path = _forwarding_pair(fingerprint)
+    sample_failure = _sample_failure(sample_meta or {})
     forwarding_mismatch = (
         bind9_forwarding_path is not None
         and unbound_forwarding_path is not None
@@ -279,7 +352,13 @@ def build_triage(
         status = "failed_replay"
         diff_class = "replay_incomplete"
         filter_labels.append("oracle_missing")
+        replay_failure_label = _replay_failure_label(sample_failure)
+        if replay_failure_label is not None:
+            filter_labels.append(replay_failure_label)
         notes.append("oracle.json 缺失，当前样本按 replay 失败处理")
+        replay_failure_note = _replay_failure_note(sample_failure)
+        if replay_failure_note is not None:
+            notes.append(replay_failure_note)
         needs_manual_review = True
     elif _oracle_parse_incomplete(statuses):
         status = "failed_parse"
@@ -365,6 +444,7 @@ def rewrite_triage_payload(
     oracle: Optional[Mapping[str, Any]] = None,
     cache_diff: Optional[Mapping[str, Any]] = None,
     fingerprint: Optional[Mapping[str, Any]] = None,
+    sample_meta: Optional[Mapping[str, Any]] = None,
     existing_triage: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     resolved_oracle = (
@@ -382,6 +462,11 @@ def rewrite_triage_payload(
         if fingerprint is not None
         else _load_json_artifact(sample_dir / "state_fingerprint.json")
     )
+    resolved_sample_meta = (
+        dict(sample_meta)
+        if sample_meta is not None
+        else _load_json_artifact(sample_dir / "sample.meta.json")
+    )
     resolved_existing_triage = (
         dict(existing_triage)
         if existing_triage is not None
@@ -391,6 +476,7 @@ def rewrite_triage_payload(
     sample_id = _resolve_sample_id(
         sample_dir,
         resolved_existing_triage,
+        resolved_sample_meta,
         resolved_oracle,
         resolved_cache_diff,
         resolved_fingerprint,
@@ -400,34 +486,28 @@ def rewrite_triage_payload(
         resolved_oracle,
         resolved_cache_diff,
         resolved_fingerprint,
+        sample_meta=resolved_sample_meta,
     )
 
     payload: Dict[str, Any] = dict(rebuilt_triage)
     payload.update(resolved_existing_triage)
 
-    status_value = payload.get("status")
-    status = (
-        status_value
-        if isinstance(status_value, str) and status_value
-        else rebuilt_triage["status"]
-    )
-    diff_class_value = payload.get("diff_class")
-    diff_class = (
-        diff_class_value
-        if isinstance(diff_class_value, str) and diff_class_value
-        else rebuilt_triage["diff_class"]
-    )
+    status = rebuilt_triage["status"]
+    diff_class = rebuilt_triage["diff_class"]
     filter_labels = _rewrite_filter_labels(
         status=status,
         diff_class=diff_class,
         oracle=resolved_oracle,
         cache_diff=resolved_cache_diff,
         fingerprint=resolved_fingerprint,
+        sample_meta=resolved_sample_meta,
     )
     bind9_forwarding_path, unbound_forwarding_path = _forwarding_pair(
         resolved_fingerprint
     )
 
+    payload["status"] = status
+    payload["diff_class"] = diff_class
     payload["filter_labels"] = filter_labels
     payload["cluster_key"] = _build_cluster_key(
         status=status,
@@ -436,7 +516,10 @@ def rewrite_triage_payload(
         bind9_forwarding_path=bind9_forwarding_path,
         unbound_forwarding_path=unbound_forwarding_path,
     )
+    payload["cache_delta_triggered"] = rebuilt_triage["cache_delta_triggered"]
+    payload["interesting_delta_count"] = rebuilt_triage["interesting_delta_count"]
     payload["needs_manual_review"] = rebuilt_triage["needs_manual_review"]
+    payload["notes"] = list(rebuilt_triage["notes"])
 
     for field in TRIAGE_REQUIRED_FIELDS:
         payload.setdefault(field, None)

@@ -13,9 +13,11 @@ from .io import atomic_write_json, load_state_file, save_state_file
 from .oracle import ORACLE_FIELDS
 from .replay import ReplayError, replay_diff_cache
 from .schema import (
+    build_follow_diff_state_payload,
     build_sample_meta_payload,
     build_state_fingerprint_payload,
     utc_timestamp,
+    validate_follow_diff_state_fields,
 )
 from .triage import build_triage
 
@@ -23,6 +25,10 @@ EXIT_USAGE = 2
 FOLLOW_DIFF_STATE_SCHEMA_VERSION = 1
 DEFAULT_FOLLOW_DIFF_INTERVAL_SEC = 60.0
 FOLLOW_DIFF_STATE_FILE_NAME = "follow_diff.state.json"
+DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = Path("unbound_experiment") / "work_stateful"
+DEFAULT_BIND9_WORK_DIR_RELATIVE = Path("named_experiment") / "work"
+DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = Path("afl_out") / "master" / "queue"
+FOLLOW_DIFF_OUTPUT_DIR_NAME = "follow_diff"
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -76,14 +82,14 @@ class FollowDiffState:
     failed_count: int = 0
 
     def to_payload(self) -> Dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "last_scan_ts": self.last_scan_ts,
-            "last_queue_event_id": self.last_queue_event_id,
-            "running_sample_id": self.running_sample_id,
-            "completed_count": self.completed_count,
-            "failed_count": self.failed_count,
-        }
+        return build_follow_diff_state_payload(
+            schema_version=self.schema_version,
+            last_scan_ts=self.last_scan_ts,
+            last_queue_event_id=self.last_queue_event_id,
+            running_sample_id=self.running_sample_id,
+            completed_count=self.completed_count,
+            failed_count=self.failed_count,
+        )
 
 
 @dataclass(frozen=True)
@@ -99,26 +105,94 @@ def _resolve_root_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def default_follow_diff_work_dir(root_dir: Optional[Path] = None) -> Path:
+    base_root = _resolve_root_dir() if root_dir is None else Path(root_dir)
+    return (
+        base_root.expanduser().resolve() / DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE
+    ).resolve()
+
+
+def resolve_follow_diff_work_dir(
+    *,
+    root_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env = os.environ if environ is None else environ
+    env_work_dir = env.get("WORK_DIR")
+    if env_work_dir:
+        return Path(env_work_dir).expanduser().resolve()
+    return default_follow_diff_work_dir(root_dir)
+
+
+def default_bind9_work_dir(root_dir: Optional[Path] = None) -> Path:
+    base_root = _resolve_root_dir() if root_dir is None else Path(root_dir)
+    return (
+        base_root.expanduser().resolve() / DEFAULT_BIND9_WORK_DIR_RELATIVE
+    ).resolve()
+
+
+def resolve_bind9_work_dir(
+    *,
+    root_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env = os.environ if environ is None else environ
+    env_bind9_work_dir = env.get("BIND9_WORK_DIR")
+    if env_bind9_work_dir:
+        return Path(env_bind9_work_dir).expanduser().resolve()
+
+    env_work_dir = env.get("WORK_DIR")
+    if env_work_dir:
+        return Path(env_work_dir).expanduser().resolve()
+
+    return default_bind9_work_dir(root_dir)
+
+
+def default_follow_diff_source_dir(bind9_work_dir: Path) -> Path:
+    return (
+        Path(bind9_work_dir).expanduser().resolve()
+        / DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE
+    ).resolve()
+
+
+def resolve_follow_diff_source_dir(
+    *,
+    root_dir: Optional[Path] = None,
+    bind9_work_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env = os.environ if environ is None else environ
+    env_source_dir = env.get("FOLLOW_DIFF_SOURCE_DIR")
+    if env_source_dir:
+        return Path(env_source_dir).expanduser().resolve()
+
+    resolved_bind9_work_dir = resolve_bind9_work_dir(
+        root_dir=root_dir,
+        environ=env,
+    )
+    if bind9_work_dir is not None:
+        resolved_bind9_work_dir = Path(bind9_work_dir).expanduser().resolve()
+    return default_follow_diff_source_dir(resolved_bind9_work_dir)
+
+
+def default_follow_diff_output_root(work_dir: Path) -> Path:
+    return (
+        Path(work_dir).expanduser().resolve() / FOLLOW_DIFF_OUTPUT_DIR_NAME
+    ).resolve()
+
+
 def _collect_config() -> FollowDiffConfig:
     root_dir = _resolve_root_dir()
-    work_dir = Path(
-        os.environ.get(
-            "WORK_DIR", str(root_dir / "unbound_experiment" / "work_stateful")
-        )
-    ).expanduser()
-    source_dir = Path(
-        os.environ.get(
-            "FOLLOW_DIFF_SOURCE_DIR", str(work_dir / "afl_out" / "master" / "queue")
-        )
-    ).expanduser()
+    work_dir = resolve_follow_diff_work_dir(root_dir=root_dir)
+    source_dir = resolve_follow_diff_source_dir(root_dir=root_dir)
 
     if source_dir.exists() and not source_dir.is_dir():
         raise FollowDiffError(f"FOLLOW_DIFF_SOURCE_DIR 不存在或不是目录: {source_dir}")
 
     return FollowDiffConfig(
-        work_dir=work_dir.resolve(),
-        source_dir=source_dir.resolve(),
-        output_root=(work_dir / "follow_diff").resolve(),
+        work_dir=work_dir,
+        source_dir=source_dir,
+        output_root=default_follow_diff_output_root(work_dir),
     )
 
 
@@ -262,6 +336,7 @@ def _write_triage_artifact(*, sample_dir: Path, sample_id: str) -> Path:
         _load_json_object(sample_dir / "oracle.json"),
         _load_json_object(sample_dir / CACHE_DIFF_FILE),
         _load_json_object(sample_dir / "state_fingerprint.json"),
+        sample_meta=_load_json_object(sample_dir / "sample.meta.json"),
     )
     return atomic_write_json(sample_dir / TRIAGE_FILE, payload)
 
@@ -312,7 +387,13 @@ def _load_follow_diff_state(state_path: Path) -> FollowDiffState:
 
 
 def _save_follow_diff_state(state_path: Path, state: FollowDiffState) -> Path:
-    return save_state_file(state_path, state.to_payload())
+    payload = state.to_payload()
+    errors = validate_follow_diff_state_fields(payload)
+    if errors:
+        raise FollowDiffError(
+            "内部错误：follow-diff 状态文件 payload 非法: " + "; ".join(errors)
+        )
+    return save_state_file(state_path, payload)
 
 
 def _resolve_follow_diff_interval_sec() -> float:
@@ -407,10 +488,10 @@ def _merge_meta_payload(
         if parsed_tags:
             afl_tags = parsed_tags
 
-    if failure is None:
-        base.pop("failure", None)
-    else:
+    if failure is not None:
         base["failure"] = dict(failure)
+    elif status != STATUS_FAILED:
+        base.pop("failure", None)
 
     return build_sample_meta_payload(
         sample_id=sample_id,
@@ -698,11 +779,7 @@ def _process_one_sample(
             sample_size=sample_size,
             status=STATUS_FAILED,
             base_payload=_load_json_object(sample_dir / "sample.meta.json"),
-            failure={
-                "kind": "replay_error",
-                "message": str(exc),
-                "exit_code": exc.exit_code,
-            },
+            failure=exc.to_failure_payload(),
         )
         _write_cache_diff_artifact(
             sample_dir=sample_dir,
@@ -932,7 +1009,25 @@ def follow_diff_once() -> int:
     config = _collect_config()
     config.output_root.mkdir(parents=True, exist_ok=True)
 
-    result = _consume_queue_entries(config)
+    state_path = _follow_diff_state_path(config)
+    state = _load_follow_diff_state(state_path)
+    _save_follow_diff_state(state_path, state)
+
+    recovered_sample_id = _recover_running_sample(
+        config,
+        state=state,
+        state_path=state_path,
+    )
+    skip_sample_ids: Sequence[str] = (
+        (recovered_sample_id,) if recovered_sample_id is not None else ()
+    )
+
+    result = _consume_queue_entries(
+        config,
+        state=state,
+        state_path=state_path,
+        skip_sample_ids=skip_sample_ids,
+    )
     _backfill_existing_sample_contracts(config)
     _write_summary("follow-diff-once 完成", result.summary)
     return 0
@@ -940,6 +1035,13 @@ def follow_diff_once() -> int:
 
 __all__ = [
     "FollowDiffError",
+    "default_bind9_work_dir",
+    "default_follow_diff_output_root",
+    "default_follow_diff_source_dir",
+    "default_follow_diff_work_dir",
     "follow_diff",
     "follow_diff_once",
+    "resolve_bind9_work_dir",
+    "resolve_follow_diff_source_dir",
+    "resolve_follow_diff_work_dir",
 ]

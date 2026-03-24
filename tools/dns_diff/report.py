@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from .follow_diff import default_follow_diff_output_root, resolve_follow_diff_work_dir
 from .io import load_json_with_fallback
 
 EXIT_USAGE = 2
@@ -22,33 +23,50 @@ def _resolve_root_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _resolve_work_dir() -> Path:
-    root_dir = _resolve_root_dir()
-    return (
-        Path(
-            os.environ.get(
-                "WORK_DIR", str(root_dir / "unbound_experiment" / "work_stateful")
-            )
-        )
-        .expanduser()
-        .resolve()
+def _resolve_work_dir(
+    *,
+    work_dir: Optional[Path] = None,
+    root_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    if work_dir is not None:
+        return Path(work_dir).expanduser().resolve()
+
+    effective_root_dir = _resolve_root_dir() if root_dir is None else Path(root_dir)
+    return resolve_follow_diff_work_dir(
+        root_dir=effective_root_dir.expanduser().resolve(),
+        environ=environ,
     )
 
 
-def default_follow_diff_root() -> Path:
-    return (_resolve_work_dir() / "follow_diff").resolve()
+def default_follow_diff_root(*, work_dir: Optional[Path] = None) -> Path:
+    return default_follow_diff_output_root(_resolve_work_dir(work_dir=work_dir))
 
 
-def resolve_high_value_manifest_path(root: Path) -> Path:
+def default_high_value_manifest_path(
+    root: Path,
+    *,
+    work_dir: Optional[Path] = None,
+) -> Path:
     root_path = Path(root).expanduser().resolve()
-    if root_path != default_follow_diff_root():
-        return (root_path / "high_value_samples.txt").resolve()
+    resolved_work_dir = _resolve_work_dir(work_dir=work_dir)
+    if root_path == default_follow_diff_root(work_dir=resolved_work_dir):
+        return (resolved_work_dir / "high_value_samples.txt").resolve()
+    return (root_path / "high_value_samples.txt").resolve()
 
-    env_manifest = os.environ.get("SYMCC_HIGH_VALUE_MANIFEST")
+
+def resolve_high_value_manifest_path(
+    root: Path,
+    *,
+    work_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env = os.environ if environ is None else environ
+    env_manifest = env.get("SYMCC_HIGH_VALUE_MANIFEST")
     if env_manifest:
         return Path(env_manifest).expanduser().resolve()
 
-    return (_resolve_work_dir() / "high_value_samples.txt").resolve()
+    return default_high_value_manifest_path(root, work_dir=work_dir)
 
 
 def _coerce_text(value: Any, fallback: str) -> str:
@@ -64,8 +82,18 @@ def _coerce_labels(value: Any) -> List[str]:
     return []
 
 
+def _is_sample_dir(path: Path) -> bool:
+    candidate = Path(path)
+    if not candidate.is_dir():
+        return False
+
+    return (candidate / "triage.json").is_file() or (
+        candidate / "sample.meta.json"
+    ).is_file()
+
+
 def _iter_sample_dirs(root: Path) -> Iterable[Path]:
-    return sorted(path for path in root.iterdir() if path.is_dir())
+    return sorted(path for path in root.iterdir() if _is_sample_dir(path))
 
 
 def _load_triage_payload(sample_dir: Path) -> Dict[str, Any]:
@@ -123,16 +151,32 @@ def _write_high_value_manifest(
     root: Path,
     *,
     high_value_paths: List[Path],
-) -> Optional[Path]:
+) -> Path:
     manifest_path = resolve_high_value_manifest_path(root)
     try:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        lines = [str(p.resolve()) for p in sorted(high_value_paths)]
-        manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines: List[str] = []
+        seen_paths = set()
+        for candidate in sorted(high_value_paths):
+            resolved_path = candidate.expanduser().resolve()
+            if not resolved_path.is_file():
+                continue
+
+            resolved_text = str(resolved_path)
+            if resolved_text in seen_paths:
+                continue
+
+            seen_paths.add(resolved_text)
+            lines.append(resolved_text)
+
+        content = "\n".join(lines)
+        if content:
+            content += "\n"
+
+        manifest_path.write_text(content, encoding="utf-8")
         return manifest_path
     except Exception as exc:
-        sys.stderr.write(f"dns-diff: 写入 high_value_samples.txt 失败: {exc}\n")
-        return None
+        raise ReportError(f"写入 high_value_samples.txt 失败: {exc}") from exc
 
 
 def _write_triage_report_md(
@@ -202,10 +246,10 @@ def generate_report(root: Path) -> int:
 
         if payload.get("needs_manual_review"):
             sample_path = sample_dir / "sample.bin"
-            if not sample_path.exists():
+            if not sample_path.is_file():
                 sample_path = sample_dir / "transcript"
 
-            if sample_path.exists():
+            if sample_path.is_file():
                 high_value_paths.append(sample_path)
 
     _write_cluster_summary(
@@ -238,6 +282,7 @@ def generate_report(root: Path) -> int:
 
 __all__ = [
     "ReportError",
+    "default_high_value_manifest_path",
     "default_follow_diff_root",
     "generate_report",
     "resolve_high_value_manifest_path",

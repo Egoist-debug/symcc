@@ -17,9 +17,54 @@ EXIT_ARTIFACT = 5
 
 
 class ReplayError(RuntimeError):
-    def __init__(self, message: str, *, exit_code: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int,
+        reason: Optional[str] = None,
+        stage: Optional[str] = None,
+        resolver: Optional[str] = None,
+        artifact_path: Optional[str] = None,
+        stderr_path: Optional[str] = None,
+        executable_path: Optional[str] = None,
+        returncode: Optional[int] = None,
+        process_started: Optional[bool] = None,
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.reason = reason
+        self.stage = stage
+        self.resolver = resolver
+        self.artifact_path = artifact_path
+        self.stderr_path = stderr_path
+        self.executable_path = executable_path
+        self.returncode = returncode
+        self.process_started = process_started
+
+    def to_failure_payload(self) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "kind": "replay_error",
+            "message": str(self),
+            "exit_code": self.exit_code,
+        }
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.stage is not None:
+            payload["stage"] = self.stage
+        if self.resolver is not None:
+            payload["resolver"] = self.resolver
+        if self.artifact_path is not None:
+            payload["artifact_path"] = self.artifact_path
+        if self.stderr_path is not None:
+            payload["stderr_path"] = self.stderr_path
+        if self.executable_path is not None:
+            payload["executable_path"] = self.executable_path
+        if self.returncode is not None:
+            payload["returncode"] = self.returncode
+        if self.process_started is not None:
+            payload["process_started"] = self.process_started
+        return payload
 
 
 @dataclass(frozen=True)
@@ -71,6 +116,15 @@ def _parse_positive_int(env_key: str, default: int) -> int:
     return value
 
 
+def _resolver_from_stage(stage: Optional[str]) -> Optional[str]:
+    if stage is None or "." not in stage:
+        return None
+    resolver, _ = stage.split(".", 1)
+    if resolver in {"bind9", "unbound"}:
+        return resolver
+    return None
+
+
 def _require_file(path: Path, *, message: str, exit_code: int) -> Path:
     if not path.is_file():
         raise ReplayError(message, exit_code=exit_code)
@@ -83,10 +137,17 @@ def _require_dir(path: Path, *, message: str, exit_code: int) -> Path:
     return path
 
 
-def _require_executable(path: Path, *, message: str) -> Path:
-    _require_file(path, message=message, exit_code=EXIT_DEPENDENCY)
-    if not os.access(path, os.X_OK):
-        raise ReplayError(message, exit_code=EXIT_DEPENDENCY)
+def _require_executable(path: Path, *, message: str, resolver: str) -> Path:
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ReplayError(
+            message,
+            exit_code=EXIT_DEPENDENCY,
+            reason="missing_executable",
+            stage=f"{resolver}.preflight",
+            resolver=resolver,
+            executable_path=str(path),
+            process_started=False,
+        )
     return path
 
 
@@ -188,6 +249,7 @@ def _run_stage(
     ok_returncodes: Sequence[int],
 ) -> None:
     stdin_handle = None
+    resolver = _resolver_from_stage(stage)
     try:
         if stdin_file is None:
             completed = subprocess.run(
@@ -210,10 +272,24 @@ def _run_stage(
             )
     except FileNotFoundError as exc:
         raise ReplayError(
-            f"子进程缺少可执行文件: {exc.filename}", exit_code=EXIT_DEPENDENCY
+            f"子进程缺少可执行文件: {exc.filename}",
+            exit_code=EXIT_DEPENDENCY,
+            reason="missing_executable",
+            stage=stage,
+            resolver=resolver,
+            executable_path=exc.filename,
+            process_started=False,
         ) from exc
     except OSError as exc:
-        raise ReplayError(f"子进程执行失败: {exc}", exit_code=EXIT_SUBPROCESS) from exc
+        raise ReplayError(
+            f"子进程执行失败: {exc}",
+            exit_code=EXIT_SUBPROCESS,
+            reason="subprocess_launch_error",
+            stage=stage,
+            resolver=resolver,
+            executable_path=str(command[0]) if command else None,
+            process_started=False,
+        ) from exc
     finally:
         if stdin_handle is not None:
             stdin_handle.close()
@@ -224,19 +300,38 @@ def _run_stage(
         return
     if completed.returncode in (124, 137):
         raise ReplayError(
-            f"{stage} 超时，退出码={completed.returncode}", exit_code=EXIT_SUBPROCESS
+            f"{stage} 超时，退出码={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+            reason="timeout",
+            stage=stage,
+            resolver=resolver,
+            stderr_path=stderr_path.name,
+            returncode=completed.returncode,
+            process_started=True,
         )
     raise ReplayError(
         f"{stage} 失败，退出码={completed.returncode}（详见 {stderr_path}）",
         exit_code=EXIT_SUBPROCESS,
+        reason="subprocess_failed",
+        stage=stage,
+        resolver=resolver,
+        stderr_path=stderr_path.name,
+        returncode=completed.returncode,
+        process_started=True,
     )
 
 
-def _ensure_nonempty_file(path: Path, *, stage: str) -> None:
+def _ensure_nonempty_file(path: Path, *, stage: str, stderr_path: Path) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise ReplayError(
             f"{stage} 未生成有效文件: {path}",
             exit_code=EXIT_ARTIFACT,
+            reason="missing_artifact",
+            stage=stage,
+            resolver=_resolver_from_stage(stage),
+            artifact_path=path.name,
+            stderr_path=stderr_path.name,
+            process_started=True,
         )
 
 
@@ -297,10 +392,12 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
     _require_executable(
         paths.unbound_binary,
         message=f"缺少 Unbound AFL 目标或不可执行: {paths.unbound_binary}",
+        resolver="unbound",
     )
     _require_executable(
         paths.bind9_binary,
         message=f"缺少 BIND9 named 目标或不可执行: {paths.bind9_binary}",
+        resolver="bind9",
     )
     _require_dir(
         paths.response_corpus_dir,
@@ -335,7 +432,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
         stderr_path=paths.unbound_stderr,
         ok_returncodes=(0, 1),
     )
-    _ensure_nonempty_file(paths.unbound_before_cache, stage="unbound.before")
+    _ensure_nonempty_file(
+        paths.unbound_before_cache,
+        stage="unbound.before",
+        stderr_path=paths.unbound_stderr,
+    )
 
     bind9_before_env = dict(bind9_env)
     bind9_before_env["NAMED_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
@@ -357,7 +458,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
         stderr_path=paths.bind9_stderr,
         ok_returncodes=(0,),
     )
-    _ensure_nonempty_file(paths.bind9_before_cache, stage="bind9.before")
+    _ensure_nonempty_file(
+        paths.bind9_before_cache,
+        stage="bind9.before",
+        stderr_path=paths.bind9_stderr,
+    )
 
     unbound_after_env = dict(unbound_env)
     unbound_after_env["UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
@@ -371,7 +476,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
         stderr_path=paths.unbound_stderr,
         ok_returncodes=(0, 1),
     )
-    _ensure_nonempty_file(paths.unbound_after_cache, stage="unbound.after")
+    _ensure_nonempty_file(
+        paths.unbound_after_cache,
+        stage="unbound.after",
+        stderr_path=paths.unbound_stderr,
+    )
 
     bind9_after_env = dict(bind9_env)
     bind9_after_env["NAMED_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
@@ -393,7 +502,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
         stderr_path=paths.bind9_stderr,
         ok_returncodes=(0,),
     )
-    _ensure_nonempty_file(paths.bind9_after_cache, stage="bind9.after")
+    _ensure_nonempty_file(
+        paths.bind9_after_cache,
+        stage="bind9.after",
+        stderr_path=paths.bind9_stderr,
+    )
 
     sample_sha1 = _sample_sha1(paths.sample_bin)
     meta_payload = stamp_with_shared_meta(

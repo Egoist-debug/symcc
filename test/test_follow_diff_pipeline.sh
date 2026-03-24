@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-follow-diff-pipeline.XXXXXX")"
 QUEUE_DIR="$WORKDIR/work/afl_out/master/queue"
 FOLLOW_ROOT="$WORKDIR/work/follow_diff"
+STATE_FILE="$WORKDIR/work/follow_diff.state.json"
+FIRST_SEEN_SNAPSHOT="$WORKDIR/first-seen.snapshot"
 export PYTHONDONTWRITEBYTECODE=1
 
 cleanup() {
@@ -55,6 +57,35 @@ assert_file_exists "$LEGACY_SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$LEGACY_SAMPLE_DIR/state_fingerprint.json"
 assert_file_exists "$LEGACY_SAMPLE_DIR/cache_diff.json"
 assert_file_exists "$LEGACY_SAMPLE_DIR/triage.json"
+assert_file_exists "$STATE_FILE"
+
+python3 - "$STATE_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+for field in (
+    "schema_version",
+    "last_scan_ts",
+    "last_queue_event_id",
+    "running_sample_id",
+    "completed_count",
+    "failed_count",
+):
+    if field not in state:
+        raise SystemExit(f"ASSERT FAIL: follow_diff.state.json 缺少字段 {field}")
+
+if state.get("schema_version") != 1:
+    raise SystemExit("ASSERT FAIL: schema_version 应为 1")
+if not isinstance(state.get("last_scan_ts"), str) or not state["last_scan_ts"]:
+    raise SystemExit("ASSERT FAIL: last_scan_ts 应为非空字符串")
+if state.get("running_sample_id") not in (None, ""):
+    raise SystemExit("ASSERT FAIL: 当前场景 running_sample_id 应为空")
+if state.get("last_queue_event_id") not in (None, ""):
+    raise SystemExit("ASSERT FAIL: queue 为空时 last_queue_event_id 应为空")
+PY
 
 mkdir -p "$QUEUE_DIR"
 QUEUE_FILE="$QUEUE_DIR/id:000001,orig:seed"
@@ -183,19 +214,56 @@ sample_id = sys.argv[2]
 PY
 
 run_cli follow-diff-once >/dev/null
-run_cli follow-diff-once >/dev/null
 
-python3 - "$COMPLETED_DIR/sample.meta.json" "$SAMPLE_ID" <<'PY'
+python3 - "$COMPLETED_DIR/sample.meta.json" "$SAMPLE_ID" "$FIRST_SEEN_SNAPSHOT" <<'PY'
 import json
 import pathlib
 import sys
 
 meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 sample_id = sys.argv[2]
+snapshot_path = pathlib.Path(sys.argv[3])
+
 if meta.get("sample_id") != sample_id:
     raise SystemExit("ASSERT FAIL: sample_id 被错误改写")
 if meta.get("status") != "completed":
     raise SystemExit("ASSERT FAIL: completed 状态未保持")
+
+first_seen_ts = meta.get("first_seen_ts")
+if not isinstance(first_seen_ts, str) or not first_seen_ts:
+    raise SystemExit("ASSERT FAIL: first_seen_ts 应为非空字符串")
+
+snapshot_path.write_text(first_seen_ts + "\n", encoding="utf-8")
+PY
+
+run_cli follow-diff-once >/dev/null
+
+python3 - "$COMPLETED_DIR/sample.meta.json" "$SAMPLE_ID" "$STATE_FILE" "$QUEUE_FILE" "$FIRST_SEEN_SNAPSHOT" <<'PY'
+import json
+import pathlib
+import sys
+
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+sample_id = sys.argv[2]
+state = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+queue_event_id = pathlib.Path(sys.argv[4]).name
+first_seen_before = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").strip()
+
+if meta.get("sample_id") != sample_id:
+    raise SystemExit("ASSERT FAIL: sample_id 被错误改写")
+if meta.get("status") != "completed":
+    raise SystemExit("ASSERT FAIL: completed 状态未保持")
+if meta.get("first_seen_ts") != first_seen_before:
+    raise SystemExit("ASSERT FAIL: first_seen_ts 在二次 follow-diff-once 后发生变化")
+
+if state.get("schema_version") != 1:
+    raise SystemExit("ASSERT FAIL: state.schema_version 应为 1")
+if not isinstance(state.get("last_scan_ts"), str) or not state["last_scan_ts"]:
+    raise SystemExit("ASSERT FAIL: state.last_scan_ts 应为非空字符串")
+if state.get("running_sample_id") not in (None, ""):
+    raise SystemExit("ASSERT FAIL: state.running_sample_id 应为空")
+if state.get("last_queue_event_id") != queue_event_id:
+    raise SystemExit("ASSERT FAIL: state.last_queue_event_id 应指向最新 queue 样本")
 PY
 
 run_cli triage-report >/dev/null

@@ -93,7 +93,14 @@ def _cmd_campaign_report(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python3 -m tools.dns_diff.cli")
+    parser = argparse.ArgumentParser(
+        prog="python3 -m tools.dns_diff.cli",
+        description=(
+            "dns-diff Python 真入口；thin wrapper 仅转发 parse-cache、"
+            "replay-diff-cache、follow-diff、follow-diff-once、triage-report、"
+            "campaign-report，triage/report 仅通过 Python CLI 直调。"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     follow_diff = subparsers.add_parser("follow-diff", help="跟随 queue 进行差分消费")

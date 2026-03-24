@@ -39,6 +39,18 @@ env \
 assert_file_contains "$HELP_OUT" "follow-diff-once"
 assert_file_contains "$HELP_OUT" "parse-cache"
 
+REMOVED_ERR="$WORKDIR/removed-command.err"
+if env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	WORK_DIR="$WORKDIR/work" \
+	SRC_TREE="$ROOT_DIR" \
+	"$WRAPPER" run >/dev/null 2>"$REMOVED_ERR"; then
+	printf 'ASSERT FAIL: 已移除厚命令 run 不应成功\n' >&2
+	exit 1
+fi
+assert_file_contains "$REMOVED_ERR" "命令 'run'"
+assert_file_contains "$REMOVED_ERR" "已从 thin wrapper 中移除"
+
 BIND_DUMP="$WORKDIR/bind.cache.txt"
 BIND_TSV="$WORKDIR/bind.norm.tsv"
 printf '%s\n' \

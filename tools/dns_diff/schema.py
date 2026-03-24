@@ -18,6 +18,15 @@ SAMPLE_META_REQUIRED_FIELDS: Sequence[str] = (
     "status",
 )
 
+FOLLOW_DIFF_STATE_REQUIRED_FIELDS: Sequence[str] = (
+    "schema_version",
+    "last_scan_ts",
+    "last_queue_event_id",
+    "running_sample_id",
+    "completed_count",
+    "failed_count",
+)
+
 STATE_FINGERPRINT_REQUIRED_FIELDS: Sequence[str] = (
     "bind9.forwarding_path",
     "bind9.retry_seen",
@@ -101,7 +110,11 @@ def build_sample_meta_payload(
         if isinstance(base_first_seen, str) and base_first_seen:
             first_seen_ts = base_first_seen
         else:
-            first_seen_ts = utc_timestamp()
+            base_generated_at = payload.get("generated_at")
+            if isinstance(base_generated_at, str) and base_generated_at:
+                first_seen_ts = base_generated_at
+            else:
+                first_seen_ts = utc_timestamp()
 
     payload.update(
         {
@@ -125,6 +138,28 @@ def build_sample_meta_payload(
     for field in SAMPLE_META_REQUIRED_FIELDS:
         stamped.setdefault(field, None)
     return stamped
+
+
+def build_follow_diff_state_payload(
+    *,
+    schema_version: int,
+    last_scan_ts: str,
+    last_queue_event_id: Optional[str],
+    running_sample_id: Optional[str],
+    completed_count: int,
+    failed_count: int,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "schema_version": schema_version,
+        "last_scan_ts": last_scan_ts,
+        "last_queue_event_id": last_queue_event_id,
+        "running_sample_id": running_sample_id,
+        "completed_count": completed_count,
+        "failed_count": failed_count,
+    }
+    for field in FOLLOW_DIFF_STATE_REQUIRED_FIELDS:
+        payload.setdefault(field, None)
+    return payload
 
 
 def build_state_fingerprint_payload(
@@ -217,17 +252,54 @@ def validate_state_fingerprint_fields(data: Mapping[str, Any]) -> List[str]:
     )
 
 
+def validate_follow_diff_state_fields(data: Mapping[str, Any]) -> List[str]:
+    errors: List[str] = []
+    for field in FOLLOW_DIFF_STATE_REQUIRED_FIELDS:
+        if field not in data:
+            errors.append(f"缺少必填字段: {field}")
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int) or schema_version < 1:
+        errors.append("schema_version 必须是 >=1 的整数")
+
+    last_scan_ts = data.get("last_scan_ts")
+    if not isinstance(last_scan_ts, str):
+        errors.append("last_scan_ts 必须是字符串")
+
+    last_queue_event_id = data.get("last_queue_event_id")
+    if last_queue_event_id is not None and (
+        not isinstance(last_queue_event_id, str) or not last_queue_event_id.strip()
+    ):
+        errors.append("last_queue_event_id 若提供则必须是非空字符串")
+
+    running_sample_id = data.get("running_sample_id")
+    if running_sample_id is not None and (
+        not isinstance(running_sample_id, str) or not running_sample_id.strip()
+    ):
+        errors.append("running_sample_id 若提供则必须是非空字符串")
+
+    for field in ("completed_count", "failed_count"):
+        value = data.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"{field} 必须是非负整数")
+
+    return errors
+
+
 __all__ = [
+    "FOLLOW_DIFF_STATE_REQUIRED_FIELDS",
     "FOLLOW_DIFF_STATUSES",
     "SCHEMA_VERSION",
     "SAMPLE_META_REQUIRED_FIELDS",
     "STATE_FINGERPRINT_REQUIRED_FIELDS",
+    "build_follow_diff_state_payload",
     "build_sample_meta_payload",
     "build_shared_meta",
     "build_state_fingerprint_payload",
     "is_shared_schema_valid",
     "stamp_with_shared_meta",
     "utc_timestamp",
+    "validate_follow_diff_state_fields",
     "validate_sample_meta_fields",
     "validate_shared_fields",
     "validate_state_fingerprint_fields",

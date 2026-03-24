@@ -4,7 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXP_DIR="$ROOT_DIR/unbound_experiment"
 PROFILE_DIR="$EXP_DIR/profiles"
-WORK_DIR="${WORK_DIR:-$EXP_DIR/work_stateful}"
+DEFAULT_WORK_DIR="$EXP_DIR/work_stateful"
+DEFAULT_BIND9_WORK_DIR="$ROOT_DIR/named_experiment/work"
+ENV_WORK_DIR="${WORK_DIR:-}"
+WORK_DIR="${ENV_WORK_DIR:-$DEFAULT_WORK_DIR}"
+BIND9_WORK_DIR="${BIND9_WORK_DIR:-${ENV_WORK_DIR:-$DEFAULT_BIND9_WORK_DIR}}"
+FOLLOW_DIFF_SOURCE_DIR="${FOLLOW_DIFF_SOURCE_DIR:-$BIND9_WORK_DIR/afl_out/master/queue}"
 SRC_TREE="${SRC_TREE:-$ROOT_DIR/unbound-1.24.2}"
 AFL_TREE="${AFL_TREE:-$ROOT_DIR/unbound-1.24.2-afl}"
 UNBOUND_TAG="${UNBOUND_TAG:-release-1.24.2}"
@@ -17,13 +22,13 @@ DNS_DIFF_CLI_TIMEOUT_GRACE_SEC="${DNS_DIFF_CLI_TIMEOUT_GRACE_SEC:-2}"
 BIND9_AFL_TREE="${BIND9_AFL_TREE:-$ROOT_DIR/bind-9.18.46-afl}"
 BIND9_NAMED_EXP="$ROOT_DIR/named_experiment"
 BIND9_NAMED_CONF_TEMPLATE="$BIND9_NAMED_EXP/runtime/named.conf"
-BIND9_WORK_DIR="${BIND9_WORK_DIR:-$ROOT_DIR/named_experiment/work}"
 BIND9_TARGET_ADDR="${BIND9_TARGET_ADDR:-127.0.0.1:55301}"
 BIND9_MUTATOR_ADDR="${BIND9_MUTATOR_ADDR:-127.0.0.1:55300}"
 
 RESPONSE_CORPUS_DIR="$WORK_DIR/response_corpus"
 CACHE_DUMP_DIR="$WORK_DIR/cache_dumps"
-SYMCC_HIGH_VALUE_MANIFEST="${SYMCC_HIGH_VALUE_MANIFEST:-$WORK_DIR/high_value_samples.txt}"
+REPORT_HIGH_VALUE_MANIFEST="$WORK_DIR/high_value_samples.txt"
+SYMCC_HIGH_VALUE_MANIFEST="${SYMCC_HIGH_VALUE_MANIFEST:-$REPORT_HIGH_VALUE_MANIFEST}"
 export SYMCC_HIGH_VALUE_MANIFEST
 
 usage() {
@@ -52,7 +57,8 @@ usage() {
 		'边界说明:' \
 		'  1. shell 仅保留命令路由、环境注入、路径检查、timeout 外壳与直接外部调用。' \
 		'  2. dns-diff 相关逻辑统一以 python3 -m tools.dns_diff.cli 为真入口。' \
-		'  3. 旧的 seed/build/explore/status 等业务编排已从本 wrapper 移除。'
+		'  3. 旧的 seed/build/explore/status 等业务编排已从本 wrapper 移除。' \
+		'  4. triage / report 仅保留在 Python 真入口，不再在 shell wrapper 暴露别名。'
 }
 
 log() {
@@ -150,6 +156,7 @@ forward_dns_diff_cli() {
 			PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 			ROOT_DIR="$ROOT_DIR" \
 			WORK_DIR="$WORK_DIR" \
+			FOLLOW_DIFF_SOURCE_DIR="$FOLLOW_DIFF_SOURCE_DIR" \
 			FUZZ_PROFILE="$FUZZ_PROFILE" \
 			BIND9_AFL_TREE="$BIND9_AFL_TREE" \
 			BIND9_NAMED_EXP="$BIND9_NAMED_EXP" \
@@ -169,6 +176,7 @@ forward_dns_diff_cli() {
 		PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 		ROOT_DIR="$ROOT_DIR" \
 		WORK_DIR="$WORK_DIR" \
+		FOLLOW_DIFF_SOURCE_DIR="$FOLLOW_DIFF_SOURCE_DIR" \
 		FUZZ_PROFILE="$FUZZ_PROFILE" \
 		BIND9_AFL_TREE="$BIND9_AFL_TREE" \
 		BIND9_NAMED_EXP="$BIND9_NAMED_EXP" \
@@ -250,7 +258,7 @@ dump_unbound_cache() {
 }
 
 reject_removed_command() {
-	die "命令 '$1' 已从 thin wrapper 中移除；请迁移到 Python/独立工具层，不再在 shell 中承载厚编排"
+	die "命令 '$1' 已从 thin wrapper 中移除；请迁移到 python3 -m tools.dns_diff.cli 或独立工具层，不再在 shell 中承载厚编排"
 }
 
 main() {
