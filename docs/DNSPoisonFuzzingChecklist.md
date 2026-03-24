@@ -94,17 +94,14 @@
 
 阶段 0 默认口径 (Frozen)：
 
-- **Ownership**: Python-first。`tools/dns_diff/` 负责所有 follower 状态机、样本分发与 diff 逻辑；shell 只保留环境变量注入、路径初始化、`timeout -k` 封装以及外部二进制调用。
+- **Ownership**: Python-first。`tools/dns_diff/` 负责所有 follower 状态机、样本分发与 diff 逻辑；shell 只保留环境变量注入、路径初始化与命令转发。闭环路径 `follow-diff-window` / `campaign-close` 的 deadline owner 固定在 Python，不允许 shell `timeout -k` 或 `DNS_DIFF_CLI_TIMEOUT_SEC` 接管。
 - **Producer Queue**: `named_experiment/work/afl_out/master/queue` (样本唯一来源)
 - **Follower Root**: `unbound_experiment/work_stateful/` (结果输出根目录)
 - **Isolation**: BIND9 Follower Replay 必须与 Producer 实例完全隔离，禁止复用 `WORK_DIR` 或端口 `55300/55301`。
 - **Sample Identity**: 必须遵循 `queue_event_id`, `sample_sha1`, `sample_id` 三元组标识约定。
-- **Timeout Budget**: 必须强制执行以下矩阵 (通过 `timeout -k` 验证)：
-  | 环节 | 软限制 (Timeout) | 硬限制 (Kill) | 备注 |
-  | :--- | :--- | :--- | :--- |
-  | Single Replay | 15s | 18s | 单 resolver 执行 |
-  | Pair Replay | 40s | 45s | 双 resolver + 基础分析 |
-  | Full Logic | 180s | 185s | `timeout -k 5 180` |
+- **Strict 1h Closure**: 正式闭环命令固定为 `python3 -m tools.dns_diff.cli campaign-close --budget-sec 3600`，或等价 wrapper 转发命令 `./unbound_experiment/run_unbound_afl_symcc.sh campaign-close --budget-sec 3600`。1 小时 deadline 由 Python `campaign-close` 持有，并固定写 summary 到 `WORK_DIR/campaign_close.summary.json`。
+- **Closure Success Rule**: 只有 `follow-diff-window -> triage-report -> campaign-report` 三阶段全部成功，且 `campaign_close.summary.json` 显示 `status=success`，才算闭环成功。task 5 和正式结论统一看 summary 与 exit code。
+- **Sample-level Timeouts**: 单样本 replay 仍可保留局部 timeout 防护，但它们只是阶段内部保护，不是 1 小时正式闭环 owner。
 - **Replay 稳定性判据**: 同一批 smoke 样本连续 3 次 replay 得到一致 oracle 结果与非空 cache dump
 - **Smoke 证据约定**: 每个 smoke 样本必须包含：
   1. `transcript` 原始输入
@@ -304,58 +301,76 @@
 
 目标：
 
-- 评估系统各模块贡献，产出可对比的实验数据
+- 评估系统各模块贡献，产出可对比的实验数据，并冻结严格 1 小时闭环结论口径
 
 任务：
 
-- 执行 `campaign-report` 汇总长期运行指标
+- 执行 `campaign-close --budget-sec 3600` 作为正式闭环命令
 - 通过环境变量控制消融开关（`ENABLE_DST1_MUTATOR`, `ENABLE_CACHE_DELTA`, `ENABLE_TRIAGE`, `ENABLE_SYMCC`）
-- 统计高价值样本复现率，验证 SymCC 与 Triage 的端到端有效性
+- 读取 `campaign_close.summary.json` 与 exit code 作为正式闭环结论
+- 统计高价值样本复现率，验证 SymCC 与 Triage 的端到端有效性，但 `repro_rate.tsv` 与 `repro_rate=1.0` 只解释为复现统计，不自动等价为漏洞已证实
+- 在本次修复完全完成前，历史 run 的结论统一保持为“当次 run 不可行”，不能改写成“只需延长时间预算即可”
 
 交付物：
 
 - 时间戳命名的 `campaign_reports` 目录
 - 包含 `summary.json`, `ablation_matrix.tsv`, `cluster_counts.tsv`, `repro_rate.tsv` 的完整报告
+- `WORK_DIR/campaign_close.summary.json`
 
 验收标准：
 
-- `campaign-report` 稳定落盘，且包含消融状态与复现率统计
-- 文档给出明确的长期运行、消融与复现实验命令
+- `campaign-close --budget-sec 3600` 稳定落盘 `campaign_close.summary.json`，且三阶段状态完整
+- 只有 summary 显示 success 且进程 exit code 为成功时，才接受正式闭环结论
+- 文档给出明确的长期运行、消融与复现实验命令，并把 `follow-diff` / `follow-diff-once` 明确降级为辅助观察命令
 
 ## 实验运行命令指南
 
 命令面冻结说明（当前实现）：
 
-- shell wrapper 主线命令：`parse-cache`、`replay-diff-cache`、`follow-diff`、`follow-diff-once`、`triage-report`、`campaign-report`
+- shell wrapper 转发命令：`parse-cache`、`replay-diff-cache`、`follow-diff`、`follow-diff-once`、`follow-diff-window`、`triage-report`、`campaign-report`、`campaign-close`
+- 正式闭环命令固定为 `python3 -m tools.dns_diff.cli campaign-close --budget-sec 3600`，wrapper 仅提供等价转发，不持有 deadline
 - `triage`、`report` 仅通过 Python CLI 直调：`python3 -m tools.dns_diff.cli triage|report`
 - 不再使用 `run/start/stop/status` 作为 unbound wrapper 现行命令
 
-### 单轮采样与 triage 汇总（推荐最小闭环）
+### 手工观察与局部检查
 ```bash
-# 默认消费 named producer queue 并执行一次 paired replay
+# 单次队列巡检
 ./unbound_experiment/run_unbound_afl_symcc.sh follow-diff-once
 
-# 重写 triage 并生成 report 四件套
+# 持续观察新样本
+./unbound_experiment/run_unbound_afl_symcc.sh follow-diff
+
+# 冻结当前 queue tail，在局部预算内收敛一轮
+./unbound_experiment/run_unbound_afl_symcc.sh follow-diff-window --budget-sec 300
+
+# 重写 triage 并生成 report 四件套，便于人工定位
 ./unbound_experiment/run_unbound_afl_symcc.sh triage-report
 ```
 
-### 长期跟随与活动级汇总（Campaign）
-```bash
-# 长期跟随新样本（持续模式）
-./unbound_experiment/run_unbound_afl_symcc.sh follow-diff
+说明：以上命令仍可用于手工观察、局部检查、失败定位和队列巡检，但不作为 task 5 或正式实验结论命令。
 
-# 输出 campaign 四件套（按时间戳落盘）
-./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+### 正式 1 小时闭环命令
+```bash
+# Python 真入口，正式结论统一使用这个命令
+python3 -m tools.dns_diff.cli campaign-close --budget-sec 3600
+
+# 等价 wrapper 转发命令
+./unbound_experiment/run_unbound_afl_symcc.sh campaign-close --budget-sec 3600
 ```
+
+正式判定规则：只有 `follow-diff-window -> triage-report -> campaign-report` 三阶段全部成功，且 `WORK_DIR/campaign_close.summary.json` 显示 `status=success`，才可认定本次闭环成功。
 
 ### 消融实验 (Ablation Study)
 ```bash
-# 通过 follow-diff-once 执行单轮样本处理，并关闭 SymCC 标记
-env ENABLE_SYMCC=0 ./unbound_experiment/run_unbound_afl_symcc.sh follow-diff-once
+# 关闭 SymCC 后执行正式 1 小时闭环
+env ENABLE_SYMCC=0 python3 -m tools.dns_diff.cli campaign-close --budget-sec 3600
 
-# 生成带消融状态的 campaign 报告
-./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
+# 读取正式闭环 summary 与最后阶段产物
+# WORK_DIR/campaign_close.summary.json
+# WORK_DIR/campaign_reports/<timestamp>/summary.json
 ```
+
+说明：`campaign-report` 仍是第三阶段和产物目录的一部分，但不再单独承担正式结论口径。
 
 ### 路径与产物默认值（用于对齐实现）
 
@@ -363,6 +378,7 @@ env ENABLE_SYMCC=0 ./unbound_experiment/run_unbound_afl_symcc.sh follow-diff-onc
 - follow_diff root 默认：`unbound_experiment/work_stateful/follow_diff`
 - report 侧 high-value manifest 默认：`WORK_DIR/high_value_samples.txt`（默认即 `unbound_experiment/work_stateful/high_value_samples.txt`）
 - campaign 输出目录默认：`WORK_DIR/campaign_reports/<timestamp>/`
+- close-loop summary 默认：`WORK_DIR/campaign_close.summary.json`
 - named 消费侧默认 manifest：优先 `named_experiment/work/high_value_samples.txt`；若本地不存在则桥接到 `unbound_experiment/work_stateful/high_value_samples.txt`
 
 ### Python CLI 直调示例（仅 triage/report）

@@ -85,6 +85,74 @@ if state.get("running_sample_id") not in (None, ""):
     raise SystemExit("ASSERT FAIL: 当前场景 running_sample_id 应为空")
 if state.get("last_queue_event_id") not in (None, ""):
     raise SystemExit("ASSERT FAIL: queue 为空时 last_queue_event_id 应为空")
+
+for optional_field in ("run_id", "last_exit_reason", "retry_count", "last_attempt_ts"):
+    if optional_field in state and state[optional_field] is not None:
+        if optional_field == "retry_count":
+            if isinstance(state[optional_field], bool) or not isinstance(state[optional_field], int) or state[optional_field] < 0:
+                raise SystemExit("ASSERT FAIL: retry_count 若存在应为非负整数")
+        elif not isinstance(state[optional_field], str) or not state[optional_field]:
+            raise SystemExit(f"ASSERT FAIL: {optional_field} 若存在应为非空字符串")
+PY
+
+python3 - "$STATE_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+state_path = pathlib.Path(sys.argv[1])
+state_path.write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "last_scan_ts": "2026-03-24T00:00:00Z",
+            "last_queue_event_id": None,
+            "running_sample_id": None,
+            "completed_count": 0,
+            "failed_count": 0,
+            "run_id": "manual-seeded-run",
+            "last_exit_reason": "quiescent",
+            "retry_count": 3,
+            "last_attempt_ts": "2026-03-24T00:00:01Z",
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+
+run_cli follow-diff-once >/dev/null
+
+python3 - "$STATE_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+required_fields = (
+    "schema_version",
+    "last_scan_ts",
+    "last_queue_event_id",
+    "running_sample_id",
+    "completed_count",
+    "failed_count",
+)
+for field in required_fields:
+    if field not in state:
+        raise SystemExit(f"ASSERT FAIL: follow_diff.state.json 缺少字段 {field}")
+
+if state.get("schema_version") != 1:
+    raise SystemExit("ASSERT FAIL: schema_version 应为 1")
+if state.get("run_id") != "manual-seeded-run":
+    raise SystemExit("ASSERT FAIL: optional run_id 读取/写回不兼容")
+if state.get("last_exit_reason") != "quiescent":
+    raise SystemExit("ASSERT FAIL: optional last_exit_reason 读取/写回不兼容")
+if state.get("retry_count") != 3:
+    raise SystemExit("ASSERT FAIL: optional retry_count 读取/写回不兼容")
+if state.get("last_attempt_ts") != "2026-03-24T00:00:01Z":
+    raise SystemExit("ASSERT FAIL: optional last_attempt_ts 读取/写回不兼容")
 PY
 
 mkdir -p "$QUEUE_DIR"

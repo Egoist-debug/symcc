@@ -29,6 +29,15 @@
 - 已具备跨 resolver 的统一结论。
 - 已具备论文级 differential testing 判真能力。
 - `cache_entry_created` 已由强语义 oracle 严格证明。
+- 历史 run 不能只因预算解释被正式翻案。在本次修复完全完成前，历史结论仍应保持为“当次 run 不可行”。
+
+## 正式闭环口径（Frozen）
+
+- 正式 1 小时闭环命令固定为 `python3 -m tools.dns_diff.cli campaign-close --budget-sec 3600`。
+- 等价 wrapper 转发命令为 `./unbound_experiment/run_unbound_afl_symcc.sh campaign-close --budget-sec 3600`。
+- deadline owner 固定在 Python `campaign-close`，不是 wrapper 的 `DNS_DIFF_CLI_TIMEOUT_SEC`，也不是外层 shell `timeout`。
+- 闭环成功的唯一口径是：`follow-diff-window -> triage-report -> campaign-report` 三阶段全部成功，且 `WORK_DIR/campaign_close.summary.json` 显示 `status=success`。
+- `follow-diff`、`follow-diff-once`、`follow-diff-window` 仍可用于手工观察、局部检查、失败定位与队列巡检，但不作为 task 5 或正式结论命令。
 
 ## 一次性准备
 
@@ -197,14 +206,11 @@ named_experiment/run_named_afl_symcc.sh stop
 - `Oracle response_accepted` 表示第一轮 query 后，mutator 确实向 resolver 返回过伪造上游响应。
 - `Oracle second_query_hit` 表示 post-check 阶段没有再观察到新的上游取数行为。
 - `Oracle cache_entry_created` 现在比 `Oracle second_query_hit` 更严格：它要求第一轮 query 已触发上游抓取并接受过伪造响应，同时 post-check 阶段没有再观察到新的上游交互；它仍然只是更强的代理信号，不能直接等价为“cache 中已新增恶意条目”。
+- `cache_entry_created`、`repro_rate.tsv` 或 `repro_rate=1.0` 都只能作为正向代理或复现统计信号，不能单独改写成“漏洞已证实”。
 - **BIND9 Replay 隔离性**：在 differential 模式下，BIND9 replay 必须与 producer 实例隔离，禁止复用 `WORK_DIR` 或 55300/55301 端口。
-- **Python-first Ownership**：`tools/dns_diff/` 承担核心 follower 调度与样本分发；shell 仅用于 `timeout -k` 包装与外部环境配置。
+- **Python-first Ownership**：`tools/dns_diff/` 承担核心 follower 调度、样本分发与正式闭环 deadline；shell 仅用于环境配置与命令转发，闭环路径不能通过 `DNS_DIFF_CLI_TIMEOUT_SEC` 接管超时。
 - **Sample Identity**：遵循 `queue_event_id`, `sample_sha1`, `sample_id` 标识约定。
-- **Timeout Budget (Strict)**：
-  | 环节 | Timeout (软) | Kill (硬) |
-  | :--- | :--- | :--- |
-  | Pair Replay | 180s | 185s |
-  | Single Resolver | 15s | 18s |
+- **Timeout Budget (Strict)**：单样本 replay 的局部保护仍可存在，但严格 1 小时正式闭环预算只认 `campaign-close --budget-sec 3600`。
 
 ## 复现实验建议
 
@@ -234,20 +240,31 @@ named_experiment/run_named_afl_symcc.sh start
 
 ### 实验总结与消融报告
 
-在实验运行结束后，使用以下命令生成汇总报告：
+在实验运行结束后，正式结论统一使用以下闭环命令：
 
 ```bash
-# 生成包含时间戳的 campaign 报告目录
-./unbound_experiment/run_unbound_afl_symcc.sh campaign-report
-# 或直接使用 Python 工具
-python3 -m tools.dns_diff.cli campaign-report
+# Python 真入口，持有严格 1 小时 deadline
+python3 -m tools.dns_diff.cli campaign-close --budget-sec 3600
+
+# 等价 wrapper 转发命令
+./unbound_experiment/run_unbound_afl_symcc.sh campaign-close --budget-sec 3600
 ```
 
-报告产物说明：
+正式判定时读取：
+- `WORK_DIR/campaign_close.summary.json`: 三阶段 summary、总 status、exit_reason、exit_code
+- 进程 exit code: 只有成功退出且 summary 显示 `status=success` 才算闭环成功
+
+阶段与报告产物说明：
+- `campaign-report` 是 `campaign-close` 的第三阶段，不再单独承担正式结论口径
 - `summary.json`: 核心计数、消融模块状态与复现成功率汇总
 - `ablation_matrix.tsv`: 记录当前实验开启的模块 (Mutator/Cache-Delta/Triage/SymCC)
 - `cluster_counts.tsv`: 各 Fingerprint 聚类下的样本分布
 - `repro_rate.tsv`: 高价值样本在当前 Campaign 中的复现达成度
+
+补充说明：
+- `follow-diff` / `follow-diff-once` 继续用于人工观察、局部排查和队列巡检
+- `campaign-report` 继续用于生成阶段三产物
+- task 5 和正式结论统一只看 `campaign_close.summary.json` 与 exit code
 
 ### 消融实验开关
 

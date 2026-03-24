@@ -3,7 +3,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -14,17 +14,21 @@ from .oracle import ORACLE_FIELDS
 from .replay import ReplayError, replay_diff_cache
 from .schema import (
     build_follow_diff_state_payload,
+    build_follow_diff_window_summary_payload,
     build_sample_meta_payload,
     build_state_fingerprint_payload,
     utc_timestamp,
     validate_follow_diff_state_fields,
+    validate_follow_diff_window_summary_fields,
 )
 from .triage import build_triage
 
 EXIT_USAGE = 2
+EXIT_DEADLINE_EXCEEDED = 6
 FOLLOW_DIFF_STATE_SCHEMA_VERSION = 1
 DEFAULT_FOLLOW_DIFF_INTERVAL_SEC = 60.0
 FOLLOW_DIFF_STATE_FILE_NAME = "follow_diff.state.json"
+FOLLOW_DIFF_WINDOW_SUMMARY_FILE_NAME = "follow_diff.window.summary.json"
 DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = Path("unbound_experiment") / "work_stateful"
 DEFAULT_BIND9_WORK_DIR_RELATIVE = Path("named_experiment") / "work"
 DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = Path("afl_out") / "master" / "queue"
@@ -37,6 +41,9 @@ STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 
 COMPLETED_PREFIX = "completed"
+WINDOW_EXIT_REASON_QUIESCENT = "quiescent"
+WINDOW_EXIT_REASON_DEADLINE_EXCEEDED = "deadline_exceeded"
+WINDOW_IDLE_CONVERGENCE_ROUNDS = 2
 
 BIND9_BEFORE_CACHE_FILE = "bind9.before.cache.txt"
 BIND9_AFTER_CACHE_FILE = "bind9.after.cache.txt"
@@ -80,6 +87,10 @@ class FollowDiffState:
     running_sample_id: Optional[str] = None
     completed_count: int = 0
     failed_count: int = 0
+    run_id: Optional[str] = None
+    last_exit_reason: Optional[str] = None
+    retry_count: int = 0
+    last_attempt_ts: Optional[str] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return build_follow_diff_state_payload(
@@ -89,6 +100,10 @@ class FollowDiffState:
             running_sample_id=self.running_sample_id,
             completed_count=self.completed_count,
             failed_count=self.failed_count,
+            run_id=self.run_id,
+            last_exit_reason=self.last_exit_reason,
+            retry_count=self.retry_count,
+            last_attempt_ts=self.last_attempt_ts,
         )
 
 
@@ -96,6 +111,61 @@ class FollowDiffState:
 class FollowDiffBatchResult:
     summary: FollowDiffSummary
     matched_sample: bool = False
+    seen_sample_ids: Set[str] = field(default_factory=set)
+    failed_sample_ids: Set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class FollowDiffRecoveryAudit:
+    status: str = "none"
+    sample_id: Optional[str] = None
+    detail: Optional[str] = None
+
+
+def _format_deadline_ts(deadline_epoch_sec: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(deadline_epoch_sec)) + "Z"
+
+
+def _write_follow_diff_window_summary(
+    *,
+    config: FollowDiffConfig,
+    budget_sec: float,
+    deadline_ts: str,
+    queue_tail_id: Optional[str],
+    state: FollowDiffState,
+    exit_reason: str,
+    exit_code: int,
+    run_id: Optional[str] = None,
+    retry_failed: bool = False,
+    recovery_audit: Optional[FollowDiffRecoveryAudit] = None,
+) -> Path:
+    summary_path = config.work_dir / FOLLOW_DIFF_WINDOW_SUMMARY_FILE_NAME
+    extra_fields: Dict[str, Any] = {"retry_failed": bool(retry_failed)}
+    if run_id:
+        extra_fields["run_id"] = run_id
+    if recovery_audit is not None:
+        extra_fields["recovery_status"] = recovery_audit.status
+        if recovery_audit.sample_id:
+            extra_fields["recovery_sample_id"] = recovery_audit.sample_id
+        if recovery_audit.detail:
+            extra_fields["recovery_detail"] = recovery_audit.detail
+    payload = build_follow_diff_window_summary_payload(
+        budget_sec=budget_sec,
+        deadline_ts=deadline_ts,
+        queue_tail_id=queue_tail_id,
+        exit_reason=exit_reason,
+        exit_code=exit_code,
+        completed_count=state.completed_count,
+        failed_count=state.failed_count,
+        last_queue_event_id=state.last_queue_event_id,
+        base_payload=extra_fields,
+    )
+    errors = validate_follow_diff_window_summary_fields(payload)
+    if errors:
+        raise FollowDiffError(
+            "内部错误：follow-diff-window summary payload 非法: " + "; ".join(errors)
+        )
+    return atomic_write_json(summary_path, payload)
 
 
 def _resolve_root_dir() -> Path:
@@ -365,6 +435,11 @@ def _coerce_non_negative_int(value: Any) -> int:
     return 0
 
 
+def _new_bounded_run_id() -> str:
+    timestamp = utc_timestamp().replace(":", "").replace("-", "")
+    return f"follow-diff-window-{timestamp}-{os.getpid()}"
+
+
 def _load_follow_diff_state(state_path: Path) -> FollowDiffState:
     load_result = load_state_file(state_path)
     if load_result.downgraded and state_path.exists():
@@ -383,6 +458,10 @@ def _load_follow_diff_state(state_path: Path) -> FollowDiffState:
         running_sample_id=_coerce_optional_text(state_data.get("running_sample_id")),
         completed_count=_coerce_non_negative_int(state_data.get("completed_count")),
         failed_count=_coerce_non_negative_int(state_data.get("failed_count")),
+        run_id=_coerce_optional_text(state_data.get("run_id")),
+        last_exit_reason=_coerce_optional_text(state_data.get("last_exit_reason")),
+        retry_count=_coerce_non_negative_int(state_data.get("retry_count")),
+        last_attempt_ts=_coerce_optional_text(state_data.get("last_attempt_ts")),
     )
 
 
@@ -425,6 +504,10 @@ def _status_is_completed(status: Any) -> bool:
     return isinstance(status, str) and (
         status == STATUS_COMPLETED or status.startswith(COMPLETED_PREFIX)
     )
+
+
+def _status_is_failed(status: Any) -> bool:
+    return isinstance(status, str) and status == STATUS_FAILED
 
 
 def _is_completed_sample(sample_dir: Path, *, sample_id: str) -> bool:
@@ -663,6 +746,7 @@ def _process_one_sample_with_state(
     sample_size: int,
     state: FollowDiffState,
     state_path: Path,
+    is_retry_attempt: bool = False,
 ) -> str:
     if _is_completed_sample(sample_dir, sample_id=sample_id):
         _ensure_sample_contract_artifacts(
@@ -681,6 +765,9 @@ def _process_one_sample_with_state(
 
     state.running_sample_id = sample_id
     state.last_queue_event_id = queue_event_id
+    state.last_attempt_ts = utc_timestamp()
+    if is_retry_attempt:
+        state.retry_count += 1
     _save_follow_diff_state(state_path, state)
 
     result = _process_one_sample(
@@ -839,9 +926,17 @@ def _consume_queue_entries(
     state_path: Optional[Path] = None,
     only_sample_id: Optional[str] = None,
     skip_sample_ids: Optional[Iterable[str]] = None,
+    max_queue_event_id: Optional[str] = None,
+    prior_failed_sample_ids: Optional[Iterable[str]] = None,
 ) -> FollowDiffBatchResult:
     summary = FollowDiffSummary()
     queue_entries = _iter_queue_entries(config.source_dir)
+    if max_queue_event_id is not None:
+        queue_entries = [
+            queue_file
+            for queue_file in queue_entries
+            if queue_file.name <= max_queue_event_id
+        ]
     summary.scanned = len(queue_entries)
 
     last_queue_event_id = queue_entries[-1].name if queue_entries else None
@@ -849,6 +944,11 @@ def _consume_queue_entries(
         sample_id for sample_id in (skip_sample_ids or ()) if sample_id
     }
     matched_sample = False
+    seen_sample_ids: Set[str] = set()
+    failed_sample_ids: Set[str] = set()
+    prior_failed_ids: Set[str] = {
+        sample_id for sample_id in (prior_failed_sample_ids or ()) if sample_id
+    }
 
     for queue_file in queue_entries:
         try:
@@ -865,11 +965,22 @@ def _consume_queue_entries(
             continue
 
         matched_sample = True
+        seen_sample_ids.add(sample_id)
         if sample_id in skipped_sample_ids:
             summary.skipped += 1
             continue
 
         sample_dir = config.output_root / sample_id
+        existing_status: Optional[str] = None
+        if sample_dir.is_dir():
+            existing_meta = _load_json_object(sample_dir / "sample.meta.json")
+            persisted_status = existing_meta.get("status")
+            if isinstance(persisted_status, str) and persisted_status:
+                existing_status = persisted_status
+
+        is_retry_attempt = sample_id in prior_failed_ids and _status_is_failed(
+            existing_status
+        )
         if state is not None:
             if state_path is None:
                 raise FollowDiffError("内部错误：缺少 follow-diff 状态文件路径")
@@ -882,6 +993,7 @@ def _consume_queue_entries(
                 sample_size=sample_info["sample_size"],
                 state=state,
                 state_path=state_path,
+                is_retry_attempt=is_retry_attempt,
             )
         else:
             result = _process_one_sample(
@@ -901,6 +1013,7 @@ def _consume_queue_entries(
                 summary.completed += 1
             elif result == STATUS_FAILED:
                 summary.failed += 1
+                failed_sample_ids.add(sample_id)
                 sys.stderr.write(f"dns-diff: 样本处理失败但继续后续样本: {sample_id}\n")
 
         if only_sample_id is not None:
@@ -913,7 +1026,12 @@ def _consume_queue_entries(
             raise FollowDiffError("内部错误：缺少 follow-diff 状态文件路径")
         _save_follow_diff_state(state_path, state)
 
-    return FollowDiffBatchResult(summary=summary, matched_sample=matched_sample)
+    return FollowDiffBatchResult(
+        summary=summary,
+        matched_sample=matched_sample,
+        seen_sample_ids=seen_sample_ids,
+        failed_sample_ids=failed_sample_ids,
+    )
 
 
 def _write_summary(prefix: str, summary: FollowDiffSummary) -> None:
@@ -932,10 +1050,11 @@ def _recover_running_sample(
     *,
     state: FollowDiffState,
     state_path: Path,
-) -> Optional[str]:
+    max_queue_event_id: Optional[str] = None,
+) -> FollowDiffRecoveryAudit:
     running_sample_id = state.running_sample_id
     if not running_sample_id:
-        return None
+        return FollowDiffRecoveryAudit(status="none")
 
     sample_dir = config.output_root / running_sample_id
     if _is_completed_sample(sample_dir, sample_id=running_sample_id):
@@ -944,7 +1063,11 @@ def _recover_running_sample(
         )
         state.running_sample_id = None
         _save_follow_diff_state(state_path, state)
-        return None
+        return FollowDiffRecoveryAudit(
+            status="cleared",
+            sample_id=running_sample_id,
+            detail="already_completed",
+        )
 
     sys.stderr.write(
         f"dns-diff: 检测到未完成样本，启动时先恢复一次: {running_sample_id}\n"
@@ -954,6 +1077,7 @@ def _recover_running_sample(
         state=state,
         state_path=state_path,
         only_sample_id=running_sample_id,
+        max_queue_event_id=max_queue_event_id,
     )
     _write_summary("恢复扫描完成", recovery_result.summary)
 
@@ -963,9 +1087,30 @@ def _recover_running_sample(
         )
         state.running_sample_id = None
         _save_follow_diff_state(state_path, state)
-        return None
+        return FollowDiffRecoveryAudit(
+            status="cleared",
+            sample_id=running_sample_id,
+            detail="stale_missing",
+        )
 
-    return running_sample_id
+    if recovery_result.summary.failed > 0:
+        sys.stderr.write(
+            f"dns-diff: running_sample 恢复失败，保留失败证据并继续流程: {running_sample_id}\n"
+        )
+        return FollowDiffRecoveryAudit(
+            status="recovery_failed",
+            sample_id=running_sample_id,
+            detail="sample_failed",
+        )
+
+    sys.stderr.write(
+        f"dns-diff: running_sample 恢复成功，后续本轮不重复处理: {running_sample_id}\n"
+    )
+    return FollowDiffRecoveryAudit(
+        status="recovered",
+        sample_id=running_sample_id,
+        detail="sample_processed",
+    )
 
 
 def follow_diff() -> int:
@@ -977,11 +1122,12 @@ def follow_diff() -> int:
     state = _load_follow_diff_state(state_path)
     _save_follow_diff_state(state_path, state)
 
-    recovered_sample_id = _recover_running_sample(
+    recovery_audit = _recover_running_sample(
         config,
         state=state,
         state_path=state_path,
     )
+    recovered_sample_id = recovery_audit.sample_id
     skip_sample_ids: Sequence[str] = (
         (recovered_sample_id,) if recovered_sample_id is not None else ()
     )
@@ -1013,11 +1159,12 @@ def follow_diff_once() -> int:
     state = _load_follow_diff_state(state_path)
     _save_follow_diff_state(state_path, state)
 
-    recovered_sample_id = _recover_running_sample(
+    recovery_audit = _recover_running_sample(
         config,
         state=state,
         state_path=state_path,
     )
+    recovered_sample_id = recovery_audit.sample_id
     skip_sample_ids: Sequence[str] = (
         (recovered_sample_id,) if recovered_sample_id is not None else ()
     )
@@ -1033,6 +1180,117 @@ def follow_diff_once() -> int:
     return 0
 
 
+def follow_diff_window(
+    *,
+    budget_sec: float,
+    queue_tail_id: Optional[str] = None,
+    retry_failed: bool = False,
+) -> int:
+    if budget_sec <= 0:
+        raise FollowDiffError("--budget-sec 必须大于 0")
+
+    config = _collect_config()
+    config.output_root.mkdir(parents=True, exist_ok=True)
+
+    interval_sec = _resolve_follow_diff_interval_sec()
+    state_path = _follow_diff_state_path(config)
+    state = _load_follow_diff_state(state_path)
+    bounded_run_id = _new_bounded_run_id()
+    state.run_id = bounded_run_id
+    state.retry_count = 0
+    state.last_exit_reason = None
+    _save_follow_diff_state(state_path, state)
+
+    if queue_tail_id is None:
+        queue_entries = _iter_queue_entries(config.source_dir)
+        queue_tail_id = queue_entries[-1].name if queue_entries else None
+    deadline_epoch_sec = time.time() + budget_sec
+    deadline_ts = _format_deadline_ts(deadline_epoch_sec)
+
+    recovery_audit = _recover_running_sample(
+        config,
+        state=state,
+        state_path=state_path,
+        max_queue_event_id=queue_tail_id,
+    )
+    skip_sample_ids: Set[str] = set()
+    if recovery_audit.sample_id is not None and (
+        recovery_audit.status in {"recovered", "cleared"}
+        or (recovery_audit.status == "recovery_failed" and not retry_failed)
+    ):
+        skip_sample_ids.add(recovery_audit.sample_id)
+    failed_sample_ids: Set[str] = set()
+
+    idle_rounds = 0
+    while True:
+        if time.time() >= deadline_epoch_sec:
+            state.last_exit_reason = WINDOW_EXIT_REASON_DEADLINE_EXCEEDED
+            state.run_id = None
+            _save_follow_diff_state(state_path, state)
+            _write_follow_diff_window_summary(
+                config=config,
+                budget_sec=budget_sec,
+                deadline_ts=deadline_ts,
+                queue_tail_id=queue_tail_id,
+                state=state,
+                exit_reason=WINDOW_EXIT_REASON_DEADLINE_EXCEEDED,
+                exit_code=EXIT_DEADLINE_EXCEEDED,
+                run_id=bounded_run_id,
+                retry_failed=retry_failed,
+                recovery_audit=recovery_audit,
+            )
+            return EXIT_DEADLINE_EXCEEDED
+
+        batch_result = _consume_queue_entries(
+            config,
+            state=state,
+            state_path=state_path,
+            skip_sample_ids=skip_sample_ids,
+            max_queue_event_id=queue_tail_id,
+            prior_failed_sample_ids=failed_sample_ids,
+        )
+        _backfill_existing_sample_contracts(config)
+        _write_summary("follow-diff-window 扫描完成", batch_result.summary)
+        failed_sample_ids.update(batch_result.failed_sample_ids)
+        if not retry_failed:
+            skip_sample_ids.update(batch_result.failed_sample_ids)
+
+        if batch_result.summary.attempted == 0 and state.running_sample_id is None:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
+
+        reached_frozen_tail = queue_tail_id is None or (
+            state.last_queue_event_id == queue_tail_id
+        )
+        if (
+            reached_frozen_tail
+            and state.running_sample_id is None
+            and idle_rounds >= WINDOW_IDLE_CONVERGENCE_ROUNDS
+        ):
+            state.last_exit_reason = WINDOW_EXIT_REASON_QUIESCENT
+            state.run_id = None
+            _save_follow_diff_state(state_path, state)
+            _write_follow_diff_window_summary(
+                config=config,
+                budget_sec=budget_sec,
+                deadline_ts=deadline_ts,
+                queue_tail_id=queue_tail_id,
+                state=state,
+                exit_reason=WINDOW_EXIT_REASON_QUIESCENT,
+                exit_code=0,
+                run_id=bounded_run_id,
+                retry_failed=retry_failed,
+                recovery_audit=recovery_audit,
+            )
+            return 0
+
+        remaining_budget = deadline_epoch_sec - time.time()
+        if remaining_budget <= 0:
+            continue
+        time.sleep(min(interval_sec, remaining_budget))
+
+
 __all__ = [
     "FollowDiffError",
     "default_bind9_work_dir",
@@ -1041,6 +1299,7 @@ __all__ = [
     "default_follow_diff_work_dir",
     "follow_diff",
     "follow_diff_once",
+    "follow_diff_window",
     "resolve_bind9_work_dir",
     "resolve_follow_diff_source_dir",
     "resolve_follow_diff_work_dir",

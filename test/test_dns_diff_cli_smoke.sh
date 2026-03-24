@@ -22,8 +22,19 @@ assert_file_exists() {
 assert_file_contains() {
 	local path="$1"
 	local expected="$2"
-	if ! grep -Fq "$expected" "$path"; then
+	if ! grep -Fq -- "$expected" "$path"; then
 		printf 'ASSERT FAIL: 期望 %s 包含: %s\n' "$path" "$expected" >&2
+		printf '实际内容:\n' >&2
+		cat "$path" >&2
+		exit 1
+	fi
+}
+
+assert_file_not_contains() {
+	local path="$1"
+	local unexpected="$2"
+	if grep -Fq -- "$unexpected" "$path"; then
+		printf 'ASSERT FAIL: 期望 %s 不包含: %s\n' "$path" "$unexpected" >&2
 		printf '实际内容:\n' >&2
 		cat "$path" >&2
 		exit 1
@@ -37,7 +48,57 @@ env \
 	SRC_TREE="$ROOT_DIR" \
 	"$WRAPPER" help >"$HELP_OUT"
 assert_file_contains "$HELP_OUT" "follow-diff-once"
+assert_file_contains "$HELP_OUT" "follow-diff-window"
 assert_file_contains "$HELP_OUT" "parse-cache"
+assert_file_contains "$HELP_OUT" "campaign-close"
+
+WINDOW_HELP_OUT="$WORKDIR/follow-diff-window.help.txt"
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	WORK_DIR="$WORKDIR/work" \
+	SRC_TREE="$ROOT_DIR" \
+	"$WRAPPER" follow-diff-window --help >"$WINDOW_HELP_OUT"
+assert_file_contains "$WINDOW_HELP_OUT" "--budget-sec"
+
+CLOSE_HELP_OUT="$WORKDIR/campaign-close.help.txt"
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	WORK_DIR="$WORKDIR/work" \
+	SRC_TREE="$ROOT_DIR" \
+	"$WRAPPER" campaign-close --help >"$CLOSE_HELP_OUT"
+assert_file_contains "$CLOSE_HELP_OUT" "--budget-sec"
+
+WINDOW_GUARD_ERR="$WORKDIR/follow-diff-window.guard.err"
+if env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	DNS_DIFF_CLI_TIMEOUT_SEC=1 \
+	WORK_DIR="$WORKDIR/work" \
+	SRC_TREE="$ROOT_DIR" \
+	"$WRAPPER" follow-diff-window --budget-sec 0.1 >/dev/null 2>"$WINDOW_GUARD_ERR"; then
+	printf 'ASSERT FAIL: follow-diff-window 设置 DNS_DIFF_CLI_TIMEOUT_SEC 时应被 wrapper 拒绝\n' >&2
+	exit 1
+fi
+assert_file_contains "$WINDOW_GUARD_ERR" "用法:"
+assert_file_contains "$WINDOW_GUARD_ERR" "DNS_DIFF_CLI_TIMEOUT_SEC"
+assert_file_contains "$WINDOW_GUARD_ERR" "follow-diff-window --budget-sec"
+assert_file_contains "$WINDOW_GUARD_ERR" "shell timeout owner"
+assert_file_not_contains "$WINDOW_GUARD_ERR" "dns-diff: follow-diff-window 失败"
+
+CLOSE_GUARD_ERR="$WORKDIR/campaign-close.guard.err"
+if env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	DNS_DIFF_CLI_TIMEOUT_SEC=1 \
+	WORK_DIR="$WORKDIR/work" \
+	SRC_TREE="$ROOT_DIR" \
+	"$WRAPPER" campaign-close --budget-sec 0.1 >/dev/null 2>"$CLOSE_GUARD_ERR"; then
+	printf 'ASSERT FAIL: campaign-close 设置 DNS_DIFF_CLI_TIMEOUT_SEC 时应被 wrapper 拒绝\n' >&2
+	exit 1
+fi
+assert_file_contains "$CLOSE_GUARD_ERR" "用法:"
+assert_file_contains "$CLOSE_GUARD_ERR" "DNS_DIFF_CLI_TIMEOUT_SEC"
+assert_file_contains "$CLOSE_GUARD_ERR" "campaign-close --budget-sec"
+assert_file_contains "$CLOSE_GUARD_ERR" "shell timeout owner"
+assert_file_not_contains "$CLOSE_GUARD_ERR" "dns-diff: campaign-close 失败"
 
 REMOVED_ERR="$WORKDIR/removed-command.err"
 if env \

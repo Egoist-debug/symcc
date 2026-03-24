@@ -27,6 +27,24 @@ FOLLOW_DIFF_STATE_REQUIRED_FIELDS: Sequence[str] = (
     "failed_count",
 )
 
+FOLLOW_DIFF_STATE_OPTIONAL_AUDIT_FIELDS: Sequence[str] = (
+    "run_id",
+    "last_exit_reason",
+    "retry_count",
+    "last_attempt_ts",
+)
+
+FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS: Sequence[str] = (
+    "budget_sec",
+    "deadline_ts",
+    "queue_tail_id",
+    "exit_reason",
+    "exit_code",
+    "completed_count",
+    "failed_count",
+    "last_queue_event_id",
+)
+
 STATE_FINGERPRINT_REQUIRED_FIELDS: Sequence[str] = (
     "bind9.forwarding_path",
     "bind9.retry_seen",
@@ -148,6 +166,10 @@ def build_follow_diff_state_payload(
     running_sample_id: Optional[str],
     completed_count: int,
     failed_count: int,
+    run_id: Optional[str] = None,
+    last_exit_reason: Optional[str] = None,
+    retry_count: Optional[int] = None,
+    last_attempt_ts: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "schema_version": schema_version,
@@ -157,7 +179,46 @@ def build_follow_diff_state_payload(
         "completed_count": completed_count,
         "failed_count": failed_count,
     }
+    optional_fields = {
+        "run_id": run_id,
+        "last_exit_reason": last_exit_reason,
+        "retry_count": retry_count,
+        "last_attempt_ts": last_attempt_ts,
+    }
+    for key, value in optional_fields.items():
+        if value is not None:
+            payload[key] = value
     for field in FOLLOW_DIFF_STATE_REQUIRED_FIELDS:
+        payload.setdefault(field, None)
+    return payload
+
+
+def build_follow_diff_window_summary_payload(
+    *,
+    budget_sec: float,
+    deadline_ts: str,
+    queue_tail_id: Optional[str],
+    exit_reason: str,
+    exit_code: int,
+    completed_count: int,
+    failed_count: int,
+    last_queue_event_id: Optional[str],
+    base_payload: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = dict(base_payload or {})
+    payload.update(
+        {
+            "budget_sec": budget_sec,
+            "deadline_ts": deadline_ts,
+            "queue_tail_id": queue_tail_id,
+            "exit_reason": exit_reason,
+            "exit_code": exit_code,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "last_queue_event_id": last_queue_event_id,
+        }
+    )
+    for field in FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS:
         payload.setdefault(field, None)
     return payload
 
@@ -283,16 +344,87 @@ def validate_follow_diff_state_fields(data: Mapping[str, Any]) -> List[str]:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             errors.append(f"{field} 必须是非负整数")
 
+    run_id = data.get("run_id")
+    if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
+        errors.append("run_id 若提供则必须是非空字符串")
+
+    last_exit_reason = data.get("last_exit_reason")
+    if last_exit_reason is not None and (
+        not isinstance(last_exit_reason, str) or not last_exit_reason.strip()
+    ):
+        errors.append("last_exit_reason 若提供则必须是非空字符串")
+
+    retry_count = data.get("retry_count")
+    if retry_count is not None and (
+        isinstance(retry_count, bool)
+        or not isinstance(retry_count, int)
+        or retry_count < 0
+    ):
+        errors.append("retry_count 若提供则必须是非负整数")
+
+    last_attempt_ts = data.get("last_attempt_ts")
+    if last_attempt_ts is not None and (
+        not isinstance(last_attempt_ts, str) or not last_attempt_ts.strip()
+    ):
+        errors.append("last_attempt_ts 若提供则必须是非空字符串")
+
+    return errors
+
+
+def validate_follow_diff_window_summary_fields(data: Mapping[str, Any]) -> List[str]:
+    errors: List[str] = []
+    for field in FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS:
+        if field not in data:
+            errors.append(f"缺少必填字段: {field}")
+
+    budget_sec = data.get("budget_sec")
+    if isinstance(budget_sec, bool) or not isinstance(budget_sec, (int, float)):
+        errors.append("budget_sec 必须是正数")
+    elif float(budget_sec) <= 0:
+        errors.append("budget_sec 必须大于 0")
+
+    deadline_ts = data.get("deadline_ts")
+    if not isinstance(deadline_ts, str) or not deadline_ts.strip():
+        errors.append("deadline_ts 必须是非空字符串")
+
+    queue_tail_id = data.get("queue_tail_id")
+    if queue_tail_id is not None and (
+        not isinstance(queue_tail_id, str) or not queue_tail_id.strip()
+    ):
+        errors.append("queue_tail_id 若提供则必须是非空字符串")
+
+    exit_reason = data.get("exit_reason")
+    if not isinstance(exit_reason, str) or not exit_reason.strip():
+        errors.append("exit_reason 必须是非空字符串")
+
+    exit_code = data.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        errors.append("exit_code 必须是整数")
+
+    for field in ("completed_count", "failed_count"):
+        value = data.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"{field} 必须是非负整数")
+
+    last_queue_event_id = data.get("last_queue_event_id")
+    if last_queue_event_id is not None and (
+        not isinstance(last_queue_event_id, str) or not last_queue_event_id.strip()
+    ):
+        errors.append("last_queue_event_id 若提供则必须是非空字符串")
+
     return errors
 
 
 __all__ = [
+    "FOLLOW_DIFF_STATE_OPTIONAL_AUDIT_FIELDS",
     "FOLLOW_DIFF_STATE_REQUIRED_FIELDS",
+    "FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS",
     "FOLLOW_DIFF_STATUSES",
     "SCHEMA_VERSION",
     "SAMPLE_META_REQUIRED_FIELDS",
     "STATE_FINGERPRINT_REQUIRED_FIELDS",
     "build_follow_diff_state_payload",
+    "build_follow_diff_window_summary_payload",
     "build_sample_meta_payload",
     "build_shared_meta",
     "build_state_fingerprint_payload",
@@ -300,6 +432,7 @@ __all__ = [
     "stamp_with_shared_meta",
     "utc_timestamp",
     "validate_follow_diff_state_fields",
+    "validate_follow_diff_window_summary_fields",
     "validate_sample_meta_fields",
     "validate_shared_fields",
     "validate_state_fingerprint_fields",

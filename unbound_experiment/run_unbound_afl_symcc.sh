@@ -46,8 +46,10 @@ usage() {
 		'                     转发到 python3 -m tools.dns_diff.cli replay-diff-cache' \
 		'  follow-diff        转发到 python3 -m tools.dns_diff.cli follow-diff' \
 		'  follow-diff-once   转发到 python3 -m tools.dns_diff.cli follow-diff-once' \
+		'  follow-diff-window 转发到 python3 -m tools.dns_diff.cli follow-diff-window' \
 		'  triage-report      转发到 python3 -m tools.dns_diff.cli triage-report' \
 		'  campaign-report    转发到 python3 -m tools.dns_diff.cli campaign-report' \
+		'  campaign-close     转发到 python3 -m tools.dns_diff.cli campaign-close' \
 		'  help               显示帮助' \
 		'' \
 		'已从 shell 移除的厚编排命令:' \
@@ -144,6 +146,15 @@ fetch_unbound() {
 forward_dns_diff_cli() {
 	local subcommand="$1"
 	shift
+
+	case "$subcommand" in
+	follow-diff-window|campaign-close)
+		if [ -n "$DNS_DIFF_CLI_TIMEOUT_SEC" ]; then
+			usage >&2
+			die "$subcommand 禁止使用 DNS_DIFF_CLI_TIMEOUT_SEC（shell timeout owner）；请改用 '$subcommand --budget-sec <秒>' 由 Python CLI 持有超时"
+		fi
+		;;
+	esac
 
 	load_profile
 	ensure_basic_dirs
@@ -275,7 +286,7 @@ main() {
 	dump-cache)
 		dump_unbound_cache "${1:-}" "${2:-}"
 		;;
-	parse-cache|replay-diff-cache|follow-diff|follow-diff-once|triage-report|campaign-report)
+	parse-cache|replay-diff-cache|follow-diff|follow-diff-once|follow-diff-window|triage-report|campaign-report|campaign-close)
 		forward_dns_diff_cli "$cmd" "$@"
 		;;
 	build|gen-seeds|explore-response|filter-seeds|smoke|prepare|start|run|stop|status)

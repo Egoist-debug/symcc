@@ -1,0 +1,24 @@
+name: DNS diff regressions
+on: [pull_request, workflow_dispatch]
+
+jobs:
+  dns_diff_regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Run DNS diff regression scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash test/test_dns_diff_cli_smoke.sh
+          bash test/test_follow_diff_pipeline.sh
+          bash test/test_follow_diff_window.sh
+          bash test/test_campaign_close_loop.sh
+          bash test/test_replay_failure_evidence.sh
+          bash test/test_triage_contract.sh
+          bash test/test_campaign_report.sh
