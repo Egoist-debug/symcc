@@ -14,6 +14,7 @@
 2. 先建立共享样本链路，再做更强的语义复核。
 3. 先统一 cache / oracle / 指纹输出，再扩大 resolver 数量。
 4. 先过滤和聚类，再人工分析差异样本。
+5. publication-facing claim 统一引用 `campaign_reports/<timestamp>/evidence_bundle.json` 这个 `publication_evidence_bundle` 合约文件，`included / excluded / unknown` 只表示发布口径状态，proxy signal 不等于真值证明。
 
 ## 当前入口
 
@@ -314,7 +315,7 @@
 交付物：
 
 - 时间戳命名的 `campaign_reports` 目录
-- 包含 `summary.json`, `ablation_matrix.tsv`, `cluster_counts.tsv`, `repro_rate.tsv` 的完整报告
+- 包含 `summary.json`, `ablation_matrix.tsv`, `cluster_counts.tsv`, `repro_rate.tsv`, `oracle_audit.tsv`, `oracle_reliability.json`, `failure_taxonomy.tsv`, `exclusion_summary.tsv`, `evidence_bundle.json` 的完整报告
 - `WORK_DIR/campaign_close.summary.json`
 
 验收标准：
@@ -378,8 +379,11 @@ env ENABLE_SYMCC=0 python3 -m tools.dns_diff.cli campaign-close --budget-sec 360
 - follow_diff root 默认：`unbound_experiment/work_stateful/follow_diff`
 - report 侧 high-value manifest 默认：`WORK_DIR/high_value_samples.txt`（默认即 `unbound_experiment/work_stateful/high_value_samples.txt`）
 - campaign 输出目录默认：`WORK_DIR/campaign_reports/<timestamp>/`
+- publication evidence bundle 默认：`WORK_DIR/campaign_reports/<timestamp>/evidence_bundle.json`
 - close-loop summary 默认：`WORK_DIR/campaign_close.summary.json`
 - named 消费侧默认 manifest：优先 `named_experiment/work/high_value_samples.txt`；若本地不存在则桥接到 `unbound_experiment/work_stateful/high_value_samples.txt`
+
+补充 guardrail：`sample.meta.json.failure` 始终表示 `sample.meta.json` 内嵌 `failure` 对象的 JSON 路径，不是独立文件名。`case_studies/index.tsv` 只有在对应文件实际生成后才能作为 case-study 证据引用；否则应通过 `evidence_bundle.json` 中的再生成命令补产，不能把悬空路径写进文稿。
 
 ### Python CLI 直调示例（仅 triage/report）
 ```bash

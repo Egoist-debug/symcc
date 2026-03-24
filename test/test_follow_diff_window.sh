@@ -256,11 +256,14 @@ required_keys = (
     "budget_sec",
     "deadline_ts",
     "queue_tail_id",
+    "run_id",
     "exit_reason",
     "exit_code",
     "completed_count",
     "failed_count",
     "last_queue_event_id",
+    "aggregation_key",
+    "baseline_compare_key",
 )
 for key in required_keys:
     if key not in summary:
@@ -270,6 +273,8 @@ if not isinstance(summary.get("budget_sec"), (int, float)) or float(summary["bud
     raise SystemExit("ASSERT FAIL: summary.budget_sec 应为正数")
 if not isinstance(summary.get("deadline_ts"), str) or not summary["deadline_ts"]:
     raise SystemExit("ASSERT FAIL: summary.deadline_ts 应为非空字符串")
+if not isinstance(summary.get("run_id"), str) or not summary["run_id"]:
+    raise SystemExit("ASSERT FAIL: summary.run_id 应为非空字符串")
 if summary.get("queue_tail_id") != expected_queue_tail_id:
     raise SystemExit(
         f"ASSERT FAIL: summary.queue_tail_id={summary.get('queue_tail_id')!r} != {expected_queue_tail_id!r}"
@@ -307,18 +312,24 @@ PY
 
 assert_state_contract() {
 	local state_path="$1"
-	local expected_last_queue_event_id="$2"
-	local expected_completed_count="$3"
-	local expected_failed_count="$4"
-	python3 - "$state_path" "$expected_last_queue_event_id" "$expected_completed_count" "$expected_failed_count" <<'PY'
+	local summary_path="$2"
+	local expected_last_queue_event_id="$3"
+	local expected_completed_count="$4"
+	local expected_failed_count="$5"
+	local expected_last_exit_reason="$6"
+	local expected_retry_count="$7"
+	python3 - "$state_path" "$summary_path" "$expected_last_queue_event_id" "$expected_completed_count" "$expected_failed_count" "$expected_last_exit_reason" "$expected_retry_count" <<'PY'
 import json
 import pathlib
 import sys
 
 state = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-expected_last_queue_event_id = sys.argv[2]
-expected_completed_count = int(sys.argv[3])
-expected_failed_count = int(sys.argv[4])
+summary = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+expected_last_queue_event_id = sys.argv[3]
+expected_completed_count = sys.argv[4]
+expected_failed_count = sys.argv[5]
+expected_last_exit_reason = sys.argv[6]
+expected_retry_count = sys.argv[7]
 
 for field in (
     "schema_version",
@@ -327,29 +338,110 @@ for field in (
     "running_sample_id",
     "completed_count",
     "failed_count",
+    "run_id",
+    "last_exit_reason",
+    "retry_count",
+    "last_attempt_ts",
+    "aggregation_key",
+    "baseline_compare_key",
 ):
     if field not in state:
         raise SystemExit(f"ASSERT FAIL: follow_diff.state.json 缺少字段 {field}")
+
+expected_aggregation_fields = {
+    "resolver_pair",
+    "producer_profile",
+    "input_model",
+    "source_queue_dir",
+    "budget_sec",
+    "seed_timeout_sec",
+    "variant_name",
+    "ablation_status",
+    "contract_version",
+}
+expected_baseline_fields = {
+    "resolver_pair",
+    "producer_profile",
+    "input_model",
+    "source_queue_dir",
+    "budget_sec",
+    "seed_timeout_sec",
+    "repeat_count",
+    "contract_version",
+}
+
+for key_name, expected_fields in (
+    ("aggregation_key", expected_aggregation_fields),
+    ("baseline_compare_key", expected_baseline_fields),
+):
+    state_key = state.get(key_name)
+    summary_key = summary.get(key_name)
+    if not isinstance(state_key, dict):
+        raise SystemExit(f"ASSERT FAIL: state.{key_name} 应为对象")
+    if not isinstance(summary_key, dict):
+        raise SystemExit(f"ASSERT FAIL: summary.{key_name} 应为对象")
+    if set(state_key.keys()) != expected_fields:
+        raise SystemExit(
+            f"ASSERT FAIL: state.{key_name} 字段集合异常: {sorted(state_key.keys())!r}"
+        )
+    if set(summary_key.keys()) != expected_fields:
+        raise SystemExit(
+            f"ASSERT FAIL: summary.{key_name} 字段集合异常: {sorted(summary_key.keys())!r}"
+        )
+    if state_key != summary_key:
+        raise SystemExit(
+            f"ASSERT FAIL: state.{key_name} 与 summary.{key_name} 在同一 run 内不一致"
+        )
 
 if state.get("schema_version") != 1:
     raise SystemExit("ASSERT FAIL: state.schema_version 应为 1")
 if not isinstance(state.get("last_scan_ts"), str) or not state["last_scan_ts"]:
     raise SystemExit("ASSERT FAIL: state.last_scan_ts 应为非空字符串")
-if state.get("last_queue_event_id") != expected_last_queue_event_id:
+if expected_last_queue_event_id == "__nonempty_or_null__":
+    if "last_queue_event_id" not in state:
+        raise SystemExit("ASSERT FAIL: state.last_queue_event_id 缺失")
+elif state.get("last_queue_event_id") != expected_last_queue_event_id:
     raise SystemExit(
         "ASSERT FAIL: state.last_queue_event_id="
         f"{state.get('last_queue_event_id')!r} != {expected_last_queue_event_id!r}"
     )
 if state.get("running_sample_id") not in (None, ""):
     raise SystemExit("ASSERT FAIL: state.running_sample_id 应为空")
-if state.get("completed_count") != expected_completed_count:
+if expected_completed_count != "__any__" and state.get("completed_count") != int(expected_completed_count):
     raise SystemExit(
-        f"ASSERT FAIL: state.completed_count={state.get('completed_count')!r} != {expected_completed_count!r}"
+        f"ASSERT FAIL: state.completed_count={state.get('completed_count')!r} != {int(expected_completed_count)!r}"
     )
-if state.get("failed_count") != expected_failed_count:
+if expected_failed_count != "__any__" and state.get("failed_count") != int(expected_failed_count):
     raise SystemExit(
-        f"ASSERT FAIL: state.failed_count={state.get('failed_count')!r} != {expected_failed_count!r}"
+        f"ASSERT FAIL: state.failed_count={state.get('failed_count')!r} != {int(expected_failed_count)!r}"
     )
+
+summary_run_id = summary.get("run_id")
+if not isinstance(summary_run_id, str) or not summary_run_id:
+    raise SystemExit("ASSERT FAIL: summary.run_id 应为非空字符串")
+if state.get("run_id") != summary_run_id:
+    raise SystemExit(
+        f"ASSERT FAIL: state.run_id={state.get('run_id')!r} != summary.run_id={summary_run_id!r}"
+    )
+if state.get("last_exit_reason") != expected_last_exit_reason:
+    raise SystemExit(
+        "ASSERT FAIL: state.last_exit_reason="
+        f"{state.get('last_exit_reason')!r} != {expected_last_exit_reason!r}"
+    )
+retry_count = state.get("retry_count")
+if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+    raise SystemExit("ASSERT FAIL: state.retry_count 应为非负整数")
+if expected_retry_count == "__positive__":
+    if retry_count <= 0:
+        raise SystemExit(
+            f"ASSERT FAIL: state.retry_count={retry_count!r} 应大于 0"
+        )
+elif retry_count != int(expected_retry_count):
+    raise SystemExit(
+        f"ASSERT FAIL: state.retry_count={retry_count!r} != {int(expected_retry_count)!r}"
+    )
+if not isinstance(state.get("last_attempt_ts"), str) or not state["last_attempt_ts"]:
+    raise SystemExit("ASSERT FAIL: state.last_attempt_ts 应为非空字符串")
 PY
 }
 
@@ -486,7 +578,7 @@ assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
 assert_completed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID"
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 1 0 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
-assert_state_contract "$STATE_FILE" "$QUEUE_EVENT_ID" 1 0
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0
 
 init_scenario "timeout" "timeout"
 SEED_TIMEOUT_SEC_OVERRIDE=10
@@ -502,6 +594,7 @@ if [ "$WINDOW_EXIT_CODE" -eq 124 ]; then
 	exit 1
 fi
 assert_file_exists "$WINDOW_SUMMARY"
+assert_file_exists "$STATE_FILE"
 assert_follow_window_summary_contract \
 	"$WINDOW_SUMMARY" \
 	"deadline_exceeded" \
@@ -510,6 +603,7 @@ assert_follow_window_summary_contract \
 	"__any__" \
 	"$QUEUE_EVENT_ID" \
 	"__nonempty_or_null__"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" 0
 
 init_scenario "failed-sample" "missing_artifact"
 run_follow_diff_window_capture 5
@@ -523,7 +617,7 @@ assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
 assert_failed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "missing_artifact"
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 0 1 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
-assert_state_contract "$STATE_FILE" "$QUEUE_EVENT_ID" 0 1
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 0 1 "quiescent" 0
 assert_invocation_count "$INVOCATION_LOG" "missing_artifact" 1
 
 init_scenario "failed-sample-retry-enabled" "missing_artifact"
@@ -537,7 +631,9 @@ if [ "$WINDOW_EXIT_CODE" -eq 124 ]; then
 	exit 1
 fi
 assert_file_exists "$WINDOW_SUMMARY"
+assert_file_exists "$STATE_FILE"
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "deadline_exceeded" "$WINDOW_EXIT_CODE" "__any__" "__any__" "$QUEUE_EVENT_ID" "__nonempty_or_null__"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" "__positive__"
 assert_invocation_count_at_least "$INVOCATION_LOG" "missing_artifact" 2
 
 python3 - "$WINDOW_SUMMARY" <<'PY'
@@ -584,7 +680,9 @@ if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
 	exit 1
 fi
 assert_file_exists "$WINDOW_SUMMARY"
+assert_file_exists "$STATE_FILE"
 assert_file_contains "$WINDOW_STDERR" "queue 中未找到待恢复样本"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0
 python3 - "$WINDOW_SUMMARY" "$STALE_SAMPLE_ID" <<'PY'
 import json
 import pathlib

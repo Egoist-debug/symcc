@@ -91,6 +91,8 @@ class FollowDiffState:
     last_exit_reason: Optional[str] = None
     retry_count: int = 0
     last_attempt_ts: Optional[str] = None
+    aggregation_key: Optional[Dict[str, Any]] = None
+    baseline_compare_key: Optional[Dict[str, Any]] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return build_follow_diff_state_payload(
@@ -104,6 +106,8 @@ class FollowDiffState:
             last_exit_reason=self.last_exit_reason,
             retry_count=self.retry_count,
             last_attempt_ts=self.last_attempt_ts,
+            aggregation_key=self.aggregation_key,
+            baseline_compare_key=self.baseline_compare_key,
         )
 
 
@@ -159,6 +163,8 @@ def _write_follow_diff_window_summary(
         failed_count=state.failed_count,
         last_queue_event_id=state.last_queue_event_id,
         base_payload=extra_fields,
+        aggregation_key=state.aggregation_key,
+        baseline_compare_key=state.baseline_compare_key,
     )
     errors = validate_follow_diff_window_summary_fields(payload)
     if errors:
@@ -435,6 +441,12 @@ def _coerce_non_negative_int(value: Any) -> int:
     return 0
 
 
+def _coerce_optional_mapping(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return None
+
+
 def _new_bounded_run_id() -> str:
     timestamp = utc_timestamp().replace(":", "").replace("-", "")
     return f"follow-diff-window-{timestamp}-{os.getpid()}"
@@ -462,6 +474,10 @@ def _load_follow_diff_state(state_path: Path) -> FollowDiffState:
         last_exit_reason=_coerce_optional_text(state_data.get("last_exit_reason")),
         retry_count=_coerce_non_negative_int(state_data.get("retry_count")),
         last_attempt_ts=_coerce_optional_text(state_data.get("last_attempt_ts")),
+        aggregation_key=_coerce_optional_mapping(state_data.get("aggregation_key")),
+        baseline_compare_key=_coerce_optional_mapping(
+            state_data.get("baseline_compare_key")
+        ),
     )
 
 

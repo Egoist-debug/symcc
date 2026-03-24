@@ -79,7 +79,9 @@ assert_summary_contract() {
 	local manifest_size="$5"
 	local reproduced_count="$6"
 	local repro_rate="$7"
-	python3 - "$summary_path" "$total_samples" "$needs_review_count" "$cluster_count" "$manifest_size" "$reproduced_count" "$repro_rate" <<'PY'
+	local oracle_audit_candidate_count="$8"
+	local semantic_diff_count="$9"
+	python3 - "$summary_path" "$total_samples" "$needs_review_count" "$cluster_count" "$manifest_size" "$reproduced_count" "$repro_rate" "$oracle_audit_candidate_count" "$semantic_diff_count" <<'PY'
 import json
 import pathlib
 import sys
@@ -92,6 +94,8 @@ expected = {
     "manifest_size": int(sys.argv[5]),
     "reproduced_count": int(sys.argv[6]),
     "repro_rate": float(sys.argv[7]),
+    "oracle_audit_candidate_count": int(sys.argv[8]),
+    "semantic_diff_count": int(sys.argv[9]),
 }
 
 for key, value in expected.items():
@@ -125,6 +129,297 @@ if ablation != expected_ablation:
 PY
 }
 
+assert_summary_metadata_contract() {
+	local summary_path="$1"
+	local scenario="$2"
+	python3 - "$summary_path" "$scenario" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+scenario = sys.argv[2]
+
+if summary.get("contract_version") != 1:
+    raise SystemExit(
+        f"ASSERT FAIL: summary.contract_version={summary.get('contract_version')!r} != 1"
+    )
+
+metric_denominators = summary.get("metric_denominators")
+if not isinstance(metric_denominators, dict):
+    raise SystemExit("ASSERT FAIL: summary.metric_denominators 应为对象")
+
+comparability = summary.get("comparability")
+if not isinstance(comparability, dict):
+    raise SystemExit("ASSERT FAIL: summary.comparability 应为对象")
+
+if scenario == "empty":
+    expected_denominators = {
+        "total_samples": 0,
+        "analysis_state": {"included": 0, "excluded": 0, "unknown": 0},
+        "comparable_samples": 0,
+        "non_comparable_samples": 0,
+    }
+    if metric_denominators != expected_denominators:
+        raise SystemExit(
+            f"ASSERT FAIL: 空 root metric_denominators={metric_denominators!r} != {expected_denominators!r}"
+        )
+    if summary.get("semantic_counts") != {}:
+        raise SystemExit(
+            f"ASSERT FAIL: 空 root semantic_counts={summary.get('semantic_counts')!r} != {{}}"
+        )
+    if summary.get("run_id") is not None:
+        raise SystemExit(
+            f"ASSERT FAIL: 空 root run_id={summary.get('run_id')!r} 应为 null"
+        )
+    if comparability.get("status") != "non_comparable":
+        raise SystemExit("ASSERT FAIL: 空 root comparability.status 应为 non_comparable")
+    if comparability.get("reason") != "no_samples":
+        raise SystemExit(
+            f"ASSERT FAIL: 空 root comparability.reason={comparability.get('reason')!r} != 'no_samples'"
+        )
+    if comparability.get("aggregation_key") is not None:
+        raise SystemExit("ASSERT FAIL: 空 root comparability.aggregation_key 应为 null")
+    if comparability.get("baseline_compare_key") is not None:
+        raise SystemExit(
+            "ASSERT FAIL: 空 root comparability.baseline_compare_key 应为 null"
+        )
+elif scenario == "comparable":
+    expected_denominators = {
+        "total_samples": 2,
+        "analysis_state": {"included": 2, "excluded": 0, "unknown": 0},
+        "comparable_samples": 2,
+        "non_comparable_samples": 0,
+    }
+    if metric_denominators != expected_denominators:
+        raise SystemExit(
+            f"ASSERT FAIL: 可比 root metric_denominators={metric_denominators!r} != {expected_denominators!r}"
+        )
+    expected_semantic_counts = {
+        "cache_diff_interesting": 1,
+        "no_diff": 1,
+    }
+    if summary.get("semantic_counts") != expected_semantic_counts:
+        raise SystemExit(
+            f"ASSERT FAIL: 可比 root semantic_counts={summary.get('semantic_counts')!r} != {expected_semantic_counts!r}"
+        )
+    if summary.get("run_id") is not None:
+        raise SystemExit(
+            f"ASSERT FAIL: 自定义 root run_id={summary.get('run_id')!r} 应为 null"
+        )
+
+    expected_aggregation_key = {
+        "resolver_pair": "bind9_vs_unbound",
+        "producer_profile": "poison-stateful",
+        "input_model": "DST1 transcript",
+        "source_queue_dir": "/tmp/follow/queue",
+        "budget_sec": 5,
+        "seed_timeout_sec": 1,
+        "variant_name": "control",
+        "ablation_status": {
+            "mutator": "off",
+            "cache-delta": "on",
+            "triage": "on",
+            "symcc": "on",
+        },
+        "contract_version": 1,
+    }
+    expected_baseline_compare_key = {
+        "resolver_pair": "bind9_vs_unbound",
+        "producer_profile": "poison-stateful",
+        "input_model": "DST1 transcript",
+        "source_queue_dir": "/tmp/follow/queue",
+        "budget_sec": 5,
+        "seed_timeout_sec": 1,
+        "repeat_count": 3,
+        "contract_version": 1,
+    }
+    if comparability.get("status") != "comparable":
+        raise SystemExit("ASSERT FAIL: 可比 root comparability.status 应为 comparable")
+    if comparability.get("reason") != "ok":
+        raise SystemExit(
+            f"ASSERT FAIL: 可比 root comparability.reason={comparability.get('reason')!r} != 'ok'"
+        )
+    if comparability.get("aggregation_key") != expected_aggregation_key:
+        raise SystemExit(
+            "ASSERT FAIL: comparability.aggregation_key 不符合预期: "
+            f"{comparability.get('aggregation_key')!r}"
+        )
+    if comparability.get("baseline_compare_key") != expected_baseline_compare_key:
+        raise SystemExit(
+            "ASSERT FAIL: comparability.baseline_compare_key 不符合预期: "
+            f"{comparability.get('baseline_compare_key')!r}"
+        )
+else:
+    raise SystemExit(f"ASSERT FAIL: 未知 scenario {scenario!r}")
+PY
+}
+
+assert_oracle_reliability_scaffold() {
+	local reliability_path="$1"
+	python3 - "$reliability_path" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+signals = payload.get("signals")
+signal_combos = payload.get("signal_combos")
+if not isinstance(signals, dict):
+    raise SystemExit("ASSERT FAIL: oracle_reliability.signals 应为对象")
+if not isinstance(signal_combos, dict):
+    raise SystemExit("ASSERT FAIL: oracle_reliability.signal_combos 应为对象")
+
+required_signal_names = {
+    "response_accepted_any",
+    "second_query_hit_any",
+    "cache_entry_created_any",
+    "oracle_diff_any",
+}
+if set(signals.keys()) != required_signal_names:
+    raise SystemExit(
+        f"ASSERT FAIL: signals keys={set(signals.keys())!r} != {required_signal_names!r}"
+    )
+
+required_combo_names = {"oracle_diff_plus_cache_diff"}
+if set(signal_combos.keys()) != required_combo_names:
+    raise SystemExit(
+        "ASSERT FAIL: signal_combos keys="
+        f"{set(signal_combos.keys())!r} != {required_combo_names!r}"
+    )
+
+required_fields = {
+    "eligible_count",
+    "pending_manual_count",
+    "judged_count",
+    "confirmed_relevant_count",
+    "false_positive_count",
+    "inconclusive_count",
+}
+
+for scope_name, scope_payload in (
+    ("signals", signals),
+    ("signal_combos", signal_combos),
+):
+    for signal_name, stats in scope_payload.items():
+        if not isinstance(stats, dict):
+            raise SystemExit(
+                f"ASSERT FAIL: {scope_name}.{signal_name} 应为对象: {stats!r}"
+            )
+        if set(stats.keys()) != required_fields:
+            raise SystemExit(
+                f"ASSERT FAIL: {scope_name}.{signal_name} fields={set(stats.keys())!r} != {required_fields!r}"
+            )
+        for field, value in stats.items():
+            if not isinstance(value, int) or value < 0:
+                raise SystemExit(
+                    f"ASSERT FAIL: {scope_name}.{signal_name}.{field} 应为非负整数，实际 {value!r}"
+                )
+        if (
+            stats["judged_count"] != 0
+            or stats["confirmed_relevant_count"] != 0
+            or stats["false_positive_count"] != 0
+            or stats["inconclusive_count"] != 0
+        ):
+            raise SystemExit(
+                f"ASSERT FAIL: {scope_name}.{signal_name} 在无 manual truth 输入时 judged 相关字段必须为 0，实际 {stats!r}"
+            )
+PY
+}
+
+assert_oracle_audit_header() {
+	local audit_tsv="$1"
+	python3 - "$audit_tsv" <<'PY'
+import pathlib
+import sys
+
+header = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()[0]
+expected = "\t".join(
+    [
+        "sample_id",
+        "triage_status",
+        "analysis_state",
+        "semantic_outcome",
+        "oracle_audit_candidate",
+        "manual_truth_status",
+        "bind9.parse_ok",
+        "unbound.parse_ok",
+        "bind9.response_accepted",
+        "unbound.response_accepted",
+        "bind9.second_query_hit",
+        "unbound.second_query_hit",
+        "bind9.cache_entry_created",
+        "unbound.cache_entry_created",
+        "oracle_diff_fields",
+        "sample_meta_path",
+        "oracle_path",
+        "cache_diff_path",
+        "triage_path",
+    ]
+)
+if header != expected:
+    raise SystemExit(f"ASSERT FAIL: oracle_audit.tsv 表头不符合预期:\nactual={header!r}\nexpected={expected!r}")
+PY
+}
+
+assert_oracle_reliability_gate_with_noneligible_signal_hits() {
+	local reliability_path="$1"
+	local audit_tsv_path="$2"
+	python3 - "$reliability_path" "$audit_tsv_path" <<'PY'
+import csv
+import json
+import pathlib
+import sys
+
+reliability = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+audit_path = pathlib.Path(sys.argv[2])
+
+signal_hit_count = 0
+with audit_path.open(encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle, delimiter="\t"))
+
+for row in rows:
+    if row.get("oracle_audit_candidate") != "false":
+        continue
+    signal_hit = (
+        row.get("bind9.response_accepted") == "true"
+        or row.get("unbound.response_accepted") == "true"
+        or row.get("bind9.second_query_hit") == "true"
+        or row.get("unbound.second_query_hit") == "true"
+        or row.get("bind9.cache_entry_created") == "true"
+        or row.get("unbound.cache_entry_created") == "true"
+        or row.get("oracle_diff_fields") != "-"
+    )
+    if signal_hit:
+        signal_hit_count += 1
+
+if signal_hit_count <= 0:
+    raise SystemExit(
+        "ASSERT FAIL: 期望至少存在 1 个非 audit candidate 且命中 signal 的样本，用于验证 denominator gate"
+    )
+
+for scope_name in ("signals", "signal_combos"):
+    scope = reliability.get(scope_name)
+    if not isinstance(scope, dict):
+        raise SystemExit(f"ASSERT FAIL: {scope_name} 应为对象")
+    for name, stats in scope.items():
+        if not isinstance(stats, dict):
+            raise SystemExit(f"ASSERT FAIL: {scope_name}.{name} 应为对象")
+        for field in (
+            "eligible_count",
+            "pending_manual_count",
+            "judged_count",
+            "confirmed_relevant_count",
+            "false_positive_count",
+            "inconclusive_count",
+        ):
+            if stats.get(field) != 0:
+                raise SystemExit(
+                    f"ASSERT FAIL: {scope_name}.{name}.{field} 期望为 0（非eligible样本不应抬高 denominator），实际 {stats.get(field)!r}"
+                )
+PY
+}
+
 mkdir -p "$EMPTY_ROOT" "$NONEMPTY_ROOT" "$FAIL_ROOT"
 touch "$EMPTY_ROOT/high_value_samples.txt"
 
@@ -135,7 +430,12 @@ assert_file_exists "$EMPTY_REPORT_DIR/summary.json"
 assert_file_exists "$EMPTY_REPORT_DIR/ablation_matrix.tsv"
 assert_file_exists "$EMPTY_REPORT_DIR/cluster_counts.tsv"
 assert_file_exists "$EMPTY_REPORT_DIR/repro_rate.tsv"
-assert_summary_contract "$EMPTY_REPORT_DIR/summary.json" 0 0 0 0 0 0.0
+assert_file_exists "$EMPTY_REPORT_DIR/oracle_audit.tsv"
+assert_file_exists "$EMPTY_REPORT_DIR/oracle_reliability.json"
+assert_summary_contract "$EMPTY_REPORT_DIR/summary.json" 0 0 0 0 0 0.0 0 0
+assert_summary_metadata_contract "$EMPTY_REPORT_DIR/summary.json" empty
+assert_oracle_audit_header "$EMPTY_REPORT_DIR/oracle_audit.tsv"
+assert_oracle_reliability_scaffold "$EMPTY_REPORT_DIR/oracle_reliability.json"
 assert_file_contains "$EMPTY_REPORT_DIR/repro_rate.tsv" $'metric\tvalue'
 assert_file_contains "$EMPTY_REPORT_DIR/repro_rate.tsv" $'manifest_size\t0'
 assert_file_contains "$EMPTY_REPORT_DIR/repro_rate.tsv" $'reproduced_count\t0'
@@ -155,8 +455,47 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 
+
+def sample_meta(sample_id: str) -> dict:
+    return {
+        "schema_version": 1,
+        "generated_at": "2026-03-23T00:00:00Z",
+        "sample_id": sample_id,
+        "contract_version": 1,
+        "aggregation_key": {
+            "resolver_pair": "bind9_vs_unbound",
+            "producer_profile": "poison-stateful",
+            "input_model": "DST1 transcript",
+            "source_queue_dir": "/tmp/follow/queue",
+            "budget_sec": 5,
+            "seed_timeout_sec": 1,
+            "variant_name": "control",
+            "ablation_status": {
+                "mutator": "off",
+                "cache-delta": "on",
+                "triage": "on",
+                "symcc": "on",
+            },
+            "contract_version": 1,
+        },
+        "baseline_compare_key": {
+            "resolver_pair": "bind9_vs_unbound",
+            "producer_profile": "poison-stateful",
+            "input_model": "DST1 transcript",
+            "source_queue_dir": "/tmp/follow/queue",
+            "budget_sec": 5,
+            "seed_timeout_sec": 1,
+            "repeat_count": 3,
+            "contract_version": 1,
+        },
+    }
+
 sample_dir = root / "sample"
 sample_dir.mkdir(parents=True, exist_ok=True)
+(sample_dir / "sample.meta.json").write_text(
+    json.dumps(sample_meta("sample"), ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
 (sample_dir / "triage.json").write_text(
     json.dumps(
         {
@@ -165,6 +504,9 @@ sample_dir.mkdir(parents=True, exist_ok=True)
             "sample_id": "sample",
             "status": "completed_no_diff",
             "diff_class": "no_diff",
+            "analysis_state": "included",
+            "exclude_reason": None,
+            "semantic_outcome": "no_diff",
             "filter_labels": [],
             "cluster_key": "non-manifest-cluster",
             "cache_delta_triggered": False,
@@ -177,10 +519,42 @@ sample_dir.mkdir(parents=True, exist_ok=True)
     + "\n",
     encoding="utf-8",
 )
+(sample_dir / "oracle.json").write_text(
+    json.dumps(
+        {
+            "bind9.parse_ok": True,
+            "unbound.parse_ok": True,
+            "bind9.response_accepted": True,
+            "unbound.response_accepted": False,
+            "bind9.second_query_hit": False,
+            "unbound.second_query_hit": False,
+            "bind9.cache_entry_created": False,
+            "unbound.cache_entry_created": False,
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+(sample_dir / "cache_diff.json").write_text(
+    json.dumps(
+        {
+            "bind9": {"has_cache_diff": False},
+            "unbound": {"has_cache_diff": False},
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 
 sample_one_dir = root / "sample-1"
 sample_one_dir.mkdir(parents=True, exist_ok=True)
 (sample_one_dir / "sample.bin").write_bytes(b"\x01\x02\x03\x04")
+(sample_one_dir / "sample.meta.json").write_text(
+    json.dumps(sample_meta("sample-1"), ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
 (sample_one_dir / "triage.json").write_text(
     json.dumps(
         {
@@ -189,12 +563,43 @@ sample_one_dir.mkdir(parents=True, exist_ok=True)
             "sample_id": "sample-1",
             "status": "completed_cache_changed_needs_review",
             "diff_class": "cache_diff_interesting",
+            "analysis_state": "included",
+            "exclude_reason": None,
+            "semantic_outcome": "cache_diff_interesting",
             "filter_labels": ["cache_delta_review"],
             "cluster_key": "review-cluster",
             "cache_delta_triggered": True,
             "interesting_delta_count": 1,
             "needs_manual_review": True,
             "notes": [],
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+(sample_one_dir / "oracle.json").write_text(
+    json.dumps(
+        {
+            "bind9.parse_ok": True,
+            "unbound.parse_ok": False,
+            "bind9.response_accepted": False,
+            "unbound.response_accepted": False,
+            "bind9.second_query_hit": True,
+            "unbound.second_query_hit": False,
+            "bind9.cache_entry_created": False,
+            "unbound.cache_entry_created": True,
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+(sample_one_dir / "cache_diff.json").write_text(
+    json.dumps(
+        {
+            "bind9": {"has_cache_diff": True},
+            "unbound": {"has_cache_diff": False},
         },
         ensure_ascii=False,
     )
@@ -215,7 +620,13 @@ assert_file_exists "$NONEMPTY_REPORT_DIR/summary.json"
 assert_file_exists "$NONEMPTY_REPORT_DIR/ablation_matrix.tsv"
 assert_file_exists "$NONEMPTY_REPORT_DIR/cluster_counts.tsv"
 assert_file_exists "$NONEMPTY_REPORT_DIR/repro_rate.tsv"
-assert_summary_contract "$NONEMPTY_REPORT_DIR/summary.json" 2 1 2 1 1 1.0
+assert_file_exists "$NONEMPTY_REPORT_DIR/oracle_audit.tsv"
+assert_file_exists "$NONEMPTY_REPORT_DIR/oracle_reliability.json"
+assert_summary_contract "$NONEMPTY_REPORT_DIR/summary.json" 2 1 2 1 1 1.0 0 0
+assert_summary_metadata_contract "$NONEMPTY_REPORT_DIR/summary.json" comparable
+assert_oracle_audit_header "$NONEMPTY_REPORT_DIR/oracle_audit.tsv"
+assert_oracle_reliability_scaffold "$NONEMPTY_REPORT_DIR/oracle_reliability.json"
+assert_oracle_reliability_gate_with_noneligible_signal_hits "$NONEMPTY_REPORT_DIR/oracle_reliability.json" "$NONEMPTY_REPORT_DIR/oracle_audit.tsv"
 assert_file_contains "$NONEMPTY_REPORT_DIR/repro_rate.tsv" $'metric\tvalue'
 assert_file_contains "$NONEMPTY_REPORT_DIR/repro_rate.tsv" $'manifest_size\t1'
 assert_file_contains "$NONEMPTY_REPORT_DIR/repro_rate.tsv" $'reproduced_count\t1'
@@ -231,7 +642,8 @@ assert_file_contains "$NONEMPTY_REPORT_DIR/ablation_matrix.tsv" $'triage\ton'
 
 run_cli campaign-report --root "$NONEMPTY_ROOT" >/dev/null
 NONEMPTY_REPORT_DIR_SECOND="$(get_latest_report_dir "$NONEMPTY_ROOT/campaign_reports")"
-assert_summary_contract "$NONEMPTY_REPORT_DIR_SECOND/summary.json" 2 1 2 1 1 1.0
+assert_summary_contract "$NONEMPTY_REPORT_DIR_SECOND/summary.json" 2 1 2 1 1 1.0 0 0
+assert_summary_metadata_contract "$NONEMPTY_REPORT_DIR_SECOND/summary.json" comparable
 
 run_cli report --root "$NONEMPTY_ROOT" >/dev/null
 assert_file_exists "$NONEMPTY_ROOT/status_summary.tsv"

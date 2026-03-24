@@ -262,6 +262,7 @@ for key in (
     "budget_sec",
     "deadline_ts",
     "queue_tail_id",
+    "run_id",
     "exit_reason",
     "exit_code",
     "completed_count",
@@ -275,6 +276,8 @@ if summary.get("queue_tail_id") != expected_queue_tail_id:
     raise SystemExit(
         f"ASSERT FAIL: follow_diff.window.summary.queue_tail_id={summary.get('queue_tail_id')!r} != {expected_queue_tail_id!r}"
     )
+if not isinstance(summary.get("run_id"), str) or not summary["run_id"]:
+    raise SystemExit("ASSERT FAIL: follow_diff.window.summary.run_id 应为非空字符串")
 if summary.get("exit_reason") != expected_exit_reason:
     raise SystemExit(
         f"ASSERT FAIL: follow_diff.window.summary.exit_reason={summary.get('exit_reason')!r} != {expected_exit_reason!r}"
@@ -448,6 +451,154 @@ if expected_message_keyword != "-":
 PY
 }
 
+assert_campaign_close_metadata_contract() {
+	local summary_path="$1"
+	local scenario="$2"
+	python3 - "$summary_path" "$scenario" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+scenario = sys.argv[2]
+
+run_id = summary.get("run_id")
+if not isinstance(run_id, str) or not run_id:
+    raise SystemExit("ASSERT FAIL: close summary.run_id 应为非空字符串")
+
+metric_denominators = summary.get("metric_denominators")
+if not isinstance(metric_denominators, dict):
+    raise SystemExit("ASSERT FAIL: close summary.metric_denominators 应为对象")
+analysis_state = metric_denominators.get("analysis_state")
+if not isinstance(analysis_state, dict):
+    raise SystemExit("ASSERT FAIL: metric_denominators.analysis_state 应为对象")
+for key in ("included", "excluded", "unknown"):
+    value = analysis_state.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(
+            f"ASSERT FAIL: metric_denominators.analysis_state[{key!r}]={value!r} 非法"
+        )
+
+total_samples = metric_denominators.get("total_samples")
+if isinstance(total_samples, bool) or not isinstance(total_samples, int) or total_samples < 0:
+    raise SystemExit(
+        f"ASSERT FAIL: metric_denominators.total_samples={total_samples!r} 非法"
+    )
+if sum(analysis_state.values()) != total_samples:
+    raise SystemExit(
+        "ASSERT FAIL: analysis_state 分母求和与 total_samples 不一致: "
+        f"{analysis_state!r} vs {total_samples!r}"
+    )
+
+comparability = summary.get("comparability")
+if not isinstance(comparability, dict):
+    raise SystemExit("ASSERT FAIL: close summary.comparability 应为对象")
+if comparability.get("status") != "non_comparable":
+    raise SystemExit(
+        f"ASSERT FAIL: close summary.comparability.status={comparability.get('status')!r} != 'non_comparable'"
+    )
+if comparability.get("aggregation_key") is not None:
+    raise SystemExit("ASSERT FAIL: close summary.comparability.aggregation_key 应为 null")
+if comparability.get("baseline_compare_key") is not None:
+    raise SystemExit(
+        "ASSERT FAIL: close summary.comparability.baseline_compare_key 应为 null"
+    )
+
+phase_context = summary.get("phase_context")
+if not isinstance(phase_context, dict):
+    raise SystemExit("ASSERT FAIL: close summary.phase_context 应为对象")
+
+state_context = phase_context.get("follow_diff_state")
+window_context = phase_context.get("follow_diff_window_summary")
+if not isinstance(state_context, dict) or not isinstance(window_context, dict):
+    raise SystemExit("ASSERT FAIL: phase_context 缺少 follow_diff_state/window_summary")
+if state_context.get("run_id") != run_id:
+    raise SystemExit(
+        f"ASSERT FAIL: phase_context.follow_diff_state.run_id={state_context.get('run_id')!r} != {run_id!r}"
+    )
+if window_context.get("run_id") != run_id:
+    raise SystemExit(
+        "ASSERT FAIL: phase_context.follow_diff_window_summary.run_id="
+        f"{window_context.get('run_id')!r} != {run_id!r}"
+    )
+retry_count = state_context.get("retry_count")
+if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+    raise SystemExit(
+        f"ASSERT FAIL: phase_context.follow_diff_state.retry_count={retry_count!r} 非法"
+    )
+last_attempt_ts = state_context.get("last_attempt_ts")
+if not isinstance(last_attempt_ts, str) or not last_attempt_ts:
+    raise SystemExit("ASSERT FAIL: phase_context.follow_diff_state.last_attempt_ts 应为非空字符串")
+
+if scenario == "success":
+    expected_denominators = {
+        "total_samples": 1,
+        "analysis_state": {"included": 1, "excluded": 0, "unknown": 0},
+        "comparable_samples": 0,
+        "non_comparable_samples": 1,
+    }
+    if metric_denominators != expected_denominators:
+        raise SystemExit(
+            f"ASSERT FAIL: success metric_denominators={metric_denominators!r} != {expected_denominators!r}"
+        )
+    if comparability.get("reason") != "missing_comparability_fields":
+        raise SystemExit(
+            f"ASSERT FAIL: success comparability.reason={comparability.get('reason')!r} != 'missing_comparability_fields'"
+        )
+    if state_context.get("last_exit_reason") != "quiescent":
+        raise SystemExit("ASSERT FAIL: success state.last_exit_reason 应为 quiescent")
+    if window_context.get("exit_reason") != "quiescent":
+        raise SystemExit("ASSERT FAIL: success window.exit_reason 应为 quiescent")
+    if retry_count != 0:
+        raise SystemExit(f"ASSERT FAIL: success retry_count={retry_count!r} != 0")
+elif scenario == "follow-timeout":
+    if metric_denominators.get("comparable_samples") != 0:
+        raise SystemExit("ASSERT FAIL: follow-timeout comparable_samples 应为 0")
+    if metric_denominators.get("non_comparable_samples") != total_samples:
+        raise SystemExit(
+            "ASSERT FAIL: follow-timeout non_comparable_samples 应等于 total_samples"
+        )
+    if comparability.get("reason") not in {"no_samples", "missing_comparability_fields"}:
+        raise SystemExit(
+            "ASSERT FAIL: follow-timeout comparability.reason 非法: "
+            f"{comparability.get('reason')!r}"
+        )
+    if state_context.get("last_exit_reason") != "deadline_exceeded":
+        raise SystemExit(
+            "ASSERT FAIL: follow-timeout state.last_exit_reason 应为 deadline_exceeded"
+        )
+    if window_context.get("exit_reason") != "deadline_exceeded":
+        raise SystemExit(
+            "ASSERT FAIL: follow-timeout window.exit_reason 应为 deadline_exceeded"
+        )
+    if retry_count != 0:
+        raise SystemExit(f"ASSERT FAIL: follow-timeout retry_count={retry_count!r} != 0")
+elif scenario == "report-missing":
+    expected_denominators = {
+        "total_samples": 1,
+        "analysis_state": {"included": 1, "excluded": 0, "unknown": 0},
+        "comparable_samples": 0,
+        "non_comparable_samples": 1,
+    }
+    if metric_denominators != expected_denominators:
+        raise SystemExit(
+            f"ASSERT FAIL: report-missing metric_denominators={metric_denominators!r} != {expected_denominators!r}"
+        )
+    if comparability.get("reason") != "missing_comparability_fields":
+        raise SystemExit(
+            "ASSERT FAIL: report-missing comparability.reason 应为 missing_comparability_fields"
+        )
+    if state_context.get("last_exit_reason") != "quiescent":
+        raise SystemExit("ASSERT FAIL: report-missing state.last_exit_reason 应为 quiescent")
+    if window_context.get("exit_reason") != "quiescent":
+        raise SystemExit("ASSERT FAIL: report-missing window.exit_reason 应为 quiescent")
+    if retry_count != 0:
+        raise SystemExit(f"ASSERT FAIL: report-missing retry_count={retry_count!r} != 0")
+else:
+    raise SystemExit(f"ASSERT FAIL: 未知 scenario {scenario!r}")
+PY
+}
+
 assert_campaign_report_artifacts() {
 	local latest_report_dir="$1"
 	assert_file_exists "$FOLLOW_ROOT/cluster_summary.tsv"
@@ -487,6 +638,7 @@ assert_follow_window_phase_summary "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" "quiescen
 SUCCESS_REPORT_DIR="$(get_latest_report_dir "$CAMPAIGN_REPORT_BASE")"
 assert_campaign_report_artifacts "$SUCCESS_REPORT_DIR"
 assert_campaign_close_success_summary "$CAMPAIGN_SUMMARY" "$QUEUE_EVENT_ID"
+assert_campaign_close_metadata_contract "$CAMPAIGN_SUMMARY" success
 
 init_scenario "follow-timeout" "timeout"
 SEED_TIMEOUT_SEC_OVERRIDE=10
@@ -512,6 +664,7 @@ assert_campaign_close_failure_summary \
 	"follow-diff-window" \
 	"deadline_exceeded" \
 	"-"
+assert_campaign_close_metadata_contract "$CAMPAIGN_SUMMARY" follow-timeout
 
 init_scenario "report-missing" "dump_success"
 SYMCC_HIGH_VALUE_MANIFEST_OVERRIDE="$SCENARIO_ROOT/high-value-manifest-as-dir"
@@ -538,5 +691,6 @@ assert_campaign_close_failure_summary \
 	"triage-report" \
 	"__nonempty__" \
 	"high_value_samples.txt"
+assert_campaign_close_metadata_contract "$CAMPAIGN_SUMMARY" report-missing
 
 printf 'PASS: campaign-close contract test passed\n'

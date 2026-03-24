@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from .io import atomic_write_json, load_json_with_fallback
 from .oracle import ORACLE_FIELDS
 from .schema import STATE_FINGERPRINT_REQUIRED_FIELDS, stamp_with_shared_meta
+from .taxonomy import infer_replay_failure_reason, normalize_failure_taxonomy
 
 RESOLVERS: Tuple[str, str] = ("bind9", "unbound")
 TRIAGE_REQUIRED_FIELDS: Sequence[str] = (
@@ -14,11 +15,20 @@ TRIAGE_REQUIRED_FIELDS: Sequence[str] = (
     "sample_id",
     "status",
     "diff_class",
+    "analysis_state",
+    "exclude_reason",
+    "semantic_outcome",
+    "failure_taxonomy_version",
+    "failure_bucket_primary",
+    "failure_bucket_detail",
     "filter_labels",
     "cluster_key",
     "cache_delta_triggered",
     "interesting_delta_count",
     "needs_manual_review",
+    "oracle_audit_candidate",
+    "case_study_candidate",
+    "manual_truth_status",
     "notes",
 )
 
@@ -104,28 +114,14 @@ def _sample_failure(sample_meta: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
+def _replay_failure_reason(failure: Mapping[str, Any]) -> Optional[str]:
+    return infer_replay_failure_reason(failure)
+
+
 def _failure_text_field(failure: Mapping[str, Any], field: str) -> Optional[str]:
     value = failure.get(field)
     if isinstance(value, str) and value:
         return value
-    return None
-
-
-def _replay_failure_reason(failure: Mapping[str, Any]) -> Optional[str]:
-    reason = _failure_text_field(failure, "reason")
-    if reason:
-        return reason
-
-    message = _failure_text_field(failure, "message") or ""
-    returncode = failure.get("returncode")
-    if returncode in (124, 137) or "超时" in message:
-        return "timeout"
-    if _failure_text_field(failure, "artifact_path") or "未生成有效文件" in message:
-        return "missing_artifact"
-    if _failure_text_field(failure, "executable_path") or any(
-        token in message for token in ("不可执行", "缺少可执行文件")
-    ):
-        return "missing_executable"
     return None
 
 
@@ -234,6 +230,40 @@ def _classify_triage_branch(
         return "cache_diff_benign"
 
     return "no_diff"
+
+
+def _derive_analysis_projection(
+    *,
+    status: Optional[str],
+    diff_class: Optional[str],
+    needs_manual_review: bool,
+    sample_failure: Mapping[str, Any],
+) -> Dict[str, Any]:
+    taxonomy = normalize_failure_taxonomy(
+        status=status,
+        diff_class=diff_class,
+        sample_failure=sample_failure,
+    )
+
+    publication_analysis_state = taxonomy["analysis_state"]
+    publication_exclude_reason = taxonomy["exclude_reason"]
+    publication_semantic_outcome = taxonomy["semantic_outcome"]
+
+    oracle_audit_candidate = bool(taxonomy["oracle_audit_candidate"])
+    case_study_candidate = oracle_audit_candidate and needs_manual_review
+    manual_truth_status = "not_started" if oracle_audit_candidate else "not_applicable"
+
+    return {
+        "analysis_state": publication_analysis_state,
+        "exclude_reason": publication_exclude_reason,
+        "semantic_outcome": publication_semantic_outcome,
+        "failure_taxonomy_version": taxonomy["failure_taxonomy_version"],
+        "failure_bucket_primary": taxonomy["failure_bucket_primary"],
+        "failure_bucket_detail": taxonomy["failure_bucket_detail"],
+        "oracle_audit_candidate": oracle_audit_candidate,
+        "case_study_candidate": case_study_candidate,
+        "manual_truth_status": manual_truth_status,
+    }
 
 
 def _rewrite_filter_labels(
@@ -433,6 +463,15 @@ def build_triage(
         sample_id=sample_id,
     )
 
+    payload.update(
+        _derive_analysis_projection(
+            status=status,
+            diff_class=diff_class,
+            needs_manual_review=needs_manual_review,
+            sample_failure=sample_failure,
+        )
+    )
+
     for field in TRIAGE_REQUIRED_FIELDS:
         payload.setdefault(field, None)
     return payload
@@ -519,6 +558,15 @@ def rewrite_triage_payload(
     payload["cache_delta_triggered"] = rebuilt_triage["cache_delta_triggered"]
     payload["interesting_delta_count"] = rebuilt_triage["interesting_delta_count"]
     payload["needs_manual_review"] = rebuilt_triage["needs_manual_review"]
+    payload["analysis_state"] = rebuilt_triage["analysis_state"]
+    payload["exclude_reason"] = rebuilt_triage["exclude_reason"]
+    payload["semantic_outcome"] = rebuilt_triage["semantic_outcome"]
+    payload["failure_taxonomy_version"] = rebuilt_triage["failure_taxonomy_version"]
+    payload["failure_bucket_primary"] = rebuilt_triage["failure_bucket_primary"]
+    payload["failure_bucket_detail"] = rebuilt_triage["failure_bucket_detail"]
+    payload["oracle_audit_candidate"] = rebuilt_triage["oracle_audit_candidate"]
+    payload["case_study_candidate"] = rebuilt_triage["case_study_candidate"]
+    payload["manual_truth_status"] = rebuilt_triage["manual_truth_status"]
     payload["notes"] = list(rebuilt_triage["notes"])
 
     for field in TRIAGE_REQUIRED_FIELDS:

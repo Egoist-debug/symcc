@@ -1,0 +1,49 @@
+{
+  "matrix_name": "poison_stateful_longbudget",
+  "comparability": {
+    "resolver_pair": "bind9_vs_unbound",
+    "producer_profile": "poison-stateful",
+    "input_model": "DST1 transcript",
+    "source_queue_dir": "afl_out/master/queue",
+    "seed_timeout_sec": 1,
+    "contract_version": 1
+  },
+  "variants": [
+    {
+      "variant_name": "full_stack",
+      "env": {
+        "ENABLE_DST1_MUTATOR": "1",
+        "ENABLE_CACHE_DELTA": "1",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "1"
+      }
+    },
+    {
+      "variant_name": "afl_only",
+      "env": {
+        "ENABLE_DST1_MUTATOR": "1",
+        "ENABLE_CACHE_DELTA": "1",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "0"
+      }
+    },
+    {
+      "variant_name": "no_mutator",
+      "env": {
+        "ENABLE_DST1_MUTATOR": "0",
+        "ENABLE_CACHE_DELTA": "1",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "1"
+      }
+    },
+    {
+      "variant_name": "no_cache_delta",
+      "env": {
+        "ENABLE_DST1_MUTATOR": "1",
+        "ENABLE_CACHE_DELTA": "0",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "1"
+      }
+    }
+  ]
+}

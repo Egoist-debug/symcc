@@ -158,6 +158,11 @@ assert_replay_failure() {
 	local expected_stderr="${10}"
 	local expected_executable_suffix="${11}"
 	local expected_process_started="${12}"
+	local expected_analysis_state="${13}"
+	local expected_failure_primary="${14}"
+	local expected_failure_detail="${15}"
+	local expected_exclude_reason="${16}"
+	local expected_semantic_outcome="${17}"
 
 	assert_file_exists "$sample_dir/sample.bin"
 	assert_file_exists "$sample_dir/sample.meta.json"
@@ -179,7 +184,12 @@ assert_replay_failure() {
 		"$expected_artifact" \
 		"$expected_stderr" \
 		"$expected_executable_suffix" \
-		"$expected_process_started" <<'PY'
+		"$expected_process_started" \
+		"$expected_analysis_state" \
+		"$expected_failure_primary" \
+		"$expected_failure_detail" \
+		"$expected_exclude_reason" \
+		"$expected_semantic_outcome" <<'PY'
 import json
 import pathlib
 import sys
@@ -196,6 +206,11 @@ expected_artifact = sys.argv[9]
 expected_stderr = sys.argv[10]
 expected_executable_suffix = sys.argv[11]
 expected_process_started = sys.argv[12] == "true"
+expected_analysis_state = sys.argv[13]
+expected_failure_primary = sys.argv[14]
+expected_failure_detail = sys.argv[15]
+expected_exclude_reason = sys.argv[16]
+expected_semantic_outcome = sys.argv[17]
 
 meta = json.loads((sample_dir / "sample.meta.json").read_text(encoding="utf-8"))
 triage = json.loads((sample_dir / "triage.json").read_text(encoding="utf-8"))
@@ -283,6 +298,36 @@ if triage.get("diff_class") != "replay_incomplete":
     raise SystemExit(
         f"ASSERT FAIL: triage.diff_class={triage.get('diff_class')!r} != 'replay_incomplete'"
     )
+if triage.get("analysis_state") != expected_analysis_state:
+    raise SystemExit(
+        f"ASSERT FAIL: triage.analysis_state={triage.get('analysis_state')!r} != {expected_analysis_state!r}"
+    )
+if triage.get("failure_bucket_primary") != expected_failure_primary:
+    raise SystemExit(
+        "ASSERT FAIL: triage.failure_bucket_primary="
+        f"{triage.get('failure_bucket_primary')!r} != {expected_failure_primary!r}"
+    )
+if triage.get("failure_bucket_detail") != expected_failure_detail:
+    raise SystemExit(
+        "ASSERT FAIL: triage.failure_bucket_detail="
+        f"{triage.get('failure_bucket_detail')!r} != {expected_failure_detail!r}"
+    )
+if expected_exclude_reason == "-":
+    if triage.get("exclude_reason") is not None:
+        raise SystemExit(
+            f"ASSERT FAIL: triage.exclude_reason 期望为空，实际 {triage.get('exclude_reason')!r}"
+        )
+else:
+    if triage.get("exclude_reason") != expected_exclude_reason:
+        raise SystemExit(
+            "ASSERT FAIL: triage.exclude_reason="
+            f"{triage.get('exclude_reason')!r} != {expected_exclude_reason!r}"
+        )
+if triage.get("semantic_outcome") != expected_semantic_outcome:
+    raise SystemExit(
+        "ASSERT FAIL: triage.semantic_outcome="
+        f"{triage.get('semantic_outcome')!r} != {expected_semantic_outcome!r}"
+    )
 
 labels = triage.get("filter_labels")
 if not isinstance(labels, list):
@@ -310,7 +355,12 @@ assert_replay_failure \
 	"-" \
 	"-" \
 	".libs/unbound-fuzzme" \
-	false
+	false \
+	"excluded" \
+	"infra_artifact_failure" \
+	"replay_missing_executable" \
+	"infra_failure" \
+	"infra_failure"
 
 init_scenario "timeout" "timeout"
 run_follow_diff_once
@@ -326,7 +376,12 @@ assert_replay_failure \
 	"-" \
 	"unbound.stderr" \
 	"-" \
-	true
+	true \
+	"unknown" \
+	"target_runtime_failure" \
+	"replay_timeout" \
+	"-" \
+	"runtime_or_parse_failure"
 
 init_scenario "missing-artifact" "missing_artifact"
 run_follow_diff_once
@@ -342,6 +397,11 @@ assert_replay_failure \
 	"unbound.before.cache.txt" \
 	"unbound.stderr" \
 	"-" \
-	true
+	true \
+	"excluded" \
+	"infra_artifact_failure" \
+	"replay_missing_artifact" \
+	"infra_failure" \
+	"infra_failure"
 
 echo "PASS: replay failure evidence regression test passed"

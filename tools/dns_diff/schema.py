@@ -2,9 +2,37 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 SCHEMA_VERSION = 1
+CONTRACT_VERSION = SCHEMA_VERSION
+_LAST_FOLLOW_DIFF_RUN_ID: Optional[str] = None
+
+ANALYSIS_STATES = {"included", "excluded", "unknown"}
+
+AGGREGATION_KEY_FIELDS: Sequence[str] = (
+    "resolver_pair",
+    "producer_profile",
+    "input_model",
+    "source_queue_dir",
+    "budget_sec",
+    "seed_timeout_sec",
+    "variant_name",
+    "ablation_status",
+    "contract_version",
+)
+
+BASELINE_COMPARE_KEY_FIELDS: Sequence[str] = (
+    "resolver_pair",
+    "producer_profile",
+    "input_model",
+    "source_queue_dir",
+    "budget_sec",
+    "seed_timeout_sec",
+    "repeat_count",
+    "contract_version",
+)
 
 SAMPLE_META_REQUIRED_FIELDS: Sequence[str] = (
     "schema_version",
+    "contract_version",
     "generated_at",
     "sample_id",
     "queue_event_id",
@@ -16,6 +44,10 @@ SAMPLE_META_REQUIRED_FIELDS: Sequence[str] = (
     "afl_tags",
     "first_seen_ts",
     "status",
+    "analysis_state",
+    "exclude_reason",
+    "aggregation_key",
+    "baseline_compare_key",
 )
 
 FOLLOW_DIFF_STATE_REQUIRED_FIELDS: Sequence[str] = (
@@ -25,6 +57,8 @@ FOLLOW_DIFF_STATE_REQUIRED_FIELDS: Sequence[str] = (
     "running_sample_id",
     "completed_count",
     "failed_count",
+    "aggregation_key",
+    "baseline_compare_key",
 )
 
 FOLLOW_DIFF_STATE_OPTIONAL_AUDIT_FIELDS: Sequence[str] = (
@@ -43,6 +77,8 @@ FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS: Sequence[str] = (
     "completed_count",
     "failed_count",
     "last_queue_event_id",
+    "aggregation_key",
+    "baseline_compare_key",
 )
 
 STATE_FINGERPRINT_REQUIRED_FIELDS: Sequence[str] = (
@@ -65,6 +101,260 @@ def utc_timestamp() -> str:
     return (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
+
+
+def _coerce_contract_version(
+    value: Any,
+    *,
+    schema_version: Any = None,
+) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    if (
+        isinstance(schema_version, int)
+        and not isinstance(schema_version, bool)
+        and schema_version >= 1
+    ):
+        return schema_version
+    return CONTRACT_VERSION
+
+
+def _coerce_analysis_state(value: Any) -> str:
+    if isinstance(value, str) and value in ANALYSIS_STATES:
+        return value
+    return "unknown"
+
+
+def _coerce_optional_text(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _is_missing_contract_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def _extract_contract_key_payload(
+    data: Mapping[str, Any],
+    *,
+    key_name: str,
+    fields: Sequence[str],
+) -> tuple[Optional[Dict[str, Any]], List[str]]:
+    key_payload = data.get(key_name)
+    if not isinstance(key_payload, Mapping):
+        return None, list(fields)
+
+    normalized: Dict[str, Any] = {}
+    missing_fields: List[str] = []
+    for field in fields:
+        value = key_payload.get(field)
+        if field not in key_payload or _is_missing_contract_value(value):
+            missing_fields.append(field)
+            continue
+        normalized[field] = value
+
+    if missing_fields:
+        return None, missing_fields
+    return normalized, []
+
+
+def _conflicting_contract_fields(
+    reference: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    fields: Sequence[str],
+) -> List[str]:
+    return [field for field in fields if reference.get(field) != candidate.get(field)]
+
+
+def build_run_comparability_payload(
+    records: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    record_list = list(records)
+    reference_aggregation_key: Optional[Dict[str, Any]] = None
+    reference_baseline_compare_key: Optional[Dict[str, Any]] = None
+    non_comparable_sample_ids: List[str] = []
+    issues: List[Dict[str, Any]] = []
+    aggregation_key_conflict_fields = set()
+    baseline_compare_key_conflict_fields = set()
+    full_key_sample_count = 0
+
+    for index, record in enumerate(record_list, start=1):
+        sample_id = record.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id.strip():
+            sample_id = f"sample-{index}"
+
+        aggregation_key, missing_aggregation_fields = _extract_contract_key_payload(
+            record,
+            key_name="aggregation_key",
+            fields=AGGREGATION_KEY_FIELDS,
+        )
+        (
+            baseline_compare_key,
+            missing_baseline_fields,
+        ) = _extract_contract_key_payload(
+            record,
+            key_name="baseline_compare_key",
+            fields=BASELINE_COMPARE_KEY_FIELDS,
+        )
+
+        if missing_aggregation_fields or missing_baseline_fields:
+            non_comparable_sample_ids.append(sample_id)
+            issue: Dict[str, Any] = {
+                "sample_id": sample_id,
+                "reason": "missing_comparability_fields",
+            }
+            if missing_aggregation_fields:
+                issue["missing_aggregation_key_fields"] = missing_aggregation_fields
+            if missing_baseline_fields:
+                issue["missing_baseline_compare_key_fields"] = missing_baseline_fields
+            issues.append(issue)
+            continue
+
+        if aggregation_key is None or baseline_compare_key is None:
+            continue
+
+        full_key_sample_count += 1
+
+        current_issue: Dict[str, Any] = {"sample_id": sample_id}
+        if reference_aggregation_key is None:
+            reference_aggregation_key = dict(aggregation_key)
+        else:
+            conflicting_fields = _conflicting_contract_fields(
+                reference_aggregation_key,
+                aggregation_key,
+                fields=AGGREGATION_KEY_FIELDS,
+            )
+            if conflicting_fields:
+                aggregation_key_conflict_fields.update(conflicting_fields)
+                non_comparable_sample_ids.append(sample_id)
+                current_issue["reason"] = "aggregation_key_conflict"
+                current_issue["aggregation_key_conflict_fields"] = conflicting_fields
+
+        if reference_baseline_compare_key is None:
+            reference_baseline_compare_key = dict(baseline_compare_key)
+        else:
+            conflicting_fields = _conflicting_contract_fields(
+                reference_baseline_compare_key,
+                baseline_compare_key,
+                fields=BASELINE_COMPARE_KEY_FIELDS,
+            )
+            if conflicting_fields:
+                baseline_compare_key_conflict_fields.update(conflicting_fields)
+                non_comparable_sample_ids.append(sample_id)
+                existing_reason = current_issue.get("reason")
+                if existing_reason is None:
+                    current_issue["reason"] = "baseline_compare_key_conflict"
+                elif existing_reason != "baseline_compare_key_conflict":
+                    current_issue["reason"] = "multiple_key_conflicts"
+                current_issue["baseline_compare_key_conflict_fields"] = (
+                    conflicting_fields
+                )
+
+        if len(current_issue) > 1:
+            issues.append(current_issue)
+
+    aggregation_comparable = (
+        bool(record_list)
+        and full_key_sample_count == len(record_list)
+        and not aggregation_key_conflict_fields
+    )
+    baseline_comparable = (
+        bool(record_list)
+        and full_key_sample_count == len(record_list)
+        and not baseline_compare_key_conflict_fields
+    )
+    comparable = aggregation_comparable and baseline_comparable
+    comparable_sample_count = len(record_list) if comparable else 0
+
+    if not record_list:
+        reason = "no_samples"
+    elif any(issue.get("reason") == "missing_comparability_fields" for issue in issues):
+        reason = "missing_comparability_fields"
+    elif aggregation_key_conflict_fields:
+        reason = "aggregation_key_conflict"
+    elif baseline_compare_key_conflict_fields:
+        reason = "baseline_compare_key_conflict"
+    else:
+        reason = "ok"
+
+    comparable_aggregation_key: Optional[Dict[str, Any]] = None
+    if aggregation_comparable and reference_aggregation_key is not None:
+        comparable_aggregation_key = dict(reference_aggregation_key)
+
+    comparable_baseline_compare_key: Optional[Dict[str, Any]] = None
+    if baseline_comparable and reference_baseline_compare_key is not None:
+        comparable_baseline_compare_key = dict(reference_baseline_compare_key)
+
+    return {
+        "status": "comparable" if comparable else "non_comparable",
+        "comparable": comparable,
+        "aggregation_comparable": aggregation_comparable,
+        "baseline_comparable": baseline_comparable,
+        "reason": reason,
+        "sample_count": len(record_list),
+        "full_key_sample_count": full_key_sample_count,
+        "comparable_sample_count": comparable_sample_count,
+        "non_comparable_sample_count": len(record_list) - comparable_sample_count,
+        "non_comparable_sample_ids": sorted(set(non_comparable_sample_ids)),
+        "aggregation_key_conflict_fields": sorted(aggregation_key_conflict_fields),
+        "baseline_compare_key_conflict_fields": sorted(
+            baseline_compare_key_conflict_fields
+        ),
+        "aggregation_key": comparable_aggregation_key,
+        "baseline_compare_key": comparable_baseline_compare_key,
+        "issues": issues,
+    }
+
+
+def _build_semantic_key(
+    *,
+    fields: Sequence[str],
+    base: Any,
+    contract_version: int,
+) -> Dict[str, Any]:
+    base_mapping: Mapping[str, Any] = {}
+    if isinstance(base, Mapping):
+        base_mapping = base
+
+    payload: Dict[str, Any] = {}
+    for field in fields:
+        if field == "contract_version":
+            payload[field] = contract_version
+            continue
+        payload[field] = base_mapping.get(field)
+    return payload
+
+
+def apply_sample_meta_contract_defaults(data: Mapping[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = dict(data)
+
+    contract_version = _coerce_contract_version(
+        payload.get("contract_version"),
+        schema_version=payload.get("schema_version"),
+    )
+    analysis_state = _coerce_analysis_state(payload.get("analysis_state"))
+
+    payload["contract_version"] = contract_version
+    payload["analysis_state"] = analysis_state
+    payload["exclude_reason"] = _coerce_optional_text(payload.get("exclude_reason"))
+
+    payload["aggregation_key"] = _build_semantic_key(
+        fields=AGGREGATION_KEY_FIELDS,
+        base=payload.get("aggregation_key"),
+        contract_version=contract_version,
+    )
+    payload["baseline_compare_key"] = _build_semantic_key(
+        fields=BASELINE_COMPARE_KEY_FIELDS,
+        base=payload.get("baseline_compare_key"),
+        contract_version=contract_version,
+    )
+    return payload
 
 
 def build_shared_meta(
@@ -153,6 +443,7 @@ def build_sample_meta_payload(
     stamped = stamp_with_shared_meta(
         payload, sample_id=sample_id, generated_at=generated_at
     )
+    stamped = apply_sample_meta_contract_defaults(stamped)
     for field in SAMPLE_META_REQUIRED_FIELDS:
         stamped.setdefault(field, None)
     return stamped
@@ -170,7 +461,20 @@ def build_follow_diff_state_payload(
     last_exit_reason: Optional[str] = None,
     retry_count: Optional[int] = None,
     last_attempt_ts: Optional[str] = None,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    global _LAST_FOLLOW_DIFF_RUN_ID
+
+    effective_run_id = _coerce_optional_text(run_id)
+    if effective_run_id is not None:
+        _LAST_FOLLOW_DIFF_RUN_ID = effective_run_id
+    elif _LAST_FOLLOW_DIFF_RUN_ID is not None and (
+        _coerce_optional_text(last_exit_reason) is not None
+        or _coerce_optional_text(last_attempt_ts) is not None
+    ):
+        effective_run_id = _LAST_FOLLOW_DIFF_RUN_ID
+
     payload: Dict[str, Any] = {
         "schema_version": schema_version,
         "last_scan_ts": last_scan_ts,
@@ -178,16 +482,21 @@ def build_follow_diff_state_payload(
         "running_sample_id": running_sample_id,
         "completed_count": completed_count,
         "failed_count": failed_count,
-    }
-    optional_fields = {
-        "run_id": run_id,
+        "run_id": effective_run_id,
         "last_exit_reason": last_exit_reason,
         "retry_count": retry_count,
         "last_attempt_ts": last_attempt_ts,
+        "aggregation_key": _build_semantic_key(
+            fields=AGGREGATION_KEY_FIELDS,
+            base=aggregation_key,
+            contract_version=CONTRACT_VERSION,
+        ),
+        "baseline_compare_key": _build_semantic_key(
+            fields=BASELINE_COMPARE_KEY_FIELDS,
+            base=baseline_compare_key,
+            contract_version=CONTRACT_VERSION,
+        ),
     }
-    for key, value in optional_fields.items():
-        if value is not None:
-            payload[key] = value
     for field in FOLLOW_DIFF_STATE_REQUIRED_FIELDS:
         payload.setdefault(field, None)
     return payload
@@ -204,6 +513,8 @@ def build_follow_diff_window_summary_payload(
     failed_count: int,
     last_queue_event_id: Optional[str],
     base_payload: Optional[Mapping[str, Any]] = None,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = dict(base_payload or {})
     payload.update(
@@ -216,6 +527,16 @@ def build_follow_diff_window_summary_payload(
             "completed_count": completed_count,
             "failed_count": failed_count,
             "last_queue_event_id": last_queue_event_id,
+            "aggregation_key": _build_semantic_key(
+                fields=AGGREGATION_KEY_FIELDS,
+                base=aggregation_key,
+                contract_version=CONTRACT_VERSION,
+            ),
+            "baseline_compare_key": _build_semantic_key(
+                fields=BASELINE_COMPARE_KEY_FIELDS,
+                base=baseline_compare_key,
+                contract_version=CONTRACT_VERSION,
+            ),
         }
     )
     for field in FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS:
@@ -294,14 +615,51 @@ def is_shared_schema_valid(
 
 
 def validate_sample_meta_fields(data: Mapping[str, Any]) -> List[str]:
+    normalized = apply_sample_meta_contract_defaults(data)
     errors = validate_shared_fields(
-        data,
+        normalized,
         require_sample_id=True,
         required_fields=SAMPLE_META_REQUIRED_FIELDS,
     )
-    status = data.get("status")
+    status = normalized.get("status")
     if status is not None and status not in FOLLOW_DIFF_STATUSES:
         errors.append("status 必须是 pending/running/completed/failed/skipped 之一")
+
+    analysis_state = normalized.get("analysis_state")
+    if analysis_state not in ANALYSIS_STATES:
+        errors.append("analysis_state 必须是 included/excluded/unknown 之一")
+
+    exclude_reason = normalized.get("exclude_reason")
+    if exclude_reason is not None and (
+        not isinstance(exclude_reason, str) or not exclude_reason.strip()
+    ):
+        errors.append("exclude_reason 若提供则必须是非空字符串")
+
+    if analysis_state == "excluded" and exclude_reason is None:
+        errors.append("analysis_state=excluded 时必须提供 exclude_reason")
+
+    for key_name, fields in (
+        ("aggregation_key", AGGREGATION_KEY_FIELDS),
+        ("baseline_compare_key", BASELINE_COMPARE_KEY_FIELDS),
+    ):
+        key_payload = normalized.get(key_name)
+        if not isinstance(key_payload, Mapping):
+            errors.append(f"{key_name} 必须是对象")
+            continue
+        for field in fields:
+            if field not in key_payload:
+                errors.append(f"{key_name} 缺少字段: {field}")
+
+        key_contract_version = key_payload.get("contract_version")
+        if (
+            isinstance(key_contract_version, bool)
+            or not isinstance(key_contract_version, int)
+            or key_contract_version < 1
+        ):
+            errors.append(f"{key_name}.contract_version 必须是 >=1 的整数")
+        elif key_contract_version != normalized.get("contract_version"):
+            errors.append(f"{key_name}.contract_version 必须与 contract_version 一致")
+
     return errors
 
 
@@ -368,6 +726,18 @@ def validate_follow_diff_state_fields(data: Mapping[str, Any]) -> List[str]:
     ):
         errors.append("last_attempt_ts 若提供则必须是非空字符串")
 
+    for key_name, fields in (
+        ("aggregation_key", AGGREGATION_KEY_FIELDS),
+        ("baseline_compare_key", BASELINE_COMPARE_KEY_FIELDS),
+    ):
+        key_payload = data.get(key_name)
+        if not isinstance(key_payload, Mapping):
+            errors.append(f"{key_name} 必须是对象")
+            continue
+        for field in fields:
+            if field not in key_payload:
+                errors.append(f"{key_name} 缺少字段: {field}")
+
     return errors
 
 
@@ -412,10 +782,26 @@ def validate_follow_diff_window_summary_fields(data: Mapping[str, Any]) -> List[
     ):
         errors.append("last_queue_event_id 若提供则必须是非空字符串")
 
+    for key_name, fields in (
+        ("aggregation_key", AGGREGATION_KEY_FIELDS),
+        ("baseline_compare_key", BASELINE_COMPARE_KEY_FIELDS),
+    ):
+        key_payload = data.get(key_name)
+        if not isinstance(key_payload, Mapping):
+            errors.append(f"{key_name} 必须是对象")
+            continue
+        for field in fields:
+            if field not in key_payload:
+                errors.append(f"{key_name} 缺少字段: {field}")
+
     return errors
 
 
 __all__ = [
+    "AGGREGATION_KEY_FIELDS",
+    "ANALYSIS_STATES",
+    "BASELINE_COMPARE_KEY_FIELDS",
+    "CONTRACT_VERSION",
     "FOLLOW_DIFF_STATE_OPTIONAL_AUDIT_FIELDS",
     "FOLLOW_DIFF_STATE_REQUIRED_FIELDS",
     "FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS",
@@ -423,8 +809,10 @@ __all__ = [
     "SCHEMA_VERSION",
     "SAMPLE_META_REQUIRED_FIELDS",
     "STATE_FINGERPRINT_REQUIRED_FIELDS",
+    "apply_sample_meta_contract_defaults",
     "build_follow_diff_state_payload",
     "build_follow_diff_window_summary_payload",
+    "build_run_comparability_payload",
     "build_sample_meta_payload",
     "build_shared_meta",
     "build_state_fingerprint_payload",

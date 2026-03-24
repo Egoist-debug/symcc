@@ -13,6 +13,7 @@ from .follow_diff import (
 from .io import atomic_write_json
 from .report import (
     ReportError,
+    collect_report_snapshot,
     default_follow_diff_root,
     generate_report,
     resolve_high_value_manifest_path,
@@ -99,6 +100,52 @@ def _write_close_summary(work_dir: Path, summary_payload: Mapping[str, Any]) -> 
     return atomic_write_json(
         work_dir / CAMPAIGN_CLOSE_SUMMARY_FILE_NAME, summary_payload
     )
+
+
+def _build_phase_context(*, run_metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    state_payload = run_metadata.get("state")
+    if not isinstance(state_payload, Mapping):
+        state_payload = {}
+    window_payload = run_metadata.get("window_summary")
+    if not isinstance(window_payload, Mapping):
+        window_payload = {}
+
+    return {
+        "follow_diff_state": {
+            "run_id": state_payload.get("run_id"),
+            "last_exit_reason": state_payload.get("last_exit_reason"),
+            "retry_count": state_payload.get("retry_count"),
+            "last_attempt_ts": state_payload.get("last_attempt_ts"),
+            "last_queue_event_id": state_payload.get("last_queue_event_id"),
+        },
+        "follow_diff_window_summary": {
+            "run_id": window_payload.get("run_id"),
+            "exit_reason": window_payload.get("exit_reason"),
+            "exit_code": window_payload.get("exit_code"),
+            "queue_tail_id": window_payload.get("queue_tail_id"),
+            "last_queue_event_id": window_payload.get("last_queue_event_id"),
+        },
+    }
+
+
+def _write_close_summary_with_context(
+    work_dir: Path,
+    follow_root: Path,
+    summary_payload: Mapping[str, Any],
+) -> Path:
+    snapshot = collect_report_snapshot(
+        follow_root,
+        work_dir=work_dir,
+        require_root=False,
+    )
+    enriched_summary = dict(summary_payload)
+    enriched_summary["run_id"] = snapshot["run_id"]
+    enriched_summary["metric_denominators"] = snapshot["metric_denominators"]
+    enriched_summary["comparability"] = snapshot["comparability"]
+    enriched_summary["phase_context"] = _build_phase_context(
+        run_metadata=snapshot["run_metadata"]
+    )
+    return _write_close_summary(work_dir, enriched_summary)
 
 
 def _build_summary_base(
@@ -241,7 +288,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
                     "exit_code": deadline_failure["exit_code"],
                 }
             )
-            _write_close_summary(work_dir, summary)
+            _write_close_summary_with_context(work_dir, follow_root, summary)
             return int(summary["exit_code"])
 
         started_epoch = _mark_phase_started(phases, phase_name)
@@ -285,7 +332,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
                         "exit_code": phase_exit_code,
                     }
                 )
-                _write_close_summary(work_dir, summary)
+                _write_close_summary_with_context(work_dir, follow_root, summary)
                 return int(summary["exit_code"])
 
             _mark_phase_finished(
@@ -336,7 +383,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
                         "exit_code": phase_exit_code,
                     }
                 )
-                _write_close_summary(work_dir, summary)
+                _write_close_summary_with_context(work_dir, follow_root, summary)
                 return int(summary["exit_code"])
             except Exception as exc:
                 _mark_phase_finished(
@@ -356,7 +403,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
                         "exit_code": EXIT_PHASE_FAILED,
                     }
                 )
-                _write_close_summary(work_dir, summary)
+                _write_close_summary_with_context(work_dir, follow_root, summary)
                 return int(summary["exit_code"])
 
             _mark_phase_finished(
@@ -398,7 +445,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
                     "exit_code": phase_exit_code,
                 }
             )
-            _write_close_summary(work_dir, summary)
+            _write_close_summary_with_context(work_dir, follow_root, summary)
             return int(summary["exit_code"])
         except Exception as exc:
             _mark_phase_finished(
@@ -418,7 +465,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
                     "exit_code": EXIT_PHASE_FAILED,
                 }
             )
-            _write_close_summary(work_dir, summary)
+            _write_close_summary_with_context(work_dir, follow_root, summary)
             return int(summary["exit_code"])
 
         _mark_phase_finished(
@@ -438,7 +485,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
         }
     )
     summary.pop("failed_phase", None)
-    _write_close_summary(work_dir, summary)
+    _write_close_summary_with_context(work_dir, follow_root, summary)
     return 0
 
 

@@ -168,6 +168,28 @@ fixtures = {
         "state_fingerprint.json": fingerprint_payload("failed_replay"),
         "triage.json": stale_triage_payload("failed_replay"),
     },
+    "failed_replay_timeout": {
+        "sample.meta.json": {
+            **shared_meta("failed_replay_timeout"),
+            "status": "failed",
+            "failure": {
+                "kind": "replay_error",
+                "message": "unbound.before 超时，退出码=124",
+                "exit_code": 4,
+                "reason": "timeout",
+                "stage": "unbound.before",
+                "resolver": "unbound",
+                "returncode": 124,
+            },
+        },
+        "oracle.json": {
+            "bind9.stderr_parse_status": None,
+            "unbound.stderr_parse_status": None,
+        },
+        "cache_diff.json": cache_diff_empty("failed_replay_timeout"),
+        "state_fingerprint.json": fingerprint_payload("failed_replay_timeout"),
+        "triage.json": stale_triage_payload("failed_replay_timeout"),
+    },
     "failed_parse": {
         "sample.meta.json": {
             **shared_meta("failed_parse"),
@@ -261,15 +283,48 @@ expected = {
     "failed_replay": {
         "status": "failed_replay",
         "diff_class": "replay_incomplete",
+        "analysis_state": "excluded",
+        "exclude_reason": "infra_failure",
+        "semantic_outcome": "infra_failure",
+        "failure_bucket_primary": "infra_artifact_failure",
+        "failure_bucket_detail": "replay_missing_artifact",
+        "oracle_audit_candidate": False,
+        "case_study_candidate": False,
+        "manual_truth_status": "not_applicable",
         "needs_manual_review": True,
         "required_labels": {"oracle_missing", "replay_missing_artifact"},
         "cluster_tokens": {"oracle_missing", "replay_missing_artifact", "fp:iterative->iterative"},
         "cache_delta_triggered": False,
         "interesting_delta_count": 0,
     },
+    "failed_replay_timeout": {
+        "status": "failed_replay",
+        "diff_class": "replay_incomplete",
+        "analysis_state": "unknown",
+        "exclude_reason": None,
+        "semantic_outcome": "runtime_or_parse_failure",
+        "failure_bucket_primary": "target_runtime_failure",
+        "failure_bucket_detail": "replay_timeout",
+        "oracle_audit_candidate": False,
+        "case_study_candidate": False,
+        "manual_truth_status": "not_applicable",
+        "needs_manual_review": True,
+        "required_labels": {"oracle_missing", "replay_timeout"},
+        "cluster_tokens": {"oracle_missing", "replay_timeout", "fp:iterative->iterative"},
+        "cache_delta_triggered": False,
+        "interesting_delta_count": 0,
+    },
     "failed_parse": {
         "status": "failed_parse",
         "diff_class": "oracle_parse_incomplete",
+        "analysis_state": "unknown",
+        "exclude_reason": None,
+        "semantic_outcome": "runtime_or_parse_failure",
+        "failure_bucket_primary": "input_parse_failure",
+        "failure_bucket_detail": "oracle_parse_incomplete",
+        "oracle_audit_candidate": False,
+        "case_study_candidate": False,
+        "manual_truth_status": "not_applicable",
         "needs_manual_review": True,
         "required_labels": {"oracle_parse_incomplete"},
         "cluster_tokens": {"oracle_parse_incomplete", "fp:iterative->iterative"},
@@ -279,6 +334,14 @@ expected = {
     "oracle_diff": {
         "status": "completed_oracle_diff",
         "diff_class": "oracle_diff",
+        "analysis_state": "included",
+        "exclude_reason": None,
+        "semantic_outcome": "oracle_diff",
+        "failure_bucket_primary": "semantic_diff",
+        "failure_bucket_detail": "oracle_diff",
+        "oracle_audit_candidate": True,
+        "case_study_candidate": True,
+        "manual_truth_status": "not_started",
         "needs_manual_review": True,
         "required_labels": {"oracle_diff"},
         "cluster_tokens": {"oracle_diff", "fp:iterative->iterative"},
@@ -288,6 +351,14 @@ expected = {
     "cache_diff": {
         "status": "completed_cache_changed_needs_review",
         "diff_class": "cache_diff_interesting",
+        "analysis_state": "included",
+        "exclude_reason": None,
+        "semantic_outcome": "cache_diff_interesting",
+        "failure_bucket_primary": "semantic_diff",
+        "failure_bucket_detail": "cache_diff_interesting",
+        "oracle_audit_candidate": True,
+        "case_study_candidate": True,
+        "manual_truth_status": "not_started",
         "needs_manual_review": True,
         "required_labels": {
             "cache_diff_present",
@@ -306,11 +377,32 @@ for sample_id, rules in expected.items():
     triage_path = follow_root / sample_id / "triage.json"
     triage = json.loads(triage_path.read_text(encoding="utf-8"))
 
-    for field in ("status", "diff_class", "needs_manual_review"):
+    for field in (
+        "status",
+        "diff_class",
+        "analysis_state",
+        "exclude_reason",
+        "semantic_outcome",
+        "failure_bucket_primary",
+        "failure_bucket_detail",
+        "oracle_audit_candidate",
+        "case_study_candidate",
+        "manual_truth_status",
+        "needs_manual_review",
+    ):
         if triage.get(field) != rules[field]:
             raise SystemExit(
                 f"ASSERT FAIL: {sample_id}.triage[{field!r}]={triage.get(field)!r} != {rules[field]!r}"
             )
+
+    if triage.get("analysis_state") != "excluded" and triage.get("exclude_reason") is not None:
+        raise SystemExit(
+            f"ASSERT FAIL: {sample_id}.triage.exclude_reason 仅允许 excluded 场景非空: {triage.get('exclude_reason')!r}"
+        )
+    if triage.get("failure_taxonomy_version") != 1:
+        raise SystemExit(
+            f"ASSERT FAIL: {sample_id}.triage.failure_taxonomy_version={triage.get('failure_taxonomy_version')!r} != 1"
+        )
 
     if triage.get("cache_delta_triggered") is not rules["cache_delta_triggered"]:
         raise SystemExit(
@@ -351,6 +443,14 @@ for sample_id, rules in expected.items():
     snapshot[sample_id] = {
         "status": triage["status"],
         "diff_class": triage["diff_class"],
+        "analysis_state": triage["analysis_state"],
+        "exclude_reason": triage["exclude_reason"],
+        "semantic_outcome": triage["semantic_outcome"],
+        "failure_bucket_primary": triage["failure_bucket_primary"],
+        "failure_bucket_detail": triage["failure_bucket_detail"],
+        "oracle_audit_candidate": triage["oracle_audit_candidate"],
+        "case_study_candidate": triage["case_study_candidate"],
+        "manual_truth_status": triage["manual_truth_status"],
         "filter_labels": labels,
         "cluster_key": cluster_key,
         "cache_delta_triggered": triage["cache_delta_triggered"],
@@ -375,7 +475,7 @@ PY
 
 write_fixture_root
 
-for sample_id in failed_replay failed_parse oracle_diff cache_diff; do
+for sample_id in failed_replay failed_replay_timeout failed_parse oracle_diff cache_diff; do
 	assert_file_exists "$FOLLOW_ROOT/$sample_id/triage.json"
 done
 

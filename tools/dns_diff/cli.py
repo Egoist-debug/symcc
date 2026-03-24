@@ -3,7 +3,9 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from .campaign import generate_campaign_report
+from .aggregate import CampaignAggregateError, run_campaign_aggregate
+from .campaign import CampaignReportError, generate_campaign_report
+from .case_study import CaseStudyError, export_case_studies
 from .cache_parser import CacheParseError, write_cache_tsv
 from .close_loop import CampaignCloseError, run_campaign_close
 from .follow_diff import (
@@ -12,6 +14,7 @@ from .follow_diff import (
     follow_diff_once,
     follow_diff_window,
 )
+from .matrix import CampaignMatrixError, run_campaign_matrix
 from .report import ReportError, default_follow_diff_root, generate_report
 from .replay import ReplayError, replay_diff_cache
 from .triage import TriageError, rewrite_triage_root
@@ -106,7 +109,23 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 def _cmd_campaign_report(args: argparse.Namespace) -> int:
     root = Path(args.root) if args.root else default_follow_diff_root()
-    return generate_campaign_report(root, is_custom_root=bool(args.root))
+    try:
+        return generate_campaign_report(root, is_custom_root=bool(args.root))
+    except CampaignReportError as exc:
+        sys.stderr.write(f"dns-diff: campaign-report 失败: {exc}\n")
+        return exc.exit_code
+
+
+def _cmd_case_study_export(args: argparse.Namespace) -> int:
+    try:
+        return export_case_studies(
+            Path(args.root),
+            Path(args.campaign_report_dir),
+            top_n=args.top_n,
+        )
+    except CaseStudyError as exc:
+        sys.stderr.write(f"dns-diff: case-study-export 失败: {exc}\n")
+        return exc.exit_code
 
 
 def _cmd_campaign_close(args: argparse.Namespace) -> int:
@@ -117,13 +136,38 @@ def _cmd_campaign_close(args: argparse.Namespace) -> int:
         return exc.exit_code
 
 
+def _cmd_campaign_aggregate(args: argparse.Namespace) -> int:
+    try:
+        return run_campaign_aggregate(
+            reports_root=Path(args.reports_root),
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+    except CampaignAggregateError as exc:
+        sys.stderr.write(f"dns-diff: campaign-aggregate 失败: {exc}\n")
+        return exc.exit_code
+
+
+def _cmd_campaign_matrix(args: argparse.Namespace) -> int:
+    try:
+        return run_campaign_matrix(
+            matrix_file=Path(args.matrix_file),
+            budget_sec=args.budget_sec,
+            repeat=args.repeat,
+            work_root=Path(args.work_root),
+        )
+    except CampaignMatrixError as exc:
+        sys.stderr.write(f"dns-diff: campaign-matrix 失败: {exc}\n")
+        return exc.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m tools.dns_diff.cli",
         description=(
             "dns-diff Python 真入口；thin wrapper 仅转发 parse-cache、"
             "replay-diff-cache、follow-diff、follow-diff-once、follow-diff-window、triage-report、"
-            "campaign-report、campaign-close，triage/report/close-loop 仅通过 Python CLI 直调。"
+            "campaign-report、case-study-export、campaign-close、campaign-aggregate、campaign-matrix，"
+            "triage/report/close-loop/matrix 仅通过 Python CLI 直调。"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -188,6 +232,24 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_report.add_argument("--root", help="可选 follow_diff 根目录")
     campaign_report.set_defaults(handler=_cmd_campaign_report)
 
+    case_study_export = subparsers.add_parser(
+        "case-study-export",
+        help="导出 case study 与 manual truth 附属证据包",
+    )
+    case_study_export.add_argument("--root", required=True, help="follow_diff 根目录")
+    case_study_export.add_argument(
+        "--campaign-report-dir",
+        required=True,
+        help="campaign report 目录；默认输出写入 <campaign-report-dir>/case_studies",
+    )
+    case_study_export.add_argument(
+        "--top-n",
+        type=int,
+        default=5,
+        help="最多导出前 N 个候选（固定上限 5，默认 5）",
+    )
+    case_study_export.set_defaults(handler=_cmd_case_study_export)
+
     campaign_close = subparsers.add_parser(
         "campaign-close",
         help="单进程闭环执行 follow-diff-window -> triage-report -> campaign-report",
@@ -199,6 +261,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="全链路闭环预算秒数（>0），由 campaign-close 统一持有 deadline",
     )
     campaign_close.set_defaults(handler=_cmd_campaign_close)
+
+    campaign_aggregate = subparsers.add_parser(
+        "campaign-aggregate",
+        help="多轮 campaign 报告聚合与方差统计",
+    )
+    campaign_aggregate.add_argument(
+        "--reports-root",
+        required=True,
+        help="campaign_reports 根目录（仅读取 */summary.json）",
+    )
+    campaign_aggregate.add_argument(
+        "--output-dir",
+        help="可选输出根目录；实际写入 <output-dir>/campaign_aggregates/<ts>/",
+    )
+    campaign_aggregate.set_defaults(handler=_cmd_campaign_aggregate)
+
+    campaign_matrix = subparsers.add_parser(
+        "campaign-matrix",
+        help="固定 poison-stateful baseline/ablation 矩阵 runner",
+    )
+    campaign_matrix.add_argument(
+        "--matrix-file",
+        required=True,
+        help="矩阵配置 JSON（固定 4 变体 poison-stateful 合约）",
+    )
+    campaign_matrix.add_argument(
+        "--budget-sec",
+        type=float,
+        required=True,
+        help="单 run campaign-close 预算秒数（>0）",
+    )
+    campaign_matrix.add_argument(
+        "--repeat",
+        type=int,
+        required=True,
+        help="每个 variant 串行重复次数（>0）",
+    )
+    campaign_matrix.add_argument(
+        "--work-root",
+        required=True,
+        help="矩阵工作根目录；输出写入 matrix_runs/ 与 _summary/",
+    )
+    campaign_matrix.set_defaults(handler=_cmd_campaign_matrix)
 
     return parser
 
