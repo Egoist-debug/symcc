@@ -1,13 +1,28 @@
 #include "testcase.hpp"
 
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 
 namespace symcc_fuzzing {
+
+std::string canonicalize_testcase_path(
+    const std::filesystem::path& p,
+    const std::optional<std::filesystem::path>& base_dir) {
+  std::filesystem::path candidate = p;
+  if (candidate.is_relative() && base_dir.has_value()) {
+    candidate = *base_dir / candidate;
+  }
+
+  std::error_code ec;
+  const auto abs = std::filesystem::absolute(candidate, ec);
+  if (ec) return candidate.lexically_normal().string();
+
+  const auto normalized = std::filesystem::weakly_canonical(abs, ec);
+  if (ec) return abs.lexically_normal().string();
+  return normalized.string();
+}
 
 TestcaseDir TestcaseDir::create(const std::filesystem::path& p) {
   std::error_code ec;
@@ -47,8 +62,9 @@ void copy_testcase(const std::filesystem::path& testcase,
   target_dir.next_id += 1;
 }
 
-TestcaseScore score_testcase(const std::filesystem::path& p) {
+TestcaseScore score_testcase(const std::filesystem::path& p, int semantic_tier) {
   TestcaseScore s;
+  s.semantic_tier = semantic_tier;
   std::error_code ec;
   auto sz = std::filesystem::file_size(p, ec);
   if (ec) return s;

@@ -68,6 +68,7 @@ struct ParsedQuestionInfo {
   size_t EndOffset = 0;
   std::string Name;
   uint16_t Type = 0;
+  uint16_t DnsClass = 0;
 };
 
 std::optional<ParsedQuestionInfo>
@@ -89,6 +90,7 @@ parseSingleQuestion(const std::vector<uint8_t> &Packet) {
   Info.EndOffset = *NameEnd + 4;
   Info.Name = DNSNameCodec::decode(Packet, Info.NameStart);
   Info.Type = readBe16(Packet, Info.TypeOffset);
+  Info.DnsClass = readBe16(Packet, Info.ClassOffset);
 
   if (Info.Name.empty()) {
     return std::nullopt;
@@ -130,6 +132,20 @@ std::optional<RRInfo> parseRRAt(const std::vector<uint8_t> &Packet,
 bool isRRBlobWellFormed(const std::vector<uint8_t> &RRBlob) {
   auto Parsed = parseRRAt(RRBlob, 0);
   return Parsed.has_value() && Parsed->EndOffset == RRBlob.size();
+}
+
+bool haveMatchingQuestionIdentity(const ParsedQuestionInfo &Left,
+                                  const ParsedQuestionInfo &Right) {
+  return Left.Name == Right.Name && Left.Type == Right.Type &&
+         Left.DnsClass == Right.DnsClass;
+}
+
+bool packetsHaveMatchingQuestionIdentity(const std::vector<uint8_t> &Left,
+                                         const std::vector<uint8_t> &Right) {
+  auto LeftQuestion = parseSingleQuestion(Left);
+  auto RightQuestion = parseSingleQuestion(Right);
+  return LeftQuestion.has_value() && RightQuestion.has_value() &&
+         haveMatchingQuestionIdentity(*LeftQuestion, *RightQuestion);
 }
 
 struct ParsedResponseLayout {
@@ -186,6 +202,147 @@ parseResponseLayout(const std::vector<uint8_t> &Packet) {
   }
 
   return Layout;
+}
+
+bool responsePacketMatchesQuery(const std::vector<uint8_t> &Response,
+                                const std::vector<uint8_t> &Query) {
+  return parseResponseLayout(Response).has_value() &&
+         packetsHaveMatchingQuestionIdentity(Response, Query);
+}
+
+bool responseSetMatchesQuery(const std::vector<std::vector<uint8_t>> &Responses,
+                             const std::vector<uint8_t> &Query) {
+  return std::all_of(Responses.begin(), Responses.end(),
+                     [&](const auto &Response) {
+                       return responsePacketMatchesQuery(Response, Query);
+                     });
+}
+
+DST1Mutator::QueryMutation &
+ensureQueryMutation(DST1Mutator::MutationRequest &Request) {
+  if (!Request.Query.has_value()) {
+    Request.Query.emplace();
+  }
+  return *Request.Query;
+}
+
+DST1Mutator::ResponseMutation &
+ensureResponseMutation(DST1Mutator::MutationRequest &Request) {
+  if (!Request.Response.has_value()) {
+    Request.Response.emplace();
+  }
+  return *Request.Response;
+}
+
+DST1Mutator::TranscriptMutation &
+ensureTranscriptMutation(DST1Mutator::MutationRequest &Request) {
+  if (!Request.Transcript.has_value()) {
+    Request.Transcript.emplace();
+  }
+  return *Request.Transcript;
+}
+
+bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
+                              const DST1Mutator::Transcript &Donor,
+                              DST1Mutator::MutationRequest &Request) {
+  if (!Request.DonorFamily.has_value()) {
+    return false;
+  }
+
+  switch (*Request.DonorFamily) {
+  case DST1Mutator::DonorMutationFamily::ResponseSpliceSameIndex: {
+    if (Request.ResponseIndex >= Target.Responses.size() ||
+        Request.ResponseIndex >= Donor.Responses.size()) {
+      return false;
+    }
+
+    const auto &Candidate = Donor.Responses[Request.ResponseIndex];
+    if (!responsePacketMatchesQuery(Candidate, Target.ClientQuery)) {
+      return false;
+    }
+
+    ensureResponseMutation(Request).Packet = Candidate;
+    return true;
+  }
+
+  case DST1Mutator::DonorMutationFamily::AuthorityTransplant: {
+    if (Request.ResponseIndex >= Target.Responses.size() ||
+        Request.ResponseIndex >= Donor.Responses.size()) {
+      return false;
+    }
+
+    const auto &Candidate = Donor.Responses[Request.ResponseIndex];
+    auto Layout = parseResponseLayout(Candidate);
+    if (!Layout || !responsePacketMatchesQuery(Candidate, Target.ClientQuery)) {
+      return false;
+    }
+
+    auto &Mutation = ensureResponseMutation(Request);
+    Mutation.AuthorityRRs = Layout->AuthorityRRs;
+    Mutation.NSCOUNT = static_cast<uint16_t>(Layout->AuthorityRRs.size());
+    return true;
+  }
+
+  case DST1Mutator::DonorMutationFamily::AdditionalOrGlueTransplant: {
+    if (Request.ResponseIndex >= Target.Responses.size() ||
+        Request.ResponseIndex >= Donor.Responses.size()) {
+      return false;
+    }
+
+    const auto &Candidate = Donor.Responses[Request.ResponseIndex];
+    auto Layout = parseResponseLayout(Candidate);
+    if (!Layout || !responsePacketMatchesQuery(Candidate, Target.ClientQuery)) {
+      return false;
+    }
+
+    auto &Mutation = ensureResponseMutation(Request);
+    Mutation.AdditionalRRs = Layout->AdditionalRRs;
+    Mutation.GlueRRs.reset();
+    Mutation.ARCOUNT = static_cast<uint16_t>(Layout->AdditionalRRs.size());
+    return true;
+  }
+
+  case DST1Mutator::DonorMutationFamily::ResponseCountExpandOrShrinkFromDonor: {
+    std::vector<std::vector<uint8_t>> Replacement = Target.Responses;
+    const size_t DonorCount = Donor.Responses.size();
+
+    if (DonorCount < Replacement.size()) {
+      Replacement.resize(DonorCount);
+    } else if (DonorCount > Replacement.size()) {
+      std::vector<std::vector<uint8_t>> Appended(
+          Donor.Responses.begin() + Replacement.size(), Donor.Responses.end());
+      if (!responseSetMatchesQuery(Appended, Target.ClientQuery)) {
+        return false;
+      }
+      Replacement.insert(Replacement.end(), Appended.begin(), Appended.end());
+    }
+
+    auto &Mutation = ensureTranscriptMutation(Request);
+    Mutation.Responses = std::move(Replacement);
+    Mutation.ResponseCount = static_cast<uint8_t>(DonorCount);
+    return true;
+  }
+
+  case DST1Mutator::DonorMutationFamily::PostCheckCoupledNameOrTypeShift: {
+    auto DonorQuery = parseSingleQuestion(Donor.ClientQuery);
+    if (!DonorQuery ||
+        !packetsHaveMatchingQuestionIdentity(Donor.ClientQuery,
+                                             Donor.PostCheckQuery)) {
+      return false;
+    }
+
+    auto &Query = ensureQueryMutation(Request);
+    Query.QNAME = DonorQuery->Name;
+    Query.QTYPE = DonorQuery->Type;
+
+    auto &Transcript = ensureTranscriptMutation(Request);
+    Transcript.PostCheckName = DonorQuery->Name;
+    Transcript.PostCheckType = DonorQuery->Type;
+    return true;
+  }
+  }
+
+  return false;
 }
 
 std::optional<std::vector<uint8_t>>
@@ -274,7 +431,9 @@ applyQuestionMutation(const std::vector<uint8_t> &Packet,
 std::optional<std::vector<uint8_t>>
 applyResponseMutation(const std::vector<uint8_t> &Packet,
                       const DST1Mutator::ResponseMutation &Mutation) {
-  auto Layout = parseResponseLayout(Packet);
+  auto Layout = Mutation.Packet.has_value()
+                    ? parseResponseLayout(Mutation.Packet.value())
+                    : parseResponseLayout(Packet);
   if (!Layout) {
     return std::nullopt;
   }
@@ -444,25 +603,9 @@ DST1Mutator::parse(const std::vector<uint8_t> &Input) {
 }
 
 std::optional<std::vector<uint8_t>>
-DST1Mutator::serialize(const Transcript &InputTranscript) {
-  auto Output = dst1::buildTranscript(InputTranscript.ClientQuery,
-                                      InputTranscript.Responses,
-                                      InputTranscript.PostCheckQuery);
-  if (Output.empty()) {
-    return std::nullopt;
-  }
-
-  if (!parse(Output).has_value()) {
-    return std::nullopt;
-  }
-
-  return Output;
-}
-
-std::optional<std::vector<uint8_t>>
-DST1Mutator::mutate(const std::vector<uint8_t> &Input,
-                    const MutationRequest &Request) {
-  auto Parsed = parse(Input);
+mutateTranscriptImpl(const std::vector<uint8_t> &Input,
+                     const DST1Mutator::MutationRequest &Request) {
+  auto Parsed = DST1Mutator::parse(Input);
   if (!Parsed) {
     return std::nullopt;
   }
@@ -485,11 +628,23 @@ DST1Mutator::mutate(const std::vector<uint8_t> &Input,
     if (!MutatedResponse) {
       return std::nullopt;
     }
+    if (Request.Response->Packet.has_value() &&
+        !responsePacketMatchesQuery(*MutatedResponse, Parsed->ClientQuery)) {
+      return std::nullopt;
+    }
     Parsed->Responses[Request.ResponseIndex] = std::move(*MutatedResponse);
   }
 
   if (Request.Transcript.has_value()) {
     const auto &Mutation = *Request.Transcript;
+    if (Mutation.Responses.has_value()) {
+      if (!responseSetMatchesQuery(Mutation.Responses.value(),
+                                   Parsed->ClientQuery)) {
+        return std::nullopt;
+      }
+      Parsed->Responses = Mutation.Responses.value();
+    }
+
     if (Mutation.ResponseCount.has_value()) {
       const uint8_t response_count = Mutation.ResponseCount.value();
       if (response_count > Parsed->Responses.size()) {
@@ -499,7 +654,7 @@ DST1Mutator::mutate(const std::vector<uint8_t> &Input,
     }
 
     if (Mutation.PostCheckName.has_value() || Mutation.PostCheckType.has_value()) {
-      QueryMutation PostMutation;
+      DST1Mutator::QueryMutation PostMutation;
       PostMutation.QNAME = Mutation.PostCheckName;
       PostMutation.QTYPE = Mutation.PostCheckType;
       auto UpdatedPost = applyQuestionMutation(Parsed->PostCheckQuery, PostMutation);
@@ -514,16 +669,67 @@ DST1Mutator::mutate(const std::vector<uint8_t> &Input,
     return std::nullopt;
   }
 
-  auto Output = serialize(*Parsed);
+  auto Output = DST1Mutator::serialize(*Parsed);
   if (!Output) {
     return std::nullopt;
   }
 
-  if (!parse(*Output).has_value()) {
+  if (!DST1Mutator::parse(*Output).has_value()) {
     return std::nullopt;
   }
 
   return Output;
+}
+
+std::optional<std::vector<uint8_t>>
+DST1Mutator::serialize(const Transcript &InputTranscript) {
+  auto Output = dst1::buildTranscript(InputTranscript.ClientQuery,
+                                      InputTranscript.Responses,
+                                      InputTranscript.PostCheckQuery);
+  if (Output.empty()) {
+    return std::nullopt;
+  }
+
+  if (!parse(Output).has_value()) {
+    return std::nullopt;
+  }
+
+  return Output;
+}
+
+std::optional<std::vector<uint8_t>>
+DST1Mutator::mutate(const std::vector<uint8_t> &Input,
+                    const MutationRequest &Request) {
+  return mutateTranscriptImpl(Input, Request);
+}
+
+std::optional<std::vector<uint8_t>>
+DST1Mutator::mutate(const std::vector<uint8_t> &Input,
+                    const MutationRequest &Request,
+                    const std::vector<uint8_t> &DonorInput) {
+  auto Donor = parse(DonorInput);
+  if (!Donor || !Request.DonorFamily.has_value()) {
+    return mutateTranscriptImpl(Input, Request);
+  }
+
+  auto Target = parse(Input);
+  if (!Target) {
+    return std::nullopt;
+  }
+
+  MutationRequest EffectiveRequest = Request;
+  const bool DonorApplied =
+      applyDonorMutationFamily(*Target, *Donor, EffectiveRequest);
+  if (!DonorApplied) {
+    return mutateTranscriptImpl(Input, Request);
+  }
+
+  auto DonorEnhanced = mutateTranscriptImpl(Input, EffectiveRequest);
+  if (DonorEnhanced) {
+    return DonorEnhanced;
+  }
+
+  return mutateTranscriptImpl(Input, Request);
 }
 
 }

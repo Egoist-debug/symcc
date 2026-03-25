@@ -6,6 +6,7 @@ WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-campaign-report.XXXXXX")"
 EMPTY_ROOT="$WORKDIR/empty-follow"
 NONEMPTY_ROOT="$WORKDIR/nonempty-follow"
 FAIL_ROOT="$WORKDIR/fail-follow"
+BAD_TRUTH_ROOT="$WORKDIR/bad-truth-follow"
 export PYTHONDONTWRITEBYTECODE=1
 
 cleanup() {
@@ -492,6 +493,7 @@ def sample_meta(sample_id: str) -> dict:
 
 sample_dir = root / "sample"
 sample_dir.mkdir(parents=True, exist_ok=True)
+(sample_dir / "sample.bin").write_bytes(b"\x00\x00\x00\x00")
 (sample_dir / "sample.meta.json").write_text(
     json.dumps(sample_meta("sample"), ensure_ascii=False) + "\n",
     encoding="utf-8",
@@ -647,11 +649,122 @@ assert_summary_metadata_contract "$NONEMPTY_REPORT_DIR_SECOND/summary.json" comp
 
 run_cli report --root "$NONEMPTY_ROOT" >/dev/null
 assert_file_exists "$NONEMPTY_ROOT/status_summary.tsv"
+assert_file_exists "$NONEMPTY_ROOT/semantic_frontier_manifest.json"
 assert_file_contains "$NONEMPTY_ROOT/status_summary.tsv" $'status\tcount'
 assert_file_contains "$NONEMPTY_ROOT/status_summary.tsv" $'completed_cache_changed_needs_review\t1'
 assert_file_contains "$NONEMPTY_ROOT/status_summary.tsv" $'completed_no_diff\t1'
 assert_file_contains "$NONEMPTY_ROOT/status_summary.tsv" $'__total__\t2'
 assert_file_not_contains "$NONEMPTY_ROOT/status_summary.tsv" $'unknown\t'
+
+python3 - "$NONEMPTY_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+payload = json.loads((root / "semantic_frontier_manifest.json").read_text(encoding="utf-8"))
+expected_top_level_fields = {
+    "contract_name",
+    "contract_version",
+    "generated_at",
+    "root",
+    "entries",
+}
+if set(payload.keys()) != expected_top_level_fields:
+    raise SystemExit(
+        "ASSERT FAIL: semantic_frontier_manifest 顶层字段不符合预期: "
+        f"{set(payload.keys())!r} != {expected_top_level_fields!r}"
+    )
+if payload.get("contract_name") != "semantic_frontier_manifest":
+    raise SystemExit(
+        f"ASSERT FAIL: semantic_frontier_manifest.contract_name={payload.get('contract_name')!r} != 'semantic_frontier_manifest'"
+    )
+if payload.get("contract_version") != 1:
+    raise SystemExit(
+        f"ASSERT FAIL: semantic_frontier_manifest.contract_version={payload.get('contract_version')!r} != 1"
+    )
+generated_at = payload.get("generated_at")
+if not isinstance(generated_at, str) or not generated_at:
+    raise SystemExit(
+        f"ASSERT FAIL: semantic_frontier_manifest.generated_at 应为非空字符串，实际 {generated_at!r}"
+    )
+if payload.get("root") != str(root.resolve()):
+    raise SystemExit(
+        f"ASSERT FAIL: semantic_frontier_manifest.root={payload.get('root')!r} != {str(root.resolve())!r}"
+    )
+entries = payload.get("entries")
+if not isinstance(entries, list):
+    raise SystemExit("ASSERT FAIL: semantic_frontier_manifest.entries 应为数组")
+
+expected_fields = {
+    "sample_path",
+    "sample_id",
+    "analysis_state",
+    "semantic_outcome",
+    "oracle_audit_candidate",
+    "needs_manual_review",
+    "priority_tier",
+}
+for entry in entries:
+    if set(entry.keys()) != expected_fields:
+        raise SystemExit(
+            f"ASSERT FAIL: semantic_frontier_manifest entry 字段不符合预期: {entry!r}"
+        )
+
+expected_paths = [
+    str((root / "sample-1" / "sample.bin").resolve()),
+    str((root / "sample" / "sample.bin").resolve()),
+]
+actual_paths = [entry.get("sample_path") for entry in entries]
+if actual_paths != expected_paths:
+    raise SystemExit(
+        f"ASSERT FAIL: semantic_frontier_manifest sample_path 顺序不符合预期: {actual_paths!r} != {expected_paths!r}"
+    )
+
+actual_tiers = [entry.get("priority_tier") for entry in entries]
+if actual_tiers != [3, 0]:
+    raise SystemExit(
+        f"ASSERT FAIL: semantic_frontier_manifest priority_tier 顺序不符合预期: {actual_tiers!r} != [3, 0]"
+    )
+
+entries_by_id = {entry["sample_id"]: entry for entry in entries}
+if entries_by_id["sample-1"] != {
+    "sample_path": expected_paths[0],
+    "sample_id": "sample-1",
+    "analysis_state": "included",
+    "semantic_outcome": "cache_diff_interesting",
+    "oracle_audit_candidate": False,
+    "needs_manual_review": True,
+    "priority_tier": 3,
+}:
+    raise SystemExit(
+        f"ASSERT FAIL: sample-1 frontier entry 不符合预期: {entries_by_id['sample-1']!r}"
+    )
+
+if entries_by_id["sample"] != {
+    "sample_path": expected_paths[1],
+    "sample_id": "sample",
+    "analysis_state": "included",
+    "semantic_outcome": "no_diff",
+    "oracle_audit_candidate": False,
+    "needs_manual_review": False,
+    "priority_tier": 0,
+}:
+    raise SystemExit(
+        f"ASSERT FAIL: sample frontier entry 不符合预期: {entries_by_id['sample']!r}"
+    )
+
+high_value_lines = (root / "high_value_samples.txt").read_text(encoding="utf-8").splitlines()
+json_subset = [
+    entry["sample_path"]
+    for entry in entries
+    if entry.get("priority_tier") in {1, 2, 3}
+]
+if high_value_lines != json_subset:
+    raise SystemExit(
+        f"ASSERT FAIL: high_value_samples.txt 与 semantic_frontier_manifest Tier1-3 子集不一致: {high_value_lines!r} != {json_subset!r}"
+    )
+PY
 
 python3 - "$FAIL_ROOT" <<'PY'
 import json
@@ -662,6 +775,19 @@ root = pathlib.Path(sys.argv[1])
 sample_dir = root / "sample-1"
 sample_dir.mkdir(parents=True, exist_ok=True)
 (sample_dir / "sample.bin").write_bytes(b"\x01")
+(sample_dir / "sample.meta.json").write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "contract_version": 1,
+            "generated_at": "2026-03-23T00:00:00Z",
+            "sample_id": "sample-1",
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 (sample_dir / "triage.json").write_text(
     json.dumps(
         {
@@ -684,6 +810,31 @@ sample_dir.mkdir(parents=True, exist_ok=True)
 )
 PY
 
+python3 - "$BAD_TRUTH_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+sample_dir = root / "sample-bad-truth"
+sample_dir.mkdir(parents=True, exist_ok=True)
+(sample_dir / "sample.bin").write_bytes(b"\x02")
+(sample_dir / "sample.meta.json").write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "contract_version": 1,
+            "generated_at": "2026-03-23T00:00:00Z",
+            "sample_id": "sample-bad-truth",
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+(sample_dir / "triage.json").write_text('{"broken":', encoding="utf-8")
+PY
+
 FAIL_MANIFEST_TARGET="$FAIL_ROOT/manifest-target-dir"
 mkdir -p "$FAIL_MANIFEST_TARGET"
 REPORT_FAIL_STDERR="$WORKDIR/report-fail.stderr"
@@ -701,5 +852,18 @@ if env \
 	exit 1
 fi
 assert_file_contains "$REPORT_FAIL_STDERR" "dns-diff: report 失败: 写入 high_value_samples.txt 失败:"
+
+CAMPAIGN_BAD_TRUTH_STDERR="$WORKDIR/campaign-bad-truth.stderr"
+if run_cli campaign-report --root "$BAD_TRUTH_ROOT" >/dev/null 2>"$CAMPAIGN_BAD_TRUTH_STDERR"; then
+	printf 'ASSERT FAIL: campaign-report 对坏 truth-source 输入不应成功\n' >&2
+	exit 1
+fi
+assert_file_contains "$CAMPAIGN_BAD_TRUTH_STDERR" 'dns-diff: campaign-report 失败: 样本 semantic truth-source 无效:'
+assert_file_contains "$CAMPAIGN_BAD_TRUTH_STDERR" 'file=triage.json'
+assert_file_not_contains "$CAMPAIGN_BAD_TRUTH_STDERR" 'Traceback'
+if [ -e "$BAD_TRUTH_ROOT/campaign_reports" ]; then
+	printf 'ASSERT FAIL: bad truth-source 时不应生成 campaign_reports 目录\n' >&2
+	exit 1
+fi
 
 printf 'PASS: campaign report regression test passed\n'

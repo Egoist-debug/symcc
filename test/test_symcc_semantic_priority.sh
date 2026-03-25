@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 resolve_helper_bin() {
   python3 - "$ROOT_DIR" <<'PY'
@@ -181,161 +181,169 @@ prepare_fixture() {
   printf '%s\n' "$queue_dir"
 }
 
-scenario_text_manifest_priority() {
-  local helper_bin="$1"
-  local work_root="$2"
-  local queue_dir manifest_sample coverage_sample manifest_file log_file
+write_sleep_target() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
 
-  queue_dir="$(prepare_fixture "$work_root")"
-  manifest_sample="$queue_dir/id:000001,src:000000,manifest"
-  coverage_sample="$queue_dir/id:000002,src:000000,+cov"
-  manifest_file="$work_root/high_value_samples.txt"
-  log_file="$work_root/helper.log"
-
-  printf 'manifest\n' > "$manifest_sample"
-  printf 'coverage\n' > "$coverage_sample"
-  printf '%s\n' "$manifest_sample" > "$manifest_file"
-
-  env \
-    SYMCC_HIGH_VALUE_MANIFEST="$manifest_file" \
-    timeout -k 1 4 "$helper_bin" \
-      -a master -o "$work_root/afl_out" -n exp -- /bin/true @@ >"$log_file" 2>&1 || true
-
-  assert_running_sequence "$log_file" "$manifest_sample"
-  assert_file_contains "$log_file" 'Loaded semantic frontier snapshot from text manifest'
-  assert_file_contains "$log_file" 'semantic JSON fallback: SYMCC_SEMANTIC_FRONTIER_MANIFEST not set'
+path = pathlib.Path(sys.argv[1])
+path.write_text(
+    "#!/usr/bin/env python3\n"
+    "import time\n"
+    "time.sleep(2.0)\n",
+    encoding="utf-8",
+)
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
 }
 
-scenario_coverage_first_without_manifests() {
-  local helper_bin="$1"
-  local work_root="$2"
-  local queue_dir plain_sample coverage_sample log_file
+wait_for_log_line() {
+  local log_file="$1"
+  local expected="$2"
+  local timeout_sec="$3"
+  local deadline=$((SECONDS + timeout_sec))
 
-  queue_dir="$(prepare_fixture "$work_root")"
-  plain_sample="$queue_dir/id:000001,src:000000,plain"
-  coverage_sample="$queue_dir/id:000002,src:000000,+cov"
-  log_file="$work_root/helper.log"
+  while (( SECONDS < deadline )); do
+    if [[ -f "$log_file" ]] && grep -Fq -- "$expected" "$log_file"; then
+      return 0
+    fi
+    sleep 0.1
+  done
 
-  printf 'plain\n' > "$plain_sample"
-  printf 'coverage\n' > "$coverage_sample"
-
-  env \
-    -u SYMCC_HIGH_VALUE_MANIFEST \
-    -u SYMCC_SEMANTIC_FRONTIER_MANIFEST \
-    timeout -k 1 4 "$helper_bin" \
-      -a master -o "$work_root/afl_out" -n exp -- /bin/true @@ >"$log_file" 2>&1 || true
-
-  assert_running_sequence "$log_file" "$coverage_sample"
-  assert_file_contains "$log_file" 'Loaded semantic frontier snapshot from coverage-first only'
-  assert_file_not_contains "$log_file" 'Fatal:'
+  printf 'ASSERT FAIL: 等待日志超时，未看到: %s\n' "$expected" >&2
+  if [[ -f "$log_file" ]]; then
+    cat "$log_file" >&2
+  fi
+  exit 1
 }
 
-scenario_json_beats_text_and_coverage() {
+scenario_relative_json_priority_and_canonicalization() {
   local helper_bin="$1"
   local work_root="$2"
-  local queue_dir json_sample text_sample coverage_sample text_manifest json_manifest log_file
+  local queue_dir relative_sample coverage_sample json_manifest log_file
 
   queue_dir="$(prepare_fixture "$work_root")"
-  json_sample="$queue_dir/id:000001,src:000000,json"
-  text_sample="$queue_dir/id:000002,src:000000,text"
-  coverage_sample="$queue_dir/id:000003,src:000000,+cov"
-  text_manifest="$work_root/high_value_samples.txt"
+  relative_sample="$queue_dir/id:000001,src:000000,relative"
+  coverage_sample="$queue_dir/id:000002,src:000000,+cov"
   json_manifest="$work_root/semantic_frontier_manifest.json"
   log_file="$work_root/helper.log"
 
-  printf 'json\n' > "$json_sample"
-  printf 'text\n' > "$text_sample"
+  printf 'relative\n' > "$relative_sample"
   printf 'coverage\n' > "$coverage_sample"
-  printf '%s\n' "$text_sample" > "$text_manifest"
-  write_json_manifest "$json_manifest" "$queue_dir" "$json_sample:::3" "$text_sample:::1"
+  write_json_manifest "$json_manifest" "$queue_dir" "$(basename "$relative_sample"):::3"
 
   env \
-    SYMCC_HIGH_VALUE_MANIFEST="$text_manifest" \
     SYMCC_SEMANTIC_FRONTIER_MANIFEST="$json_manifest" \
     timeout -k 1 4 "$helper_bin" \
       -a master -o "$work_root/afl_out" -n exp -- /bin/true @@ >"$log_file" 2>&1 || true
 
-  assert_running_sequence "$log_file" "$json_sample"
+  assert_running_sequence "$log_file" "$relative_sample"
   assert_file_contains "$log_file" 'Loaded semantic frontier snapshot from semantic JSON manifest'
-  assert_file_contains "$log_file" "Picked high-value request sample from semantic JSON manifest (tier=3): $json_sample"
-  assert_all_copy_counts_zero "$log_file"
-  assert_no_symcc_queue_samples "$queue_dir"
+  assert_file_contains "$log_file" "Picked high-value request sample from semantic JSON manifest (tier=3): $relative_sample"
 }
 
-scenario_valid_json_does_not_fall_through_to_text() {
+scenario_bad_json_reload_keeps_last_known_good() {
   local helper_bin="$1"
   local work_root="$2"
-  local queue_dir json_tier0_sample text_only_sample coverage_sample text_manifest json_manifest log_file
+  local queue_dir tier3_sample tier2_sample text_only_sample coverage_sample text_manifest json_manifest log_file sleep_target timeout_pid
 
   queue_dir="$(prepare_fixture "$work_root")"
-  json_tier0_sample="$queue_dir/id:000001,src:000000,json-tier0"
-  text_only_sample="$queue_dir/id:000002,src:000000,text-only"
-  coverage_sample="$queue_dir/id:000003,src:000000,+cov"
+  tier3_sample="$queue_dir/id:000001,src:000000,tier3"
+  tier2_sample="$queue_dir/id:000002,src:000000,tier2"
+  text_only_sample="$queue_dir/id:000003,src:000000,text-only"
+  coverage_sample="$queue_dir/id:000004,src:000000,+cov"
   text_manifest="$work_root/high_value_samples.txt"
   json_manifest="$work_root/semantic_frontier_manifest.json"
   log_file="$work_root/helper.log"
+  sleep_target="$work_root/fake_target.py"
 
-  printf 'json-tier0\n' > "$json_tier0_sample"
+  printf 'tier3\n' > "$tier3_sample"
+  printf 'tier2\n' > "$tier2_sample"
   printf 'text-only\n' > "$text_only_sample"
   printf 'coverage\n' > "$coverage_sample"
   printf '%s\n' "$text_only_sample" > "$text_manifest"
-  write_json_manifest "$json_manifest" "$queue_dir" "$json_tier0_sample:::0"
+  write_json_manifest "$json_manifest" "$queue_dir" "$tier3_sample:::3" "$tier2_sample:::2"
+  write_sleep_target "$sleep_target"
 
   env \
     SYMCC_HIGH_VALUE_MANIFEST="$text_manifest" \
     SYMCC_SEMANTIC_FRONTIER_MANIFEST="$json_manifest" \
-    timeout -k 1 4 "$helper_bin" \
-      -a master -o "$work_root/afl_out" -n exp -- /bin/true @@ >"$log_file" 2>&1 || true
+    SYMCC_FRONTIER_RELOAD_SEC=1 \
+    timeout -k 1 8 "$helper_bin" \
+      -a master -o "$work_root/afl_out" -n exp -- "$sleep_target" @@ >"$log_file" 2>&1 &
+  timeout_pid=$!
 
-  assert_running_sequence "$log_file" "$coverage_sample"
-  assert_file_contains "$log_file" 'Loaded semantic frontier snapshot from semantic JSON manifest'
-  assert_file_not_contains "$log_file" "Picked high-value request sample from semantic JSON manifest (tier=1): $text_only_sample"
+  wait_for_log_line "$log_file" "Running SymCC on request sample $tier3_sample" 5
+  printf '%s\n' '{"contract_name": "semantic_frontier_manifest", "entries": [' > "$json_manifest"
+
+  wait "$timeout_pid" || true
+
+  assert_running_sequence "$log_file" "$tier3_sample" "$tier2_sample" "$coverage_sample" "$text_only_sample"
+  assert_file_contains "$log_file" 'Kept last-known-good semantic frontier snapshot from semantic JSON manifest'
+  assert_file_contains "$log_file" 'semantic frontier JSON parse error'
+  assert_file_contains "$log_file" 'Semantic frontier snapshot state preserved: source=semantic JSON manifest, applied_at='
+  assert_file_contains "$log_file" "Picked high-value request sample from semantic JSON manifest (tier=2): $tier2_sample"
+  assert_file_not_contains "$log_file" 'Reloaded semantic frontier snapshot from text manifest'
+  assert_file_not_contains "$log_file" "Picked high-value request sample from text manifest (tier=1): $text_only_sample"
+  assert_all_copy_counts_zero "$log_file"
+  assert_no_symcc_queue_samples "$queue_dir"
+  assert_file_not_contains "$log_file" 'Fatal:'
 }
 
-scenario_invalid_json_falls_back_to_text() {
+scenario_same_tier_order_stable() {
   local helper_bin="$1"
   local work_root="$2"
-  local queue_dir text_sample coverage_sample text_manifest json_manifest log_file
+  local queue_dir cov_sample seed_sample small_sample base_a_sample base_b_sample json_manifest log_file
 
   queue_dir="$(prepare_fixture "$work_root")"
-  text_sample="$queue_dir/id:000001,src:000000,text"
-  coverage_sample="$queue_dir/id:000002,src:000000,+cov"
-  text_manifest="$work_root/high_value_samples.txt"
+  cov_sample="$queue_dir/id:000005,src:000000,+cov"
+  seed_sample="$queue_dir/id:000004,orig:seed"
+  small_sample="$queue_dir/id:000003,src:000000,small"
+  base_a_sample="$queue_dir/id:000001,src:000000,aaa"
+  base_b_sample="$queue_dir/id:000002,src:000000,bbb"
   json_manifest="$work_root/semantic_frontier_manifest.json"
   log_file="$work_root/helper.log"
 
-  printf 'text\n' > "$text_sample"
-  printf 'coverage\n' > "$coverage_sample"
-  printf '%s\n' "$text_sample" > "$text_manifest"
-  printf '%s\n' '{"contract_name": "semantic_frontier_manifest", "entries": [' > "$json_manifest"
+  printf 'coverage\n' > "$cov_sample"
+  printf 'seed-seed\n' > "$seed_sample"
+  printf 's\n' > "$small_sample"
+  printf 'bbb\n' > "$base_b_sample"
+  printf 'aaa\n' > "$base_a_sample"
+  write_json_manifest "$json_manifest" "$queue_dir" \
+    "$cov_sample:::2" \
+    "$seed_sample:::2" \
+    "$small_sample:::2" \
+    "$base_a_sample:::2" \
+    "$base_b_sample:::2"
 
   env \
-    SYMCC_HIGH_VALUE_MANIFEST="$text_manifest" \
     SYMCC_SEMANTIC_FRONTIER_MANIFEST="$json_manifest" \
-    timeout -k 1 4 "$helper_bin" \
+    timeout -k 1 5 "$helper_bin" \
       -a master -o "$work_root/afl_out" -n exp -- /bin/true @@ >"$log_file" 2>&1 || true
 
-  assert_running_sequence "$log_file" "$text_sample"
-  assert_file_contains "$log_file" 'Loaded semantic frontier snapshot from text manifest'
-  assert_file_contains "$log_file" 'semantic JSON fallback:'
-  assert_file_not_contains "$log_file" 'Fatal:'
+  assert_running_sequence "$log_file" \
+    "$cov_sample" \
+    "$seed_sample" \
+    "$small_sample" \
+    "$base_b_sample" \
+    "$base_a_sample"
 }
 
 main() {
   local helper_bin=""
-  local tmp_root=""
+  local work_root=""
 
   helper_bin="$(ensure_helper_bin)"
-  tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/symcc-high-value-priority.XXXXXX")"
-  trap 'rm -rf "${tmp_root:-}"' EXIT
+  work_root="$(mktemp -d "${TMPDIR:-/tmp}/symcc-semantic-priority.XXXXXX")"
+  trap 'rm -rf "${work_root:-}"' EXIT
 
-  scenario_text_manifest_priority "$helper_bin" "$tmp_root/text-manifest"
-  scenario_coverage_first_without_manifests "$helper_bin" "$tmp_root/coverage-only"
-  scenario_json_beats_text_and_coverage "$helper_bin" "$tmp_root/json-priority"
-  scenario_valid_json_does_not_fall_through_to_text "$helper_bin" "$tmp_root/json-no-text-fallback"
-  scenario_invalid_json_falls_back_to_text "$helper_bin" "$tmp_root/json-fallback"
+  scenario_relative_json_priority_and_canonicalization "$helper_bin" "$work_root/relative-json"
+  scenario_bad_json_reload_keeps_last_known_good "$helper_bin" "$work_root/reload-keep"
+  scenario_same_tier_order_stable "$helper_bin" "$work_root/same-tier-order"
 
-  printf 'PASS: high-value priority fixture regression test passed\n'
+  printf 'PASS: semantic priority regression test passed\n'
 }
 
 main "$@"

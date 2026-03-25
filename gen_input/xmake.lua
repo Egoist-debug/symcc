@@ -20,6 +20,7 @@ target("gen_input")
     add_includedirs("../runtime/include")
     add_cxxflags("-Wall", "-Wextra", "-Wpedantic", "-fPIC")
     add_packages("z3")
+    add_links("z3")
     
     if is_mode("debug") then
         add_cxxflags("-g", "-O0")

@@ -12,6 +12,14 @@ namespace geninput {
 
 class DST1Mutator {
 public:
+  enum class DonorMutationFamily {
+    ResponseSpliceSameIndex,
+    AuthorityTransplant,
+    AdditionalOrGlueTransplant,
+    ResponseCountExpandOrShrinkFromDonor,
+    PostCheckCoupledNameOrTypeShift,
+  };
+
   struct Transcript {
     std::vector<uint8_t> ClientQuery;
     std::vector<std::vector<uint8_t>> Responses;
@@ -27,6 +35,7 @@ public:
   };
 
   struct ResponseMutation {
+    std::optional<std::vector<uint8_t>> Packet;
     std::optional<bool> AA;
     std::optional<bool> RA;
     std::optional<uint8_t> RCODE;
@@ -40,6 +49,7 @@ public:
 
   struct TranscriptMutation {
     std::optional<uint8_t> ResponseCount;
+    std::optional<std::vector<std::vector<uint8_t>>> Responses;
     std::optional<std::string> PostCheckName;
     std::optional<uint16_t> PostCheckType;
   };
@@ -48,6 +58,7 @@ public:
     std::optional<QueryMutation> Query;
     std::optional<ResponseMutation> Response;
     std::optional<TranscriptMutation> Transcript;
+    std::optional<DonorMutationFamily> DonorFamily;
     size_t ResponseIndex = 0;
   };
 
@@ -56,6 +67,9 @@ public:
   serialize(const Transcript &InputTranscript);
   static std::optional<std::vector<uint8_t>>
   mutate(const std::vector<uint8_t> &Input, const MutationRequest &Request);
+  static std::optional<std::vector<uint8_t>>
+  mutate(const std::vector<uint8_t> &Input, const MutationRequest &Request,
+         const std::vector<uint8_t> &DonorInput);
 };
 
 }

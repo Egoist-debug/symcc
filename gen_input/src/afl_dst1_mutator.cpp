@@ -6,6 +6,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -126,8 +129,19 @@ namespace geninput {
 namespace {
 
 struct AFLDST1MutatorState {
+  struct TrimState {
+    bool Active = false;
+    std::vector<uint8_t> Baseline;
+    std::vector<std::vector<uint8_t>> Candidates;
+    size_t NextCandidateIndex = 0;
+    std::vector<uint8_t> PendingCandidate;
+  };
+
   std::mt19937 Rng;
   std::vector<unsigned char> Output;
+  std::vector<uint8_t> LastFuzzInput;
+  bool LastFuzzUsedParseableDonor = false;
+  TrimState Trim;
 
   explicit AFLDST1MutatorState(unsigned int Seed) : Rng(Seed) {}
 };
@@ -223,6 +237,187 @@ size_t storeOutput(AFLDST1MutatorState &State,
   State.Output.assign(Bytes.begin(), Bytes.begin() + OutputSize);
   *OutBuf = State.Output.empty() ? nullptr : State.Output.data();
   return State.Output.size();
+}
+
+size_t storeOutput(AFLDST1MutatorState &State,
+                   const std::vector<uint8_t> &Bytes,
+                   unsigned char **OutBuf) {
+  if (OutBuf == nullptr || Bytes.empty()) {
+    return 0;
+  }
+
+  State.Output.assign(Bytes.begin(), Bytes.end());
+  *OutBuf = State.Output.data();
+  return State.Output.size();
+}
+
+bool isMutatorOnlyEnabled() {
+  const char *Value = std::getenv("DST1_MUTATOR_ONLY");
+  return Value != nullptr && std::string(Value) == "1";
+}
+
+std::optional<std::vector<uint8_t>> readFileBytes(const char *Path) {
+  if (Path == nullptr) {
+    return std::nullopt;
+  }
+
+  std::ifstream File(Path, std::ios::binary);
+  if (!File) {
+    return std::nullopt;
+  }
+
+  return std::vector<uint8_t>((std::istreambuf_iterator<char>(File)),
+                              std::istreambuf_iterator<char>());
+}
+
+std::optional<std::vector<uint8_t>> canonicalizeTranscript(
+    const std::vector<uint8_t> &Input) {
+  auto Parsed = DST1Mutator::parse(Input);
+  if (!Parsed) {
+    return std::nullopt;
+  }
+
+  auto Serialized = DST1Mutator::serialize(*Parsed);
+  if (!Serialized || Serialized->empty()) {
+    return std::nullopt;
+  }
+
+  return Serialized;
+}
+
+void recordFuzzCountHint(AFLDST1MutatorState &State,
+                         const std::vector<uint8_t> &Input,
+                         bool UsedParseableDonor) {
+  State.LastFuzzInput = Input;
+  State.LastFuzzUsedParseableDonor = UsedParseableDonor;
+}
+
+unsigned int determineFuzzCount(const AFLDST1MutatorState *State,
+                                const std::vector<uint8_t> &Input) {
+  if (!DST1Mutator::parse(Input).has_value()) {
+    return 1U;
+  }
+
+  if (State != nullptr && State->LastFuzzUsedParseableDonor &&
+      State->LastFuzzInput == Input) {
+    return 8U;
+  }
+
+  return 4U;
+}
+
+void maybeAttachDonorFamily(DST1Mutator::MutationRequest &Request,
+                            const DST1Mutator::Transcript &Target,
+                            const DST1Mutator::Transcript &Donor,
+                            std::mt19937 &Rng) {
+  std::vector<DST1Mutator::DonorMutationFamily> Families = {
+      DST1Mutator::DonorMutationFamily::ResponseCountExpandOrShrinkFromDonor,
+      DST1Mutator::DonorMutationFamily::PostCheckCoupledNameOrTypeShift,
+  };
+
+  const size_t SharedResponses =
+      std::min(Target.Responses.size(), Donor.Responses.size());
+  if (SharedResponses != 0) {
+    Families.push_back(DST1Mutator::DonorMutationFamily::ResponseSpliceSameIndex);
+    Families.push_back(DST1Mutator::DonorMutationFamily::AuthorityTransplant);
+    Families.push_back(
+        DST1Mutator::DonorMutationFamily::AdditionalOrGlueTransplant);
+  }
+
+  std::uniform_int_distribution<size_t> FamilyDist(0, Families.size() - 1);
+  Request.DonorFamily = Families[FamilyDist(Rng)];
+
+  switch (*Request.DonorFamily) {
+  case DST1Mutator::DonorMutationFamily::ResponseSpliceSameIndex:
+  case DST1Mutator::DonorMutationFamily::AuthorityTransplant:
+  case DST1Mutator::DonorMutationFamily::AdditionalOrGlueTransplant: {
+    if (SharedResponses == 0) {
+      Request.DonorFamily.reset();
+      return;
+    }
+
+    if (Request.ResponseIndex >= SharedResponses) {
+      std::uniform_int_distribution<size_t> ResponseDist(0, SharedResponses - 1);
+      Request.ResponseIndex = ResponseDist(Rng);
+    }
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+void addTrimCandidate(std::vector<std::vector<uint8_t>> &Candidates,
+                      std::optional<std::vector<uint8_t>> Candidate,
+                      size_t MaxSize) {
+  if (!Candidate || Candidate->empty() || Candidate->size() >= MaxSize ||
+      Candidate->size() > MaxSize || !DST1Mutator::parse(*Candidate).has_value()) {
+    return;
+  }
+
+  if (std::find(Candidates.begin(), Candidates.end(), *Candidate) ==
+      Candidates.end()) {
+    Candidates.push_back(std::move(*Candidate));
+  }
+}
+
+std::vector<std::vector<uint8_t>>
+buildTrimCandidates(const std::vector<uint8_t> &Input) {
+  std::vector<std::vector<uint8_t>> Candidates;
+  auto Parsed = DST1Mutator::parse(Input);
+  if (!Parsed) {
+    return Candidates;
+  }
+
+  for (size_t RemoveIndex = Parsed->Responses.size(); RemoveIndex > 0;
+       --RemoveIndex) {
+    DST1Mutator::MutationRequest Request;
+    DST1Mutator::TranscriptMutation Mutation;
+    auto Responses = Parsed->Responses;
+    Responses.erase(Responses.begin() + static_cast<std::ptrdiff_t>(RemoveIndex - 1));
+    Mutation.Responses = Responses;
+    Mutation.ResponseCount = static_cast<uint8_t>(Responses.size());
+    Request.Transcript = Mutation;
+    addTrimCandidate(Candidates, DST1Mutator::mutate(Input, Request), Input.size());
+  }
+
+  for (size_t ResponseIndex = 0; ResponseIndex < Parsed->Responses.size();
+       ++ResponseIndex) {
+    auto Layout = parseResponseLayout(Parsed->Responses[ResponseIndex]);
+    if (!Layout) {
+      continue;
+    }
+
+    if (!Layout->AuthorityRRs.empty()) {
+      DST1Mutator::MutationRequest Request;
+      DST1Mutator::ResponseMutation Mutation;
+      Request.ResponseIndex = ResponseIndex;
+      Mutation.NSCOUNT =
+          static_cast<uint16_t>(Layout->AuthorityRRs.size() - 1);
+      Request.Response = Mutation;
+      addTrimCandidate(Candidates, DST1Mutator::mutate(Input, Request),
+                       Input.size());
+    }
+
+    if (!Layout->AdditionalRRs.empty()) {
+      DST1Mutator::MutationRequest Request;
+      DST1Mutator::ResponseMutation Mutation;
+      Request.ResponseIndex = ResponseIndex;
+      Mutation.ARCOUNT =
+          static_cast<uint16_t>(Layout->AdditionalRRs.size() - 1);
+      Request.Response = Mutation;
+      addTrimCandidate(Candidates, DST1Mutator::mutate(Input, Request),
+                       Input.size());
+    }
+  }
+
+  return Candidates;
+}
+
+void refreshTrimState(AFLDST1MutatorState &State) {
+  State.Trim.Candidates = buildTrimCandidates(State.Trim.Baseline);
+  State.Trim.NextCandidateIndex = 0;
+  State.Trim.PendingCandidate.clear();
 }
 
 std::optional<DST1Mutator::MutationRequest>
@@ -364,12 +559,19 @@ buildMutationRequest(const DST1Mutator::Transcript &Transcript, std::mt19937 &Rn
   }
 }
 
-std::optional<std::vector<uint8_t>> mutateTranscript(const std::vector<uint8_t> &Input,
-                                                     size_t MaxSize,
-                                                     std::mt19937 &Rng) {
+std::optional<std::vector<uint8_t>> mutateTranscript(
+    const std::vector<uint8_t> &Input,
+    const std::vector<uint8_t> *DonorInput,
+    size_t MaxSize,
+    std::mt19937 &Rng) {
   auto Transcript = DST1Mutator::parse(Input);
   if (!Transcript) {
     return std::nullopt;
+  }
+
+  std::optional<DST1Mutator::Transcript> DonorTranscript;
+  if (DonorInput != nullptr) {
+    DonorTranscript = DST1Mutator::parse(*DonorInput);
   }
 
   for (size_t Attempt = 0; Attempt < 16; ++Attempt) {
@@ -378,7 +580,13 @@ std::optional<std::vector<uint8_t>> mutateTranscript(const std::vector<uint8_t> 
       continue;
     }
 
-    auto Mutated = DST1Mutator::mutate(Input, *Request);
+    if (DonorInput != nullptr && DonorTranscript.has_value()) {
+      maybeAttachDonorFamily(*Request, *Transcript, *DonorTranscript, Rng);
+    }
+
+    auto Mutated = (DonorInput != nullptr && DonorTranscript.has_value())
+                       ? DST1Mutator::mutate(Input, *Request, *DonorInput)
+                       : DST1Mutator::mutate(Input, *Request);
     if (!Mutated || Mutated->empty() || Mutated->size() > MaxSize ||
         *Mutated == Input) {
       continue;
@@ -399,6 +607,17 @@ afl_custom_init(void *AflState, unsigned int Seed) {
   return new geninput::AFLDST1MutatorState(Seed);
 }
 
+extern "C" __attribute__((visibility("default"))) unsigned int
+afl_custom_fuzz_count(void *Data, const unsigned char *Buf, size_t BufSize) {
+  if (Buf == nullptr || BufSize == 0) {
+    return 1U;
+  }
+
+  const auto *State = static_cast<const geninput::AFLDST1MutatorState *>(Data);
+  std::vector<uint8_t> Input(Buf, Buf + BufSize);
+  return geninput::determineFuzzCount(State, Input);
+}
+
 extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
     void *Data,
     unsigned char *Buf,
@@ -407,21 +626,135 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
     unsigned char *AddBuf,
     size_t AddBufSize,
     size_t MaxSize) {
-  (void)AddBuf;
-  (void)AddBufSize;
-
   auto *State = static_cast<geninput::AFLDST1MutatorState *>(Data);
   if (State == nullptr || Buf == nullptr || BufSize == 0) {
     return 0;
   }
 
   std::vector<uint8_t> Input(Buf, Buf + BufSize);
-  auto Mutated = geninput::mutateTranscript(Input, MaxSize, State->Rng);
+  const bool InputParseable = geninput::DST1Mutator::parse(Input).has_value();
+  if (!InputParseable) {
+    geninput::recordFuzzCountHint(*State, Input, false);
+    if (geninput::isMutatorOnlyEnabled()) {
+      return 0;
+    }
+    return geninput::storeOutput(*State, Input, MaxSize, OutBuf);
+  }
+
+  std::optional<std::vector<uint8_t>> DonorInput;
+  if (AddBuf != nullptr && AddBufSize != 0) {
+    DonorInput.emplace(AddBuf, AddBuf + AddBufSize);
+  }
+
+  const bool DonorParseable =
+      DonorInput.has_value() && geninput::DST1Mutator::parse(*DonorInput).has_value();
+  geninput::recordFuzzCountHint(*State, Input, DonorParseable);
+
+  auto Mutated = geninput::mutateTranscript(
+      Input, DonorParseable ? &DonorInput.value() : nullptr, MaxSize, State->Rng);
   if (Mutated) {
     return geninput::storeOutput(*State, *Mutated, MaxSize, OutBuf);
   }
 
   return geninput::storeOutput(*State, Input, MaxSize, OutBuf);
+}
+
+extern "C" __attribute__((visibility("default"))) unsigned char
+afl_custom_queue_get(void *Data, const unsigned char *Filename) {
+  (void)Data;
+
+  if (!geninput::isMutatorOnlyEnabled()) {
+    return 1;
+  }
+
+  auto Bytes =
+      geninput::readFileBytes(reinterpret_cast<const char *>(Filename));
+  return Bytes.has_value() && geninput::DST1Mutator::parse(*Bytes).has_value();
+}
+
+extern "C" __attribute__((visibility("default"))) size_t afl_custom_post_process(
+    void *Data,
+    unsigned char *Buf,
+    size_t BufSize,
+    unsigned char **OutBuf) {
+  auto *State = static_cast<geninput::AFLDST1MutatorState *>(Data);
+  if (State == nullptr || OutBuf == nullptr) {
+    return 0;
+  }
+
+  std::vector<uint8_t> Input;
+  if (Buf != nullptr && BufSize != 0) {
+    Input.assign(Buf, Buf + BufSize);
+  }
+
+  auto Canonical = geninput::canonicalizeTranscript(Input);
+  if (Canonical && !Canonical->empty()) {
+    return geninput::storeOutput(*State, *Canonical, OutBuf);
+  }
+
+  if (Input.empty()) {
+    return 0;
+  }
+
+  return geninput::storeOutput(*State, Input, OutBuf);
+}
+
+extern "C" __attribute__((visibility("default"))) int afl_custom_init_trim(
+    void *Data,
+    unsigned char *Buf,
+    size_t BufSize) {
+  auto *State = static_cast<geninput::AFLDST1MutatorState *>(Data);
+  if (State == nullptr || Buf == nullptr || BufSize == 0) {
+    return 0;
+  }
+
+  std::vector<uint8_t> Input(Buf, Buf + BufSize);
+  if (!geninput::DST1Mutator::parse(Input).has_value()) {
+    State->Trim = {};
+    return 0;
+  }
+
+  State->Trim = {};
+  State->Trim.Active = true;
+  State->Trim.Baseline = std::move(Input);
+  geninput::refreshTrimState(*State);
+  return State->Trim.Candidates.empty() ? 0 : 1;
+}
+
+extern "C" __attribute__((visibility("default"))) size_t afl_custom_trim(
+    void *Data,
+    unsigned char **OutBuf) {
+  auto *State = static_cast<geninput::AFLDST1MutatorState *>(Data);
+  if (State == nullptr || !State->Trim.Active ||
+      State->Trim.NextCandidateIndex >= State->Trim.Candidates.size()) {
+    return 0;
+  }
+
+  State->Trim.PendingCandidate =
+      State->Trim.Candidates[State->Trim.NextCandidateIndex];
+  return geninput::storeOutput(*State, State->Trim.PendingCandidate, OutBuf);
+}
+
+extern "C" __attribute__((visibility("default"))) int afl_custom_post_trim(
+    void *Data,
+    unsigned char Success) {
+  auto *State = static_cast<geninput::AFLDST1MutatorState *>(Data);
+  if (State == nullptr || !State->Trim.Active) {
+    return 1;
+  }
+
+  if (Success != 0 && !State->Trim.PendingCandidate.empty()) {
+    State->Trim.Baseline = State->Trim.PendingCandidate;
+    geninput::refreshTrimState(*State);
+    return State->Trim.Candidates.empty() ? 1 : 0;
+  }
+
+  State->Trim.PendingCandidate.clear();
+  if (State->Trim.NextCandidateIndex < State->Trim.Candidates.size()) {
+    State->Trim.NextCandidateIndex += 1;
+  }
+
+  return State->Trim.NextCandidateIndex < State->Trim.Candidates.size() ? 0 : 1;
 }
 
 extern "C" __attribute__((visibility("default"))) void afl_custom_deinit(

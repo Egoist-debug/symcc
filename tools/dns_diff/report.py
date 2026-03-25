@@ -2,7 +2,7 @@ import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, NoReturn, Optional, Tuple
 
 from .follow_diff import (
     FOLLOW_DIFF_STATE_FILE_NAME,
@@ -10,8 +10,13 @@ from .follow_diff import (
     default_follow_diff_output_root,
     resolve_follow_diff_work_dir,
 )
-from .io import load_json_with_fallback
-from .schema import ANALYSIS_STATES, CONTRACT_VERSION, build_run_comparability_payload
+from .io import atomic_write_json, load_json_with_fallback
+from .schema import (
+    ANALYSIS_STATES,
+    CONTRACT_VERSION,
+    build_run_comparability_payload,
+    utc_timestamp,
+)
 from .taxonomy import (
     FAILURE_BUCKET_DETAIL_ORDER,
     FAILURE_BUCKET_PRIMARY_ORDER,
@@ -19,6 +24,16 @@ from .taxonomy import (
 
 EXIT_USAGE = 2
 ANALYSIS_STATE_ORDER: Tuple[str, ...] = ("included", "excluded", "unknown")
+SEMANTIC_FRONTIER_MANIFEST_FILE_NAME = "semantic_frontier_manifest.json"
+SEMANTIC_FRONTIER_MANIFEST_CONTRACT_NAME = "semantic_frontier_manifest"
+SEMANTIC_FRONTIER_TIER3_OUTCOMES = frozenset(
+    {"oracle_and_cache_diff", "oracle_diff", "cache_diff_interesting"}
+)
+SEMANTIC_FRONTIER_OUTCOME_ORDER = {
+    "oracle_and_cache_diff": 0,
+    "oracle_diff": 1,
+    "cache_diff_interesting": 2,
+}
 
 
 class ReportError(RuntimeError):
@@ -80,6 +95,20 @@ def resolve_high_value_manifest_path(
     return default_high_value_manifest_path(root, work_dir=work_dir)
 
 
+def resolve_semantic_frontier_manifest_path(
+    root: Path,
+    *,
+    work_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    manifest_path = resolve_high_value_manifest_path(
+        root,
+        work_dir=work_dir,
+        environ=environ,
+    )
+    return (manifest_path.parent / SEMANTIC_FRONTIER_MANIFEST_FILE_NAME).resolve()
+
+
 def _coerce_text(value: Any, fallback: str) -> str:
     if isinstance(value, str) and value:
         return value
@@ -90,6 +119,12 @@ def _coerce_optional_text(value: Any) -> Optional[str]:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return False
 
 
 def _coerce_analysis_state(value: Any) -> str:
@@ -140,15 +175,76 @@ def collect_sample_dirs(root: Path, *, require_root: bool = True) -> List[Path]:
     return list(_iter_sample_dirs(root_path))
 
 
-def _load_triage_payload(sample_dir: Path) -> Dict[str, Any]:
-    triage_path = sample_dir / "triage.json"
-    load_result = load_json_with_fallback(triage_path)
-    if load_result.downgraded and triage_path.exists():
-        detail = load_result.error or load_result.status
-        sys.stderr.write(
-            f"dns-diff: report 读取 triage 降级，已回退默认值 {triage_path}: {detail}\n"
+def _raise_truth_source_load_error(
+    *,
+    sample_dir: Path,
+    path: Path,
+    label: str,
+    status: str,
+    detail: Optional[str],
+) -> NoReturn:
+    resolved_sample_dir = sample_dir.expanduser().resolve()
+    resolved_path = path.expanduser().resolve()
+    reason = {
+        "missing": "文件缺失",
+        "corrupt_fallback": "JSON 损坏",
+        "type_mismatch_fallback": "JSON 顶层类型无效（期望 object）",
+        "utf8_decode_error": "UTF-8 解码失败",
+        "read_error": "文件读取失败",
+    }.get(status, status)
+    message = (
+        "样本 semantic truth-source 无效: "
+        f"sample_dir={resolved_sample_dir} file={label} path={resolved_path} "
+        f"reason={reason}"
+    )
+    if detail:
+        message += f" detail={detail}"
+    raise ReportError(message)
+
+
+def _load_required_truth_source_payload(
+    sample_dir: Path,
+    *,
+    file_name: str,
+    label: str,
+) -> Dict[str, Any]:
+    artifact_path = sample_dir / file_name
+    try:
+        load_result = load_json_with_fallback(artifact_path)
+    except UnicodeDecodeError as exc:
+        _raise_truth_source_load_error(
+            sample_dir=sample_dir,
+            path=artifact_path,
+            label=label,
+            status="utf8_decode_error",
+            detail=str(exc),
         )
-    payload = dict(load_result.data)
+    except OSError as exc:
+        _raise_truth_source_load_error(
+            sample_dir=sample_dir,
+            path=artifact_path,
+            label=label,
+            status="read_error",
+            detail=str(exc),
+        )
+    else:
+        if load_result.downgraded:
+            _raise_truth_source_load_error(
+                sample_dir=sample_dir,
+                path=artifact_path,
+                label=label,
+                status=load_result.status,
+                detail=load_result.error,
+            )
+        return dict(load_result.data)
+
+
+def _load_triage_payload(sample_dir: Path) -> Dict[str, Any]:
+    payload = _load_required_truth_source_payload(
+        sample_dir,
+        file_name="triage.json",
+        label="triage.json",
+    )
     payload.setdefault("sample_id", sample_dir.name)
     payload.setdefault("status", "unknown")
     payload.setdefault("cluster_key", "_")
@@ -160,26 +256,145 @@ def _load_triage_payload(sample_dir: Path) -> Dict[str, Any]:
 
 
 def _load_sample_meta_payload(sample_dir: Path) -> Dict[str, Any]:
-    meta_path = sample_dir / "sample.meta.json"
-    load_result = load_json_with_fallback(meta_path)
-    if load_result.downgraded and meta_path.exists():
-        detail = load_result.error or load_result.status
-        sys.stderr.write(
-            f"dns-diff: report 读取 sample.meta 降级，已回退默认值 {meta_path}: {detail}\n"
-        )
-    payload = dict(load_result.data)
+    payload = _load_required_truth_source_payload(
+        sample_dir,
+        file_name="sample.meta.json",
+        label="sample.meta.json",
+    )
     payload.setdefault("sample_id", sample_dir.name)
     return payload
 
 
 def _load_auxiliary_payload(path: Path, *, label: str) -> Dict[str, Any]:
-    load_result = load_json_with_fallback(path)
+    try:
+        load_result = load_json_with_fallback(path)
+    except UnicodeDecodeError as exc:
+        sys.stderr.write(
+            f"dns-diff: report 读取 {label} 降级，已回退默认值 {path}: UTF-8 解码失败: {exc}\n"
+        )
+        return {}
+    except OSError as exc:
+        sys.stderr.write(
+            f"dns-diff: report 读取 {label} 降级，已回退默认值 {path}: 文件读取失败: {exc}\n"
+        )
+        return {}
     if load_result.downgraded and path.exists():
         detail = load_result.error or load_result.status
         sys.stderr.write(
             f"dns-diff: report 读取 {label} 降级，已回退默认值 {path}: {detail}\n"
         )
     return dict(load_result.data)
+
+
+def _resolve_sample_artifact_path(sample_dir: Path) -> Optional[Path]:
+    sample_path = sample_dir / "sample.bin"
+    if not sample_path.is_file():
+        sample_path = sample_dir / "transcript"
+    if sample_path.is_file():
+        return sample_path
+    return None
+
+
+def _resolve_semantic_frontier_sample_path(
+    sample_dir: Path,
+    *,
+    sample_meta_payload: Mapping[str, Any],
+) -> Optional[Path]:
+    source_queue_file = sample_meta_payload.get("source_queue_file")
+    if isinstance(source_queue_file, str) and source_queue_file.strip():
+        resolved_queue_file = Path(source_queue_file).expanduser().resolve()
+        if resolved_queue_file.is_file():
+            return resolved_queue_file
+
+    return _resolve_sample_artifact_path(sample_dir)
+
+
+def _derive_semantic_frontier_priority_tier(
+    *,
+    analysis_state: str,
+    semantic_outcome: str,
+    oracle_audit_candidate: bool,
+    needs_manual_review: bool,
+) -> int:
+    if (
+        analysis_state == "included"
+        and semantic_outcome in SEMANTIC_FRONTIER_TIER3_OUTCOMES
+    ):
+        return 3
+    if oracle_audit_candidate:
+        return 2
+    if needs_manual_review:
+        return 1
+    return 0
+
+
+def _semantic_frontier_entry_sort_key(
+    entry: Mapping[str, Any],
+) -> Tuple[int, int, str, str]:
+    priority_tier_raw = entry.get("priority_tier")
+    if isinstance(priority_tier_raw, bool) or not isinstance(priority_tier_raw, int):
+        priority_tier = 0
+    else:
+        priority_tier = max(0, min(priority_tier_raw, 3))
+    semantic_outcome = _coerce_text(entry.get("semantic_outcome"), "unknown")
+    semantic_outcome_rank = SEMANTIC_FRONTIER_OUTCOME_ORDER.get(
+        semantic_outcome,
+        len(SEMANTIC_FRONTIER_OUTCOME_ORDER),
+    )
+    sample_id = _coerce_text(entry.get("sample_id"), "")
+    sample_path = _coerce_text(entry.get("sample_path"), "")
+    return (-priority_tier, semantic_outcome_rank, sample_id, sample_path)
+
+
+def _normalize_semantic_frontier_entries(
+    entries: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    prepared_entries: List[Dict[str, Any]] = []
+    for entry in entries:
+        sample_path_value = entry.get("sample_path")
+        if sample_path_value is None:
+            continue
+
+        resolved_path = Path(sample_path_value).expanduser().resolve()
+        if not resolved_path.is_file():
+            continue
+
+        prepared_entries.append(
+            {
+                "sample_path": str(resolved_path),
+                "sample_id": _coerce_text(entry.get("sample_id"), resolved_path.name),
+                "analysis_state": _coerce_analysis_state(entry.get("analysis_state")),
+                "semantic_outcome": _coerce_text(
+                    entry.get("semantic_outcome"),
+                    "unknown",
+                ),
+                "oracle_audit_candidate": _coerce_bool(
+                    entry.get("oracle_audit_candidate")
+                ),
+                "needs_manual_review": _coerce_bool(entry.get("needs_manual_review")),
+                "priority_tier": _derive_semantic_frontier_priority_tier(
+                    analysis_state=_coerce_analysis_state(entry.get("analysis_state")),
+                    semantic_outcome=_coerce_text(
+                        entry.get("semantic_outcome"),
+                        "unknown",
+                    ),
+                    oracle_audit_candidate=_coerce_bool(
+                        entry.get("oracle_audit_candidate")
+                    ),
+                    needs_manual_review=_coerce_bool(entry.get("needs_manual_review")),
+                ),
+            }
+        )
+
+    normalized_entries: List[Dict[str, Any]] = []
+    seen_paths = set()
+    for entry in sorted(prepared_entries, key=_semantic_frontier_entry_sort_key):
+        sample_path = entry["sample_path"]
+        if sample_path in seen_paths:
+            continue
+        seen_paths.add(sample_path)
+        normalized_entries.append(entry)
+    return normalized_entries
 
 
 def _resolve_associated_work_dir(
@@ -318,6 +533,23 @@ def _write_status_summary(
     return output
 
 
+def _normalize_manifest_paths(paths: Iterable[Path]) -> List[str]:
+    lines: List[str] = []
+    seen_paths = set()
+    for candidate in paths:
+        resolved_path = candidate.expanduser().resolve()
+        if not resolved_path.is_file():
+            continue
+
+        resolved_text = str(resolved_path)
+        if resolved_text in seen_paths:
+            continue
+
+        seen_paths.add(resolved_text)
+        lines.append(resolved_text)
+    return lines
+
+
 def _write_high_value_manifest(
     root: Path,
     *,
@@ -326,19 +558,7 @@ def _write_high_value_manifest(
     manifest_path = resolve_high_value_manifest_path(root)
     try:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        lines: List[str] = []
-        seen_paths = set()
-        for candidate in sorted(high_value_paths):
-            resolved_path = candidate.expanduser().resolve()
-            if not resolved_path.is_file():
-                continue
-
-            resolved_text = str(resolved_path)
-            if resolved_text in seen_paths:
-                continue
-
-            seen_paths.add(resolved_text)
-            lines.append(resolved_text)
+        lines = _normalize_manifest_paths(high_value_paths)
 
         content = "\n".join(lines)
         if content:
@@ -348,6 +568,36 @@ def _write_high_value_manifest(
         return manifest_path
     except Exception as exc:
         raise ReportError(f"写入 high_value_samples.txt 失败: {exc}") from exc
+
+
+def _write_semantic_frontier_manifest(
+    root: Path,
+    *,
+    frontier_entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    manifest_path = resolve_semantic_frontier_manifest_path(root)
+    try:
+        root_path = Path(root).expanduser().resolve()
+        manifest_payload = {
+            "contract_name": SEMANTIC_FRONTIER_MANIFEST_CONTRACT_NAME,
+            "contract_version": CONTRACT_VERSION,
+            "generated_at": utc_timestamp(),
+            "root": str(root_path),
+            "entries": [dict(entry) for entry in frontier_entries],
+        }
+        written_path = atomic_write_json(
+            manifest_path,
+            manifest_payload,
+        )
+        return {
+            "path": written_path,
+            "generated_at": manifest_payload["generated_at"],
+            "entry_count": len(manifest_payload["entries"]),
+        }
+    except Exception as exc:
+        raise ReportError(
+            f"写入 {SEMANTIC_FRONTIER_MANIFEST_FILE_NAME} 失败: {exc}"
+        ) from exc
 
 
 def _write_triage_report_md(
@@ -410,6 +660,7 @@ def collect_report_snapshot(
             "status_counter": Counter(),
             "cluster_counter": Counter(),
             "cluster_samples": {},
+            "semantic_frontier_entries": [],
             "high_value_paths": [],
             "total_samples": 0,
             "needs_review_count": 0,
@@ -441,6 +692,7 @@ def collect_report_snapshot(
     failure_bucket_detail_counter: Counter[str] = Counter()
     failure_taxonomy_counter: Counter[Tuple[str, str]] = Counter()
     semantic_outcome_counter: Counter[str] = Counter()
+    semantic_frontier_candidates: List[Dict[str, Any]] = []
     sample_meta_payloads: List[Mapping[str, Any]] = []
     total_samples = 0
     needs_review_count = 0
@@ -460,6 +712,8 @@ def collect_report_snapshot(
             payload.get("failure_bucket_detail")
         )
         semantic_outcome = _coerce_text(payload.get("semantic_outcome"), "unknown")
+        oracle_audit_candidate = _coerce_bool(payload.get("oracle_audit_candidate"))
+        needs_manual_review = _coerce_bool(payload.get("needs_manual_review"))
         labels = _coerce_labels(payload.get("filter_labels"))
         if labels and cluster_key == "_":
             cluster_key = ",".join(labels)
@@ -474,23 +728,48 @@ def collect_report_snapshot(
         failure_taxonomy_counter[(failure_bucket_primary, failure_bucket_detail)] += 1
         semantic_outcome_counter[semantic_outcome] += 1
 
-        if payload.get("needs_manual_review"):
+        if needs_manual_review:
             needs_review_count += 1
-            sample_path = sample_dir / "sample.bin"
-            if not sample_path.is_file():
-                sample_path = sample_dir / "transcript"
 
-            if sample_path.is_file():
-                high_value_paths.append(sample_path)
+        sample_path = _resolve_semantic_frontier_sample_path(
+            sample_dir,
+            sample_meta_payload=sample_meta_payload,
+        )
+        if sample_path is not None:
+            semantic_frontier_candidates.append(
+                {
+                    "sample_path": sample_path,
+                    "sample_id": sample_id,
+                    "analysis_state": analysis_state,
+                    "semantic_outcome": semantic_outcome,
+                    "oracle_audit_candidate": oracle_audit_candidate,
+                    "needs_manual_review": needs_manual_review,
+                    "priority_tier": _derive_semantic_frontier_priority_tier(
+                        analysis_state=analysis_state,
+                        semantic_outcome=semantic_outcome,
+                        oracle_audit_candidate=oracle_audit_candidate,
+                        needs_manual_review=needs_manual_review,
+                    ),
+                }
+            )
 
     comparability = build_run_comparability_payload(sample_meta_payloads)
     run_metadata = _load_run_metadata(root_path, work_dir=work_dir, environ=environ)
+    semantic_frontier_entries = _normalize_semantic_frontier_entries(
+        semantic_frontier_candidates
+    )
+    high_value_paths = [
+        Path(entry["sample_path"])
+        for entry in semantic_frontier_entries
+        if entry["priority_tier"] > 0
+    ]
     return {
         "root": root_path,
         "sample_dirs": sample_dirs,
         "status_counter": status_counter,
         "cluster_counter": cluster_counter,
         "cluster_samples": cluster_samples,
+        "semantic_frontier_entries": semantic_frontier_entries,
         "high_value_paths": high_value_paths,
         "total_samples": total_samples,
         "needs_review_count": needs_review_count,
@@ -532,6 +811,10 @@ def generate_report(root: Path) -> int:
         root_path,
         high_value_paths=snapshot["high_value_paths"],
     )
+    semantic_frontier_manifest = _write_semantic_frontier_manifest(
+        root_path,
+        frontier_entries=snapshot["semantic_frontier_entries"],
+    )
     _write_triage_report_md(
         root_path,
         total_samples=snapshot["total_samples"],
@@ -539,6 +822,12 @@ def generate_report(root: Path) -> int:
         cluster_counter=snapshot["cluster_counter"],
     )
 
+    sys.stdout.write(
+        "dns-diff: semantic frontier sidecar 已写入 "
+        f"path={semantic_frontier_manifest['path']} "
+        f"generated_at={semantic_frontier_manifest['generated_at']} "
+        f"entries={semantic_frontier_manifest['entry_count']}\n"
+    )
     sys.stdout.write(
         f"dns-diff: report 生成完成 root={root_path} samples={snapshot['total_samples']}\n"
     )
@@ -553,4 +842,5 @@ __all__ = [
     "derive_semantic_diff_count",
     "generate_report",
     "resolve_high_value_manifest_path",
+    "resolve_semantic_frontier_manifest_path",
 ]

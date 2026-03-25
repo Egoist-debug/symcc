@@ -10,13 +10,14 @@ from .follow_diff import (
     resolve_follow_diff_source_dir,
     resolve_follow_diff_work_dir,
 )
-from .io import atomic_write_json
+from .io import atomic_write_json, load_json_with_fallback
 from .report import (
     ReportError,
     collect_report_snapshot,
     default_follow_diff_root,
     generate_report,
     resolve_high_value_manifest_path,
+    resolve_semantic_frontier_manifest_path,
 )
 from .schema import utc_timestamp
 from .triage import TriageError, rewrite_triage_root
@@ -128,6 +129,37 @@ def _build_phase_context(*, run_metadata: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _collect_semantic_frontier_lifecycle(
+    follow_root: Path,
+    *,
+    work_dir: Path,
+) -> Dict[str, Any]:
+    text_manifest_path = resolve_high_value_manifest_path(
+        follow_root, work_dir=work_dir
+    )
+    semantic_manifest_path = resolve_semantic_frontier_manifest_path(
+        follow_root,
+        work_dir=work_dir,
+    )
+    load_result = load_json_with_fallback(semantic_manifest_path)
+    payload = load_result.data
+    entries = payload.get("entries")
+    generated_at = payload.get("generated_at")
+
+    return {
+        "text_manifest_path": str(text_manifest_path),
+        "text_manifest_exists": text_manifest_path.is_file(),
+        "sidecar_path": str(semantic_manifest_path),
+        "sidecar_exists": semantic_manifest_path.is_file(),
+        "sidecar_status": load_result.status,
+        "generated_at": generated_at
+        if isinstance(generated_at, str) and generated_at
+        else None,
+        "entry_count": len(entries) if isinstance(entries, list) else 0,
+        "error": load_result.error,
+    }
+
+
 def _write_close_summary_with_context(
     work_dir: Path,
     follow_root: Path,
@@ -142,9 +174,12 @@ def _write_close_summary_with_context(
     enriched_summary["run_id"] = snapshot["run_id"]
     enriched_summary["metric_denominators"] = snapshot["metric_denominators"]
     enriched_summary["comparability"] = snapshot["comparability"]
-    enriched_summary["phase_context"] = _build_phase_context(
-        run_metadata=snapshot["run_metadata"]
+    phase_context = _build_phase_context(run_metadata=snapshot["run_metadata"])
+    phase_context["semantic_frontier_manifest"] = _collect_semantic_frontier_lifecycle(
+        follow_root,
+        work_dir=work_dir,
     )
+    enriched_summary["phase_context"] = phase_context
     return _write_close_summary(work_dir, enriched_summary)
 
 

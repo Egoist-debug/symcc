@@ -196,16 +196,16 @@ AflConfig AflConfig::load_from_fuzzer_output(const std::filesystem::path& fuzzer
 
 std::optional<std::filesystem::path> AflConfig::best_new_testcase(
     const std::unordered_set<std::string>& seen,
-    const std::unordered_set<std::string>* high_value_manifest,
+    const std::unordered_map<std::string, int>* semantic_frontier,
     bool* picked_high_value,
-    std::uint64_t* high_value_candidates) const {
+    std::uint64_t* high_value_candidates,
+    int* picked_semantic_tier) const {
   if (picked_high_value != nullptr) *picked_high_value = false;
   if (high_value_candidates != nullptr) *high_value_candidates = 0;
+  if (picked_semantic_tier != nullptr) *picked_semantic_tier = 0;
 
-  std::optional<std::filesystem::path> best_high_value;
-  std::optional<TestcaseScore> best_high_value_score;
-  std::optional<std::filesystem::path> best_normal;
-  std::optional<TestcaseScore> best_normal_score;
+  std::optional<std::filesystem::path> best;
+  std::optional<TestcaseScore> best_score;
 
   std::error_code ec;
   for (auto it = std::filesystem::directory_iterator(queue_dir, ec);
@@ -213,33 +213,32 @@ std::optional<std::filesystem::path> AflConfig::best_new_testcase(
        it.increment(ec)) {
     const auto p = it->path();
     if (!it->is_regular_file()) continue;
-    const auto key = p.string();
+    const auto key = canonicalize_testcase_path(p);
     if (seen.find(key) != seen.end()) continue;
 
-    auto sc = score_testcase(p);
-    const bool in_high_value_manifest =
-        high_value_manifest != nullptr && (high_value_manifest->find(key) != high_value_manifest->end());
-
-    if (in_high_value_manifest) {
-      if (high_value_candidates != nullptr) *high_value_candidates += 1;
-      if (!best_high_value.has_value() || sc > *best_high_value_score) {
-        best_high_value = p;
-        best_high_value_score = sc;
+    int semantic_tier = 0;
+    if (semantic_frontier != nullptr) {
+      const auto frontier_it = semantic_frontier->find(key);
+      if (frontier_it != semantic_frontier->end()) {
+        semantic_tier = frontier_it->second;
       }
-      continue;
+    }
+    if (semantic_tier > 0 && high_value_candidates != nullptr) {
+      *high_value_candidates += 1;
     }
 
-    if (!best_normal.has_value() || sc > *best_normal_score) {
-      best_normal = p;
-      best_normal_score = sc;
+    auto sc = score_testcase(p, semantic_tier);
+    if (!best.has_value() || sc > *best_score) {
+      best = p;
+      best_score = sc;
     }
   }
 
-  if (best_high_value.has_value()) {
-    if (picked_high_value != nullptr) *picked_high_value = true;
-    return best_high_value;
+  if (best_score.has_value()) {
+    if (picked_high_value != nullptr) *picked_high_value = (best_score->semantic_tier > 0);
+    if (picked_semantic_tier != nullptr) *picked_semantic_tier = best_score->semantic_tier;
   }
-  return best_normal;
+  return best;
 }
 
 static std::vector<std::string> insert_input_file(const std::vector<std::string>& cmd,

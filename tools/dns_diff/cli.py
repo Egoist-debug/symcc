@@ -111,6 +111,9 @@ def _cmd_campaign_report(args: argparse.Namespace) -> int:
     root = Path(args.root) if args.root else default_follow_diff_root()
     try:
         return generate_campaign_report(root, is_custom_root=bool(args.root))
+    except ReportError as exc:
+        sys.stderr.write(f"dns-diff: campaign-report 失败: {exc}\n")
+        return exc.exit_code
     except CampaignReportError as exc:
         sys.stderr.write(f"dns-diff: campaign-report 失败: {exc}\n")
         return exc.exit_code

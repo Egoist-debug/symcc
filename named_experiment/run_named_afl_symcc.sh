@@ -62,8 +62,11 @@ JOBS="${JOBS:-2}"
 AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-3000+}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-15}"
 ENABLE_SECONDARY="${ENABLE_SECONDARY:-1}"
-ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-0}"
-DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-0}"
+ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-}"
+DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-}"
+SYMCC_FRONTIER_RELOAD_SEC="${SYMCC_FRONTIER_RELOAD_SEC:-}"
+SYMCC_FRONTIER_RETRY_LIMIT="${SYMCC_FRONTIER_RETRY_LIMIT:-}"
+SYMCC_SEMANTIC_FRONTIER_MANIFEST="${SYMCC_SEMANTIC_FRONTIER_MANIFEST:-}"
 REGEN_SEEDS="${REGEN_SEEDS:-0}"
 REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
 RESET_OUTPUT="${RESET_OUTPUT:-1}"
@@ -124,9 +127,12 @@ usage() {
   REFILTER_QUERIES=0
   RESET_OUTPUT=1
   SHOW_AFL_UI=1
-  ENABLE_DST1_MUTATOR=0
+  ENABLE_DST1_MUTATOR=1 (poison-stateful 默认)
   DST1_MUTATOR_LIBRARY=build/linux/x86_64/release/libafl_dst1_mutator.so
   DST1_MUTATOR_ONLY=0
+  SYMCC_FRONTIER_RELOAD_SEC=15
+  SYMCC_FRONTIER_RETRY_LIMIT=1
+  SYMCC_SEMANTIC_FRONTIER_MANIFEST=<dirname(SYMCC_HIGH_VALUE_MANIFEST)>/semantic_frontier_manifest.json
   RESPONSE_QUERY_SEEDS=8
   TRANSCRIPT_MAX_ITER=256
   TRANSCRIPT_RESPONSE_SEEDS=24
@@ -156,6 +162,54 @@ require_cmd() {
 
 require_file() {
 	[ -e "$1" ] || die "缺少文件: $1"
+}
+
+resolve_semantic_frontier_manifest_default() {
+	local manifest_dir="$SYMCC_HIGH_VALUE_MANIFEST"
+
+	case "$manifest_dir" in
+	*/*)
+		manifest_dir="${manifest_dir%/*}"
+		;;
+	*)
+		manifest_dir='.'
+		;;
+	esac
+
+	printf '%s/semantic_frontier_manifest.json' "$manifest_dir"
+}
+
+apply_profile_semantic_defaults() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-1}"
+		DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-0}"
+		SYMCC_FRONTIER_RELOAD_SEC="${SYMCC_FRONTIER_RELOAD_SEC:-15}"
+		SYMCC_FRONTIER_RETRY_LIMIT="${SYMCC_FRONTIER_RETRY_LIMIT:-1}"
+		SYMCC_SEMANTIC_FRONTIER_MANIFEST="${SYMCC_SEMANTIC_FRONTIER_MANIFEST:-$(resolve_semantic_frontier_manifest_default)}"
+		export ENABLE_DST1_MUTATOR="$ENABLE_DST1_MUTATOR"
+		export DST1_MUTATOR_ONLY="$DST1_MUTATOR_ONLY"
+		export SYMCC_FRONTIER_RELOAD_SEC="$SYMCC_FRONTIER_RELOAD_SEC"
+		export SYMCC_FRONTIER_RETRY_LIMIT="$SYMCC_FRONTIER_RETRY_LIMIT"
+		export SYMCC_SEMANTIC_FRONTIER_MANIFEST="$SYMCC_SEMANTIC_FRONTIER_MANIFEST"
+		return 0
+	fi
+
+	ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-0}"
+	DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-0}"
+}
+
+show_semantic_config_summary() {
+	local semantic_manifest="${SYMCC_SEMANTIC_FRONTIER_MANIFEST:-<unset>}"
+	local frontier_reload_sec="${SYMCC_FRONTIER_RELOAD_SEC:-<unset>}"
+	local frontier_retry_limit="${SYMCC_FRONTIER_RETRY_LIMIT:-<unset>}"
+
+	printf '\nProducer semantic 配置:\n'
+	printf '  %-14s %s\n' "high_value" "$SYMCC_HIGH_VALUE_MANIFEST"
+	printf '  %-14s %s\n' "semantic_json" "$semantic_manifest"
+	printf '  %-14s %s\n' "dst1_mutator" "$ENABLE_DST1_MUTATOR"
+	printf '  %-14s %s\n' "mutator_only" "$DST1_MUTATOR_ONLY"
+	printf '  %-14s %s\n' "reload_sec" "$frontier_reload_sec"
+	printf '  %-14s %s\n' "retry_limit" "$frontier_retry_limit"
 }
 
 prepare_transcript_seed_mix() {
@@ -206,6 +260,7 @@ load_profile() {
 		die "未知 FUZZ_PROFILE: $FUZZ_PROFILE"
 		;;
 	esac
+	apply_profile_semantic_defaults
 }
 
 active_input_corpus_dir() {
@@ -781,6 +836,7 @@ start_all() {
 	local helper_target_csv
 	local -a master_no_ui=()
 	local -a afl_env=()
+	local -a helper_env=()
 	local -a helper_extra=()
 	local input_dir
 
@@ -814,6 +870,21 @@ start_all() {
 			-r "$RESPONSE_CORPUS_DIR"
 			-e NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL
 		)
+	fi
+	helper_env=(
+		LD_LIBRARY_PATH="$ld_path"
+		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR"
+		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS"
+		SYMCC_HIGH_VALUE_MANIFEST="$SYMCC_HIGH_VALUE_MANIFEST"
+	)
+	if [ -n "$SYMCC_FRONTIER_RELOAD_SEC" ]; then
+		helper_env+=(SYMCC_FRONTIER_RELOAD_SEC="$SYMCC_FRONTIER_RELOAD_SEC")
+	fi
+	if [ -n "$SYMCC_FRONTIER_RETRY_LIMIT" ]; then
+		helper_env+=(SYMCC_FRONTIER_RETRY_LIMIT="$SYMCC_FRONTIER_RETRY_LIMIT")
+	fi
+	if [ -n "$SYMCC_SEMANTIC_FRONTIER_MANIFEST" ]; then
+		helper_env+=(SYMCC_SEMANTIC_FRONTIER_MANIFEST="$SYMCC_SEMANTIC_FRONTIER_MANIFEST")
 	fi
 
 	if [ "$SHOW_AFL_UI" -ne 1 ] || ! tmux_enabled; then
@@ -912,16 +983,14 @@ start_all() {
 		launch_shell_in_tmux \
 			"$HELPER_SESSION" \
 			"$HELPER_LOG" \
-			"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env LD_LIBRARY_PATH="$ld_path" NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}" -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
+			"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env "${helper_env[@]}" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}" -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
 	else
 		wait_for_master_queue
 		launch_in_background \
 			"$HELPER_LOG" \
 			"$HELPER_PID" \
 			env \
-			LD_LIBRARY_PATH="$ld_path" \
-			NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
-			NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
+			"${helper_env[@]}" \
 			"$HELPER_BIN" \
 			-o "$HELPER_RUN_ROOT" \
 			-n "$HELPER_RUN_NAME" \
@@ -990,6 +1059,7 @@ status_all() {
 	printf '\nAFL 统计:\n'
 	show_fuzzer_stats "$AFL_OUT_DIR/master/fuzzer_stats"
 	show_fuzzer_stats "$AFL_OUT_DIR/secondary/fuzzer_stats"
+	show_semantic_config_summary
 
 	if tmux_session_alive "$MASTER_SESSION"; then
 		printf '\nAFL UI:\n'

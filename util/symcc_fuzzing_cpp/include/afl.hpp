@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -59,9 +60,10 @@ struct AflConfig {
                                            const std::vector<std::string>& custom_target = {});
   std::optional<std::filesystem::path> best_new_testcase(
       const std::unordered_set<std::string>& seen,
-      const std::unordered_set<std::string>* high_value_manifest = nullptr,
+      const std::unordered_map<std::string, int>* semantic_frontier = nullptr,
       bool* picked_high_value = nullptr,
-      std::uint64_t* high_value_candidates = nullptr) const;
+      std::uint64_t* high_value_candidates = nullptr,
+      int* picked_semantic_tier = nullptr) const;
 
   AflShowmapResult run_showmap(const std::filesystem::path& bitmap_out,
                               const std::filesystem::path& testcase,
