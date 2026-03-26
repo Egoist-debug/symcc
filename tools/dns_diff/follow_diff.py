@@ -13,10 +13,12 @@ from .io import atomic_write_json, load_state_file, save_state_file
 from .oracle import ORACLE_FIELDS
 from .replay import ReplayError, replay_diff_cache
 from .schema import (
+    CONTRACT_VERSION,
     build_follow_diff_state_payload,
     build_follow_diff_window_summary_payload,
     build_sample_meta_payload,
     build_state_fingerprint_payload,
+    normalize_seed_provenance_payload,
     utc_timestamp,
     validate_follow_diff_state_fields,
     validate_follow_diff_window_summary_fields,
@@ -33,6 +35,50 @@ DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = Path("unbound_experiment") / "work_state
 DEFAULT_BIND9_WORK_DIR_RELATIVE = Path("named_experiment") / "work"
 DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = Path("afl_out") / "master" / "queue"
 FOLLOW_DIFF_OUTPUT_DIR_NAME = "follow_diff"
+PRODUCER_SEED_PROVENANCE_FILE_NAME = "producer_seed_provenance.json"
+FOLLOW_DIFF_RESOLVER_PAIR = "bind9_vs_unbound"
+FOLLOW_DIFF_PRODUCER_PROFILE = "poison-stateful"
+FOLLOW_DIFF_INPUT_MODEL = "DST1 transcript"
+DEFAULT_SEED_TIMEOUT_SEC = 5
+FOLLOW_DIFF_REPEAT_COUNT = 1
+FOLLOW_DIFF_TOGGLE_ENV_DEFAULTS: Dict[str, str] = {
+    "ENABLE_DST1_MUTATOR": "0",
+    "ENABLE_CACHE_DELTA": "1",
+    "ENABLE_TRIAGE": "1",
+    "ENABLE_SYMCC": "1",
+}
+FOLLOW_DIFF_TOGGLE_ENV_TO_ABLATION_KEY: Dict[str, str] = {
+    "ENABLE_DST1_MUTATOR": "mutator",
+    "ENABLE_CACHE_DELTA": "cache-delta",
+    "ENABLE_TRIAGE": "triage",
+    "ENABLE_SYMCC": "symcc",
+}
+FOLLOW_DIFF_VARIANT_ENVS: Dict[str, Dict[str, str]] = {
+    "full_stack": {
+        "ENABLE_DST1_MUTATOR": "1",
+        "ENABLE_CACHE_DELTA": "1",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "1",
+    },
+    "afl_only": {
+        "ENABLE_DST1_MUTATOR": "1",
+        "ENABLE_CACHE_DELTA": "1",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "0",
+    },
+    "no_mutator": {
+        "ENABLE_DST1_MUTATOR": "0",
+        "ENABLE_CACHE_DELTA": "1",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "1",
+    },
+    "no_cache_delta": {
+        "ENABLE_DST1_MUTATOR": "1",
+        "ENABLE_CACHE_DELTA": "0",
+        "ENABLE_TRIAGE": "1",
+        "ENABLE_SYMCC": "1",
+    },
+}
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -68,6 +114,7 @@ class FollowDiffConfig:
     work_dir: Path
     source_dir: Path
     output_root: Path
+    seed_provenance: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -165,6 +212,7 @@ def _write_follow_diff_window_summary(
         base_payload=extra_fields,
         aggregation_key=state.aggregation_key,
         baseline_compare_key=state.baseline_compare_key,
+        seed_provenance=config.seed_provenance,
     )
     errors = validate_follow_diff_window_summary_fields(payload)
     if errors:
@@ -269,7 +317,55 @@ def _collect_config() -> FollowDiffConfig:
         work_dir=work_dir,
         source_dir=source_dir,
         output_root=default_follow_diff_output_root(work_dir),
+        seed_provenance=_load_seed_provenance_sidecar(
+            work_dir=work_dir,
+            source_dir=source_dir,
+        ),
     )
+
+
+def _iter_seed_provenance_sidecar_candidates(
+    *, work_dir: Path, source_dir: Path
+) -> Iterable[Path]:
+    seen: Set[Path] = set()
+    candidate_roots: List[Path] = [work_dir]
+    candidate_roots.extend(source_dir.parents[:4])
+    for candidate_root in candidate_roots:
+        candidate_path = (
+            Path(candidate_root).expanduser().resolve()
+            / PRODUCER_SEED_PROVENANCE_FILE_NAME
+        )
+        if candidate_path in seen:
+            continue
+        seen.add(candidate_path)
+        yield candidate_path
+
+
+def _load_seed_provenance_sidecar(
+    *, work_dir: Path, source_dir: Path
+) -> Optional[Dict[str, Any]]:
+    for candidate_path in _iter_seed_provenance_sidecar_candidates(
+        work_dir=work_dir,
+        source_dir=source_dir,
+    ):
+        load_result = load_state_file(candidate_path)
+        if load_result.status == "missing":
+            continue
+        if load_result.downgraded:
+            sys.stderr.write(
+                "dns-diff: seed_provenance sidecar 读取失败，已忽略 "
+                f"path={candidate_path} status={load_result.status} detail={load_result.error}\n"
+            )
+            continue
+        normalized = normalize_seed_provenance_payload(load_result.data)
+        if normalized is None:
+            sys.stderr.write(
+                "dns-diff: seed_provenance sidecar 内容非法，已忽略 "
+                f"path={candidate_path}\n"
+            )
+            continue
+        return normalized
+    return None
 
 
 def _iter_queue_entries(source_dir: Path) -> List[Path]:
@@ -447,6 +543,119 @@ def _coerce_optional_mapping(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _parse_positive_int_env(
+    env_name: str,
+    default: int,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> int:
+    env = os.environ if environ is None else environ
+    raw_value = env.get(env_name)
+    if raw_value is None or raw_value == "":
+        return default
+
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:
+        raise FollowDiffError(
+            f"{env_name} 必须是正整数，当前值: {raw_value!r}"
+        ) from exc
+    if parsed <= 0:
+        raise FollowDiffError(f"{env_name} 必须大于 0，当前值: {raw_value!r}")
+    return parsed
+
+
+def _normalize_budget_sec(budget_sec: float) -> int | float:
+    if float(budget_sec).is_integer():
+        return int(budget_sec)
+    return budget_sec
+
+
+def _resolve_follow_diff_toggle_env(
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    env = os.environ if environ is None else environ
+    resolved: Dict[str, str] = {}
+    for env_name, default_value in FOLLOW_DIFF_TOGGLE_ENV_DEFAULTS.items():
+        resolved[env_name] = "1" if env.get(env_name, default_value) == "1" else "0"
+    return resolved
+
+
+def _build_follow_diff_ablation_status(toggle_env: Mapping[str, str]) -> Dict[str, str]:
+    return {
+        ablation_key: "on" if toggle_env.get(env_name) == "1" else "off"
+        for env_name, ablation_key in FOLLOW_DIFF_TOGGLE_ENV_TO_ABLATION_KEY.items()
+    }
+
+
+def _resolve_follow_diff_variant_name(toggle_env: Mapping[str, str]) -> str:
+    normalized_env = {
+        env_name: "1" if toggle_env.get(env_name) == "1" else "0"
+        for env_name in FOLLOW_DIFF_TOGGLE_ENV_DEFAULTS
+    }
+    for variant_name, expected_env in FOLLOW_DIFF_VARIANT_ENVS.items():
+        if normalized_env == expected_env:
+            return variant_name
+
+    custom_parts = [
+        f"{FOLLOW_DIFF_TOGGLE_ENV_TO_ABLATION_KEY[env_name]}-"
+        f"{'on' if normalized_env[env_name] == '1' else 'off'}"
+        for env_name in FOLLOW_DIFF_TOGGLE_ENV_DEFAULTS
+    ]
+    return "custom-" + "-".join(custom_parts)
+
+
+def _build_follow_diff_comparability_keys(
+    config: FollowDiffConfig,
+    *,
+    budget_sec: float,
+    repeat_count: int = FOLLOW_DIFF_REPEAT_COUNT,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    toggle_env = _resolve_follow_diff_toggle_env(environ=environ)
+    normalized_budget_sec = _normalize_budget_sec(budget_sec)
+    seed_timeout_sec = _parse_positive_int_env(
+        "SEED_TIMEOUT_SEC",
+        DEFAULT_SEED_TIMEOUT_SEC,
+        environ=environ,
+    )
+    variant_name = _resolve_follow_diff_variant_name(toggle_env)
+    ablation_status = _build_follow_diff_ablation_status(toggle_env)
+
+    shared_fields: Dict[str, Any] = {
+        "resolver_pair": FOLLOW_DIFF_RESOLVER_PAIR,
+        "producer_profile": FOLLOW_DIFF_PRODUCER_PROFILE,
+        "input_model": FOLLOW_DIFF_INPUT_MODEL,
+        "source_queue_dir": str(config.source_dir),
+        "budget_sec": normalized_budget_sec,
+        "seed_timeout_sec": seed_timeout_sec,
+        "contract_version": CONTRACT_VERSION,
+    }
+    aggregation_key = {
+        **shared_fields,
+        "variant_name": variant_name,
+        "ablation_status": ablation_status,
+    }
+    baseline_compare_key = {
+        **shared_fields,
+        "repeat_count": repeat_count,
+    }
+    return aggregation_key, baseline_compare_key
+
+
+def _apply_comparability_keys(
+    payload: Dict[str, Any],
+    *,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
+) -> None:
+    if aggregation_key is not None:
+        payload["aggregation_key"] = dict(aggregation_key)
+    if baseline_compare_key is not None:
+        payload["baseline_compare_key"] = dict(baseline_compare_key)
+
+
 def _new_bounded_run_id() -> str:
     timestamp = utc_timestamp().replace(":", "").replace("-", "")
     return f"follow-diff-window-{timestamp}-{os.getpid()}"
@@ -552,8 +761,16 @@ def _merge_meta_payload(
     status: str,
     base_payload: Optional[Mapping[str, Any]] = None,
     failure: Optional[Mapping[str, Any]] = None,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     base = dict(base_payload or {})
+    _apply_comparability_keys(
+        base,
+        aggregation_key=aggregation_key,
+        baseline_compare_key=baseline_compare_key,
+    )
 
     source_resolver: Optional[str] = None
     existing_source_resolver = base.get("source_resolver")
@@ -603,6 +820,7 @@ def _merge_meta_payload(
         is_stateful=is_stateful,
         afl_tags=afl_tags,
         first_seen_ts=None,
+        seed_provenance=seed_provenance,
         base_payload=base,
         extra_fields={"output_dir": str(sample_dir)},
     )
@@ -630,6 +848,9 @@ def _ensure_sample_contract_artifacts(
     sample_sha1: str,
     sample_size: int,
     status: str,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
 ) -> None:
     existing_meta = _load_json_object(sample_dir / "sample.meta.json")
     persisted_status = existing_meta.get("status")
@@ -645,6 +866,9 @@ def _ensure_sample_contract_artifacts(
         sample_size=sample_size,
         status=status,
         base_payload=existing_meta,
+        aggregation_key=aggregation_key,
+        baseline_compare_key=baseline_compare_key,
+        seed_provenance=seed_provenance,
     )
     _write_state_fingerprint(
         sample_dir=sample_dir,
@@ -670,6 +894,9 @@ def _write_sample_meta(
     status: str,
     base_payload: Optional[Mapping[str, Any]] = None,
     failure: Optional[Mapping[str, Any]] = None,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     payload = _merge_meta_payload(
         sample_id=sample_id,
@@ -681,11 +908,20 @@ def _write_sample_meta(
         status=status,
         base_payload=base_payload,
         failure=failure,
+        aggregation_key=aggregation_key,
+        baseline_compare_key=baseline_compare_key,
+        seed_provenance=seed_provenance,
     )
     return atomic_write_json(sample_dir / "sample.meta.json", payload)
 
 
-def _backfill_existing_sample_contracts(config: FollowDiffConfig) -> None:
+def _backfill_existing_sample_contracts(
+    config: FollowDiffConfig,
+    *,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
+) -> None:
     if not config.output_root.is_dir():
         return
 
@@ -738,6 +974,9 @@ def _backfill_existing_sample_contracts(config: FollowDiffConfig) -> None:
             sample_size=sample_size,
             status=status,
             base_payload=existing_meta,
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=seed_provenance,
         )
         _write_state_fingerprint(
             sample_dir=sample_dir,
@@ -762,8 +1001,12 @@ def _process_one_sample_with_state(
     sample_size: int,
     state: FollowDiffState,
     state_path: Path,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
     is_retry_attempt: bool = False,
 ) -> str:
+    aggregation_key = state.aggregation_key if state.run_id else None
+    baseline_compare_key = state.baseline_compare_key if state.run_id else None
+
     if _is_completed_sample(sample_dir, sample_id=sample_id):
         _ensure_sample_contract_artifacts(
             sample_dir=sample_dir,
@@ -773,6 +1016,9 @@ def _process_one_sample_with_state(
             sample_sha1=sample_sha1,
             sample_size=sample_size,
             status=STATUS_COMPLETED,
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=seed_provenance,
         )
         if state.running_sample_id == sample_id:
             state.running_sample_id = None
@@ -793,6 +1039,9 @@ def _process_one_sample_with_state(
         queue_event_id=queue_event_id,
         sample_sha1=sample_sha1,
         sample_size=sample_size,
+        aggregation_key=aggregation_key,
+        baseline_compare_key=baseline_compare_key,
+        seed_provenance=seed_provenance,
     )
 
     if result == STATUS_COMPLETED:
@@ -813,6 +1062,9 @@ def _process_one_sample(
     queue_event_id: str,
     sample_sha1: str,
     sample_size: int,
+    aggregation_key: Optional[Mapping[str, Any]] = None,
+    baseline_compare_key: Optional[Mapping[str, Any]] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
 ) -> str:
     if _is_completed_sample(sample_dir, sample_id=sample_id):
         _ensure_sample_contract_artifacts(
@@ -823,6 +1075,9 @@ def _process_one_sample(
             sample_sha1=sample_sha1,
             sample_size=sample_size,
             status=STATUS_COMPLETED,
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=seed_provenance,
         )
         return STATUS_SKIPPED
 
@@ -850,6 +1105,9 @@ def _process_one_sample(
                 "kind": "empty_sample",
                 "message": "样本为空，跳过 replay",
             },
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=seed_provenance,
         )
         _write_cache_diff_artifact(
             sample_dir=sample_dir,
@@ -868,6 +1126,9 @@ def _process_one_sample(
         sample_size=sample_size,
         status=STATUS_RUNNING,
         base_payload=existing_meta,
+        aggregation_key=aggregation_key,
+        baseline_compare_key=baseline_compare_key,
+        seed_provenance=seed_provenance,
     )
 
     try:
@@ -883,6 +1144,9 @@ def _process_one_sample(
             status=STATUS_FAILED,
             base_payload=_load_json_object(sample_dir / "sample.meta.json"),
             failure=exc.to_failure_payload(),
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=seed_provenance,
         )
         _write_cache_diff_artifact(
             sample_dir=sample_dir,
@@ -906,6 +1170,9 @@ def _process_one_sample(
                 "message": str(exc),
                 "exception_type": type(exc).__name__,
             },
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=seed_provenance,
         )
         _write_cache_diff_artifact(
             sample_dir=sample_dir,
@@ -925,6 +1192,9 @@ def _process_one_sample(
         sample_size=sample_size,
         status=STATUS_COMPLETED,
         base_payload=replay_meta,
+        aggregation_key=aggregation_key,
+        baseline_compare_key=baseline_compare_key,
+        seed_provenance=seed_provenance,
     )
     _write_cache_diff_artifact(
         sample_dir=sample_dir,
@@ -1009,6 +1279,7 @@ def _consume_queue_entries(
                 sample_size=sample_info["sample_size"],
                 state=state,
                 state_path=state_path,
+                seed_provenance=config.seed_provenance,
                 is_retry_attempt=is_retry_attempt,
             )
         else:
@@ -1019,6 +1290,7 @@ def _consume_queue_entries(
                 queue_event_id=sample_info["queue_event_id"],
                 sample_sha1=sample_info["sample_sha1"],
                 sample_size=sample_info["sample_size"],
+                seed_provenance=config.seed_provenance,
             )
 
         if result == STATUS_SKIPPED:
@@ -1136,6 +1408,9 @@ def follow_diff() -> int:
     interval_sec = _resolve_follow_diff_interval_sec()
     state_path = _follow_diff_state_path(config)
     state = _load_follow_diff_state(state_path)
+    state.run_id = None
+    state.aggregation_key = None
+    state.baseline_compare_key = None
     _save_follow_diff_state(state_path, state)
 
     recovery_audit = _recover_running_sample(
@@ -1161,7 +1436,10 @@ def follow_diff() -> int:
             state_path=state_path,
             skip_sample_ids=skip_sample_ids,
         )
-        _backfill_existing_sample_contracts(config)
+        _backfill_existing_sample_contracts(
+            config,
+            seed_provenance=config.seed_provenance,
+        )
         _write_summary("follow-diff 扫描完成", batch_result.summary)
         skip_sample_ids = ()
         time.sleep(interval_sec)
@@ -1173,6 +1451,9 @@ def follow_diff_once() -> int:
 
     state_path = _follow_diff_state_path(config)
     state = _load_follow_diff_state(state_path)
+    state.run_id = None
+    state.aggregation_key = None
+    state.baseline_compare_key = None
     _save_follow_diff_state(state_path, state)
 
     recovery_audit = _recover_running_sample(
@@ -1191,7 +1472,10 @@ def follow_diff_once() -> int:
         state_path=state_path,
         skip_sample_ids=skip_sample_ids,
     )
-    _backfill_existing_sample_contracts(config)
+    _backfill_existing_sample_contracts(
+        config,
+        seed_provenance=config.seed_provenance,
+    )
     _write_summary("follow-diff-once 完成", result.summary)
     return 0
 
@@ -1212,9 +1496,15 @@ def follow_diff_window(
     state_path = _follow_diff_state_path(config)
     state = _load_follow_diff_state(state_path)
     bounded_run_id = _new_bounded_run_id()
+    aggregation_key, baseline_compare_key = _build_follow_diff_comparability_keys(
+        config,
+        budget_sec=budget_sec,
+    )
     state.run_id = bounded_run_id
     state.retry_count = 0
     state.last_exit_reason = None
+    state.aggregation_key = aggregation_key
+    state.baseline_compare_key = baseline_compare_key
     _save_follow_diff_state(state_path, state)
 
     if queue_tail_id is None:
@@ -1265,7 +1555,12 @@ def follow_diff_window(
             max_queue_event_id=queue_tail_id,
             prior_failed_sample_ids=failed_sample_ids,
         )
-        _backfill_existing_sample_contracts(config)
+        _backfill_existing_sample_contracts(
+            config,
+            aggregation_key=aggregation_key,
+            baseline_compare_key=baseline_compare_key,
+            seed_provenance=config.seed_provenance,
+        )
         _write_summary("follow-diff-window 扫描完成", batch_result.summary)
         failed_sample_ids.update(batch_result.failed_sample_ids)
         if not retry_failed:

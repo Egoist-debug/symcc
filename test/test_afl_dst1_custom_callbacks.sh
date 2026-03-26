@@ -373,13 +373,39 @@ std::vector<uint8_t> callPostProcess(const MutatorApi &api,
 }
 
 void testFuzzAndCount(const MutatorApi &api) {
-  MutatorSession session(api, 0xC0FFEEU);
   const auto base = buildBaseTranscript();
   const auto donor = buildCompatibleDonorTranscript();
   const std::vector<uint8_t> malformed = {0x13, 0x37, 0x42};
+  MutatorSession session(api, 0xC0FFEEU);
 
-  require(api.fuzzCount(session.state, base.data(), base.size()) == 4,
-          "parseable/no-donor fuzz_count 必须为 4");
+  const unsigned int freshSessionCount =
+      api.fuzzCount(session.state, base.data(), base.size());
+  require(freshSessionCount == 8,
+          "fresh session 首次 parseable fuzz_count 必须为 8");
+
+  {
+    MutatorSession countThenFuzzSession(api, 0x111111U);
+    require(api.fuzzCount(countThenFuzzSession.state, base.data(), base.size()) == 8,
+            "先 count 后 fuzz 路径的首次 fuzz_count 必须为 8");
+    auto countThenFuzz =
+        callFuzz(api, countThenFuzzSession.state, base, nullptr, 4096);
+    require(DST1Mutator::parse(countThenFuzz).has_value(),
+            "先 count 后 fuzz 路径的结果必须保持 transcript 可解析");
+    require(api.fuzzCount(countThenFuzzSession.state, base.data(), base.size()) ==
+                8,
+            "先 count 后 fuzz 路径在 fuzz 之后 fuzz_count 仍必须为 8");
+  }
+
+  {
+    MutatorSession fuzzThenCountSession(api, 0x222222U);
+    auto fuzzThenCount = callFuzz(api, fuzzThenCountSession.state, base, nullptr,
+                                  4096);
+    require(DST1Mutator::parse(fuzzThenCount).has_value(),
+            "先 fuzz 后 count 路径的结果必须保持 transcript 可解析");
+    require(api.fuzzCount(fuzzThenCountSession.state, base.data(), base.size()) ==
+                8,
+            "先 fuzz 后 count 路径的 fuzz_count 必须为 8");
+  }
 
   bool donorUsed = false;
   for (size_t attempt = 0; attempt < 128; ++attempt) {
@@ -393,22 +419,30 @@ void testFuzzAndCount(const MutatorApi &api) {
   }
   require(donorUsed, "带 donor 的 afl_custom_fuzz 未实际消费 donor 输入");
   require(api.fuzzCount(session.state, base.data(), base.size()) == 8,
-          "parseable/with-donor fuzz_count 必须为 8");
+          "带 donor 路径之后 parseable fuzz_count 仍必须为 8");
 
   auto withoutDonor = callFuzz(api, session.state, base, nullptr, 4096);
   require(DST1Mutator::parse(withoutDonor).has_value(),
           "无 donor 的 fuzz 结果必须保持 transcript 可解析");
-  require(api.fuzzCount(session.state, base.data(), base.size()) == 4,
-          "parseable/no-donor fuzz_count 必须回落为 4");
+  const unsigned int postFuzzCount =
+      api.fuzzCount(session.state, base.data(), base.size());
+  require(postFuzzCount == 8,
+          "无 donor 路径之后 parseable fuzz_count 仍必须为 8");
 
   auto malformedFallback = callFuzz(api, session.state, base, &malformed, 4096);
   require(!malformedFallback.empty(), "malformed donor fallback 结果不能为空");
   require(DST1Mutator::parse(malformedFallback).has_value(),
           "malformed donor fallback 必须保持 transcript 可解析");
-  require(api.fuzzCount(session.state, malformed.data(), malformed.size()) == 1,
-          "non-parseable fuzz_count 必须为 1");
+  const unsigned int malformedCount =
+      api.fuzzCount(session.state, malformed.data(), malformed.size());
+  require(malformedCount == 1, "non-parseable fuzz_count 必须为 1");
+
+  std::cout << "INFO fresh_session_count=" << freshSessionCount << std::endl;
+  std::cout << "INFO post_fuzz_count=" << postFuzzCount << std::endl;
+  std::cout << "INFO malformed_count=" << malformedCount << std::endl;
 
   std::cout << "PASS fuzz_count_rules" << std::endl;
+  std::cout << "PASS fuzz_count_order_regression" << std::endl;
   std::cout << "PASS donor_consumed" << std::endl;
   std::cout << "PASS malformed_donor_fallback" << std::endl;
 }
@@ -558,6 +592,7 @@ PY
 "$HELPER_BIN" "$LIB_PATH" "$TMP_DIR" | tee "$LOG_FILE"
 
 assert_file_contains "$LOG_FILE" 'PASS fuzz_count_rules'
+assert_file_contains "$LOG_FILE" 'PASS fuzz_count_order_regression'
 assert_file_contains "$LOG_FILE" 'PASS donor_consumed'
 assert_file_contains "$LOG_FILE" 'PASS malformed_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS queue_get_mutator_only_filter'

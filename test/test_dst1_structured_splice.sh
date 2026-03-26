@@ -201,6 +201,24 @@ void requirePostCheckCoupling(const DST1Mutator::Transcript &transcript,
           label + " 的 post-check coupling 被破坏");
 }
 
+void requireResponsesMatchQuery(const DST1Mutator::Transcript &transcript,
+                                const std::string &label) {
+  auto query = parseSingleQuestion(transcript.ClientQuery);
+  require(query.has_value(), label + " 的 client query 解析失败");
+
+  for (size_t i = 0; i < transcript.Responses.size(); ++i) {
+    auto responseQuestion = parseSingleQuestion(transcript.Responses[i]);
+    require(responseQuestion.has_value(),
+            label + " 的第 " + std::to_string(i) +
+                " 个 response question 解析失败");
+    require(responseQuestion->name == query->name &&
+                responseQuestion->type == query->type &&
+                responseQuestion->dnsClass == query->dnsClass,
+            label + " 的第 " + std::to_string(i) +
+                " 个 response 与 client query question identity 不一致");
+  }
+}
+
 void requireRoundTrip(const std::vector<uint8_t> &bytes, const std::string &label) {
   auto parsed = requireParsedTranscript(bytes, label);
   requirePostCheckCoupling(parsed, label);
@@ -270,6 +288,22 @@ std::vector<uint8_t> buildShiftDonorTranscript() {
   auto postCheck = DNSPacketBuilder::buildQuery("shift.example.test", 28);
   auto transcript = dst1::buildTranscript(query, {response}, postCheck);
   require(!transcript.empty(), "post-check donor transcript 构造失败");
+  return transcript;
+}
+
+std::vector<uint8_t> buildMismatchedShiftDonorTranscript() {
+  auto query = DNSPacketBuilder::buildQuery("shift.example.test", 28);
+  auto response = DNSPacketBuilder()
+                      .setID(0x4321)
+                      .asResponse()
+                      .setRecursionDesired(true)
+                      .setRecursionAvailable(true)
+                      .addQuestion("cache.example.test", 1, 1)
+                      .addAnswer("cache.example.test", 1, 1, 300, {7, 7, 7, 7})
+                      .build();
+  auto postCheck = DNSPacketBuilder::buildQuery("shift.example.test", 28);
+  auto transcript = dst1::buildTranscript(query, {response}, postCheck);
+  require(!transcript.empty(), "mismatched shift donor transcript 构造失败");
   return transcript;
 }
 
@@ -377,6 +411,8 @@ void testPostCheckCoupledShift(const std::vector<uint8_t> &base,
   require(mutated.has_value(), "post_check_coupled_name_or_type_shift 未生成结果");
   auto parsed = requireParsedTranscript(*mutated,
                                         "post_check_coupled_name_or_type_shift");
+  auto donorParsed = requireParsedTranscript(
+      donor, "post_check_coupled_name_or_type_shift donor");
   auto query = parseSingleQuestion(parsed.ClientQuery);
   auto post = parseSingleQuestion(parsed.PostCheckQuery);
   require(query.has_value() && post.has_value(),
@@ -385,12 +421,39 @@ void testPostCheckCoupledShift(const std::vector<uint8_t> &base,
           "post_check_coupled_name_or_type_shift 未应用 donor query name/type");
   require(post->name == "shift.example.test" && post->type == 28,
           "post_check_coupled_name_or_type_shift 未保持 post-check coupling");
+  require(parsed.Responses.size() == donorParsed.Responses.size(),
+          "post_check_coupled_name_or_type_shift 未采用 donor response 数量");
+  require(parsed.Responses == donorParsed.Responses,
+          "post_check_coupled_name_or_type_shift 未整体注入 donor responses");
+  requireResponsesMatchQuery(parsed, "post_check_coupled_name_or_type_shift");
   requireRoundTrip(*mutated, "post_check_coupled_name_or_type_shift");
   std::cout << "PASS post_check_coupled_name_or_type_shift" << std::endl;
 }
 
+void testMismatchedShiftDonorFallback(const std::vector<uint8_t> &base,
+                                      const std::vector<uint8_t> &mismatchedDonor) {
+  DST1Mutator::MutationRequest request;
+  request.DonorFamily =
+      DST1Mutator::DonorMutationFamily::PostCheckCoupledNameOrTypeShift;
+
+  auto fallbackOnly = DST1Mutator::mutate(base, request);
+  require(fallbackOnly.has_value(),
+          "mismatched shift donor fallback 的基线变异失败");
+
+  auto withMismatchedDonor = DST1Mutator::mutate(base, request, mismatchedDonor);
+  require(withMismatchedDonor.has_value(),
+          "mismatched shift donor fallback 未返回回退结果");
+  require(*withMismatchedDonor == *fallbackOnly,
+          "mismatched shift donor fallback 未退回原始自包含请求");
+  auto parsed = requireParsedTranscript(*withMismatchedDonor,
+                                        "mismatched shift donor fallback");
+  requireResponsesMatchQuery(parsed, "mismatched shift donor fallback");
+  requireRoundTrip(*withMismatchedDonor, "mismatched shift donor fallback");
+  std::cout << "PASS mismatched_shift_donor_fallback" << std::endl;
+}
+
 void testMalformedDonorFallback(const std::vector<uint8_t> &base,
-                                 const std::vector<uint8_t> &malformedDonor) {
+                                  const std::vector<uint8_t> &malformedDonor) {
   DST1Mutator::MutationRequest request;
   request.DonorFamily = DST1Mutator::DonorMutationFamily::AuthorityTransplant;
   request.ResponseIndex = 0;
@@ -414,18 +477,15 @@ void testMalformedDonorFallback(const std::vector<uint8_t> &base,
 }
 
 void testParseableButIncompatibleDonorFallback(const std::vector<uint8_t> &base,
-                                               const std::vector<uint8_t> &donor) {
+                                                const std::vector<uint8_t> &donor) {
   DST1Mutator::MutationRequest request;
   request.DonorFamily = DST1Mutator::DonorMutationFamily::ResponseSpliceSameIndex;
   request.ResponseIndex = 0;
 
-  DST1Mutator::QueryMutation query;
-  query.QNAME = std::string("shifted.local.example.test");
-  request.Query = query;
-
-  DST1Mutator::TranscriptMutation transcript;
-  transcript.PostCheckName = std::string("shifted.local.example.test");
-  request.Transcript = transcript;
+  DST1Mutator::ResponseMutation fallback;
+  fallback.AA = true;
+  fallback.RCODE = 3;
+  request.Response = fallback;
 
   auto fallbackOnly = DST1Mutator::mutate(base, request);
   require(fallbackOnly.has_value(),
@@ -446,6 +506,7 @@ int main() {
   const auto base = buildBaseTranscript();
   const auto compatibleDonor = buildCompatibleDonorTranscript();
   const auto shiftDonor = buildShiftDonorTranscript();
+  const auto mismatchedShiftDonor = buildMismatchedShiftDonorTranscript();
   const auto zeroDonor = buildZeroResponseDonorTranscript();
   const std::vector<uint8_t> malformedDonor = {0x00, 0x01, 0x02, 0x03};
 
@@ -454,8 +515,9 @@ int main() {
   testAdditionalOrGlueTransplant(base, compatibleDonor);
   testResponseCountExpandAndShrink(base, compatibleDonor, zeroDonor);
   testPostCheckCoupledShift(base, shiftDonor);
+  testMismatchedShiftDonorFallback(base, mismatchedShiftDonor);
   testMalformedDonorFallback(base, malformedDonor);
-  testParseableButIncompatibleDonorFallback(base, compatibleDonor);
+  testParseableButIncompatibleDonorFallback(base, shiftDonor);
 
   std::cout << "PASS all_structured_splice_checks" << std::endl;
   return 0;
@@ -483,6 +545,7 @@ assert_file_contains "$LOG_FILE" 'PASS additional_or_glue_transplant'
 assert_file_contains "$LOG_FILE" 'PASS response_count_expand_from_donor'
 assert_file_contains "$LOG_FILE" 'PASS response_count_shrink_from_donor'
 assert_file_contains "$LOG_FILE" 'PASS post_check_coupled_name_or_type_shift'
+assert_file_contains "$LOG_FILE" 'PASS mismatched_shift_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS malformed_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS parseable_but_incompatible_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS all_structured_splice_checks'

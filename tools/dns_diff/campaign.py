@@ -303,6 +303,7 @@ def _write_evidence_bundle(
                 "metric_denominators.analysis_state.excluded",
                 "metric_denominators.analysis_state.unknown",
                 "repro_rate",
+                "seed_provenance",
             ],
         ),
         "oracle_audit": _build_artifact_reference(
@@ -351,6 +352,7 @@ def _write_evidence_bundle(
                 "unbound.stderr",
             ],
         },
+        "seed_provenance": summary.get("seed_provenance"),
         "regeneration_commands": regeneration_commands,
         "claims": _build_publication_claims(
             summary=summary,
@@ -429,6 +431,7 @@ def generate_campaign_report(root: Path, is_custom_root: bool = False) -> int:
         "comparability": snapshot["comparability"],
         "run_id": snapshot["run_id"],
         "ablation_status": ablation,
+        "seed_provenance": snapshot["seed_provenance"],
         "manifest_size": manifest_size,
         "reproduced_count": reproduced_count,
         "repro_rate": repro_rate,

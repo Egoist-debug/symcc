@@ -570,6 +570,7 @@ def _write_matrix_manifest(
         "matrix_name": config.matrix_name,
         "matrix_file": str(config.matrix_file),
         "baseline_variant_name": BASELINE_VARIANT_NAME,
+        "matrix_internal_baseline_variant": BASELINE_VARIANT_NAME,
         "budget_sec": _normalize_key_number(float(budget_sec)),
         "repeat_count": int(repeat_count),
         "work_root": str(work_root),
@@ -752,6 +753,7 @@ def _write_delta_vs_baseline_tsv(
         "baseline_mean",
         "variant_mean",
         "delta",
+        "baseline_variant_scope",
     ]
     lines = ["\t".join(header)]
 
@@ -790,6 +792,7 @@ def _write_delta_vs_baseline_tsv(
                         _format_metric_value(baseline_mean),
                         _format_metric_value(variant_mean),
                         _format_metric_value(delta_value),
+                        "matrix_internal",
                     ]
                 )
             )

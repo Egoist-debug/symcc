@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-campaign-report.XXXXXX")"
 EMPTY_ROOT="$WORKDIR/empty-follow"
 NONEMPTY_ROOT="$WORKDIR/nonempty-follow"
+META_ONLY_ROOT="$WORKDIR/meta-only-follow"
 FAIL_ROOT="$WORKDIR/fail-follow"
 BAD_TRUTH_ROOT="$WORKDIR/bad-truth-follow"
 export PYTHONDONTWRITEBYTECODE=1
@@ -421,7 +422,7 @@ for scope_name in ("signals", "signal_combos"):
 PY
 }
 
-mkdir -p "$EMPTY_ROOT" "$NONEMPTY_ROOT" "$FAIL_ROOT"
+mkdir -p "$EMPTY_ROOT" "$NONEMPTY_ROOT" "$META_ONLY_ROOT" "$FAIL_ROOT"
 touch "$EMPTY_ROOT/high_value_samples.txt"
 
 run_cli campaign-report --root "$EMPTY_ROOT" >/dev/null
@@ -765,6 +766,197 @@ if high_value_lines != json_subset:
         f"ASSERT FAIL: high_value_samples.txt 与 semantic_frontier_manifest Tier1-3 子集不一致: {high_value_lines!r} != {json_subset!r}"
     )
 PY
+
+python3 - "$META_ONLY_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+sample_dir = root / "sample-meta-only"
+sample_dir.mkdir(parents=True, exist_ok=True)
+(sample_dir / "sample.bin").write_bytes(b"\x09\x08\x07\x06")
+(sample_dir / "sample.meta.json").write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "generated_at": "2026-03-26T00:00:00Z",
+            "sample_id": "sample-meta-only",
+            "status": "completed",
+            "contract_version": 1,
+            "aggregation_key": {
+                "resolver_pair": "bind9_vs_unbound",
+                "producer_profile": "poison-stateful",
+                "input_model": "DST1 transcript",
+                "source_queue_dir": "/tmp/follow/queue",
+                "budget_sec": 5,
+                "seed_timeout_sec": 1,
+                "variant_name": "control",
+                "ablation_status": {
+                    "mutator": "off",
+                    "cache-delta": "on",
+                    "triage": "on",
+                    "symcc": "on",
+                },
+                "contract_version": 1,
+            },
+            "baseline_compare_key": {
+                "resolver_pair": "bind9_vs_unbound",
+                "producer_profile": "poison-stateful",
+                "input_model": "DST1 transcript",
+                "source_queue_dir": "/tmp/follow/queue",
+                "budget_sec": 5,
+                "seed_timeout_sec": 1,
+                "repeat_count": 3,
+                "contract_version": 1,
+            },
+            "seed_provenance": {
+                "cold_start": False,
+                "seed_source_dir": "/tmp/follow/stable_transcript_corpus",
+                "seed_materialization_method": "reused_filtered_corpus",
+                "seed_snapshot_id": "1111111111111111111111111111111111111111",
+                "regen_seeds": False,
+                "refilter_queries": False,
+                "stable_input_dir": "/tmp/follow/stable_transcript_corpus",
+                "recorded_at": "2026-03-26T00:00:00Z",
+            },
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+(root / "high_value_samples.txt").write_text(
+    str((sample_dir / "sample.bin").resolve()) + "\n",
+    encoding="utf-8",
+)
+PY
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+	ROOT_DIR="$ROOT_DIR" \
+	python3 - "$META_ONLY_ROOT" <<'PY'
+import pathlib
+import sys
+
+from tools.dns_diff.report import collect_report_snapshot
+
+root = pathlib.Path(sys.argv[1])
+snapshot = collect_report_snapshot(root, require_root=False)
+
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": "/tmp/follow/stable_transcript_corpus",
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": "/tmp/follow/stable_transcript_corpus",
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+expected_aggregation_key = {
+    "resolver_pair": "bind9_vs_unbound",
+    "producer_profile": "poison-stateful",
+    "input_model": "DST1 transcript",
+    "source_queue_dir": "/tmp/follow/queue",
+    "budget_sec": 5,
+    "seed_timeout_sec": 1,
+    "variant_name": "control",
+    "ablation_status": {
+        "mutator": "off",
+        "cache-delta": "on",
+        "triage": "on",
+        "symcc": "on",
+    },
+    "contract_version": 1,
+}
+expected_baseline_compare_key = {
+    "resolver_pair": "bind9_vs_unbound",
+    "producer_profile": "poison-stateful",
+    "input_model": "DST1 transcript",
+    "source_queue_dir": "/tmp/follow/queue",
+    "budget_sec": 5,
+    "seed_timeout_sec": 1,
+    "repeat_count": 3,
+    "contract_version": 1,
+}
+
+if snapshot.get("total_samples") != 1:
+    raise SystemExit(f"ASSERT FAIL: meta-only snapshot.total_samples={snapshot.get('total_samples')!r} != 1")
+if snapshot.get("run_id") is not None:
+    raise SystemExit(f"ASSERT FAIL: meta-only snapshot.run_id={snapshot.get('run_id')!r} 应为 null")
+if snapshot.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: meta-only snapshot.seed_provenance 不符合预期: "
+        f"{snapshot.get('seed_provenance')!r}"
+    )
+if dict(snapshot.get("status_counter", {})) != {"completed": 1}:
+    raise SystemExit(
+        f"ASSERT FAIL: meta-only status_counter={dict(snapshot.get('status_counter', {}))!r} != {{'completed': 1}}"
+    )
+if dict(snapshot.get("cluster_counter", {})) != {"_": 1}:
+    raise SystemExit(
+        f"ASSERT FAIL: meta-only cluster_counter={dict(snapshot.get('cluster_counter', {}))!r} != {{'_': 1}}"
+    )
+if dict(snapshot.get("analysis_state_counter", {})) != {"unknown": 1}:
+    raise SystemExit(
+        "ASSERT FAIL: meta-only analysis_state_counter 应把缺失 triage 的样本记为 unknown"
+    )
+
+comparability = snapshot.get("comparability")
+if comparability.get("status") != "comparable" or comparability.get("reason") != "ok":
+    raise SystemExit(
+        f"ASSERT FAIL: meta-only comparability={comparability!r} 期望 status=comparable, reason=ok"
+    )
+if comparability.get("aggregation_key") != expected_aggregation_key:
+    raise SystemExit(
+        "ASSERT FAIL: meta-only comparability.aggregation_key 不符合预期: "
+        f"{comparability.get('aggregation_key')!r}"
+    )
+if comparability.get("baseline_compare_key") != expected_baseline_compare_key:
+    raise SystemExit(
+        "ASSERT FAIL: meta-only comparability.baseline_compare_key 不符合预期: "
+        f"{comparability.get('baseline_compare_key')!r}"
+    )
+
+metric_denominators = snapshot.get("metric_denominators")
+expected_denominators = {
+    "total_samples": 1,
+    "analysis_state": {"included": 0, "excluded": 0, "unknown": 1},
+    "comparable_samples": 1,
+    "non_comparable_samples": 0,
+}
+if metric_denominators != expected_denominators:
+    raise SystemExit(
+        f"ASSERT FAIL: meta-only metric_denominators={metric_denominators!r} != {expected_denominators!r}"
+    )
+
+frontier_entries = snapshot.get("semantic_frontier_entries")
+if not isinstance(frontier_entries, list) or len(frontier_entries) != 1:
+    raise SystemExit(
+        f"ASSERT FAIL: meta-only semantic_frontier_entries={frontier_entries!r} 应为长度 1 的数组"
+    )
+entry = frontier_entries[0]
+expected_sample_path = str((root / "sample-meta-only" / "sample.bin").resolve())
+if entry != {
+    "sample_path": expected_sample_path,
+    "sample_id": "sample-meta-only",
+    "analysis_state": "unknown",
+    "semantic_outcome": "unknown",
+    "oracle_audit_candidate": False,
+    "needs_manual_review": False,
+    "priority_tier": 0,
+}:
+    raise SystemExit(f"ASSERT FAIL: meta-only frontier entry 不符合预期: {entry!r}")
+PY
+
+run_cli report --root "$META_ONLY_ROOT" >/dev/null
+assert_file_exists "$META_ONLY_ROOT/status_summary.tsv"
+assert_file_exists "$META_ONLY_ROOT/semantic_frontier_manifest.json"
+assert_file_contains "$META_ONLY_ROOT/status_summary.tsv" $'status\tcount'
+assert_file_contains "$META_ONLY_ROOT/status_summary.tsv" $'completed\t1'
+assert_file_contains "$META_ONLY_ROOT/status_summary.tsv" $'__total__\t1'
 
 python3 - "$FAIL_ROOT" <<'PY'
 import json

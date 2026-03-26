@@ -139,8 +139,6 @@ struct AFLDST1MutatorState {
 
   std::mt19937 Rng;
   std::vector<unsigned char> Output;
-  std::vector<uint8_t> LastFuzzInput;
-  bool LastFuzzUsedParseableDonor = false;
   TrimState Trim;
 
   explicit AFLDST1MutatorState(unsigned int Seed) : Rng(Seed) {}
@@ -285,25 +283,12 @@ std::optional<std::vector<uint8_t>> canonicalizeTranscript(
   return Serialized;
 }
 
-void recordFuzzCountHint(AFLDST1MutatorState &State,
-                         const std::vector<uint8_t> &Input,
-                         bool UsedParseableDonor) {
-  State.LastFuzzInput = Input;
-  State.LastFuzzUsedParseableDonor = UsedParseableDonor;
-}
-
-unsigned int determineFuzzCount(const AFLDST1MutatorState *State,
-                                const std::vector<uint8_t> &Input) {
+unsigned int determineFuzzCount(const std::vector<uint8_t> &Input) {
   if (!DST1Mutator::parse(Input).has_value()) {
     return 1U;
   }
 
-  if (State != nullptr && State->LastFuzzUsedParseableDonor &&
-      State->LastFuzzInput == Input) {
-    return 8U;
-  }
-
-  return 4U;
+  return 8U;
 }
 
 void maybeAttachDonorFamily(DST1Mutator::MutationRequest &Request,
@@ -609,13 +594,13 @@ afl_custom_init(void *AflState, unsigned int Seed) {
 
 extern "C" __attribute__((visibility("default"))) unsigned int
 afl_custom_fuzz_count(void *Data, const unsigned char *Buf, size_t BufSize) {
+  (void)Data;
   if (Buf == nullptr || BufSize == 0) {
     return 1U;
   }
 
-  const auto *State = static_cast<const geninput::AFLDST1MutatorState *>(Data);
   std::vector<uint8_t> Input(Buf, Buf + BufSize);
-  return geninput::determineFuzzCount(State, Input);
+  return geninput::determineFuzzCount(Input);
 }
 
 extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
@@ -634,7 +619,6 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
   std::vector<uint8_t> Input(Buf, Buf + BufSize);
   const bool InputParseable = geninput::DST1Mutator::parse(Input).has_value();
   if (!InputParseable) {
-    geninput::recordFuzzCountHint(*State, Input, false);
     if (geninput::isMutatorOnlyEnabled()) {
       return 0;
     }
@@ -648,7 +632,6 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
 
   const bool DonorParseable =
       DonorInput.has_value() && geninput::DST1Mutator::parse(*DonorInput).has_value();
-  geninput::recordFuzzCountHint(*State, Input, DonorParseable);
 
   auto Mutated = geninput::mutateTranscript(
       Input, DonorParseable ? &DonorInput.value() : nullptr, MaxSize, State->Rng);

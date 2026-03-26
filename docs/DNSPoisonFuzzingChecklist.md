@@ -373,6 +373,13 @@ env ENABLE_SYMCC=0 python3 -m tools.dns_diff.cli campaign-close --budget-sec 360
 
 说明：`campaign-report` 仍是第三阶段和产物目录的一部分，但不再单独承担正式结论口径。
 
+消融 guardrail：
+
+- `tools/dns_diff/matrix.py` 的内部比较锚点仍是 `full_stack`
+- `_summary/matrix_manifest.json.matrix_internal_baseline_variant` 与 `_summary/delta_vs_baseline.tsv.baseline_variant_scope=matrix_internal` 只表示 **matrix internal baseline**
+- publication-facing 的正式 baseline 仍按 contract / verdict 口径读取 `afl_only`
+- 不能直接把 matrix `_summary/delta_vs_baseline.tsv` 当成正式 baseline verdict
+
 ### 路径与产物默认值（用于对齐实现）
 
 - producer queue 默认：`named_experiment/work/afl_out/master/queue`
@@ -384,6 +391,14 @@ env ENABLE_SYMCC=0 python3 -m tools.dns_diff.cli campaign-close --budget-sec 360
 - named 消费侧默认 manifest：优先 `named_experiment/work/high_value_samples.txt`；若本地不存在则桥接到 `unbound_experiment/work_stateful/high_value_samples.txt`
 
 补充 guardrail：`sample.meta.json.failure` 始终表示 `sample.meta.json` 内嵌 `failure` 对象的 JSON 路径，不是独立文件名。`case_studies/index.tsv` 只有在对应文件实际生成后才能作为 case-study 证据引用；否则应通过 `evidence_bundle.json` 中的再生成命令补产，不能把悬空路径写进文稿。
+
+补充 seed provenance guardrail：
+
+- `WORK_DIR/producer_seed_provenance.json` 是 producer 侧唯一权威 sidecar；若 freeze / handoff 发生在仓库外，必须随 frozen queue 一起复制，不能只口头说明“这是 cold start”
+- `sample.meta.json.seed_provenance`、`follow_diff.window.summary.json.seed_provenance`、`campaign_close.summary.json.seed_provenance`、`campaign_reports/<timestamp>/summary.json.seed_provenance` 与 `evidence_bundle.json.seed_provenance` 应表示同一个 run 级 provenance 对象，而不是各自发明字段
+- `seed_materialization_method=reused_filtered_corpus` 明确表示复用已有 stable corpus，**不能**在 publication 文稿里写成 cold-start
+- `seed_snapshot_id` 是 stable input 目录内容的审计锚点，不是 comparability key，也不能替代 baseline / variant 语义
+- 旧 artifact 若缺失 `seed_provenance`，只能标记为 provenance 缺失；不能按默认值补成 `cold_start=true`
 
 ### Python CLI 直调示例（仅 triage/report）
 ```bash

@@ -30,6 +30,17 @@ BASELINE_COMPARE_KEY_FIELDS: Sequence[str] = (
     "contract_version",
 )
 
+SEED_PROVENANCE_FIELDS: Sequence[str] = (
+    "cold_start",
+    "seed_source_dir",
+    "seed_materialization_method",
+    "seed_snapshot_id",
+    "regen_seeds",
+    "refilter_queries",
+    "stable_input_dir",
+    "recorded_at",
+)
+
 SAMPLE_META_REQUIRED_FIELDS: Sequence[str] = (
     "schema_version",
     "contract_version",
@@ -127,6 +138,12 @@ def _coerce_analysis_state(value: Any) -> str:
 
 def _coerce_optional_text(value: Any) -> Optional[str]:
     if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
         return value
     return None
 
@@ -354,7 +371,74 @@ def apply_sample_meta_contract_defaults(data: Mapping[str, Any]) -> Dict[str, An
         base=payload.get("baseline_compare_key"),
         contract_version=contract_version,
     )
+
+    seed_provenance = normalize_seed_provenance_payload(payload.get("seed_provenance"))
+    if seed_provenance is None:
+        payload.pop("seed_provenance", None)
+    else:
+        payload["seed_provenance"] = seed_provenance
     return payload
+
+
+def build_seed_provenance_payload(
+    *,
+    cold_start: Optional[bool] = None,
+    seed_source_dir: Optional[str] = None,
+    seed_materialization_method: Optional[str] = None,
+    seed_snapshot_id: Optional[str] = None,
+    regen_seeds: Optional[bool] = None,
+    refilter_queries: Optional[bool] = None,
+    stable_input_dir: Optional[str] = None,
+    recorded_at: Optional[str] = None,
+    base_payload: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = dict(base_payload or {})
+
+    base_cold_start = _coerce_optional_bool(payload.get("cold_start"))
+    base_regen_seeds = _coerce_optional_bool(payload.get("regen_seeds"))
+    base_refilter_queries = _coerce_optional_bool(payload.get("refilter_queries"))
+
+    payload["cold_start"] = (
+        cold_start if isinstance(cold_start, bool) else bool(base_cold_start)
+    )
+    payload["seed_source_dir"] = _coerce_optional_text(
+        seed_source_dir
+        if seed_source_dir is not None
+        else payload.get("seed_source_dir")
+    )
+    payload["seed_materialization_method"] = _coerce_optional_text(
+        seed_materialization_method
+        if seed_materialization_method is not None
+        else payload.get("seed_materialization_method")
+    )
+    payload["seed_snapshot_id"] = _coerce_optional_text(
+        seed_snapshot_id
+        if seed_snapshot_id is not None
+        else payload.get("seed_snapshot_id")
+    )
+    payload["regen_seeds"] = (
+        regen_seeds if isinstance(regen_seeds, bool) else bool(base_regen_seeds)
+    )
+    payload["refilter_queries"] = (
+        refilter_queries
+        if isinstance(refilter_queries, bool)
+        else bool(base_refilter_queries)
+    )
+    payload["stable_input_dir"] = _coerce_optional_text(
+        stable_input_dir
+        if stable_input_dir is not None
+        else payload.get("stable_input_dir")
+    )
+    payload["recorded_at"] = _coerce_optional_text(
+        recorded_at if recorded_at is not None else payload.get("recorded_at")
+    )
+    return payload
+
+
+def normalize_seed_provenance_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    return build_seed_provenance_payload(base_payload=value)
 
 
 def build_shared_meta(
@@ -407,6 +491,7 @@ def build_sample_meta_payload(
     is_stateful: Optional[bool],
     afl_tags: Optional[List[str]],
     first_seen_ts: Optional[str] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
     base_payload: Optional[Mapping[str, Any]] = None,
     generated_at: Optional[str] = None,
     extra_fields: Optional[Mapping[str, Any]] = None,
@@ -439,6 +524,16 @@ def build_sample_meta_payload(
     )
     if extra_fields:
         payload.update(extra_fields)
+
+    normalized_seed_provenance = normalize_seed_provenance_payload(
+        seed_provenance
+        if seed_provenance is not None
+        else payload.get("seed_provenance")
+    )
+    if normalized_seed_provenance is None:
+        payload.pop("seed_provenance", None)
+    else:
+        payload["seed_provenance"] = normalized_seed_provenance
 
     stamped = stamp_with_shared_meta(
         payload, sample_id=sample_id, generated_at=generated_at
@@ -515,8 +610,14 @@ def build_follow_diff_window_summary_payload(
     base_payload: Optional[Mapping[str, Any]] = None,
     aggregation_key: Optional[Mapping[str, Any]] = None,
     baseline_compare_key: Optional[Mapping[str, Any]] = None,
+    seed_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = dict(base_payload or {})
+    normalized_seed_provenance = normalize_seed_provenance_payload(
+        seed_provenance
+        if seed_provenance is not None
+        else payload.get("seed_provenance")
+    )
     payload.update(
         {
             "budget_sec": budget_sec,
@@ -539,6 +640,10 @@ def build_follow_diff_window_summary_payload(
             ),
         }
     )
+    if normalized_seed_provenance is None:
+        payload.pop("seed_provenance", None)
+    else:
+        payload["seed_provenance"] = normalized_seed_provenance
     for field in FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS:
         payload.setdefault(field, None)
     return payload
@@ -659,6 +764,49 @@ def validate_sample_meta_fields(data: Mapping[str, Any]) -> List[str]:
             errors.append(f"{key_name}.contract_version 必须是 >=1 的整数")
         elif key_contract_version != normalized.get("contract_version"):
             errors.append(f"{key_name}.contract_version 必须与 contract_version 一致")
+
+    seed_provenance = normalized.get("seed_provenance")
+    if seed_provenance is not None:
+        if not isinstance(seed_provenance, Mapping):
+            errors.append("seed_provenance 必须是对象")
+        else:
+            errors.extend(
+                f"seed_provenance.{error}"
+                for error in validate_seed_provenance_fields(seed_provenance)
+            )
+
+    return errors
+
+
+def validate_seed_provenance_fields(data: Mapping[str, Any]) -> List[str]:
+    errors: List[str] = []
+    for field in SEED_PROVENANCE_FIELDS:
+        if field not in data:
+            errors.append(f"缺少字段: {field}")
+
+    for field in ("cold_start", "regen_seeds", "refilter_queries"):
+        value = data.get(field)
+        if not isinstance(value, bool):
+            errors.append(f"{field} 必须是布尔值")
+
+    for field in (
+        "seed_source_dir",
+        "seed_materialization_method",
+        "seed_snapshot_id",
+        "stable_input_dir",
+        "recorded_at",
+    ):
+        value = data.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            errors.append(f"{field} 若提供则必须是非空字符串")
+
+    recorded_at = data.get("recorded_at")
+    if isinstance(recorded_at, str) and recorded_at.strip():
+        ts = recorded_at.replace("Z", "+00:00")
+        try:
+            datetime.fromisoformat(ts)
+        except ValueError:
+            errors.append("recorded_at 必须是 ISO-8601 时间戳")
 
     return errors
 
@@ -794,6 +942,16 @@ def validate_follow_diff_window_summary_fields(data: Mapping[str, Any]) -> List[
             if field not in key_payload:
                 errors.append(f"{key_name} 缺少字段: {field}")
 
+    seed_provenance = data.get("seed_provenance")
+    if seed_provenance is not None:
+        if not isinstance(seed_provenance, Mapping):
+            errors.append("seed_provenance 必须是对象")
+        else:
+            errors.extend(
+                f"seed_provenance.{error}"
+                for error in validate_seed_provenance_fields(seed_provenance)
+            )
+
     return errors
 
 
@@ -807,6 +965,7 @@ __all__ = [
     "FOLLOW_DIFF_WINDOW_SUMMARY_REQUIRED_FIELDS",
     "FOLLOW_DIFF_STATUSES",
     "SCHEMA_VERSION",
+    "SEED_PROVENANCE_FIELDS",
     "SAMPLE_META_REQUIRED_FIELDS",
     "STATE_FINGERPRINT_REQUIRED_FIELDS",
     "apply_sample_meta_contract_defaults",
@@ -814,14 +973,17 @@ __all__ = [
     "build_follow_diff_window_summary_payload",
     "build_run_comparability_payload",
     "build_sample_meta_payload",
+    "build_seed_provenance_payload",
     "build_shared_meta",
     "build_state_fingerprint_payload",
     "is_shared_schema_valid",
+    "normalize_seed_provenance_payload",
     "stamp_with_shared_meta",
     "utc_timestamp",
     "validate_follow_diff_state_fields",
     "validate_follow_diff_window_summary_fields",
     "validate_sample_meta_fields",
+    "validate_seed_provenance_fields",
     "validate_shared_fields",
     "validate_state_fingerprint_fields",
 ]

@@ -53,6 +53,16 @@ def write_json(path: pathlib.Path, payload: dict) -> None:
 
 
 def sample_meta(sample_id: str) -> dict:
+    seed_provenance = {
+        "cold_start": False,
+        "seed_source_dir": "/tmp/follow/stable_transcript_corpus",
+        "seed_materialization_method": "reused_filtered_corpus",
+        "seed_snapshot_id": "1111111111111111111111111111111111111111",
+        "regen_seeds": False,
+        "refilter_queries": False,
+        "stable_input_dir": "/tmp/follow/stable_transcript_corpus",
+        "recorded_at": "2026-03-26T00:00:00Z",
+    }
     return {
         "schema_version": 1,
         "generated_at": "2026-03-24T00:00:00Z",
@@ -84,6 +94,7 @@ def sample_meta(sample_id: str) -> dict:
             "repeat_count": 3,
             "contract_version": 1,
         },
+        "seed_provenance": seed_provenance,
     }
 
 
@@ -239,6 +250,7 @@ required_keys = {
     "exclusion_summary",
     "case_study_index",
     "raw_sample_root",
+    "seed_provenance",
     "regeneration_commands",
     "claims",
 }
@@ -290,9 +302,29 @@ for key in ("triage_rewrite", "triage_report", "campaign_report", "case_study_ex
         raise SystemExit(f"ASSERT FAIL: regeneration_commands.{key} 未引用 root 路径")
 
 summary = json.loads((report_dir / "summary.json").read_text(encoding="utf-8"))
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": "/tmp/follow/stable_transcript_corpus",
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": "/tmp/follow/stable_transcript_corpus",
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
 if summary.get("semantic_diff_count") != 1:
     raise SystemExit(
         f"ASSERT FAIL: summary.semantic_diff_count={summary.get('semantic_diff_count')!r} != 1"
+    )
+if summary.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: summary.seed_provenance 不符合预期: "
+        f"{summary.get('seed_provenance')!r}"
+    )
+if bundle.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: evidence_bundle.seed_provenance 不符合预期: "
+        f"{bundle.get('seed_provenance')!r}"
     )
 
 claims = bundle["claims"]

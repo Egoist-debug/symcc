@@ -47,6 +47,7 @@ CACHE_DUMP_DIR="$WORK_DIR/cache_dumps"
 QUERY_GEN_LOG="$WORK_DIR/query_gen.log"
 RESPONSE_GEN_LOG="$WORK_DIR/response_gen.log"
 TRANSCRIPT_GEN_LOG="$WORK_DIR/transcript_gen.log"
+SEED_PROVENANCE_FILE="$WORK_DIR/producer_seed_provenance.json"
 
 MASTER_LOG="$LOG_DIR/afl_master_persistent.log"
 SECONDARY_LOG="$LOG_DIR/afl_secondary_persistent.log"
@@ -87,6 +88,9 @@ SHOW_AFL_UI="${SHOW_AFL_UI:-1}"
 MASTER_SESSION="${MASTER_SESSION:-named_afl_master}"
 SECONDARY_SESSION="${SECONDARY_SESSION:-named_afl_secondary}"
 HELPER_SESSION="${HELPER_SESSION:-named_symcc_helper}"
+QUERY_CORPUS_GENERATED_THIS_RUN=0
+RESPONSE_CORPUS_GENERATED_THIS_RUN=0
+TRANSCRIPT_CORPUS_GENERATED_THIS_RUN=0
 if [ ! -r "$DEFAULT_SYMCC_HIGH_VALUE_MANIFEST" ]; then
 	DEFAULT_SYMCC_HIGH_VALUE_MANIFEST="$UNBOUND_REPORT_HIGH_VALUE_MANIFEST"
 fi
@@ -210,6 +214,124 @@ show_semantic_config_summary() {
 	printf '  %-14s %s\n' "mutator_only" "$DST1_MUTATOR_ONLY"
 	printf '  %-14s %s\n' "reload_sec" "$frontier_reload_sec"
 	printf '  %-14s %s\n' "retry_limit" "$frontier_retry_limit"
+}
+
+active_source_generated_this_run() {
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		printf '%s' "$TRANSCRIPT_CORPUS_GENERATED_THIS_RUN"
+	else
+		printf '%s' "$QUERY_CORPUS_GENERATED_THIS_RUN"
+	fi
+}
+
+write_seed_provenance_sidecar() {
+	local cold_start="$1"
+	local source_dir="$2"
+	local stable_input_dir="$3"
+	local materialization_method="$4"
+
+	command -v python3 >/dev/null 2>&1 || die "缺少命令: python3"
+	mkdir -p "$(dirname "$SEED_PROVENANCE_FILE")"
+
+	env \
+		SEED_PROVENANCE_OUT="$SEED_PROVENANCE_FILE" \
+		SEED_PROVENANCE_COLD_START="$cold_start" \
+		SEED_PROVENANCE_SOURCE_DIR="$source_dir" \
+		SEED_PROVENANCE_STABLE_INPUT_DIR="$stable_input_dir" \
+		SEED_PROVENANCE_METHOD="$materialization_method" \
+		SEED_PROVENANCE_REGEN_SEEDS="$REGEN_SEEDS" \
+		SEED_PROVENANCE_REFILTER_QUERIES="$REFILTER_QUERIES" \
+		python3 - <<'PY'
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+
+
+def env_bool(name: str) -> bool:
+    return os.environ.get(name, "0") == "1"
+
+
+def optional_path(name: str):
+    value = os.environ.get(name, "").strip()
+    return str(Path(value).resolve()) if value else None
+
+
+def snapshot_dir(path_text: str | None):
+    if not path_text:
+        return None
+    path = Path(path_text)
+    if not path.is_dir():
+        return None
+    digest = hashlib.sha1()
+    file_count = 0
+    for candidate in sorted(path.rglob("*")):
+        if not candidate.is_file():
+            continue
+        file_count += 1
+        rel_path = candidate.relative_to(path).as_posix()
+        data = candidate.read_bytes()
+        digest.update(rel_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(data)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha1(data).hexdigest().encode("ascii"))
+        digest.update(b"\0")
+    if file_count == 0:
+        return None
+    return digest.hexdigest()
+
+
+stable_input_dir = optional_path("SEED_PROVENANCE_STABLE_INPUT_DIR")
+payload = {
+    "cold_start": env_bool("SEED_PROVENANCE_COLD_START"),
+    "seed_source_dir": optional_path("SEED_PROVENANCE_SOURCE_DIR"),
+    "seed_materialization_method": os.environ.get("SEED_PROVENANCE_METHOD", "").strip() or None,
+    "seed_snapshot_id": snapshot_dir(stable_input_dir),
+    "regen_seeds": env_bool("SEED_PROVENANCE_REGEN_SEEDS"),
+    "refilter_queries": env_bool("SEED_PROVENANCE_REFILTER_QUERIES"),
+    "stable_input_dir": stable_input_dir,
+    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+}
+
+output_path = Path(os.environ["SEED_PROVENANCE_OUT"])
+output_path.write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
+	log "producer seed provenance 已写出: $SEED_PROVENANCE_FILE"
+}
+
+show_seed_provenance_summary() {
+	printf '\nSeed provenance:\n'
+	printf '  %-14s %s\n' "sidecar" "$SEED_PROVENANCE_FILE"
+	if [ ! -f "$SEED_PROVENANCE_FILE" ]; then
+		printf '  %-14s %s\n' "status" "missing"
+		return 0
+	fi
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		printf '  %-14s %s\n' "status" "python3-missing"
+		return 0
+	fi
+
+	python3 - "$SEED_PROVENANCE_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+print(f"  {'status':14s} ready")
+print(f"  {'method':14s} {payload.get('seed_materialization_method') or '<unset>'}")
+print(f"  {'cold_start':14s} {payload.get('cold_start')}")
+print(f"  {'seed_source':14s} {payload.get('seed_source_dir') or '<unset>'}")
+print(f"  {'stable_input':14s} {payload.get('stable_input_dir') or '<unset>'}")
+print(f"  {'snapshot_id':14s} {payload.get('seed_snapshot_id') or '<unset>'}")
+PY
 }
 
 prepare_transcript_seed_mix() {
@@ -503,6 +625,7 @@ generate_seeds() {
 	if [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$QUERY_CORPUS_DIR" ] || \
 		[ -z "$(find "$QUERY_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]
 	then
+		QUERY_CORPUS_GENERATED_THIS_RUN=1
 		require_file "$QUERY_PARSER_BIN"
 		rm -rf "$QUERY_CORPUS_DIR"
 		mkdir -p "$QUERY_CORPUS_DIR"
@@ -519,6 +642,7 @@ generate_seeds() {
 	if [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$RESPONSE_CORPUS_DIR" ] || \
 		[ -z "$(find "$RESPONSE_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]
 	then
+		RESPONSE_CORPUS_GENERATED_THIS_RUN=1
 		require_file "$RESPONSE_PARSER_BIN"
 		rm -rf "$RESPONSE_CORPUS_DIR"
 		mkdir -p "$RESPONSE_CORPUS_DIR"
@@ -540,6 +664,7 @@ generate_seeds() {
 		{ [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$TRANSCRIPT_CORPUS_DIR" ] || \
 			[ -z "$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]; }
 	then
+		TRANSCRIPT_CORPUS_GENERATED_THIS_RUN=1
 		require_file "$TRANSCRIPT_GEN_TARGET"
 		rm -rf "$TRANSCRIPT_CORPUS_DIR"
 		mkdir -p "$TRANSCRIPT_CORPUS_DIR"
@@ -637,6 +762,11 @@ filter_seeds() {
 	if [ "$REFILTER_QUERIES" -eq 0 ] && [ -d "$target_dir" ] && \
 		[ -n "$(find "$target_dir" -maxdepth 1 -type f 2>/dev/null)" ]
 	then
+		write_seed_provenance_sidecar \
+			0 \
+			"$target_dir" \
+			"$target_dir" \
+			"reused_filtered_corpus"
 		log "复用已有稳定输入语料: $target_dir"
 		return 0
 	fi
@@ -671,6 +801,11 @@ filter_seeds() {
 
 	rm -rf "$target_dir"
 	mv "$tmp_dir" "$target_dir"
+	write_seed_provenance_sidecar \
+		"$(active_source_generated_this_run)" \
+		"$source_dir" \
+		"$target_dir" \
+		"filtered_from_source_corpus"
 	log "稳定输入语料已生成，目录: $target_dir，样本数: $seed_count"
 }
 
@@ -1060,6 +1195,7 @@ status_all() {
 	show_fuzzer_stats "$AFL_OUT_DIR/master/fuzzer_stats"
 	show_fuzzer_stats "$AFL_OUT_DIR/secondary/fuzzer_stats"
 	show_semantic_config_summary
+	show_seed_provenance_summary
 
 	if tmux_session_alive "$MASTER_SESSION"; then
 		printf '\nAFL UI:\n'

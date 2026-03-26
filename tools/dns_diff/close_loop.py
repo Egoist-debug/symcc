@@ -125,6 +125,9 @@ def _build_phase_context(*, run_metadata: Mapping[str, Any]) -> Dict[str, Any]:
             "exit_code": window_payload.get("exit_code"),
             "queue_tail_id": window_payload.get("queue_tail_id"),
             "last_queue_event_id": window_payload.get("last_queue_event_id"),
+            "seed_provenance": window_payload.get("seed_provenance")
+            if isinstance(window_payload.get("seed_provenance"), Mapping)
+            else None,
         },
     }
 
@@ -174,6 +177,7 @@ def _write_close_summary_with_context(
     enriched_summary["run_id"] = snapshot["run_id"]
     enriched_summary["metric_denominators"] = snapshot["metric_denominators"]
     enriched_summary["comparability"] = snapshot["comparability"]
+    enriched_summary["seed_provenance"] = snapshot["seed_provenance"]
     phase_context = _build_phase_context(run_metadata=snapshot["run_metadata"])
     phase_context["semantic_frontier_manifest"] = _collect_semantic_frontier_lifecycle(
         follow_root,

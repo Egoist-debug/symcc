@@ -235,6 +235,14 @@ def run_comparable_scenario() -> None:
             assert_true(path.is_file(), f"缺少输出文件 {path}")
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert_true(
+            manifest.get("baseline_variant_name") == "full_stack",
+            f"manifest baseline_variant_name 非预期: {manifest.get('baseline_variant_name')!r}",
+        )
+        assert_true(
+            manifest.get("matrix_internal_baseline_variant") == "full_stack",
+            "manifest 未显式标记 matrix_internal_baseline_variant=full_stack",
+        )
         variants = manifest.get("variants")
         assert_true(isinstance(variants, list) and len(variants) == 4, "manifest 变体数非法")
         assert_true(
@@ -279,12 +287,21 @@ def run_comparable_scenario() -> None:
         )
 
         delta_lines = delta_path.read_text(encoding="utf-8").splitlines()
-        expected_total_delta = "full_stack\tafl_only\ttotal_samples\tok\tok\tsymcc\t105.000000\t85.000000\t-20.000000"
+        assert_true(
+            delta_lines[0]
+            == "baseline_variant\tvariant_name\tmetric\tstatus\treason\ttoggle_diff_field\tbaseline_mean\tvariant_mean\tdelta\tbaseline_variant_scope",
+            f"delta_vs_baseline 表头非预期: {delta_lines[0]!r}",
+        )
+        assert_true(
+            all(line.endswith("\tmatrix_internal") for line in delta_lines[1:]),
+            "delta_vs_baseline 数据行未显式标记 matrix_internal baseline",
+        )
+        expected_total_delta = "full_stack\tafl_only\ttotal_samples\tok\tok\tsymcc\t105.000000\t85.000000\t-20.000000\tmatrix_internal"
         assert_true(
             expected_total_delta in delta_lines,
             f"delta_vs_baseline 缺少预期 total_samples delta 行: {expected_total_delta}",
         )
-        expected_cache_delta = "full_stack\tno_cache_delta\tcluster_count\tok\tok\tcache-delta\t21.000000\t17.500000\t-3.500000"
+        expected_cache_delta = "full_stack\tno_cache_delta\tcluster_count\tok\tok\tcache-delta\t21.000000\t17.500000\t-3.500000\tmatrix_internal"
         assert_true(
             expected_cache_delta in delta_lines,
             f"delta_vs_baseline 缺少预期 cluster_count delta 行: {expected_cache_delta}",
@@ -356,7 +373,7 @@ def run_non_comparable_scenario() -> None:
         ).splitlines()
 
         expected_status_line = (
-            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tbaseline_compare_key_mismatch\tsymcc\t\t\t"
+            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tbaseline_compare_key_mismatch\tsymcc\t\t\t\tmatrix_internal"
         )
         assert_true(
             expected_status_line in delta_lines,
@@ -434,7 +451,7 @@ def run_missing_comparability_scenario() -> None:
         ).splitlines()
 
         expected_missing_delta_line = (
-            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tmissing_comparability_metadata\tsymcc\t\t\t"
+            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tmissing_comparability_metadata\tsymcc\t\t\t\tmatrix_internal"
         )
         assert_true(
             expected_missing_delta_line in delta_lines,

@@ -142,6 +142,31 @@ print(f"{path.name}__{sha1[:8]}")
 PY
 }
 
+write_seed_provenance_fixture() {
+	local work_dir="$1"
+	python3 - "$work_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+work_dir = pathlib.Path(sys.argv[1]).resolve()
+seed_dir = (work_dir / "stable_transcript_corpus").resolve()
+seed_dir.mkdir(parents=True, exist_ok=True)
+payload = {
+    "cold_start": False,
+    "seed_source_dir": str(seed_dir),
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": str(seed_dir),
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+path = work_dir / "producer_seed_provenance.json"
+path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 init_scenario() {
 	local scenario_name="$1"
 	local unbound_mode="$2"
@@ -167,6 +192,7 @@ init_scenario() {
 	SEED_TIMEOUT_SEC_OVERRIDE=1
 
 	mkdir -p "$QUEUE_DIR" "$FOLLOW_ROOT" "$RESPONSE_DIR"
+	write_seed_provenance_fixture "$SCENARIO_WORK"
 	write_text_file "$NAMED_CONF_TEMPLATE" $'options { directory "__RUNTIME_STATE_DIR__"; };\n'
 	write_fake_binary "$BIND9_BIN" "$bind9_mode"
 	write_fake_binary "$UNBOUND_BIN" "$unbound_mode"
@@ -217,6 +243,10 @@ run_follow_diff_window_capture() {
 		BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
 		FOLLOW_DIFF_INTERVAL_SEC=0.01 \
 		SEED_TIMEOUT_SEC="$SEED_TIMEOUT_SEC_OVERRIDE" \
+		ENABLE_DST1_MUTATOR=0 \
+		ENABLE_CACHE_DELTA=1 \
+		ENABLE_TRIAGE=1 \
+		ENABLE_SYMCC=1 \
 		FAKE_BINARY_LOG_PATH="$INVOCATION_LOG" \
 		python3 -m tools.dns_diff.cli follow-diff-window --budget-sec "$budget_sec" "$@" >"$WINDOW_STDOUT" 2>"$WINDOW_STDERR"
 	WINDOW_EXIT_CODE=$?
@@ -264,6 +294,7 @@ required_keys = (
     "last_queue_event_id",
     "aggregation_key",
     "baseline_compare_key",
+    "seed_provenance",
 )
 for key in required_keys:
     if key not in summary:
@@ -307,6 +338,23 @@ elif summary.get("last_queue_event_id") != expected_last_queue_event_id:
         "ASSERT FAIL: summary.last_queue_event_id="
         f"{summary.get('last_queue_event_id')!r} != {expected_last_queue_event_id!r}"
     )
+
+expected_seed_dir = str((pathlib.Path(sys.argv[1]).resolve().parent / "stable_transcript_corpus").resolve())
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": expected_seed_dir,
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": expected_seed_dir,
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+if summary.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: summary.seed_provenance 不符合预期: "
+        f"{summary.get('seed_provenance')!r}"
+    )
 PY
 }
 
@@ -318,7 +366,12 @@ assert_state_contract() {
 	local expected_failed_count="$5"
 	local expected_last_exit_reason="$6"
 	local expected_retry_count="$7"
-	python3 - "$state_path" "$summary_path" "$expected_last_queue_event_id" "$expected_completed_count" "$expected_failed_count" "$expected_last_exit_reason" "$expected_retry_count" <<'PY'
+	local expected_source_queue_dir="$8"
+	local expected_budget_sec="$9"
+	local expected_seed_timeout_sec="${10}"
+	local expected_variant_name="${11}"
+	local expected_repeat_count="${12}"
+	python3 - "$state_path" "$summary_path" "$expected_last_queue_event_id" "$expected_completed_count" "$expected_failed_count" "$expected_last_exit_reason" "$expected_retry_count" "$expected_source_queue_dir" "$expected_budget_sec" "$expected_seed_timeout_sec" "$expected_variant_name" "$expected_repeat_count" <<'PY'
 import json
 import pathlib
 import sys
@@ -330,6 +383,85 @@ expected_completed_count = sys.argv[4]
 expected_failed_count = sys.argv[5]
 expected_last_exit_reason = sys.argv[6]
 expected_retry_count = sys.argv[7]
+expected_source_queue_dir = sys.argv[8]
+expected_budget_sec = float(sys.argv[9])
+if expected_budget_sec.is_integer():
+    expected_budget_sec = int(expected_budget_sec)
+expected_seed_timeout_sec = int(sys.argv[10])
+expected_variant_name = sys.argv[11]
+expected_repeat_count = int(sys.argv[12])
+expected_ablation_status = {
+    "mutator": "off",
+    "cache-delta": "on",
+    "triage": "on",
+    "symcc": "on",
+}
+expected_seed_dir = str((pathlib.Path(sys.argv[1]).resolve().parent / "stable_transcript_corpus").resolve())
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": expected_seed_dir,
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": expected_seed_dir,
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+
+
+def assert_expected_int_field(payload: dict, owner: str, field_name: str, expected: int) -> None:
+    actual = payload.get(field_name)
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 int）"
+        )
+
+
+def assert_expected_budget_field(payload: dict, owner: str, field_name: str, expected: int | float) -> None:
+    actual = payload.get(field_name)
+    if isinstance(expected, int):
+        if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 int）"
+            )
+        return
+    if isinstance(actual, bool) or not isinstance(actual, float) or actual != expected:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 float）"
+        )
+
+
+def assert_comparability_payload(payload: dict, owner: str) -> None:
+    if payload.get("resolver_pair") != "bind9_vs_unbound":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.resolver_pair={payload.get('resolver_pair')!r} != 'bind9_vs_unbound'"
+        )
+    if payload.get("producer_profile") != "poison-stateful":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.producer_profile={payload.get('producer_profile')!r} != 'poison-stateful'"
+        )
+    if payload.get("input_model") != "DST1 transcript":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.input_model={payload.get('input_model')!r} != 'DST1 transcript'"
+        )
+    if payload.get("source_queue_dir") != expected_source_queue_dir:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.source_queue_dir={payload.get('source_queue_dir')!r} != {expected_source_queue_dir!r}"
+        )
+    assert_expected_budget_field(payload, owner, "budget_sec", expected_budget_sec)
+    assert_expected_int_field(payload, owner, "seed_timeout_sec", expected_seed_timeout_sec)
+    if owner.endswith("aggregation_key"):
+        if payload.get("variant_name") != expected_variant_name:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.variant_name={payload.get('variant_name')!r} != {expected_variant_name!r}"
+            )
+        if payload.get("ablation_status") != expected_ablation_status:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.ablation_status={payload.get('ablation_status')!r} != {expected_ablation_status!r}"
+            )
+    else:
+        assert_expected_int_field(payload, owner, "repeat_count", expected_repeat_count)
+    assert_expected_int_field(payload, owner, "contract_version", 1)
 
 for field in (
     "schema_version",
@@ -393,6 +525,20 @@ for key_name, expected_fields in (
             f"ASSERT FAIL: state.{key_name} 与 summary.{key_name} 在同一 run 内不一致"
         )
 
+assert_comparability_payload(state["aggregation_key"], "state.aggregation_key")
+assert_comparability_payload(summary["aggregation_key"], "summary.aggregation_key")
+assert_comparability_payload(
+    state["baseline_compare_key"], "state.baseline_compare_key"
+)
+assert_comparability_payload(
+    summary["baseline_compare_key"], "summary.baseline_compare_key"
+)
+if summary.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: summary.seed_provenance 不符合预期: "
+        f"{summary.get('seed_provenance')!r}"
+    )
+
 if state.get("schema_version") != 1:
     raise SystemExit("ASSERT FAIL: state.schema_version 应为 1")
 if not isinstance(state.get("last_scan_ts"), str) or not state["last_scan_ts"]:
@@ -448,19 +594,105 @@ PY
 assert_completed_sample_contract() {
 	local sample_dir="$1"
 	local expected_sample_id="$2"
+	local expected_source_queue_dir="$3"
+	local expected_budget_sec="$4"
+	local expected_seed_timeout_sec="$5"
+	local expected_variant_name="$6"
+	local expected_repeat_count="$7"
 	assert_file_exists "$sample_dir/sample.meta.json"
 	assert_file_exists "$sample_dir/state_fingerprint.json"
 	assert_file_exists "$sample_dir/cache_diff.json"
 	assert_file_exists "$sample_dir/triage.json"
-	python3 - "$sample_dir" "$expected_sample_id" <<'PY'
+	python3 - "$sample_dir" "$expected_sample_id" "$expected_source_queue_dir" "$expected_budget_sec" "$expected_seed_timeout_sec" "$expected_variant_name" "$expected_repeat_count" <<'PY'
 import json
 import pathlib
 import sys
 
 sample_dir = pathlib.Path(sys.argv[1])
 expected_sample_id = sys.argv[2]
+expected_source_queue_dir = sys.argv[3]
+expected_budget_sec = float(sys.argv[4])
+if expected_budget_sec.is_integer():
+    expected_budget_sec = int(expected_budget_sec)
+expected_seed_timeout_sec = int(sys.argv[5])
+expected_variant_name = sys.argv[6]
+expected_repeat_count = int(sys.argv[7])
 meta = json.loads((sample_dir / "sample.meta.json").read_text(encoding="utf-8"))
 triage = json.loads((sample_dir / "triage.json").read_text(encoding="utf-8"))
+expected_ablation_status = {
+    "mutator": "off",
+    "cache-delta": "on",
+    "triage": "on",
+    "symcc": "on",
+}
+expected_seed_dir = str((sample_dir.parent.parent / "stable_transcript_corpus").resolve())
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": expected_seed_dir,
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": expected_seed_dir,
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+
+
+def assert_expected_int_field(payload: dict, owner: str, field_name: str, expected: int) -> None:
+    actual = payload.get(field_name)
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 int）"
+        )
+
+
+def assert_expected_budget_field(payload: dict, owner: str, field_name: str, expected: int | float) -> None:
+    actual = payload.get(field_name)
+    if isinstance(expected, int):
+        if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 int）"
+            )
+        return
+    if isinstance(actual, bool) or not isinstance(actual, float) or actual != expected:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 float）"
+        )
+
+
+def assert_comparability_payload(payload: object, owner: str, *, baseline: bool) -> None:
+    if not isinstance(payload, dict):
+        raise SystemExit(f"ASSERT FAIL: {owner} 应为对象")
+    if payload.get("resolver_pair") != "bind9_vs_unbound":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.resolver_pair={payload.get('resolver_pair')!r} != 'bind9_vs_unbound'"
+        )
+    if payload.get("producer_profile") != "poison-stateful":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.producer_profile={payload.get('producer_profile')!r} != 'poison-stateful'"
+        )
+    if payload.get("input_model") != "DST1 transcript":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.input_model={payload.get('input_model')!r} != 'DST1 transcript'"
+        )
+    if payload.get("source_queue_dir") != expected_source_queue_dir:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.source_queue_dir={payload.get('source_queue_dir')!r} != {expected_source_queue_dir!r}"
+        )
+    assert_expected_budget_field(payload, owner, "budget_sec", expected_budget_sec)
+    assert_expected_int_field(payload, owner, "seed_timeout_sec", expected_seed_timeout_sec)
+    if baseline:
+        assert_expected_int_field(payload, owner, "repeat_count", expected_repeat_count)
+    else:
+        if payload.get("variant_name") != expected_variant_name:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.variant_name={payload.get('variant_name')!r} != {expected_variant_name!r}"
+            )
+        if payload.get("ablation_status") != expected_ablation_status:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.ablation_status={payload.get('ablation_status')!r} != {expected_ablation_status!r}"
+            )
+    assert_expected_int_field(payload, owner, "contract_version", 1)
 
 if meta.get("sample_id") != expected_sample_id:
     raise SystemExit(
@@ -470,6 +702,13 @@ if meta.get("status") != "completed":
     raise SystemExit("ASSERT FAIL: sample.meta.json.status 应为 completed")
 if not isinstance(meta.get("first_seen_ts"), str) or not meta["first_seen_ts"]:
     raise SystemExit("ASSERT FAIL: sample.meta.json.first_seen_ts 应为非空字符串")
+assert_comparability_payload(meta.get("aggregation_key"), "sample.meta.json.aggregation_key", baseline=False)
+assert_comparability_payload(meta.get("baseline_compare_key"), "sample.meta.json.baseline_compare_key", baseline=True)
+if meta.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: sample.meta.json.seed_provenance 不符合预期: "
+        f"{meta.get('seed_provenance')!r}"
+    )
 if not isinstance(triage.get("status"), str) or not triage["status"].startswith("completed"):
     raise SystemExit(f"ASSERT FAIL: triage.status 未保持 completed 前缀: {triage.get('status')!r}")
 PY
@@ -479,9 +718,14 @@ assert_failed_sample_contract() {
 	local sample_dir="$1"
 	local expected_sample_id="$2"
 	local expected_reason="$3"
+	local expected_source_queue_dir="$4"
+	local expected_budget_sec="$5"
+	local expected_seed_timeout_sec="$6"
+	local expected_variant_name="$7"
+	local expected_repeat_count="$8"
 	assert_file_exists "$sample_dir/sample.meta.json"
 	assert_file_exists "$sample_dir/triage.json"
-	python3 - "$sample_dir" "$expected_sample_id" "$expected_reason" <<'PY'
+	python3 - "$sample_dir" "$expected_sample_id" "$expected_reason" "$expected_source_queue_dir" "$expected_budget_sec" "$expected_seed_timeout_sec" "$expected_variant_name" "$expected_repeat_count" <<'PY'
 import json
 import pathlib
 import sys
@@ -489,8 +733,89 @@ import sys
 sample_dir = pathlib.Path(sys.argv[1])
 expected_sample_id = sys.argv[2]
 expected_reason = sys.argv[3]
+expected_source_queue_dir = sys.argv[4]
+expected_budget_sec = float(sys.argv[5])
+if expected_budget_sec.is_integer():
+    expected_budget_sec = int(expected_budget_sec)
+expected_seed_timeout_sec = int(sys.argv[6])
+expected_variant_name = sys.argv[7]
+expected_repeat_count = int(sys.argv[8])
 meta = json.loads((sample_dir / "sample.meta.json").read_text(encoding="utf-8"))
 triage = json.loads((sample_dir / "triage.json").read_text(encoding="utf-8"))
+expected_ablation_status = {
+    "mutator": "off",
+    "cache-delta": "on",
+    "triage": "on",
+    "symcc": "on",
+}
+expected_seed_dir = str((sample_dir.parent.parent / "stable_transcript_corpus").resolve())
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": expected_seed_dir,
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": expected_seed_dir,
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+
+
+def assert_expected_int_field(payload: dict, owner: str, field_name: str, expected: int) -> None:
+    actual = payload.get(field_name)
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 int）"
+        )
+
+
+def assert_expected_budget_field(payload: dict, owner: str, field_name: str, expected: int | float) -> None:
+    actual = payload.get(field_name)
+    if isinstance(expected, int):
+        if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 int）"
+            )
+        return
+    if isinstance(actual, bool) or not isinstance(actual, float) or actual != expected:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.{field_name}={actual!r} != {expected!r}（应为 float）"
+        )
+
+
+def assert_comparability_payload(payload: object, owner: str, *, baseline: bool) -> None:
+    if not isinstance(payload, dict):
+        raise SystemExit(f"ASSERT FAIL: {owner} 应为对象")
+    if payload.get("resolver_pair") != "bind9_vs_unbound":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.resolver_pair={payload.get('resolver_pair')!r} != 'bind9_vs_unbound'"
+        )
+    if payload.get("producer_profile") != "poison-stateful":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.producer_profile={payload.get('producer_profile')!r} != 'poison-stateful'"
+        )
+    if payload.get("input_model") != "DST1 transcript":
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.input_model={payload.get('input_model')!r} != 'DST1 transcript'"
+        )
+    if payload.get("source_queue_dir") != expected_source_queue_dir:
+        raise SystemExit(
+            f"ASSERT FAIL: {owner}.source_queue_dir={payload.get('source_queue_dir')!r} != {expected_source_queue_dir!r}"
+        )
+    assert_expected_budget_field(payload, owner, "budget_sec", expected_budget_sec)
+    assert_expected_int_field(payload, owner, "seed_timeout_sec", expected_seed_timeout_sec)
+    if baseline:
+        assert_expected_int_field(payload, owner, "repeat_count", expected_repeat_count)
+    else:
+        if payload.get("variant_name") != expected_variant_name:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.variant_name={payload.get('variant_name')!r} != {expected_variant_name!r}"
+            )
+        if payload.get("ablation_status") != expected_ablation_status:
+            raise SystemExit(
+                f"ASSERT FAIL: {owner}.ablation_status={payload.get('ablation_status')!r} != {expected_ablation_status!r}"
+            )
+    assert_expected_int_field(payload, owner, "contract_version", 1)
 
 if meta.get("sample_id") != expected_sample_id:
     raise SystemExit(
@@ -509,6 +834,13 @@ if failure.get("reason") != expected_reason:
     )
 if not isinstance(failure.get("exit_code"), int) or failure["exit_code"] <= 0:
     raise SystemExit("ASSERT FAIL: failure.exit_code 应为正整数")
+assert_comparability_payload(meta.get("aggregation_key"), "sample.meta.json.aggregation_key", baseline=False)
+assert_comparability_payload(meta.get("baseline_compare_key"), "sample.meta.json.baseline_compare_key", baseline=True)
+if meta.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: sample.meta.json.seed_provenance 不符合预期: "
+        f"{meta.get('seed_provenance')!r}"
+    )
 if triage.get("status") != "failed_replay":
     raise SystemExit(f"ASSERT FAIL: triage.status={triage.get('status')!r} != 'failed_replay'")
 if triage.get("diff_class") != "replay_incomplete":
@@ -576,9 +908,9 @@ if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
 fi
 assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
-assert_completed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID"
+assert_completed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "$QUEUE_DIR" 5 1 "no_mutator" 1
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 1 0 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
-assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
 
 init_scenario "timeout" "timeout"
 SEED_TIMEOUT_SEC_OVERRIDE=10
@@ -603,7 +935,7 @@ assert_follow_window_summary_contract \
 	"__any__" \
 	"$QUEUE_EVENT_ID" \
 	"__nonempty_or_null__"
-assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" 0
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" 0 "$QUEUE_DIR" 1 10 "no_mutator" 1
 
 init_scenario "failed-sample" "missing_artifact"
 run_follow_diff_window_capture 5
@@ -615,9 +947,9 @@ if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
 fi
 assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
-assert_failed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "missing_artifact"
+assert_failed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "missing_artifact" "$QUEUE_DIR" 5 1 "no_mutator" 1
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 0 1 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
-assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 0 1 "quiescent" 0
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 0 1 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
 assert_invocation_count "$INVOCATION_LOG" "missing_artifact" 1
 
 init_scenario "failed-sample-retry-enabled" "missing_artifact"
@@ -633,7 +965,7 @@ fi
 assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "deadline_exceeded" "$WINDOW_EXIT_CODE" "__any__" "__any__" "$QUEUE_EVENT_ID" "__nonempty_or_null__"
-assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" "__positive__"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" "__positive__" "$QUEUE_DIR" 1 1 "no_mutator" 1
 assert_invocation_count_at_least "$INVOCATION_LOG" "missing_artifact" 2
 
 python3 - "$WINDOW_SUMMARY" <<'PY'
@@ -682,7 +1014,7 @@ fi
 assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
 assert_file_contains "$WINDOW_STDERR" "queue 中未找到待恢复样本"
-assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
 python3 - "$WINDOW_SUMMARY" "$STALE_SAMPLE_ID" <<'PY'
 import json
 import pathlib

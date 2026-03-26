@@ -327,7 +327,8 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
     auto DonorQuery = parseSingleQuestion(Donor.ClientQuery);
     if (!DonorQuery ||
         !packetsHaveMatchingQuestionIdentity(Donor.ClientQuery,
-                                             Donor.PostCheckQuery)) {
+                                             Donor.PostCheckQuery) ||
+        !responseSetMatchesQuery(Donor.Responses, Donor.ClientQuery)) {
       return false;
     }
 
@@ -338,6 +339,8 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
     auto &Transcript = ensureTranscriptMutation(Request);
     Transcript.PostCheckName = DonorQuery->Name;
     Transcript.PostCheckType = DonorQuery->Type;
+    Transcript.Responses = Donor.Responses;
+    Transcript.ResponseCount = static_cast<uint8_t>(Donor.Responses.size());
     return true;
   }
   }
@@ -663,6 +666,10 @@ mutateTranscriptImpl(const std::vector<uint8_t> &Input,
       }
       Parsed->PostCheckQuery = std::move(*UpdatedPost);
     }
+  }
+
+  if (!responseSetMatchesQuery(Parsed->Responses, Parsed->ClientQuery)) {
+    return std::nullopt;
   }
 
   if (!checkPostQueryNameAndType(Parsed->ClientQuery, Parsed->PostCheckQuery)) {

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from collections import Counter, defaultdict
@@ -15,6 +16,7 @@ from .schema import (
     ANALYSIS_STATES,
     CONTRACT_VERSION,
     build_run_comparability_payload,
+    normalize_seed_provenance_payload,
     utc_timestamp,
 )
 from .taxonomy import (
@@ -255,6 +257,32 @@ def _load_triage_payload(sample_dir: Path) -> Dict[str, Any]:
     return payload
 
 
+def _build_triage_fallback_payload(
+    sample_dir: Path,
+    *,
+    sample_meta_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    payload = {
+        "sample_id": _coerce_text(
+            sample_meta_payload.get("sample_id"), sample_dir.name
+        ),
+        "status": _coerce_text(sample_meta_payload.get("status"), "unknown"),
+        "cluster_key": "_",
+        "diff_class": "unknown",
+        "analysis_state": _coerce_analysis_state(
+            sample_meta_payload.get("analysis_state")
+        ),
+        "semantic_outcome": _coerce_text(
+            sample_meta_payload.get("semantic_outcome"),
+            "unknown",
+        ),
+        "filter_labels": [],
+        "oracle_audit_candidate": False,
+        "needs_manual_review": False,
+    }
+    return payload
+
+
 def _load_sample_meta_payload(sample_dir: Path) -> Dict[str, Any]:
     payload = _load_required_truth_source_payload(
         sample_dir,
@@ -448,6 +476,37 @@ def _load_run_metadata(
         "state": state_payload,
         "window_summary": window_summary_payload,
     }
+
+
+def _stable_payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _derive_seed_provenance(
+    *,
+    sample_meta_payloads: Iterable[Mapping[str, Any]],
+    run_metadata: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    window_summary = run_metadata.get("window_summary")
+    if isinstance(window_summary, Mapping):
+        normalized_window = normalize_seed_provenance_payload(
+            window_summary.get("seed_provenance")
+        )
+        if normalized_window is not None:
+            return normalized_window
+
+    unique_payloads: Dict[str, Dict[str, Any]] = {}
+    for sample_meta_payload in sample_meta_payloads:
+        normalized = normalize_seed_provenance_payload(
+            sample_meta_payload.get("seed_provenance")
+        )
+        if normalized is None:
+            continue
+        unique_payloads[_stable_payload_fingerprint(normalized)] = normalized
+
+    if len(unique_payloads) == 1:
+        return next(iter(unique_payloads.values()))
+    return None
 
 
 def _build_metric_denominators(
@@ -654,6 +713,11 @@ def collect_report_snapshot(
             raise ReportError(f"follow_diff 根目录不存在或不是目录: {root_path}")
 
         empty_comparability = build_run_comparability_payload(())
+        run_metadata = _load_run_metadata(
+            root_path,
+            work_dir=work_dir,
+            environ=environ,
+        )
         return {
             "root": root_path,
             "sample_dirs": sample_dirs,
@@ -676,10 +740,10 @@ def collect_report_snapshot(
             ),
             "comparability": empty_comparability,
             "run_id": None,
-            "run_metadata": _load_run_metadata(
-                root_path,
-                work_dir=work_dir,
-                environ=environ,
+            "run_metadata": run_metadata,
+            "seed_provenance": _derive_seed_provenance(
+                sample_meta_payloads=(),
+                run_metadata=run_metadata,
             ),
         }
 
@@ -697,9 +761,17 @@ def collect_report_snapshot(
     total_samples = 0
     needs_review_count = 0
     for sample_dir in sample_dirs:
-        payload = _load_triage_payload(sample_dir)
         sample_meta_payload = _load_sample_meta_payload(sample_dir)
         sample_meta_payloads.append(sample_meta_payload)
+
+        triage_path = sample_dir / "triage.json"
+        if triage_path.is_file():
+            payload = _load_triage_payload(sample_dir)
+        else:
+            payload = _build_triage_fallback_payload(
+                sample_dir,
+                sample_meta_payload=sample_meta_payload,
+            )
 
         sample_id = _coerce_text(payload.get("sample_id"), sample_dir.name)
         status = _coerce_text(payload.get("status"), "unknown")
@@ -755,6 +827,10 @@ def collect_report_snapshot(
 
     comparability = build_run_comparability_payload(sample_meta_payloads)
     run_metadata = _load_run_metadata(root_path, work_dir=work_dir, environ=environ)
+    seed_provenance = _derive_seed_provenance(
+        sample_meta_payloads=sample_meta_payloads,
+        run_metadata=run_metadata,
+    )
     semantic_frontier_entries = _normalize_semantic_frontier_entries(
         semantic_frontier_candidates
     )
@@ -789,6 +865,7 @@ def collect_report_snapshot(
         "comparability": comparability,
         "run_id": run_metadata["run_id"],
         "run_metadata": run_metadata,
+        "seed_provenance": seed_provenance,
     }
 
 

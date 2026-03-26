@@ -142,6 +142,31 @@ print(f"{path.name}__{sha1[:8]}")
 PY
 }
 
+write_seed_provenance_fixture() {
+	local work_dir="$1"
+	python3 - "$work_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+work_dir = pathlib.Path(sys.argv[1]).resolve()
+seed_dir = (work_dir / "stable_transcript_corpus").resolve()
+seed_dir.mkdir(parents=True, exist_ok=True)
+payload = {
+    "cold_start": False,
+    "seed_source_dir": str(seed_dir),
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": str(seed_dir),
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+path = work_dir / "producer_seed_provenance.json"
+path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 get_latest_report_dir() {
 	local report_base="$1"
 	python3 - "$report_base" <<'PY'
@@ -187,6 +212,7 @@ init_scenario() {
 	SYMCC_HIGH_VALUE_MANIFEST_OVERRIDE=''
 
 	mkdir -p "$QUEUE_DIR" "$FOLLOW_ROOT" "$RESPONSE_DIR"
+	write_seed_provenance_fixture "$SCENARIO_WORK"
 	write_text_file "$NAMED_CONF_TEMPLATE" $'options { directory "__RUNTIME_STATE_DIR__"; };\n'
 	write_fake_binary "$BIND9_BIN" "$bind9_mode"
 	write_fake_binary "$UNBOUND_BIN" "$unbound_mode"
@@ -268,6 +294,7 @@ for key in (
     "completed_count",
     "failed_count",
     "last_queue_event_id",
+    "seed_provenance",
 ):
     if key not in summary:
         raise SystemExit(f"ASSERT FAIL: follow_diff.window.summary.json 缺少字段 {key}")
@@ -285,6 +312,23 @@ if summary.get("exit_reason") != expected_exit_reason:
 if summary.get("exit_code") != expected_exit_code:
     raise SystemExit(
         f"ASSERT FAIL: follow_diff.window.summary.exit_code={summary.get('exit_code')!r} != {expected_exit_code!r}"
+    )
+
+expected_seed_dir = str((pathlib.Path(sys.argv[1]).resolve().parent / "stable_transcript_corpus").resolve())
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": expected_seed_dir,
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": expected_seed_dir,
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
+if summary.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: follow_diff.window.summary.seed_provenance 不符合预期: "
+        f"{summary.get('seed_provenance')!r}"
     )
 PY
 }
@@ -461,6 +505,18 @@ import sys
 
 summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 scenario = sys.argv[2]
+work_dir = pathlib.Path(sys.argv[1]).resolve().parent
+expected_seed_dir = str((work_dir / "stable_transcript_corpus").resolve())
+expected_seed_provenance = {
+    "cold_start": False,
+    "seed_source_dir": expected_seed_dir,
+    "seed_materialization_method": "reused_filtered_corpus",
+    "seed_snapshot_id": "1111111111111111111111111111111111111111",
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": expected_seed_dir,
+    "recorded_at": "2026-03-26T00:00:00Z",
+}
 
 run_id = summary.get("run_id")
 if not isinstance(run_id, str) or not run_id:
@@ -493,15 +549,48 @@ if sum(analysis_state.values()) != total_samples:
 comparability = summary.get("comparability")
 if not isinstance(comparability, dict):
     raise SystemExit("ASSERT FAIL: close summary.comparability 应为对象")
-if comparability.get("status") != "non_comparable":
+if scenario in {"success", "report-missing"}:
+    if comparability.get("status") != "comparable":
+        raise SystemExit(
+            f"ASSERT FAIL: close summary.comparability.status={comparability.get('status')!r} != 'comparable'"
+        )
+    if not isinstance(comparability.get("aggregation_key"), dict):
+        raise SystemExit("ASSERT FAIL: comparable 场景 aggregation_key 应为对象")
+    if not isinstance(comparability.get("baseline_compare_key"), dict):
+        raise SystemExit("ASSERT FAIL: comparable 场景 baseline_compare_key 应为对象")
+elif scenario == "follow-timeout":
+    if comparability.get("status") == "comparable":
+        if not isinstance(comparability.get("aggregation_key"), dict):
+            raise SystemExit("ASSERT FAIL: follow-timeout comparable aggregation_key 应为对象")
+        if not isinstance(comparability.get("baseline_compare_key"), dict):
+            raise SystemExit("ASSERT FAIL: follow-timeout comparable baseline_compare_key 应为对象")
+    else:
+        if comparability.get("status") != "non_comparable":
+            raise SystemExit(
+                f"ASSERT FAIL: close summary.comparability.status={comparability.get('status')!r} 非法"
+            )
+        if comparability.get("aggregation_key") is not None:
+            raise SystemExit("ASSERT FAIL: follow-timeout non_comparable aggregation_key 应为 null")
+        if comparability.get("baseline_compare_key") is not None:
+            raise SystemExit(
+                "ASSERT FAIL: follow-timeout non_comparable baseline_compare_key 应为 null"
+            )
+else:
+    if comparability.get("status") != "non_comparable":
+        raise SystemExit(
+            f"ASSERT FAIL: close summary.comparability.status={comparability.get('status')!r} != 'non_comparable'"
+        )
+    if comparability.get("aggregation_key") is not None:
+        raise SystemExit("ASSERT FAIL: close summary.comparability.aggregation_key 应为 null")
+    if comparability.get("baseline_compare_key") is not None:
+        raise SystemExit(
+            "ASSERT FAIL: close summary.comparability.baseline_compare_key 应为 null"
+        )
+
+if summary.get("seed_provenance") != expected_seed_provenance:
     raise SystemExit(
-        f"ASSERT FAIL: close summary.comparability.status={comparability.get('status')!r} != 'non_comparable'"
-    )
-if comparability.get("aggregation_key") is not None:
-    raise SystemExit("ASSERT FAIL: close summary.comparability.aggregation_key 应为 null")
-if comparability.get("baseline_compare_key") is not None:
-    raise SystemExit(
-        "ASSERT FAIL: close summary.comparability.baseline_compare_key 应为 null"
+        "ASSERT FAIL: close summary.seed_provenance 不符合预期: "
+        f"{summary.get('seed_provenance')!r}"
     )
 
 phase_context = summary.get("phase_context")
@@ -529,21 +618,26 @@ if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_co
 last_attempt_ts = state_context.get("last_attempt_ts")
 if not isinstance(last_attempt_ts, str) or not last_attempt_ts:
     raise SystemExit("ASSERT FAIL: phase_context.follow_diff_state.last_attempt_ts 应为非空字符串")
+if window_context.get("seed_provenance") != expected_seed_provenance:
+    raise SystemExit(
+        "ASSERT FAIL: phase_context.follow_diff_window_summary.seed_provenance 不符合预期: "
+        f"{window_context.get('seed_provenance')!r}"
+    )
 
 if scenario == "success":
     expected_denominators = {
         "total_samples": 1,
         "analysis_state": {"included": 1, "excluded": 0, "unknown": 0},
-        "comparable_samples": 0,
-        "non_comparable_samples": 1,
+        "comparable_samples": 1,
+        "non_comparable_samples": 0,
     }
     if metric_denominators != expected_denominators:
         raise SystemExit(
             f"ASSERT FAIL: success metric_denominators={metric_denominators!r} != {expected_denominators!r}"
         )
-    if comparability.get("reason") != "missing_comparability_fields":
+    if comparability.get("reason") != "ok":
         raise SystemExit(
-            f"ASSERT FAIL: success comparability.reason={comparability.get('reason')!r} != 'missing_comparability_fields'"
+            f"ASSERT FAIL: success comparability.reason={comparability.get('reason')!r} != 'ok'"
         )
     if state_context.get("last_exit_reason") != "quiescent":
         raise SystemExit("ASSERT FAIL: success state.last_exit_reason 应为 quiescent")
@@ -552,17 +646,31 @@ if scenario == "success":
     if retry_count != 0:
         raise SystemExit(f"ASSERT FAIL: success retry_count={retry_count!r} != 0")
 elif scenario == "follow-timeout":
-    if metric_denominators.get("comparable_samples") != 0:
-        raise SystemExit("ASSERT FAIL: follow-timeout comparable_samples 应为 0")
-    if metric_denominators.get("non_comparable_samples") != total_samples:
-        raise SystemExit(
-            "ASSERT FAIL: follow-timeout non_comparable_samples 应等于 total_samples"
-        )
-    if comparability.get("reason") not in {"no_samples", "missing_comparability_fields"}:
-        raise SystemExit(
-            "ASSERT FAIL: follow-timeout comparability.reason 非法: "
-            f"{comparability.get('reason')!r}"
-        )
+    if comparability.get("status") == "comparable":
+        if metric_denominators.get("comparable_samples") != total_samples:
+            raise SystemExit(
+                "ASSERT FAIL: follow-timeout comparable 场景 comparable_samples 应等于 total_samples"
+            )
+        if metric_denominators.get("non_comparable_samples") != 0:
+            raise SystemExit(
+                "ASSERT FAIL: follow-timeout comparable 场景 non_comparable_samples 应为 0"
+            )
+        if comparability.get("reason") != "ok":
+            raise SystemExit(
+                f"ASSERT FAIL: follow-timeout comparable.reason={comparability.get('reason')!r} != 'ok'"
+            )
+    else:
+        if metric_denominators.get("comparable_samples") != 0:
+            raise SystemExit("ASSERT FAIL: follow-timeout non_comparable 场景 comparable_samples 应为 0")
+        if metric_denominators.get("non_comparable_samples") != total_samples:
+            raise SystemExit(
+                "ASSERT FAIL: follow-timeout non_comparable 场景 non_comparable_samples 应等于 total_samples"
+            )
+        if comparability.get("reason") not in {"no_samples", "missing_comparability_fields"}:
+            raise SystemExit(
+                "ASSERT FAIL: follow-timeout comparability.reason 非法: "
+                f"{comparability.get('reason')!r}"
+            )
     if state_context.get("last_exit_reason") != "deadline_exceeded":
         raise SystemExit(
             "ASSERT FAIL: follow-timeout state.last_exit_reason 应为 deadline_exceeded"
@@ -577,16 +685,16 @@ elif scenario == "report-missing":
     expected_denominators = {
         "total_samples": 1,
         "analysis_state": {"included": 1, "excluded": 0, "unknown": 0},
-        "comparable_samples": 0,
-        "non_comparable_samples": 1,
+        "comparable_samples": 1,
+        "non_comparable_samples": 0,
     }
     if metric_denominators != expected_denominators:
         raise SystemExit(
             f"ASSERT FAIL: report-missing metric_denominators={metric_denominators!r} != {expected_denominators!r}"
         )
-    if comparability.get("reason") != "missing_comparability_fields":
+    if comparability.get("reason") != "ok":
         raise SystemExit(
-            "ASSERT FAIL: report-missing comparability.reason 应为 missing_comparability_fields"
+            "ASSERT FAIL: report-missing comparability.reason 应为 ok"
         )
     if state_context.get("last_exit_reason") != "quiescent":
         raise SystemExit("ASSERT FAIL: report-missing state.last_exit_reason 应为 quiescent")
