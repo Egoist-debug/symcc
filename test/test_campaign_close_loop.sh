@@ -160,6 +160,9 @@ payload = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": str(seed_dir),
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 path = work_dir / "producer_seed_provenance.json"
@@ -323,6 +326,9 @@ expected_seed_provenance = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": expected_seed_dir,
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 if summary.get("seed_provenance") != expected_seed_provenance:
@@ -515,6 +521,9 @@ expected_seed_provenance = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": expected_seed_dir,
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 
@@ -732,6 +741,81 @@ if not isinstance(campaign_id, str) or not campaign_id:
 PY
 }
 
+emit_campaign_close_evidence() {
+	local scenario="$1"
+	local summary_path="$2"
+	local window_summary_path="$3"
+	local report_dir="${4:-}"
+	python3 - "$scenario" "$summary_path" "$window_summary_path" "$report_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+scenario, summary_path, window_summary_path, report_dir = sys.argv[1:5]
+summary = json.loads(pathlib.Path(summary_path).read_text(encoding="utf-8"))
+window_summary = json.loads(pathlib.Path(window_summary_path).read_text(encoding="utf-8"))
+seed = summary.get("seed_provenance") or {}
+comparability = summary.get("comparability") or {}
+metric_denominators = summary.get("metric_denominators") or {}
+analysis_state = metric_denominators.get("analysis_state") or {}
+phase_window = (summary.get("phase_context") or {}).get("follow_diff_window_summary") or {}
+
+
+def fmt(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+print(
+    "EVIDENCE_T7 campaign_close "
+    f"scenario={scenario} "
+    f"status={fmt(summary.get('status'))} "
+    f"exit_reason={fmt(summary.get('exit_reason'))} "
+    f"exit_code={fmt(summary.get('exit_code'))} "
+    f"failed_phase={fmt(summary.get('failed_phase') or 'none')} "
+    f"queue_tail_id={fmt(summary.get('queue_tail_id'))} "
+    f"run_id={fmt(summary.get('run_id'))}"
+)
+print(
+    "EVIDENCE_T7 campaign_close_provenance "
+    f"scenario={scenario} "
+    f"transcript_format_version={fmt(seed.get('transcript_format_version'))} "
+    f"transcript_max_responses={fmt(seed.get('transcript_max_responses'))} "
+    f"response_preserve={fmt(seed.get('response_preserve'))} "
+    f"seed_materialization_method={fmt(seed.get('seed_materialization_method'))}"
+)
+print(
+    "EVIDENCE_T7 campaign_close_metrics "
+    f"scenario={scenario} "
+    f"total_samples={fmt(metric_denominators.get('total_samples'))} "
+    f"included={fmt(analysis_state.get('included'))} "
+    f"excluded={fmt(analysis_state.get('excluded'))} "
+    f"unknown={fmt(analysis_state.get('unknown'))} "
+    f"comparability_status={fmt(comparability.get('status'))} "
+    f"comparability_reason={fmt(comparability.get('reason'))}"
+)
+print(
+    "EVIDENCE_T7 campaign_close_window "
+    f"scenario={scenario} "
+    f"window_exit_reason={fmt(window_summary.get('exit_reason'))} "
+    f"window_run_id={fmt(window_summary.get('run_id'))} "
+    f"phase_window_run_id={fmt(phase_window.get('run_id'))}"
+)
+if report_dir:
+    report_summary = json.loads((pathlib.Path(report_dir) / "summary.json").read_text(encoding="utf-8"))
+    print(
+        "EVIDENCE_T7 campaign_report "
+        f"scenario={scenario} "
+        f"report_dir={pathlib.Path(report_dir).resolve()} "
+        f"campaign_id={fmt(report_summary.get('campaign_id'))} "
+        f"total_samples={fmt(report_summary.get('total_samples'))}"
+    )
+PY
+}
+
 init_scenario "success" "dump_success"
 run_campaign_close_capture 10
 if [ "$CAMPAIGN_EXIT_CODE" -ne 0 ]; then
@@ -747,6 +831,7 @@ SUCCESS_REPORT_DIR="$(get_latest_report_dir "$CAMPAIGN_REPORT_BASE")"
 assert_campaign_report_artifacts "$SUCCESS_REPORT_DIR"
 assert_campaign_close_success_summary "$CAMPAIGN_SUMMARY" "$QUEUE_EVENT_ID"
 assert_campaign_close_metadata_contract "$CAMPAIGN_SUMMARY" success
+emit_campaign_close_evidence "success" "$CAMPAIGN_SUMMARY" "$WINDOW_SUMMARY" "$SUCCESS_REPORT_DIR"
 
 init_scenario "follow-timeout" "timeout"
 SEED_TIMEOUT_SEC_OVERRIDE=10
@@ -773,6 +858,7 @@ assert_campaign_close_failure_summary \
 	"deadline_exceeded" \
 	"-"
 assert_campaign_close_metadata_contract "$CAMPAIGN_SUMMARY" follow-timeout
+emit_campaign_close_evidence "follow-timeout" "$CAMPAIGN_SUMMARY" "$WINDOW_SUMMARY"
 
 init_scenario "report-missing" "dump_success"
 SYMCC_HIGH_VALUE_MANIFEST_OVERRIDE="$SCENARIO_ROOT/high-value-manifest-as-dir"
@@ -800,5 +886,6 @@ assert_campaign_close_failure_summary \
 	"__nonempty__" \
 	"high_value_samples.txt"
 assert_campaign_close_metadata_contract "$CAMPAIGN_SUMMARY" report-missing
+emit_campaign_close_evidence "report-missing" "$CAMPAIGN_SUMMARY" "$WINDOW_SUMMARY"
 
 printf 'PASS: campaign-close contract test passed\n'

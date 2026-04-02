@@ -160,6 +160,9 @@ payload = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": str(seed_dir),
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 path = work_dir / "producer_seed_provenance.json"
@@ -348,6 +351,9 @@ expected_seed_provenance = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": expected_seed_dir,
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 if summary.get("seed_provenance") != expected_seed_provenance:
@@ -405,6 +411,9 @@ expected_seed_provenance = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": expected_seed_dir,
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 
@@ -634,6 +643,9 @@ expected_seed_provenance = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": expected_seed_dir,
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 
@@ -757,6 +769,9 @@ expected_seed_provenance = {
     "regen_seeds": False,
     "refilter_queries": False,
     "stable_input_dir": expected_seed_dir,
+    "transcript_format_version": 2,
+    "transcript_max_responses": 3,
+    "response_preserve": 20,
     "recorded_at": "2026-03-26T00:00:00Z",
 }
 
@@ -898,6 +913,100 @@ if actual_count < expected_min_count:
 PY
 }
 
+emit_follow_window_evidence() {
+	local scenario="$1"
+	local summary_path="$2"
+	local state_path="$3"
+	local sample_meta_path="${4:-}"
+	local triage_path="${5:-}"
+	local expected_recovery_sample_id="${6:-}"
+	python3 - "$scenario" "$summary_path" "$state_path" "$sample_meta_path" "$triage_path" "$expected_recovery_sample_id" <<'PY'
+import json
+import pathlib
+import sys
+
+scenario, summary_path, state_path, sample_meta_path, triage_path, expected_recovery_sample_id = sys.argv[1:7]
+summary = json.loads(pathlib.Path(summary_path).read_text(encoding="utf-8"))
+state = json.loads(pathlib.Path(state_path).read_text(encoding="utf-8"))
+seed = summary.get("seed_provenance") or {}
+
+
+def fmt(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+print(
+    "EVIDENCE_T7 follow_diff "
+    f"scenario={scenario} "
+    f"exit_reason={fmt(summary.get('exit_reason'))} "
+    f"exit_code={fmt(summary.get('exit_code'))} "
+    f"completed_count={fmt(summary.get('completed_count'))} "
+    f"failed_count={fmt(summary.get('failed_count'))} "
+    f"queue_tail_id={fmt(summary.get('queue_tail_id'))} "
+    f"last_queue_event_id={fmt(summary.get('last_queue_event_id'))} "
+    f"run_id={fmt(summary.get('run_id'))}"
+)
+if seed:
+    print(
+        "EVIDENCE_T7 follow_diff_provenance "
+        f"scenario={scenario} "
+        f"transcript_format_version={fmt(seed.get('transcript_format_version'))} "
+        f"transcript_max_responses={fmt(seed.get('transcript_max_responses'))} "
+        f"response_preserve={fmt(seed.get('response_preserve'))} "
+        f"seed_materialization_method={fmt(seed.get('seed_materialization_method'))}"
+    )
+print(
+    "EVIDENCE_T7 follow_diff_state "
+    f"scenario={scenario} "
+    f"last_exit_reason={fmt(state.get('last_exit_reason'))} "
+    f"retry_count={fmt(state.get('retry_count'))} "
+    f"running_sample_id={fmt(state.get('running_sample_id'))} "
+    f"last_attempt_ts={fmt(state.get('last_attempt_ts'))}"
+)
+if "retry_failed" in summary:
+    print(
+        "EVIDENCE_T7 follow_diff_retry "
+        f"scenario={scenario} retry_failed={fmt(summary.get('retry_failed'))}"
+    )
+if summary.get("recovery_status") is not None:
+    print(
+        "EVIDENCE_T7 follow_diff_recovery "
+        f"scenario={scenario} "
+        f"recovery_status={fmt(summary.get('recovery_status'))} "
+        f"recovery_detail={fmt(summary.get('recovery_detail'))} "
+        f"recovery_sample_id={fmt(summary.get('recovery_sample_id'))}"
+    )
+if sample_meta_path and pathlib.Path(sample_meta_path).is_file():
+    meta = json.loads(pathlib.Path(sample_meta_path).read_text(encoding="utf-8"))
+    failure = meta.get("failure") or {}
+    print(
+        "EVIDENCE_T7 follow_diff_sample "
+        f"scenario={scenario} "
+        f"sample_id={fmt(meta.get('sample_id'))} "
+        f"status={fmt(meta.get('status'))} "
+        f"failure_kind={fmt(failure.get('kind'))} "
+        f"failure_reason={fmt(failure.get('reason'))}"
+    )
+if triage_path and pathlib.Path(triage_path).is_file():
+    triage = json.loads(pathlib.Path(triage_path).read_text(encoding="utf-8"))
+    print(
+        "EVIDENCE_T7 follow_diff_triage "
+        f"scenario={scenario} "
+        f"status={fmt(triage.get('status'))} "
+        f"diff_class={fmt(triage.get('diff_class'))}"
+    )
+if expected_recovery_sample_id:
+    print(
+        "EVIDENCE_T7 follow_diff_expected "
+        f"scenario={scenario} recovery_sample_id={expected_recovery_sample_id}"
+    )
+PY
+}
+
 init_scenario "quiescent" "dump_success"
 run_follow_diff_window_capture 5
 if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
@@ -911,6 +1020,7 @@ assert_file_exists "$STATE_FILE"
 assert_completed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "$QUEUE_DIR" 5 1 "no_mutator" 1
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 1 0 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
 assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
+emit_follow_window_evidence "quiescent" "$WINDOW_SUMMARY" "$STATE_FILE" "$SAMPLE_DIR/sample.meta.json" "$SAMPLE_DIR/triage.json"
 
 init_scenario "timeout" "timeout"
 SEED_TIMEOUT_SEC_OVERRIDE=10
@@ -936,6 +1046,7 @@ assert_follow_window_summary_contract \
 	"$QUEUE_EVENT_ID" \
 	"__nonempty_or_null__"
 assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" 0 "$QUEUE_DIR" 1 10 "no_mutator" 1
+emit_follow_window_evidence "timeout" "$WINDOW_SUMMARY" "$STATE_FILE"
 
 init_scenario "failed-sample" "missing_artifact"
 run_follow_diff_window_capture 5
@@ -951,6 +1062,7 @@ assert_failed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "missing_artifact" "$QU
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 0 1 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
 assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 0 1 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
 assert_invocation_count "$INVOCATION_LOG" "missing_artifact" 1
+emit_follow_window_evidence "failed-sample" "$WINDOW_SUMMARY" "$STATE_FILE" "$SAMPLE_DIR/sample.meta.json" "$SAMPLE_DIR/triage.json"
 
 init_scenario "failed-sample-retry-enabled" "missing_artifact"
 run_follow_diff_window_capture 1 --retry-failed
@@ -979,6 +1091,7 @@ if summary.get("retry_failed") is not True:
 if not isinstance(summary.get("run_id"), str) or not summary["run_id"]:
     raise SystemExit("ASSERT FAIL: --retry-failed 场景 summary.run_id 应为非空字符串")
 PY
+emit_follow_window_evidence "failed-sample-retry-enabled" "$WINDOW_SUMMARY" "$STATE_FILE"
 
 init_scenario "stale-running" "dump_success"
 STALE_SAMPLE_ID="id:009999,orig:stale__deadbeef"
@@ -1036,5 +1149,6 @@ if summary.get("recovery_sample_id") != stale_sample_id:
         f"ASSERT FAIL: stale recovery summary.recovery_sample_id={summary.get('recovery_sample_id')!r} != {stale_sample_id!r}"
     )
 PY
+emit_follow_window_evidence "stale-running" "$WINDOW_SUMMARY" "$STATE_FILE" "" "" "$STALE_SAMPLE_ID"
 
 printf 'PASS: follow-diff-window contract test passed\n'

@@ -36,10 +36,11 @@ usage() {
 		'用法:' \
 		'  unbound_experiment/run_unbound_afl_symcc.sh <命令>' \
 		'' \
-		'保留的薄包装命令:' \
-		'  fetch              直接 git clone Unbound release-1.24.2 源码树' \
-		'  dump-cache <样本> [输出文件]' \
-		'                     直接调用 unbound-fuzzme 并导出 cache dump' \
+		'兼容转发命令（真实语义统一由 python3 -m tools.dns_diff.cli 持有）:' \
+		'  fetch [--target <目标>]' \
+		'                     转发到 python3 -m tools.dns_diff.cli fetch' \
+		'  dump-cache [--target <目标>] [样本] [输出文件]' \
+		'                     转发到 python3 -m tools.dns_diff.cli dump-cache（默认 target=unbound）' \
 		'  parse-cache <resolver> <dump文件> [输出文件]' \
 		'                     转发到 python3 -m tools.dns_diff.cli parse-cache' \
 		'  replay-diff-cache <样本> [输出目录]' \
@@ -57,7 +58,7 @@ usage() {
 		'  start / run / stop / status' \
 		'' \
 		'边界说明:' \
-		'  1. shell 仅保留命令路由、环境注入、路径检查、timeout 外壳与直接外部调用。' \
+		'  1. shell 仅保留命令路由、环境注入与兼容性 glue，不再持有业务编排。' \
 		'  2. dns-diff 相关逻辑统一以 python3 -m tools.dns_diff.cli 为真入口。' \
 		'  3. 旧的 seed/build/explore/status 等业务编排已从本 wrapper 移除。' \
 		'  4. triage / report 仅保留在 Python 真入口，不再在 shell wrapper 暴露别名。'
@@ -105,44 +106,6 @@ load_profile() {
 	esac
 }
 
-tree_ld_library_path() {
-	local tree="$1"
-	local dirs=()
-
-	mapfile -t dirs < <(find "$tree" -type d -path '*/.libs' | sort)
-	[ "${#dirs[@]}" -gt 0 ] || die "未找到 $tree 下的 .libs 目录，请先构建"
-	(
-		IFS=:
-		printf '%s' "${dirs[*]}"
-	)
-}
-
-afl_target_bin() {
-	printf '%s' "$AFL_TREE/.libs/unbound-fuzzme"
-}
-
-fetch_unbound() {
-	require_cmd git
-	ensure_basic_dirs
-
-	if [ -d "$SRC_TREE/.git" ]; then
-		log "Unbound 源码树已存在: $SRC_TREE"
-		return 0
-	fi
-
-	if [ -e "$SRC_TREE" ]; then
-		die "目标路径已存在但不是 git clone 结果: $SRC_TREE"
-	fi
-
-	log "拉取 Unbound $UNBOUND_TAG"
-	(
-		cd "$ROOT_DIR"
-		git clone --depth 1 --branch "$UNBOUND_TAG" \
-			https://github.com/NLnetLabs/unbound.git \
-			"$(basename "$SRC_TREE")"
-	)
-}
-
 forward_dns_diff_cli() {
 	local subcommand="$1"
 	shift
@@ -156,10 +119,12 @@ forward_dns_diff_cli() {
 		;;
 	esac
 
-	load_profile
-	ensure_basic_dirs
 	require_cmd python3
 	require_file "$ROOT_DIR/tools/dns_diff/cli.py"
+	if [ "$subcommand" != 'fetch' ]; then
+		load_profile
+		ensure_basic_dirs
+	fi
 
 	if [ -n "$DNS_DIFF_CLI_TIMEOUT_SEC" ]; then
 		env \
@@ -200,74 +165,6 @@ forward_dns_diff_cli() {
 		python3 -m tools.dns_diff.cli "$subcommand" "$@"
 }
 
-dump_unbound_cache() {
-	local sample="${1:-}"
-	local output_path="${2:-}"
-	local base_name="empty"
-	local target
-	local ld_path
-	local stderr_file
-	local rc=0
-
-	load_profile
-	ensure_basic_dirs
-	require_cmd timeout
-
-	target="$(afl_target_bin)"
-	require_file "$target"
-	ld_path="$(tree_ld_library_path "$AFL_TREE")"
-	stderr_file="$WORK_DIR/unbound_dump_cache.stderr"
-
-	if [ -n "$sample" ]; then
-		require_file "$sample"
-		require_dir "$RESPONSE_CORPUS_DIR"
-		base_name="$(basename "$sample")"
-	fi
-
-	if [ -z "$output_path" ]; then
-		output_path="$CACHE_DUMP_DIR/${base_name}.unbound.cache.txt"
-	fi
-
-	mkdir -p "$(dirname "$output_path")"
-	rm -f "$output_path" "$stderr_file"
-
-	set +e
-	if [ -n "$sample" ]; then
-		env \
-			LD_LIBRARY_PATH="$ld_path" \
-			UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR="$RESPONSE_CORPUS_DIR" \
-			UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH="$output_path" \
-			UNBOUND_RESOLVER_AFL_SYMCC_LOG=1 \
-			timeout -k 2 "$SEED_TIMEOUT_SEC" "$target" \
-			<"$sample" \
-			>/dev/null 2>"$stderr_file"
-	else
-		env \
-			LD_LIBRARY_PATH="$ld_path" \
-			UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH="$output_path" \
-			UNBOUND_RESOLVER_AFL_SYMCC_LOG=1 \
-			timeout -k 2 "$SEED_TIMEOUT_SEC" "$target" \
-			</dev/null \
-			>/dev/null 2>"$stderr_file"
-	fi
-	rc=$?
-	set -e
-
-	case "$rc" in
-	0|1)
-		;;
-	124|137)
-		die "dump-cache 超时: rc=$rc"
-		;;
-	*)
-		die "dump-cache 异常退出: rc=$rc"
-		;;
-	esac
-
-	[ -s "$output_path" ] || die "cache dump 为空，stderr: $stderr_file"
-	log "cache dump 已写出: $output_path"
-}
-
 reject_removed_command() {
 	die "命令 '$1' 已从 thin wrapper 中移除；请迁移到 python3 -m tools.dns_diff.cli 或独立工具层，不再在 shell 中承载厚编排"
 }
@@ -280,15 +177,6 @@ main() {
 	fi
 
 	case "$cmd" in
-	fetch)
-		fetch_unbound
-		;;
-	dump-cache)
-		dump_unbound_cache "${1:-}" "${2:-}"
-		;;
-	parse-cache|replay-diff-cache|follow-diff|follow-diff-once|follow-diff-window|triage-report|campaign-report|campaign-close)
-		forward_dns_diff_cli "$cmd" "$@"
-		;;
 	build|gen-seeds|explore-response|filter-seeds|smoke|prepare|start|run|stop|status)
 		reject_removed_command "$cmd"
 		;;
@@ -296,8 +184,7 @@ main() {
 		usage
 		;;
 	*)
-		usage
-		die "未知命令: $cmd"
+		forward_dns_diff_cli "$cmd" "$@"
 		;;
 	esac
 }

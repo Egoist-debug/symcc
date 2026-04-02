@@ -62,6 +62,9 @@ class DnsDiffSchemaTest(unittest.TestCase):
             regen_seeds=False,
             refilter_queries=False,
             stable_input_dir="/tmp/named-work/stable_transcript_corpus",
+            transcript_format_version=2,
+            transcript_max_responses=3,
+            response_preserve=20,
             recorded_at="2026-03-26T00:00:00Z",
         )
         payload = build_sample_meta_payload(
@@ -78,6 +81,23 @@ class DnsDiffSchemaTest(unittest.TestCase):
         )
         self.assertEqual(seed_provenance, payload.get("seed_provenance"))
 
+    def test_build_seed_provenance_payload_keeps_legacy_shape_when_optional_fields_absent(
+        self,
+    ) -> None:
+        payload = build_seed_provenance_payload(
+            cold_start=False,
+            seed_source_dir="/tmp/named-work/stable_transcript_corpus",
+            seed_materialization_method="reused_filtered_corpus",
+            seed_snapshot_id="a" * 40,
+            regen_seeds=False,
+            refilter_queries=False,
+            stable_input_dir="/tmp/named-work/stable_transcript_corpus",
+            recorded_at="2026-03-26T00:00:00Z",
+        )
+        self.assertNotIn("transcript_format_version", payload)
+        self.assertNotIn("transcript_max_responses", payload)
+        self.assertNotIn("response_preserve", payload)
+
     def test_validate_seed_provenance_fields_rejects_invalid_boolean(self) -> None:
         errors = validate_seed_provenance_fields(
             {
@@ -92,6 +112,43 @@ class DnsDiffSchemaTest(unittest.TestCase):
             }
         )
         self.assertTrue(any("cold_start 必须是布尔值" in error for error in errors))
+
+    def test_validate_seed_provenance_fields_rejects_invalid_transcript_metadata(
+        self,
+    ) -> None:
+        errors = validate_seed_provenance_fields(
+            {
+                "cold_start": False,
+                "seed_source_dir": "/tmp/source",
+                "seed_materialization_method": "reused_filtered_corpus",
+                "seed_snapshot_id": "a" * 40,
+                "regen_seeds": False,
+                "refilter_queries": False,
+                "stable_input_dir": "/tmp/stable",
+                "transcript_format_version": "2",
+                "transcript_max_responses": 0,
+                "response_preserve": -1,
+                "recorded_at": "2026-03-26T00:00:00Z",
+            }
+        )
+        self.assertTrue(
+            any(
+                "transcript_format_version 若提供则必须是 >=1 的整数" in error
+                for error in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                "transcript_max_responses 若提供则必须是 >=1 的整数" in error
+                for error in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                "response_preserve 若提供则必须是 >=0 的整数" in error
+                for error in errors
+            )
+        )
 
     def test_validate_sample_meta_fields_rejects_invalid_seed_provenance(self) -> None:
         payload = build_sample_meta_payload(
@@ -119,6 +176,42 @@ class DnsDiffSchemaTest(unittest.TestCase):
         self.assertTrue(
             any(
                 "seed_provenance.recorded_at 必须是 ISO-8601 时间戳" in error
+                for error in errors
+            )
+        )
+
+    def test_validate_sample_meta_fields_rejects_invalid_transcript_seed_provenance(
+        self,
+    ) -> None:
+        payload = build_sample_meta_payload(
+            sample_id="id:000001__deadbeef",
+            queue_event_id="id:000001",
+            source_queue_file="/tmp/queue/id:000001",
+            sample_sha1="deadbeef",
+            sample_size=4,
+            status="completed",
+            source_resolver="unbound",
+            is_stateful=False,
+            afl_tags=[],
+        )
+        payload["seed_provenance"] = {
+            "cold_start": False,
+            "seed_source_dir": "/tmp/source",
+            "seed_materialization_method": "reused_filtered_corpus",
+            "seed_snapshot_id": "a" * 40,
+            "regen_seeds": False,
+            "refilter_queries": False,
+            "stable_input_dir": "/tmp/stable",
+            "transcript_format_version": "2",
+            "transcript_max_responses": 3,
+            "response_preserve": 20,
+            "recorded_at": "2026-03-26T00:00:00Z",
+        }
+        errors = validate_sample_meta_fields(payload)
+        self.assertTrue(
+            any(
+                "seed_provenance.transcript_format_version 若提供则必须是 >=1 的整数"
+                in error
                 for error in errors
             )
         )

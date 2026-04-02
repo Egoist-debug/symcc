@@ -17,14 +17,41 @@ from .follow_diff import (
 from .matrix import CampaignMatrixError, run_campaign_matrix
 from .report import ReportError, default_follow_diff_root, generate_report
 from .replay import ReplayError, replay_diff_cache
+from .targets import (
+    TargetRegistryError,
+    dump_cache,
+    fetch_target,
+    registered_resolver_names,
+    registered_target_names,
+    resolve_cache_resolver,
+)
 from .triage import TriageError, rewrite_triage_root
 
 
-def _fail_unimplemented(command: str) -> int:
-    sys.stderr.write(
-        f"dns-diff: 子命令 {command!r} 尚未实现（本任务仅提供基础 CLI 框架）\n"
-    )
-    return 2
+def _target_help() -> str:
+    registered = ", ".join(registered_target_names())
+    return f"目标名（已注册: {registered}；默认: unbound）"
+
+
+def _resolver_help() -> str:
+    registered = ", ".join(registered_resolver_names())
+    return f"resolver 类型（已注册: {registered}）"
+
+
+def _cmd_fetch(args: argparse.Namespace) -> int:
+    try:
+        return fetch_target(args.target)
+    except TargetRegistryError as exc:
+        sys.stderr.write(f"dns-diff: fetch 失败: {exc}\n")
+        return exc.exit_code
+
+
+def _cmd_dump_cache(args: argparse.Namespace) -> int:
+    try:
+        return dump_cache(args.target, args.sample, args.output_file)
+    except TargetRegistryError as exc:
+        sys.stderr.write(f"dns-diff: dump-cache 失败: {exc}\n")
+        return exc.exit_code
 
 
 def _cmd_follow_diff(_: argparse.Namespace) -> int:
@@ -56,9 +83,10 @@ def _cmd_follow_diff_window(args: argparse.Namespace) -> int:
 
 def _cmd_parse_cache(args: argparse.Namespace) -> int:
     try:
-        write_cache_tsv(args.resolver, args.dump_file, args.output_file)
+        resolver = resolve_cache_resolver(args.resolver)
+        write_cache_tsv(resolver, args.dump_file, args.output_file)
         return 0
-    except CacheParseError as exc:
+    except (CacheParseError, TargetRegistryError) as exc:
         sys.stderr.write(f"dns-diff: parse-cache 失败: {exc}\n")
         return exc.exit_code
 
@@ -167,13 +195,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m tools.dns_diff.cli",
         description=(
-            "dns-diff Python 真入口；thin wrapper 仅转发 parse-cache、"
-            "replay-diff-cache、follow-diff、follow-diff-once、follow-diff-window、triage-report、"
-            "campaign-report、case-study-export、campaign-close、campaign-aggregate、campaign-matrix，"
-            "triage/report/close-loop/matrix 仅通过 Python CLI 直调。"
+            "dns-diff Python 真入口；target/resolver 选择统一走 registry，"
+            "thin wrapper 只做兼容转发与环境注入。"
         ),
     )
+    if hasattr(parser, "suggest_on_error"):
+        setattr(parser, "suggest_on_error", True)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fetch = subparsers.add_parser("fetch", help="拉取实验目标源码树")
+    fetch.add_argument("--target", default="unbound", help=_target_help())
+    fetch.set_defaults(handler=_cmd_fetch)
+
+    dump_cache_parser = subparsers.add_parser(
+        "dump-cache", help="直接调用目标并导出 cache dump"
+    )
+    dump_cache_parser.add_argument("--target", default="unbound", help=_target_help())
+    dump_cache_parser.add_argument("sample", nargs="?", help="可选输入样本路径")
+    dump_cache_parser.add_argument("output_file", nargs="?", help="可选输出文件路径")
+    dump_cache_parser.set_defaults(handler=_cmd_dump_cache)
 
     follow_diff = subparsers.add_parser("follow-diff", help="跟随 queue 进行差分消费")
     follow_diff.set_defaults(handler=_cmd_follow_diff)
@@ -201,7 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     follow_diff_window.set_defaults(handler=_cmd_follow_diff_window)
 
     parse_cache = subparsers.add_parser("parse-cache", help="解析 resolver cache dump")
-    parse_cache.add_argument("resolver", help="resolver 类型，例如 unbound 或 bind9")
+    parse_cache.add_argument("resolver", help=_resolver_help())
     parse_cache.add_argument("dump_file", help="cache dump 文件路径")
     parse_cache.add_argument("output_file", nargs="?", help="可选输出文件路径")
     parse_cache.set_defaults(handler=_cmd_parse_cache)

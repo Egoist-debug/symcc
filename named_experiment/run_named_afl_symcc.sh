@@ -11,7 +11,8 @@ UNBOUND_REPORT_WORK_DIR="$ROOT_DIR/unbound_experiment/work_stateful"
 NAMED_HIGH_VALUE_MANIFEST="$WORK_DIR/high_value_samples.txt"
 UNBOUND_REPORT_HIGH_VALUE_MANIFEST="$UNBOUND_REPORT_WORK_DIR/high_value_samples.txt"
 DEFAULT_SYMCC_HIGH_VALUE_MANIFEST="$NAMED_HIGH_VALUE_MANIFEST"
-PATCH_DIR="$ROOT_DIR/patch/bind9"
+PATCH_ROOT="$ROOT_DIR/patch"
+PATCH_VARIANT="${PATCH_VARIANT:-cache}"
 SRC_TREE="$ROOT_DIR/bind-9.18.46"
 AFL_TREE="$ROOT_DIR/bind-9.18.46-afl"
 SYMCC_TREE="$ROOT_DIR/bind-9.18.46-symcc"
@@ -76,7 +77,9 @@ RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-500}"
 RESPONSE_QUERY_SEEDS="${RESPONSE_QUERY_SEEDS:-8}"
 TRANSCRIPT_MAX_ITER="${TRANSCRIPT_MAX_ITER:-256}"
 TRANSCRIPT_RESPONSE_SEEDS="${TRANSCRIPT_RESPONSE_SEEDS:-24}"
+TRANSCRIPT_MAX_RESPONSES="${TRANSCRIPT_MAX_RESPONSES:-3}"
 RESPONSE_PRESERVE="${RESPONSE_PRESERVE:-20}"
+TRANSCRIPT_FORMAT_VERSION="${TRANSCRIPT_FORMAT_VERSION:-2}"
 RUN_DURATION_SEC="${RUN_DURATION_SEC:-180}"
 FUZZ_PROFILE="${FUZZ_PROFILE:-poison-stateful}"
 TRANSCRIPT_GEN_TARGET="${TRANSCRIPT_GEN_TARGET:-/bin/true}"
@@ -115,7 +118,7 @@ usage() {
 
 默认约定:
   1. AFL++ 目标使用 shared-memory testcase 持久模式，仍由 target 内部注入线程驱动执行。
-  2. patch/ 作为实验补丁源，会同步到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
+  2. patch/ 按 PATCH_VARIANT(cache|fuzz) + resolver 分层；named 只同步 patch/<variant>/bind9 到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
   3. 运行产物默认写入 named_experiment/work/，可通过 WORK_DIR 覆盖。
   4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
   5. FUZZ_PROFILE 支持 legacy-response-tail 与 poison-stateful，默认 poison-stateful。
@@ -123,6 +126,7 @@ usage() {
 
 常用环境变量:
   FUZZ_PROFILE=poison-stateful
+  PATCH_VARIANT=cache|fuzz (兼容旧值 diff->cache；默认 cache)
   JOBS=2
   ENABLE_SECONDARY=1
   AFL_TIMEOUT_MS=7000+
@@ -140,6 +144,9 @@ usage() {
   RESPONSE_QUERY_SEEDS=8
   TRANSCRIPT_MAX_ITER=256
   TRANSCRIPT_RESPONSE_SEEDS=24
+  TRANSCRIPT_FORMAT_VERSION=2
+  TRANSCRIPT_MAX_RESPONSES=3
+  RESPONSE_PRESERVE=20
   TRANSCRIPT_GEN_TARGET=/bin/true
   RUN_DURATION_SEC=180
   MUTATOR_ADDR=127.0.0.1:55300
@@ -214,6 +221,9 @@ show_semantic_config_summary() {
 	printf '  %-14s %s\n' "mutator_only" "$DST1_MUTATOR_ONLY"
 	printf '  %-14s %s\n' "reload_sec" "$frontier_reload_sec"
 	printf '  %-14s %s\n' "retry_limit" "$frontier_retry_limit"
+	printf '  %-28s %s\n' "transcript_format_version" "$TRANSCRIPT_FORMAT_VERSION"
+	printf '  %-28s %s\n' "transcript_max_responses" "$TRANSCRIPT_MAX_RESPONSES"
+	printf '  %-28s %s\n' "response_preserve" "$RESPONSE_PRESERVE"
 }
 
 active_source_generated_this_run() {
@@ -241,6 +251,9 @@ write_seed_provenance_sidecar() {
 		SEED_PROVENANCE_METHOD="$materialization_method" \
 		SEED_PROVENANCE_REGEN_SEEDS="$REGEN_SEEDS" \
 		SEED_PROVENANCE_REFILTER_QUERIES="$REFILTER_QUERIES" \
+		SEED_PROVENANCE_TRANSCRIPT_FORMAT_VERSION="$TRANSCRIPT_FORMAT_VERSION" \
+		SEED_PROVENANCE_TRANSCRIPT_MAX_RESPONSES="$TRANSCRIPT_MAX_RESPONSES" \
+		SEED_PROVENANCE_RESPONSE_PRESERVE="$RESPONSE_PRESERVE" \
 		python3 - <<'PY'
 import datetime
 import hashlib
@@ -256,6 +269,13 @@ def env_bool(name: str) -> bool:
 def optional_path(name: str):
     value = os.environ.get(name, "").strip()
     return str(Path(value).resolve()) if value else None
+
+
+def env_int(name: str):
+    value = os.environ.get(name, "").strip()
+    if value == "":
+        return None
+    return int(value)
 
 
 def snapshot_dir(path_text: str | None):
@@ -292,6 +312,9 @@ payload = {
     "regen_seeds": env_bool("SEED_PROVENANCE_REGEN_SEEDS"),
     "refilter_queries": env_bool("SEED_PROVENANCE_REFILTER_QUERIES"),
     "stable_input_dir": stable_input_dir,
+    "transcript_format_version": env_int("SEED_PROVENANCE_TRANSCRIPT_FORMAT_VERSION"),
+    "transcript_max_responses": env_int("SEED_PROVENANCE_TRANSCRIPT_MAX_RESPONSES"),
+    "response_preserve": env_int("SEED_PROVENANCE_RESPONSE_PRESERVE"),
     "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
 }
 
@@ -331,12 +354,76 @@ print(f"  {'cold_start':14s} {payload.get('cold_start')}")
 print(f"  {'seed_source':14s} {payload.get('seed_source_dir') or '<unset>'}")
 print(f"  {'stable_input':14s} {payload.get('stable_input_dir') or '<unset>'}")
 print(f"  {'snapshot_id':14s} {payload.get('seed_snapshot_id') or '<unset>'}")
+print(f"  {'transcript_format_version':28s} {payload.get('transcript_format_version')}")
+print(f"  {'transcript_max_responses':28s} {payload.get('transcript_max_responses')}")
+print(f"  {'response_preserve':28s} {payload.get('response_preserve')}")
 PY
+}
+
+validate_transcript_seed_v2_two_part() {
+	local sample="$1"
+
+	python3 - "$sample" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+sample_path = Path(sys.argv[1])
+data = sample_path.read_bytes()
+
+if len(data) < 8:
+    raise SystemExit(f"{sample_path}: transcript seed 太短，无法解析两段式 header")
+
+if data[:4] != b"DST1":
+    raise SystemExit(f"{sample_path}: transcript magic 非 DST1，拒绝作为两段式 v2 seed")
+
+response_count = data[4]
+version = data[5]
+query_len = struct.unpack_from("<H", data, 6)[0]
+offset = 8
+length_table_bytes = response_count * 2
+
+if len(data) < offset + length_table_bytes:
+    raise SystemExit(f"{sample_path}: transcript seed 不完整，缺少 response length 表")
+
+response_lengths = []
+for _ in range(response_count):
+    response_lengths.append(struct.unpack_from("<H", data, offset)[0])
+    offset += 2
+
+if version != 2:
+    raise SystemExit(
+        f"{sample_path}: transcript version={version}，仅支持 version=2 两段式 seed"
+    )
+
+expected_total = offset + query_len + sum(response_lengths)
+actual_total = len(data)
+if expected_total != actual_total:
+    raise SystemExit(
+        f"{sample_path}: transcript 长度不匹配，期望 {expected_total} 实际 {actual_total}（疑似旧三段式或损坏 seed）"
+    )
+PY
+}
+
+validate_transcript_corpus_dir_or_die() {
+	local dir_path="$1"
+	local context_tag="$2"
+	local sample
+
+	[ -d "$dir_path" ] || return 0
+	for sample in "$dir_path"/*; do
+		[ -f "$sample" ] || continue
+		if ! validate_transcript_seed_v2_two_part "$sample"; then
+			die "$context_tag 检测到旧三段式/非 version=2 transcript seed: $sample。请删除旧语料后重新生成 transcript corpus（例如设置 REGEN_SEEDS=1 重新跑 gen-seeds/prepare）。"
+		fi
+	done
 }
 
 prepare_transcript_seed_mix() {
 	local seed_index
 	local sample
+
+	validate_transcript_corpus_dir_or_die "$TRANSCRIPT_CORPUS_DIR" "prepare_transcript_seed_mix"
 
 	rm -rf "$TRANSCRIPT_SEED_MIX_DIR"
 	mkdir -p "$TRANSCRIPT_SEED_MIX_DIR"
@@ -383,6 +470,9 @@ load_profile() {
 		;;
 	esac
 	apply_profile_semantic_defaults
+	if [ "$TRANSCRIPT_FORMAT_VERSION" != "2" ]; then
+		die "仅支持两段式 transcript 格式版本：TRANSCRIPT_FORMAT_VERSION 必须为 2（当前: $TRANSCRIPT_FORMAT_VERSION）"
+	fi
 }
 
 active_input_corpus_dir() {
@@ -428,59 +518,176 @@ ensure_tree_exists() {
 	fi
 }
 
+validate_patch_variant() {
+	local variant="$1"
+	case "$variant" in
+	cache|diff|fuzz)
+		;;
+	*)
+		die "未知 PATCH_VARIANT: $variant（仅支持 cache、fuzz，兼容旧值 diff）"
+		;;
+	esac
+}
+
+normalize_patch_variant() {
+	local variant="$1"
+	validate_patch_variant "$variant"
+	case "$variant" in
+	diff)
+		printf '%s' cache
+		;;
+	*)
+		printf '%s' "$variant"
+		;;
+	esac
+}
+
+bind9_patch_variant_root() {
+	local variant="$1"
+	local normalized_variant=""
+
+	normalized_variant="$(normalize_patch_variant "$variant")"
+	printf '%s/%s/bind9' "$PATCH_ROOT" "$normalized_variant"
+}
+
+patch_variant_mappings() {
+	local variant="$1"
+	local normalized_variant=""
+
+	normalized_variant="$(normalize_patch_variant "$variant")"
+	case "$normalized_variant" in
+	cache)
+		printf '%s\n' \
+			"bin/named/main.c:bin/named/main.c" \
+			"bin/named/resolver_afl_symcc_orchestrator.c:bin/named/resolver_afl_symcc_orchestrator.c" \
+			"bin/named/resolver_afl_symcc_mutator_server.c:bin/named/resolver_afl_symcc_mutator_server.c" \
+			"include/named/resolver_afl_symcc_orchestrator.h:bin/named/include/named/resolver_afl_symcc_orchestrator.h" \
+			"include/named/resolver_afl_symcc_mutator_server.h:bin/named/include/named/resolver_afl_symcc_mutator_server.h" \
+			"lib/dns/dispatch.c:lib/dns/dispatch.c" \
+			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h" \
+			"lib/ns/client.c:lib/ns/client.c"
+		;;
+	fuzz)
+		printf '%s\n' \
+			"bin/named/fuzz.c:bin/named/fuzz.c" \
+			"lib/ns/client.c:lib/ns/client.c"
+		;;
+	esac
+}
+
+patch_source_mappings() {
+	local variant="$1"
+	patch_variant_mappings "$variant"
+}
+
+copy_if_different() {
+	local src="$1"
+	local dst="$2"
+	mkdir -p "$(dirname "$dst")"
+	if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+		return 0
+	fi
+	cp "$src" "$dst"
+}
+
+snapshot_patch_tree_variant_baselines() {
+	local tree="$1"
+	local baseline_root="$tree/.symcc_patch_baseline"
+	local files_root="$baseline_root/files"
+	local absent_root="$baseline_root/absent"
+	local variant=""
+	local src_rel=""
+	local dst_rel=""
+	local baseline_path=""
+	local absent_path=""
+
+	[ -d "$tree" ] || return 0
+	mkdir -p "$files_root" "$absent_root"
+
+	for variant in cache fuzz; do
+		while IFS=: read -r src_rel dst_rel; do
+			[ -n "$dst_rel" ] || continue
+			baseline_path="$files_root/$dst_rel"
+			absent_path="$absent_root/$dst_rel"
+			if [ -f "$baseline_path" ] || [ -e "$absent_path" ]; then
+				continue
+			fi
+			mkdir -p "$(dirname "$baseline_path")" "$(dirname "$absent_path")"
+			if [ -e "$tree/$dst_rel" ]; then
+				cp "$tree/$dst_rel" "$baseline_path"
+			else
+				: >"$absent_path"
+			fi
+		done < <(patch_variant_mappings "$variant")
+	done
+}
+
+restore_inactive_patch_variant_files() {
+	local tree="$1"
+	local active_variant="$2"
+	local normalized_active_variant=""
+	local baseline_root="$tree/.symcc_patch_baseline"
+	local files_root="$baseline_root/files"
+	local absent_root="$baseline_root/absent"
+	local variant=""
+	local src_rel=""
+	local dst_rel=""
+	local baseline_path=""
+	local absent_path=""
+
+	normalized_active_variant="$(normalize_patch_variant "$active_variant")"
+	for variant in cache fuzz; do
+		[ "$variant" = "$normalized_active_variant" ] && continue
+		while IFS=: read -r src_rel dst_rel; do
+			[ -n "$dst_rel" ] || continue
+			baseline_path="$files_root/$dst_rel"
+			absent_path="$absent_root/$dst_rel"
+			if [ -f "$baseline_path" ]; then
+				copy_if_different "$baseline_path" "$tree/$dst_rel"
+			elif [ -e "$absent_path" ]; then
+				rm -f "$tree/$dst_rel"
+			fi
+		done < <(patch_variant_mappings "$variant")
+	done
+}
+
 sync_patch_tree() {
 	local tree="$1"
+	local variant="${2:-$PATCH_VARIANT}"
+	local patch_variant_root=""
+	local src_rel=""
+	local dst_rel=""
+	validate_patch_variant "$variant"
 	[ -d "$tree" ] || return 0
 
-	copy_if_different() {
-		local src="$1"
-		local dst="$2"
-		if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
-			return 0
-		fi
-		cp "$src" "$dst"
-	}
+	patch_variant_root="$(bind9_patch_variant_root "$variant")"
+	snapshot_patch_tree_variant_baselines "$tree"
+	restore_inactive_patch_variant_files "$tree" "$variant"
 
-	mkdir -p \
-		"$tree/bin/named" \
-		"$tree/bin/named/include/named" \
-		"$tree/lib/dns" \
-		"$tree/lib/dns/include/dns" \
-		"$tree/lib/ns"
-	copy_if_different "$PATCH_DIR/bin/named/main.c" "$tree/bin/named/main.c"
-	copy_if_different "$PATCH_DIR/bin/named/fuzz.c" "$tree/bin/named/fuzz.c"
-	copy_if_different "$PATCH_DIR/bin/named/resolver_afl_symcc_orchestrator.c" \
-		"$tree/bin/named/resolver_afl_symcc_orchestrator.c"
-	copy_if_different "$PATCH_DIR/bin/named/resolver_afl_symcc_mutator_server.c" \
-		"$tree/bin/named/resolver_afl_symcc_mutator_server.c"
-	copy_if_different "$PATCH_DIR/lib/dns/dispatch.c" \
-		"$tree/lib/dns/dispatch.c"
-	copy_if_different "$PATCH_DIR/lib/ns/client.c" \
-		"$tree/lib/ns/client.c"
-	copy_if_different "$PATCH_DIR/include/named/resolver_afl_symcc_orchestrator.h" \
-		"$tree/bin/named/include/named/resolver_afl_symcc_orchestrator.h"
-	copy_if_different "$PATCH_DIR/include/named/resolver_afl_symcc_mutator_server.h" \
-		"$tree/bin/named/include/named/resolver_afl_symcc_mutator_server.h"
-	copy_if_different "$PATCH_DIR/lib/dns/include/dns/dispatch.h" \
-		"$tree/lib/dns/include/dns/dispatch.h"
+	while IFS=: read -r src_rel dst_rel; do
+		[ -n "$src_rel" ] || continue
+		copy_if_different "$patch_variant_root/$src_rel" "$tree/$dst_rel"
+	done < <(patch_source_mappings "$variant")
 }
 
 sync_patch() {
-	require_file "$PATCH_DIR/bin/named/main.c"
-	require_file "$PATCH_DIR/bin/named/fuzz.c"
-	require_file "$PATCH_DIR/bin/named/resolver_afl_symcc_orchestrator.c"
-	require_file "$PATCH_DIR/bin/named/resolver_afl_symcc_mutator_server.c"
-	require_file "$PATCH_DIR/lib/dns/dispatch.c"
-	require_file "$PATCH_DIR/lib/ns/client.c"
-	require_file "$PATCH_DIR/include/named/resolver_afl_symcc_orchestrator.h"
-	require_file "$PATCH_DIR/include/named/resolver_afl_symcc_mutator_server.h"
-	require_file "$PATCH_DIR/lib/dns/include/dns/dispatch.h"
+	local variant="${1:-$PATCH_VARIANT}"
+	local patch_variant_root=""
+	local src_rel=""
+	local dst_rel=""
+	validate_patch_variant "$variant"
 
-	sync_patch_tree "$SRC_TREE"
+	patch_variant_root="$(bind9_patch_variant_root "$variant")"
+	while IFS=: read -r src_rel dst_rel; do
+		[ -n "$src_rel" ] || continue
+		require_file "$patch_variant_root/$src_rel"
+	done < <(patch_source_mappings "$variant")
+
+	sync_patch_tree "$SRC_TREE" "$variant"
 	ensure_tree_exists "$AFL_TREE"
 	ensure_tree_exists "$SYMCC_TREE"
-	sync_patch_tree "$AFL_TREE"
-	sync_patch_tree "$SYMCC_TREE"
+	sync_patch_tree "$AFL_TREE" "$variant"
+	sync_patch_tree "$SYMCC_TREE" "$variant"
 }
 
 build_helper_and_gen_input() {
@@ -541,7 +748,7 @@ build_afl_named() {
 
 	require_file "$AFL_CC_BIN"
 	ensure_tree_exists "$AFL_TREE"
-	sync_patch_tree "$AFL_TREE"
+	sync_patch_tree "$AFL_TREE" "$PATCH_VARIANT"
 
 	if [ ! -f "$AFL_TREE/config.status" ]; then
 		reconfigure=1
@@ -579,7 +786,7 @@ build_symcc_named() {
 	require_file "$SYMCC_CC_BIN"
 	require_file "$SYMCC_CXX_BIN"
 	ensure_tree_exists "$SYMCC_TREE"
-	sync_patch_tree "$SYMCC_TREE"
+	sync_patch_tree "$SYMCC_TREE" "$PATCH_VARIANT"
 
 	if [ ! -f "$SYMCC_TREE/config.status" ]; then
 		reconfigure=1
@@ -660,6 +867,13 @@ generate_seeds() {
 			>"$RESPONSE_GEN_LOG" 2>&1
 	fi
 
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ] && [ "$REGEN_SEEDS" -eq 0 ] && \
+		[ -d "$TRANSCRIPT_CORPUS_DIR" ] && \
+		[ -n "$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]
+	then
+		validate_transcript_corpus_dir_or_die "$TRANSCRIPT_CORPUS_DIR" "generate_seeds"
+	fi
+
 	if [ "$FUZZ_PROFILE" = "poison-stateful" ] && \
 		{ [ "$REGEN_SEEDS" -eq 1 ] || [ ! -d "$TRANSCRIPT_CORPUS_DIR" ] || \
 			[ -z "$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]; }
@@ -674,6 +888,7 @@ generate_seeds() {
 			-v \
 			-f dns-stateful-transcript \
 			--seed-dir "$TRANSCRIPT_SEED_MIX_DIR" \
+			--max-responses-per-transcript "$TRANSCRIPT_MAX_RESPONSES" \
 			-i "$TRANSCRIPT_MAX_ITER" \
 			-o "$TRANSCRIPT_CORPUS_DIR" \
 			"$TRANSCRIPT_GEN_TARGET" \
@@ -762,6 +977,9 @@ filter_seeds() {
 	if [ "$REFILTER_QUERIES" -eq 0 ] && [ -d "$target_dir" ] && \
 		[ -n "$(find "$target_dir" -maxdepth 1 -type f 2>/dev/null)" ]
 	then
+		if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+			validate_transcript_corpus_dir_or_die "$target_dir" "filter_seeds(reuse)"
+		fi
 		write_seed_provenance_sidecar \
 			0 \
 			"$target_dir" \
@@ -769,6 +987,10 @@ filter_seeds() {
 			"reused_filtered_corpus"
 		log "复用已有稳定输入语料: $target_dir"
 		return 0
+	fi
+
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		validate_transcript_corpus_dir_or_die "$source_dir" "filter_seeds(source)"
 	fi
 
 	build_afl_named
@@ -1012,6 +1234,9 @@ start_all() {
 		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS"
 		SYMCC_HIGH_VALUE_MANIFEST="$SYMCC_HIGH_VALUE_MANIFEST"
 	)
+	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
+		helper_env+=(RESPONSE_PRESERVE="$RESPONSE_PRESERVE")
+	fi
 	if [ -n "$SYMCC_FRONTIER_RELOAD_SEC" ]; then
 		helper_env+=(SYMCC_FRONTIER_RELOAD_SEC="$SYMCC_FRONTIER_RELOAD_SEC")
 	fi
@@ -1352,14 +1577,18 @@ main() {
 	esac
 }
 
-require_cmd timeout
-require_cmd make
-require_cmd grep
-require_cmd sed
-require_cmd find
-require_cmd awk
-require_file "$SRC_TREE"
-require_file "$NAMED_CONF_TEMPLATE"
-load_profile
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	require_cmd timeout
+	require_cmd make
+	require_cmd grep
+	require_cmd sed
+	require_cmd find
+	require_cmd awk
+	validate_patch_variant "$PATCH_VARIANT"
+	require_file "$PATCH_ROOT"
+	require_file "$SRC_TREE"
+	require_file "$NAMED_CONF_TEMPLATE"
+	load_profile
 
-main "$@"
+	main "$@"
+fi

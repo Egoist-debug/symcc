@@ -41,6 +41,12 @@ SEED_PROVENANCE_FIELDS: Sequence[str] = (
     "recorded_at",
 )
 
+SEED_PROVENANCE_OPTIONAL_INTEGER_FIELDS: Sequence[str] = (
+    "transcript_format_version",
+    "transcript_max_responses",
+    "response_preserve",
+)
+
 SAMPLE_META_REQUIRED_FIELDS: Sequence[str] = (
     "schema_version",
     "contract_version",
@@ -144,6 +150,12 @@ def _coerce_optional_text(value: Any) -> Optional[str]:
 
 def _coerce_optional_bool(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
+        return value
+    return None
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool):
         return value
     return None
 
@@ -389,6 +401,9 @@ def build_seed_provenance_payload(
     regen_seeds: Optional[bool] = None,
     refilter_queries: Optional[bool] = None,
     stable_input_dir: Optional[str] = None,
+    transcript_format_version: Optional[int] = None,
+    transcript_max_responses: Optional[int] = None,
+    response_preserve: Optional[int] = None,
     recorded_at: Optional[str] = None,
     base_payload: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -397,6 +412,13 @@ def build_seed_provenance_payload(
     base_cold_start = _coerce_optional_bool(payload.get("cold_start"))
     base_regen_seeds = _coerce_optional_bool(payload.get("regen_seeds"))
     base_refilter_queries = _coerce_optional_bool(payload.get("refilter_queries"))
+    base_transcript_format_version = _coerce_optional_int(
+        payload.get("transcript_format_version")
+    )
+    base_transcript_max_responses = _coerce_optional_int(
+        payload.get("transcript_max_responses")
+    )
+    base_response_preserve = _coerce_optional_int(payload.get("response_preserve"))
 
     payload["cold_start"] = (
         cold_start if isinstance(cold_start, bool) else bool(base_cold_start)
@@ -429,6 +451,39 @@ def build_seed_provenance_payload(
         if stable_input_dir is not None
         else payload.get("stable_input_dir")
     )
+    normalized_transcript_format_version = (
+        transcript_format_version
+        if isinstance(transcript_format_version, int)
+        and not isinstance(transcript_format_version, bool)
+        else base_transcript_format_version
+    )
+    if normalized_transcript_format_version is None:
+        payload.pop("transcript_format_version", None)
+    else:
+        payload["transcript_format_version"] = normalized_transcript_format_version
+
+    normalized_transcript_max_responses = (
+        transcript_max_responses
+        if isinstance(transcript_max_responses, int)
+        and not isinstance(transcript_max_responses, bool)
+        else base_transcript_max_responses
+    )
+    if normalized_transcript_max_responses is None:
+        payload.pop("transcript_max_responses", None)
+    else:
+        payload["transcript_max_responses"] = normalized_transcript_max_responses
+
+    normalized_response_preserve = (
+        response_preserve
+        if isinstance(response_preserve, int)
+        and not isinstance(response_preserve, bool)
+        else base_response_preserve
+    )
+    if normalized_response_preserve is None:
+        payload.pop("response_preserve", None)
+    else:
+        payload["response_preserve"] = normalized_response_preserve
+
     payload["recorded_at"] = _coerce_optional_text(
         recorded_at if recorded_at is not None else payload.get("recorded_at")
     )
@@ -765,7 +820,7 @@ def validate_sample_meta_fields(data: Mapping[str, Any]) -> List[str]:
         elif key_contract_version != normalized.get("contract_version"):
             errors.append(f"{key_name}.contract_version 必须与 contract_version 一致")
 
-    seed_provenance = normalized.get("seed_provenance")
+    seed_provenance = data.get("seed_provenance")
     if seed_provenance is not None:
         if not isinstance(seed_provenance, Mapping):
             errors.append("seed_provenance 必须是对象")
@@ -807,6 +862,39 @@ def validate_seed_provenance_fields(data: Mapping[str, Any]) -> List[str]:
             datetime.fromisoformat(ts)
         except ValueError:
             errors.append("recorded_at 必须是 ISO-8601 时间戳")
+
+    transcript_format_version = data.get("transcript_format_version")
+    if "transcript_format_version" in data and (
+        transcript_format_version is not None
+        and (
+            isinstance(transcript_format_version, bool)
+            or not isinstance(transcript_format_version, int)
+            or transcript_format_version < 1
+        )
+    ):
+        errors.append("transcript_format_version 若提供则必须是 >=1 的整数")
+
+    transcript_max_responses = data.get("transcript_max_responses")
+    if "transcript_max_responses" in data and (
+        transcript_max_responses is not None
+        and (
+            isinstance(transcript_max_responses, bool)
+            or not isinstance(transcript_max_responses, int)
+            or transcript_max_responses < 1
+        )
+    ):
+        errors.append("transcript_max_responses 若提供则必须是 >=1 的整数")
+
+    response_preserve = data.get("response_preserve")
+    if "response_preserve" in data and (
+        response_preserve is not None
+        and (
+            isinstance(response_preserve, bool)
+            or not isinstance(response_preserve, int)
+            or response_preserve < 0
+        )
+    ):
+        errors.append("response_preserve 若提供则必须是 >=0 的整数")
 
     return errors
 

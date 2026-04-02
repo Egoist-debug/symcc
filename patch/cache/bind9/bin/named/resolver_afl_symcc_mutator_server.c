@@ -12,6 +12,7 @@
  */
 
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -245,6 +246,73 @@ load_file_bytes(const char *path, uint8_t *buf, size_t buf_size, size_t *len) {
 }
 
 static int
+load_response_tail_preserve(size_t *preserve) {
+	const char *raw =
+		getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_PRESERVE");
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (raw == NULL || *raw == '\0' || preserve == NULL) {
+		return -1;
+	}
+
+	errno = 0;
+	parsed = strtoull(raw, &end, 10);
+	if (errno != 0 || end == raw || *end != '\0' || parsed > SIZE_MAX) {
+		return -1;
+	}
+
+	*preserve = (size_t)parsed;
+	return 0;
+}
+
+static int
+load_response_packet(named_resolver_afl_symcc_mutator_server_t *server,
+			 uint8_t *packet, size_t packet_max,
+			 size_t *packet_len) {
+	const char *symbolic_suffix_path =
+		getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_SYMBOLIC_SUFFIX");
+	uint8_t symbolic_suffix[65536];
+	size_t symbolic_suffix_len = 0;
+	size_t preserve = 0;
+	char path[PATH_MAX];
+
+	if (!pick_response_tail_path(server, path, sizeof(path))) {
+		return 0;
+	}
+
+	if (load_file_bytes(path, packet, packet_max, packet_len) != 0) {
+		return -1;
+	}
+
+	if (symbolic_suffix_path == NULL || *symbolic_suffix_path == '\0') {
+		return 1;
+	}
+
+	if (load_response_tail_preserve(&preserve) != 0) {
+		return -1;
+	}
+
+	if (load_file_bytes(symbolic_suffix_path, symbolic_suffix,
+			    sizeof(symbolic_suffix), &symbolic_suffix_len) != 0)
+	{
+		return -1;
+	}
+
+	if (preserve >= *packet_len) {
+		return 1;
+	}
+
+	if (preserve + symbolic_suffix_len > packet_max) {
+		return -1;
+	}
+
+	memcpy(packet + preserve, symbolic_suffix, symbolic_suffix_len);
+	*packet_len = preserve + symbolic_suffix_len;
+	return 1;
+}
+
+static int
 load_response_sections(named_resolver_afl_symcc_mutator_server_t *server,
 		       uint8_t *sections, size_t sections_max,
 		       size_t *sections_len, dns_header_t *tail_hdr,
@@ -252,18 +320,16 @@ load_response_sections(named_resolver_afl_symcc_mutator_server_t *server,
 	uint8_t packet[65536];
 	size_t packet_len = 0;
 	size_t question_end = 0;
-	char path[PATH_MAX];
 
 	*sections_len = 0;
 	memset(tail_hdr, 0, sizeof(*tail_hdr));
 	*tail_flags_hi = 0;
 	*tail_flags_lo = 0;
 
-	if (!pick_response_tail_path(server, path, sizeof(path))) {
+	if (load_response_packet(server, packet, sizeof(packet), &packet_len) == 0) {
 		return 0;
 	}
-
-	if (load_file_bytes(path, packet, sizeof(packet), &packet_len) != 0) {
+	if (packet_len == 0) {
 		return -1;
 	}
 
