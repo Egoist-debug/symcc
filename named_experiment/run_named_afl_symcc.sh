@@ -13,12 +13,17 @@ UNBOUND_REPORT_HIGH_VALUE_MANIFEST="$UNBOUND_REPORT_WORK_DIR/high_value_samples.
 DEFAULT_SYMCC_HIGH_VALUE_MANIFEST="$NAMED_HIGH_VALUE_MANIFEST"
 PATCH_ROOT="$ROOT_DIR/patch"
 PATCH_VARIANT="${PATCH_VARIANT:-cache}"
-SRC_TREE="$ROOT_DIR/bind-9.18.46"
-AFL_TREE="$ROOT_DIR/bind-9.18.46-afl"
-SYMCC_TREE="$ROOT_DIR/bind-9.18.46-symcc"
+RESOLVERS_LOCK_FILE="${RESOLVERS_LOCK_FILE:-$ROOT_DIR/experiments/resolvers.lock.json}"
+LEGACY_SRC_TREE="$ROOT_DIR/bind-9.18.46"
+LEGACY_AFL_TREE="$ROOT_DIR/bind-9.18.46-afl"
+LEGACY_SYMCC_TREE="$ROOT_DIR/bind-9.18.46-symcc"
+SRC_TREE="${SRC_TREE:-}"
+AFL_TREE="${AFL_TREE:-}"
+SYMCC_TREE="${SYMCC_TREE:-}"
 
 HELPER_BIN="$ROOT_DIR/build/linux/x86_64/release/symcc_fuzzing_helper"
 GEN_INPUT_BIN="$ROOT_DIR/build/linux/x86_64/release/gen_input"
+DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl"
 DST1_MUTATOR_LIBRARY="${DST1_MUTATOR_LIBRARY:-$ROOT_DIR/build/linux/x86_64/release/libafl_dst1_mutator.so}"
 AFL_FUZZ_BIN="${AFL_FUZZ_BIN:-/usr/local/bin/afl-fuzz}"
 AFL_CC_BIN="${AFL_CC_BIN:-/usr/local/bin/afl-clang-fast}"
@@ -118,7 +123,7 @@ usage() {
 
 默认约定:
   1. AFL++ 目标使用 shared-memory testcase 持久模式，仍由 target 内部注入线程驱动执行。
-  2. patch/ 按 PATCH_VARIANT(cache|fuzz) + resolver 分层；named 只同步 patch/<variant>/bind9 到 bind-9.18.46、bind-9.18.46-afl、bind-9.18.46-symcc。
+  2. patch/ 按 PATCH_VARIANT(cache|fuzz) + resolver 分层；named 默认同步到 experiments/subjects/bind9/<tag>、<tag>-afl、<tag>-symcc，缺少 lock/subjects 时回落到旧 bind-9.18.46* 路径。
   3. 运行产物默认写入 named_experiment/work/，可通过 WORK_DIR 覆盖。
   4. start 默认清理旧的 afl_out 和当前日志；如需保留可设置 RESET_OUTPUT=0。
   5. FUZZ_PROFILE 支持 legacy-response-tail 与 poison-stateful，默认 poison-stateful。
@@ -173,6 +178,84 @@ require_cmd() {
 
 require_file() {
 	[ -e "$1" ] || die "缺少文件: $1"
+}
+
+require_dir() {
+	[ -d "$1" ] || die "缺少目录: $1"
+}
+
+locked_tag_for() {
+	local resolver="$1"
+
+	[ -f "$RESOLVERS_LOCK_FILE" ] || return 1
+	if [ -x "$DNSLABCTL_BIN" ]; then
+		if "$DNSLABCTL_BIN" lock-resolved-tag \
+			--lock-file "$RESOLVERS_LOCK_FILE" \
+			--resolver "$resolver"
+		then
+			return 0
+		fi
+	fi
+
+	command -v python3 >/dev/null 2>&1 || return 1
+
+	python3 - "$RESOLVERS_LOCK_FILE" "$resolver" <<'PY'
+import json
+import pathlib
+import sys
+
+lock_path = pathlib.Path(sys.argv[1])
+resolver = sys.argv[2]
+payload = json.loads(lock_path.read_text(encoding="utf-8"))
+for entry in payload.get("resolvers", []):
+    if entry.get("resolver") != resolver:
+        continue
+    tag = entry.get("resolved_tag") or entry.get("desired_tag")
+    if not isinstance(tag, str) or not tag:
+        raise SystemExit(1)
+    print(tag)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+resolve_bind9_tree_layout_defaults() {
+	local locked_tag=""
+	local subject_root=""
+
+	if [ -z "$SRC_TREE" ] || [ -z "$AFL_TREE" ] || [ -z "$SYMCC_TREE" ]; then
+		if locked_tag="$(locked_tag_for bind9 2>/dev/null)"; then
+			subject_root="$ROOT_DIR/experiments/subjects/bind9/$locked_tag"
+			[ -n "$SRC_TREE" ] || SRC_TREE="$subject_root"
+			[ -n "$AFL_TREE" ] || AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/${locked_tag}-afl"
+			[ -n "$SYMCC_TREE" ] || SYMCC_TREE="$ROOT_DIR/experiments/subjects/bind9/${locked_tag}-symcc"
+		fi
+	fi
+
+	[ -n "$SRC_TREE" ] || SRC_TREE="$LEGACY_SRC_TREE"
+	[ -n "$AFL_TREE" ] || AFL_TREE="$LEGACY_AFL_TREE"
+	[ -n "$SYMCC_TREE" ] || SYMCC_TREE="$LEGACY_SYMCC_TREE"
+}
+
+ensure_src_tree_materialized() {
+	if [ -d "$SRC_TREE" ]; then
+		return 0
+	fi
+
+	if [ "$SRC_TREE" != "$LEGACY_SRC_TREE" ] && [ -x "$DNSLABCTL_BIN" ]; then
+		if "$DNSLABCTL_BIN" prepare-subject --resolver bind9 >/dev/null 2>&1; then
+			[ -d "$SRC_TREE" ] && return 0
+		fi
+	fi
+
+	if [ "$SRC_TREE" != "$LEGACY_SRC_TREE" ] && [ -d "$LEGACY_SRC_TREE" ]; then
+		log "lock/subjects 源树缺失，使用旧树初始化: $SRC_TREE <- $LEGACY_SRC_TREE"
+		mkdir -p "$(dirname "$SRC_TREE")"
+		cp -a "$LEGACY_SRC_TREE" "$SRC_TREE"
+		return 0
+	fi
+
+	die "缺少目录: $SRC_TREE"
 }
 
 resolve_semantic_frontier_manifest_default() {
@@ -512,6 +595,7 @@ afl_ld_library_path() {
 
 ensure_tree_exists() {
 	local tree="$1"
+	ensure_src_tree_materialized
 	if [ ! -d "$tree" ]; then
 		log "创建构建树: $tree"
 		cp -a "$SRC_TREE" "$tree"
@@ -588,6 +672,17 @@ copy_if_different() {
 		return 0
 	fi
 	cp "$src" "$dst"
+}
+
+apply_bind9_tree_compat_fixes() {
+	local tree="$1"
+	local qp_file="$tree/lib/dns/qp.c"
+
+	if [ -f "$qp_file" ] && grep -Fq 'chunk_get_raw(dns_qp_t *qp) {' "$qp_file"; then
+		perl -0pi -e 's/chunk_get_raw\(dns_qp_t \*qp\) \{/chunk_get_raw(dns_qp_t *qp, size_t bytes) {/g' "$qp_file"
+		perl -0pi -e 's/size_t size = chunk_size_raw\(\);\n\t\tvoid \*ptr = mmap/size_t size = chunk_size_raw();\n\t\tINSIST(bytes <= size);\n\t\tvoid *ptr = mmap/g' "$qp_file"
+		perl -0pi -e 's/return isc_mem_allocate\(qp->mctx, QP_CHUNK_BYTES\);/return isc_mem_allocate(qp->mctx, bytes);/g' "$qp_file"
+	fi
 }
 
 snapshot_patch_tree_variant_baselines() {
@@ -668,6 +763,7 @@ sync_patch_tree() {
 		[ -n "$src_rel" ] || continue
 		copy_if_different "$patch_variant_root/$src_rel" "$tree/$dst_rel"
 	done < <(patch_source_mappings "$variant")
+	apply_bind9_tree_compat_fixes "$tree"
 }
 
 sync_patch() {
@@ -676,6 +772,7 @@ sync_patch() {
 	local src_rel=""
 	local dst_rel=""
 	validate_patch_variant "$variant"
+	ensure_src_tree_materialized
 
 	patch_variant_root="$(bind9_patch_variant_root "$variant")"
 	while IFS=: read -r src_rel dst_rel; do
@@ -743,12 +840,45 @@ build_seed_parsers() {
 	fi
 }
 
+ensure_bind9_configure_ready() {
+	local tree="$1"
+	local configure_path="$tree/configure"
+
+	[ -d "$tree" ] || die "缺少目录: $tree"
+
+	if [ -x "$configure_path" ]; then
+		return 0
+	fi
+
+	if [ -f "$configure_path" ]; then
+		chmod +x "$configure_path" 2>/dev/null || true
+		if [ -x "$configure_path" ]; then
+			return 0
+		fi
+	fi
+
+	require_file "$tree/configure.ac"
+	require_cmd autoreconf
+	log "检测到 BIND9 git 源码树缺少 configure，执行 autoreconf -fi: $tree"
+	(
+		cd "$tree"
+		autoreconf -fi
+	)
+	require_file "$configure_path"
+	chmod +x "$configure_path" 2>/dev/null || true
+	[ -x "$configure_path" ] || die "autoreconf 未生成可执行 configure: $configure_path"
+}
+
 build_afl_named() {
 	local reconfigure=0
 
 	require_file "$AFL_CC_BIN"
 	ensure_tree_exists "$AFL_TREE"
 	sync_patch_tree "$AFL_TREE" "$PATCH_VARIANT"
+	if [ ! -x "$AFL_TREE/configure" ]; then
+		ensure_bind9_configure_ready "$AFL_TREE"
+		reconfigure=1
+	fi
 
 	if [ ! -f "$AFL_TREE/config.status" ]; then
 		reconfigure=1
@@ -787,6 +917,10 @@ build_symcc_named() {
 	require_file "$SYMCC_CXX_BIN"
 	ensure_tree_exists "$SYMCC_TREE"
 	sync_patch_tree "$SYMCC_TREE" "$PATCH_VARIANT"
+	if [ ! -x "$SYMCC_TREE/configure" ]; then
+		ensure_bind9_configure_ready "$SYMCC_TREE"
+		reconfigure=1
+	fi
 
 	if [ ! -f "$SYMCC_TREE/config.status" ]; then
 		reconfigure=1
@@ -1586,8 +1720,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	require_cmd awk
 	validate_patch_variant "$PATCH_VARIANT"
 	require_file "$PATCH_ROOT"
-	require_file "$SRC_TREE"
 	require_file "$NAMED_CONF_TEMPLATE"
+	resolve_bind9_tree_layout_defaults
 	load_profile
 
 	main "$@"

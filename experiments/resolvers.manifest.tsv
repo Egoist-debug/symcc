@@ -1,0 +1,7 @@
+resolver	repo_url	desired_tag	candidate_tags	note
+bind9	https://gitlab.isc.org/isc-projects/bind9.git	v9.20.22	v9.20.22,v9.18.48	producer 默认冻结当前 stable ESV，保留旧 stable 作为对照候选
+unbound	https://github.com/NLnetLabs/unbound.git	release-1.24.2	release-1.24.2	论文主线沿用当前 Unbound baseline
+maradns	https://github.com/samboy/MaraDNS.git	deadwood-3.3.02	deadwood-3.3.02,maradns-2.0.17	MaraDNS 递归解析器实际对应 Deadwood 组件
+dnsmasq	https://github.com/imp/dnsmasq.git	v2.92	v2.92,v2.93test4	优先稳定 tag，保留 test tag 供后续消融
+smartdns	https://github.com/pymumu/smartdns.git	Release47.1	Release47.1	计划文档已点名的现行稳定 tag
+knot-resolver	https://github.com/CZ-NIC/knot-resolver.git	v6.2.0	v6.2.0	Knot Resolver v6 主线

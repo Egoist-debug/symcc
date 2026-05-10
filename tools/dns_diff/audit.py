@@ -66,6 +66,7 @@ class AuditSampleRecord:
     oracle_path: Path
     cache_diff_path: Path
     triage_path: Path
+    secondary_resolver: str
     signal_response_accepted_any: bool
     signal_second_query_hit_any: bool
     signal_cache_entry_created_any: bool
@@ -107,18 +108,43 @@ def _load_json_artifact(path: Path, *, label: str) -> Dict[str, Any]:
     return dict(load_result.data)
 
 
-def _oracle_diff_fields(oracle_payload: Mapping[str, Any]) -> Tuple[str, ...]:
+def _infer_secondary_resolver_name(
+    sample_meta_payload: Mapping[str, Any], oracle_payload: Mapping[str, Any]
+) -> str:
+    artifacts = sample_meta_payload.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        for key in artifacts.keys():
+            if (
+                isinstance(key, str)
+                and key.endswith("_stderr")
+                and key != "bind9_stderr"
+            ):
+                return key[: -len("_stderr")]
+    for key in oracle_payload.keys():
+        if not isinstance(key, str) or "." not in key:
+            continue
+        prefix, _ = key.split(".", 1)
+        if prefix != "bind9":
+            return prefix
+    return "unbound"
+
+
+def _oracle_diff_fields(
+    oracle_payload: Mapping[str, Any], secondary_resolver: str
+) -> Tuple[str, ...]:
     fields: List[str] = []
     for field in ORACLE_FIELDS:
         if oracle_payload.get(f"bind9.{field}") != oracle_payload.get(
-            f"unbound.{field}"
+            f"{secondary_resolver}.{field}"
         ):
             fields.append(field)
     return tuple(fields)
 
 
-def _cache_diff_any(cache_diff_payload: Mapping[str, Any]) -> bool:
-    for resolver in ("bind9", "unbound"):
+def _cache_diff_any(
+    cache_diff_payload: Mapping[str, Any], secondary_resolver: str
+) -> bool:
+    for resolver in ("bind9", secondary_resolver):
         resolver_payload = cache_diff_payload.get(resolver)
         if not isinstance(resolver_payload, Mapping):
             continue
@@ -134,8 +160,12 @@ def _build_sample_record(sample_dir: Path) -> AuditSampleRecord:
     cache_diff_path = sample_dir / "cache_diff.json"
 
     triage_payload = _load_json_artifact(triage_path, label="triage")
+    sample_meta_payload = _load_json_artifact(sample_meta_path, label="sample.meta")
     oracle_payload = _load_json_artifact(oracle_path, label="oracle")
     cache_diff_payload = _load_json_artifact(cache_diff_path, label="cache_diff")
+    secondary_resolver = _infer_secondary_resolver_name(
+        sample_meta_payload, oracle_payload
+    )
 
     sample_id = _coerce_text(triage_payload.get("sample_id"), sample_dir.name)
     triage_status = _coerce_text(triage_payload.get("status"), "unknown")
@@ -148,31 +178,30 @@ def _build_sample_record(sample_dir: Path) -> AuditSampleRecord:
     )
 
     bind9_parse_ok = _coerce_oracle_bool(oracle_payload, "bind9.parse_ok")
-    unbound_parse_ok = _coerce_oracle_bool(oracle_payload, "unbound.parse_ok")
+    unbound_parse_ok = _coerce_oracle_bool(
+        oracle_payload, f"{secondary_resolver}.parse_ok"
+    )
     bind9_response_accepted = _coerce_oracle_bool(
         oracle_payload, "bind9.response_accepted"
     )
     unbound_response_accepted = _coerce_oracle_bool(
-        oracle_payload,
-        "unbound.response_accepted",
+        oracle_payload, f"{secondary_resolver}.response_accepted"
     )
     bind9_second_query_hit = _coerce_oracle_bool(
         oracle_payload, "bind9.second_query_hit"
     )
     unbound_second_query_hit = _coerce_oracle_bool(
-        oracle_payload,
-        "unbound.second_query_hit",
+        oracle_payload, f"{secondary_resolver}.second_query_hit"
     )
     bind9_cache_entry_created = _coerce_oracle_bool(
         oracle_payload,
         "bind9.cache_entry_created",
     )
     unbound_cache_entry_created = _coerce_oracle_bool(
-        oracle_payload,
-        "unbound.cache_entry_created",
+        oracle_payload, f"{secondary_resolver}.cache_entry_created"
     )
 
-    oracle_diff_fields = _oracle_diff_fields(oracle_payload)
+    oracle_diff_fields = _oracle_diff_fields(oracle_payload, secondary_resolver)
     response_accepted_any = bool(bind9_response_accepted) or bool(
         unbound_response_accepted
     )
@@ -184,7 +213,7 @@ def _build_sample_record(sample_dir: Path) -> AuditSampleRecord:
     )
     oracle_diff_any = len(oracle_diff_fields) > 0
     oracle_diff_plus_cache_diff = oracle_diff_any and _cache_diff_any(
-        cache_diff_payload
+        cache_diff_payload, secondary_resolver
     )
 
     return AuditSampleRecord(
@@ -207,6 +236,7 @@ def _build_sample_record(sample_dir: Path) -> AuditSampleRecord:
         oracle_path=oracle_path.resolve(),
         cache_diff_path=cache_diff_path.resolve(),
         triage_path=triage_path.resolve(),
+        secondary_resolver=secondary_resolver,
         signal_response_accepted_any=response_accepted_any,
         signal_second_query_hit_any=second_query_hit_any,
         signal_cache_entry_created_any=cache_entry_created_any,

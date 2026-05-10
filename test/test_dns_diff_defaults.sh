@@ -14,6 +14,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+locked_tag_for() {
+	local resolver="$1"
+
+	python3 - "$ROOT_DIR/experiments/resolvers.lock.json" "$resolver" <<'PY'
+import json
+import pathlib
+import sys
+
+lock_path = pathlib.Path(sys.argv[1])
+resolver = sys.argv[2]
+payload = json.loads(lock_path.read_text(encoding="utf-8"))
+for entry in payload.get("resolvers", []):
+    if entry.get("resolver") != resolver:
+        continue
+    print(entry.get("resolved_tag") or entry.get("desired_tag") or "")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 assert_file_exists() {
 	local path="$1"
 	if [ ! -f "$path" ]; then
@@ -59,6 +79,12 @@ assert_path_absent() {
 		exit 1
 	fi
 }
+
+BIND9_TAG="$(locked_tag_for bind9)"
+UNBOUND_TAG="$(locked_tag_for unbound)"
+EXPECTED_BIND9_AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/${BIND9_TAG}-afl"
+EXPECTED_UNBOUND_SRC_TREE="$ROOT_DIR/experiments/subjects/unbound/$UNBOUND_TAG"
+EXPECTED_UNBOUND_AFL_TREE="$ROOT_DIR/experiments/subjects/unbound/${UNBOUND_TAG}-afl"
 
 mkdir -p "$ISOLATED_ROOT"
 
@@ -187,6 +213,9 @@ env \
 assert_file_contains "$UNBOUND_DEFAULT_TRACE" "WORK_DIR=$WORK_OVERRIDE"
 assert_file_contains "$UNBOUND_DEFAULT_TRACE" "BIND9_WORK_DIR=$WORK_OVERRIDE"
 assert_file_contains "$UNBOUND_DEFAULT_TRACE" "FOLLOW_DIFF_SOURCE_DIR=$WORK_OVERRIDE/afl_out/master/queue"
+assert_file_contains "$UNBOUND_DEFAULT_TRACE" "SRC_TREE=$EXPECTED_UNBOUND_SRC_TREE"
+assert_file_contains "$UNBOUND_DEFAULT_TRACE" "AFL_TREE=$EXPECTED_UNBOUND_AFL_TREE"
+assert_file_contains "$UNBOUND_DEFAULT_TRACE" "BIND9_AFL_TREE=$EXPECTED_BIND9_AFL_TREE"
 assert_file_contains "$UNBOUND_DEFAULT_TRACE" "REPORT_HIGH_VALUE_MANIFEST=$WORK_OVERRIDE/high_value_samples.txt"
 assert_file_contains "$UNBOUND_DEFAULT_TRACE" "SYMCC_HIGH_VALUE_MANIFEST=$WORK_OVERRIDE/high_value_samples.txt"
 

@@ -1,0 +1,93 @@
+#pragma once
+
+#include "dnslab_core/evidence_contract.hpp"
+#include "dnslab_core/json_value.hpp"
+#include "dnslab_core/oracle.hpp"
+
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace dnslab {
+
+struct CacheRecord {
+  std::string Resolver;
+  std::string View;
+  std::string QName;
+  std::string QType;
+  std::string RRType;
+  std::string Section;
+  std::string CacheType;
+  std::string TTL;
+  std::string RDataNorm;
+  std::string Flags;
+
+  std::vector<std::string> toFields() const;
+};
+
+struct CacheDeltaItem {
+  std::string Kind;
+  int CountBefore = 0;
+  int CountAfter = 0;
+  int Delta = 0;
+  CacheRecord Fields;
+};
+
+struct ResolverCacheDiff {
+  int EntriesBefore = 0;
+  int EntriesAfter = 0;
+  bool HasCacheDiff = false;
+  int InterestingDeltaCount = 0;
+  std::vector<CacheDeltaItem> DeltaItems;
+};
+
+struct CacheDiffResult {
+  std::string SampleId;
+  bool CacheDeltaTriggered = false;
+  ResolverCacheDiff Bind9;
+  ResolverCacheDiff Unbound;
+};
+
+struct TriageRecord {
+  std::string SampleId;
+  std::string GeneratedAt;
+  std::string Status;
+  std::string DiffClass;
+  std::string AnalysisState;
+  std::optional<std::string> ExcludeReason;
+  std::string SemanticOutcome;
+  int FailureTaxonomyVersion = 1;
+  std::string FailureBucketPrimary;
+  std::string FailureBucketDetail;
+  std::vector<std::string> FilterLabels;
+  std::string ClusterKey;
+  bool CacheDeltaTriggered = false;
+  int InterestingDeltaCount = 0;
+  bool NeedsManualReview = false;
+  bool OracleAuditCandidate = false;
+  bool CaseStudyCandidate = false;
+  std::string ManualTruthStatus = "not_started";
+  std::vector<std::string> Notes;
+};
+
+std::vector<CacheRecord> parseCacheDump(const std::string &Resolver,
+                                        const std::filesystem::path &DumpPath);
+CacheDiffResult buildCacheDiff(const std::string &SampleId,
+                               const std::vector<CacheRecord> &Bind9Before,
+                               const std::vector<CacheRecord> &Bind9After,
+                               const std::vector<CacheRecord> &UnboundBefore,
+                               const std::vector<CacheRecord> &UnboundAfter,
+                               bool Triggered);
+TriageRecord buildTriageRecord(const std::string &SampleId,
+                               const json::Value::Object &OraclePayload,
+                               const CacheDiffResult &CacheDiff,
+                               const StateFingerprint &Fingerprint,
+                               const std::optional<FailureEvidence> &Failure);
+
+json::Value toJson(const CacheDeltaItem &Input);
+json::Value toJson(const ResolverCacheDiff &Input);
+json::Value toJson(const CacheDiffResult &Input);
+json::Value toJson(const TriageRecord &Input);
+
+} // namespace dnslab

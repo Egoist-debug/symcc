@@ -46,4 +46,4 @@
 
 - `named_experiment/run_named_afl_symcc.sh` 只消费 `patch/<variant>/bind9`。
 - `PATCH_VARIANT=cache|fuzz`；兼容旧值 `diff`，内部按 `cache` 处理。
-- `bind-9.18.46*` 中仍是 patch fan-out 目标树；切换 variant 时会先恢复非激活 variant 的基线文件，再覆盖当前 variant。
+- patch fan-out 默认目标树是 `experiments/subjects/bind9/<tag>`、`<tag>-afl`、`<tag>-symcc`；缺少 lock/subjects 时回落到旧 `bind-9.18.46*` 路径。切换 variant 时会先恢复非激活 variant 的基线文件，再覆盖当前 variant。

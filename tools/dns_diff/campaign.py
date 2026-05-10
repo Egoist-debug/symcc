@@ -188,6 +188,37 @@ def _build_claim(
     return payload
 
 
+def _collect_claim_review_artifacts(root_path: Path) -> List[str]:
+    ordered: List[str] = [
+        "sample.meta.json",
+        "oracle.json",
+        "cache_diff.json",
+        "triage.json",
+        "sample.bin",
+    ]
+    seen = set(ordered)
+    for sample_dir in sorted(path for path in root_path.iterdir() if path.is_dir()):
+        sample_meta_path = sample_dir / "sample.meta.json"
+        if not sample_meta_path.is_file():
+            continue
+        try:
+            payload = json.loads(sample_meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        artifacts = payload.get("artifacts")
+        if not isinstance(artifacts, dict):
+            continue
+        for key in sorted(artifacts.keys()):
+            value = artifacts.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
 def _build_publication_claims(
     *,
     summary: Mapping[str, Any],
@@ -342,15 +373,7 @@ def _write_evidence_bundle(
             "path": str(root_path.resolve()),
             "exists": root_path.is_dir(),
             "sample_dir_pattern": "<raw_sample_root>/<sample_id>/",
-            "claim_review_artifacts": [
-                "sample.meta.json",
-                "oracle.json",
-                "cache_diff.json",
-                "triage.json",
-                "sample.bin",
-                "bind9.stderr",
-                "unbound.stderr",
-            ],
+            "claim_review_artifacts": _collect_claim_review_artifacts(root_path),
         },
         "seed_provenance": summary.get("seed_provenance"),
         "regeneration_commands": regeneration_commands,

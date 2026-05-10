@@ -80,6 +80,169 @@ def _resolve_unbound_afl_tree(root_dir: Path) -> Path:
     )
 
 
+def _resolve_dnslabctl_bin(root_dir: Path) -> Path:
+    return (
+        Path(
+            os.environ.get(
+                "DNSLABCTL_BIN",
+                str(root_dir / "build" / "linux" / "x86_64" / "release" / "dnslabctl"),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_dnsmasq_tag(root_dir: Path) -> str:
+    raw = os.environ.get("DNSMASQ_TAG")
+    if raw and raw.strip():
+        return raw.strip()
+    dnslabctl = _resolve_dnslabctl_bin(root_dir)
+    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
+        try:
+            completed = subprocess.run(
+                [str(dnslabctl), "lock-resolved-tag", "--resolver", "dnsmasq"],
+                check=True,
+                cwd=root_dir,
+                capture_output=True,
+                text=True,
+            )
+            value = completed.stdout.strip()
+            if value:
+                return value
+        except subprocess.SubprocessError:
+            pass
+    return "v2.92"
+
+
+def _resolve_smartdns_tag(root_dir: Path) -> str:
+    raw = os.environ.get("SMARTDNS_TAG")
+    if raw and raw.strip():
+        return raw.strip()
+    dnslabctl = _resolve_dnslabctl_bin(root_dir)
+    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
+        try:
+            completed = subprocess.run(
+                [str(dnslabctl), "lock-resolved-tag", "--resolver", "smartdns"],
+                check=True,
+                cwd=root_dir,
+                capture_output=True,
+                text=True,
+            )
+            value = completed.stdout.strip()
+            if value:
+                return value
+        except subprocess.SubprocessError:
+            pass
+    return "Release47.1"
+
+
+def _resolve_maradns_tag(root_dir: Path) -> str:
+    raw = os.environ.get("MARADNS_TAG")
+    if raw and raw.strip():
+        return raw.strip()
+    dnslabctl = _resolve_dnslabctl_bin(root_dir)
+    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
+        try:
+            completed = subprocess.run(
+                [str(dnslabctl), "lock-resolved-tag", "--resolver", "maradns"],
+                check=True,
+                cwd=root_dir,
+                capture_output=True,
+                text=True,
+            )
+            value = completed.stdout.strip()
+            if value:
+                return value
+        except subprocess.SubprocessError:
+            pass
+    return "deadwood-3.3.02"
+
+
+def _resolve_dnsmasq_src_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_dnsmasq_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "DNSMASQ_SRC_TREE",
+                str(root_dir / "experiments" / "subjects" / "dnsmasq" / default_tag),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_dnsmasq_build_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_dnsmasq_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "DNSMASQ_BUILD_TREE",
+                str(root_dir / "experiments" / "subjects" / "dnsmasq" / f"{default_tag}-build"),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_smartdns_src_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_smartdns_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "SMARTDNS_SRC_TREE",
+                str(root_dir / "experiments" / "subjects" / "smartdns" / default_tag),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_smartdns_build_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_smartdns_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "SMARTDNS_BUILD_TREE",
+                str(root_dir / "experiments" / "subjects" / "smartdns" / f"{default_tag}-build"),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_maradns_src_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_maradns_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "MARADNS_SRC_TREE",
+                str(root_dir / "experiments" / "subjects" / "maradns" / default_tag),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_maradns_build_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_maradns_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "MARADNS_BUILD_TREE",
+                str(root_dir / "experiments" / "subjects" / "maradns" / f"{default_tag}-build"),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
 def _parse_positive_int(env_key: str, default: int) -> int:
     raw = os.environ.get(env_key)
     if raw is None or not raw.strip():
@@ -184,6 +347,216 @@ def _fetch_unbound_target() -> int:
     return 0
 
 
+def _run_dnslabctl_command(root_dir: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    dnslabctl = _resolve_dnslabctl_bin(root_dir)
+    if not dnslabctl.is_file() or not os.access(dnslabctl, os.X_OK):
+        raise TargetRegistryError(
+            f"缺少 dnslabctl 可执行文件: {dnslabctl}",
+            exit_code=EXIT_DEPENDENCY,
+        )
+    try:
+        return subprocess.run(
+            [str(dnslabctl), *args],
+            check=False,
+            cwd=root_dir,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ),
+        )
+    except FileNotFoundError as exc:
+        raise TargetRegistryError("缺少命令: dnslabctl", exit_code=EXIT_DEPENDENCY) from exc
+
+
+def _fetch_dnsmasq_target() -> int:
+    root_dir = _resolve_root_dir()
+    completed = _run_dnslabctl_command(root_dir, ["prepare-subject", "--resolver", "dnsmasq"])
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"dnsmasq prepare-subject 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    return 0
+
+
+def _fetch_smartdns_target() -> int:
+    root_dir = _resolve_root_dir()
+    completed = _run_dnslabctl_command(root_dir, ["prepare-subject", "--resolver", "smartdns"])
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"smartdns prepare-subject 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    return 0
+
+
+def _fetch_maradns_target() -> int:
+    root_dir = _resolve_root_dir()
+    completed = _run_dnslabctl_command(root_dir, ["prepare-subject", "--resolver", "maradns"])
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"maradns prepare-subject 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    return 0
+
+
+def _fetch_knot_resolver_target() -> int:
+    root_dir = _resolve_root_dir()
+    completed = _run_dnslabctl_command(root_dir, ["prepare-subject", "--resolver", "knot-resolver"])
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"knot-resolver prepare-subject 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    return 0
+
+
+def _dump_maradns_cache(sample: Optional[str], output_path: Optional[str]) -> int:
+    root_dir = _resolve_root_dir()
+    work_dir = _resolve_work_dir(root_dir)
+    cache_dump_dir = _resolve_cache_dump_dir(work_dir)
+    build_root = _resolve_maradns_build_tree(root_dir)
+    source_root = _resolve_maradns_src_tree(root_dir)
+    runtime_root = (work_dir / "maradns_dump_runtime").resolve()
+
+    sample_path: Optional[Path] = None
+    base_name = "empty"
+    if sample is not None:
+        sample_path = Path(sample).expanduser().resolve()
+        if not sample_path.is_file():
+            raise TargetRegistryError(
+                f"样本不存在或不可读: {sample}", exit_code=EXIT_USAGE
+            )
+        base_name = sample_path.name
+
+    if output_path:
+        output_file = Path(output_path).expanduser().resolve()
+    else:
+        output_file = (cache_dump_dir / f"{base_name}.maradns.cache.txt").resolve()
+
+    cache_dump_dir.mkdir(parents=True, exist_ok=True)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    binary = build_root / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        build_args = [
+            "adapter-build",
+            "--resolver",
+            "maradns",
+            "--source-root",
+            str(source_root),
+            "--build-root",
+            str(build_root),
+        ]
+        completed = _run_dnslabctl_command(root_dir, build_args)
+        if completed.returncode != 0:
+            raise TargetRegistryError(
+                f"maradns adapter-build 失败: rc={completed.returncode}",
+                exit_code=EXIT_SUBPROCESS,
+            )
+
+    dump_args = [
+        "adapter-dump-cache",
+        "--resolver",
+        "maradns",
+        "--source-root",
+        str(source_root),
+        "--build-root",
+        str(build_root),
+        "--run-root",
+        str(runtime_root),
+        "--output-file",
+        str(output_file),
+    ]
+    if sample_path is not None:
+        dump_args.extend(["--sample", str(sample_path)])
+    completed = _run_dnslabctl_command(root_dir, dump_args)
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"maradns adapter-dump-cache 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    if not output_file.is_file() or output_file.stat().st_size == 0:
+        raise TargetRegistryError(
+            f"cache dump 为空: {output_file}", exit_code=EXIT_SUBPROCESS
+        )
+    return 0
+
+
+def _dump_smartdns_cache(sample: Optional[str], output_path: Optional[str]) -> int:
+    root_dir = _resolve_root_dir()
+    work_dir = _resolve_work_dir(root_dir)
+    cache_dump_dir = _resolve_cache_dump_dir(work_dir)
+    build_root = _resolve_smartdns_build_tree(root_dir)
+    source_root = _resolve_smartdns_src_tree(root_dir)
+    runtime_root = (work_dir / "smartdns_dump_runtime").resolve()
+
+    sample_path: Optional[Path] = None
+    base_name = "empty"
+    if sample is not None:
+        sample_path = Path(sample).expanduser().resolve()
+        if not sample_path.is_file():
+            raise TargetRegistryError(
+                f"样本不存在或不可读: {sample}", exit_code=EXIT_USAGE
+            )
+        base_name = sample_path.name
+
+    if output_path:
+        output_file = Path(output_path).expanduser().resolve()
+    else:
+        output_file = (cache_dump_dir / f"{base_name}.smartdns.cache.bin").resolve()
+
+    cache_dump_dir.mkdir(parents=True, exist_ok=True)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    binary = build_root / "src" / "smartdns"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        build_args = [
+            "adapter-build",
+            "--resolver",
+            "smartdns",
+            "--source-root",
+            str(source_root),
+            "--build-root",
+            str(build_root),
+        ]
+        completed = _run_dnslabctl_command(root_dir, build_args)
+        if completed.returncode != 0:
+            raise TargetRegistryError(
+                f"smartdns adapter-build 失败: rc={completed.returncode}",
+                exit_code=EXIT_SUBPROCESS,
+            )
+
+    dump_args = [
+        "adapter-dump-cache",
+        "--resolver",
+        "smartdns",
+        "--source-root",
+        str(source_root),
+        "--build-root",
+        str(build_root),
+        "--run-root",
+        str(runtime_root),
+        "--output-file",
+        str(output_file),
+    ]
+    if sample_path is not None:
+        dump_args.extend(["--sample", str(sample_path)])
+    completed = _run_dnslabctl_command(root_dir, dump_args)
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"smartdns adapter-dump-cache 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    if not output_file.is_file() or output_file.stat().st_size == 0:
+        raise TargetRegistryError(
+            f"cache dump 为空: {output_file}", exit_code=EXIT_SUBPROCESS
+        )
+    return 0
+
+
 def _dump_unbound_cache(sample: Optional[str], output_path: Optional[str]) -> int:
     root_dir = _resolve_root_dir()
     work_dir = _resolve_work_dir(root_dir)
@@ -284,12 +657,112 @@ def _dump_unbound_cache(sample: Optional[str], output_path: Optional[str]) -> in
     return 0
 
 
+def _dump_dnsmasq_cache(sample: Optional[str], output_path: Optional[str]) -> int:
+    root_dir = _resolve_root_dir()
+    work_dir = _resolve_work_dir(root_dir)
+    cache_dump_dir = _resolve_cache_dump_dir(work_dir)
+    build_root = _resolve_dnsmasq_build_tree(root_dir)
+    source_root = _resolve_dnsmasq_src_tree(root_dir)
+    runtime_root = (work_dir / "dnsmasq_dump_runtime").resolve()
+
+    sample_path: Optional[Path] = None
+    base_name = "empty"
+    if sample is not None:
+        sample_path = Path(sample).expanduser().resolve()
+        if not sample_path.is_file():
+            raise TargetRegistryError(
+                f"样本不存在或不可读: {sample}", exit_code=EXIT_USAGE
+            )
+        base_name = sample_path.name
+
+    if output_path:
+        output_file = Path(output_path).expanduser().resolve()
+    else:
+        output_file = (cache_dump_dir / f"{base_name}.dnsmasq.cache.txt").resolve()
+
+    cache_dump_dir.mkdir(parents=True, exist_ok=True)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    binary = build_root / "dnsmasq"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        build_args = [
+            "adapter-build",
+            "--resolver",
+            "dnsmasq",
+            "--source-root",
+            str(source_root),
+            "--build-root",
+            str(build_root),
+        ]
+        completed = _run_dnslabctl_command(root_dir, build_args)
+        if completed.returncode != 0:
+            raise TargetRegistryError(
+                f"dnsmasq adapter-build 失败: rc={completed.returncode}",
+                exit_code=EXIT_SUBPROCESS,
+            )
+
+    dump_args = [
+        "adapter-dump-cache",
+        "--resolver",
+        "dnsmasq",
+        "--source-root",
+        str(source_root),
+        "--build-root",
+        str(build_root),
+        "--run-root",
+        str(runtime_root),
+        "--output-file",
+        str(output_file),
+    ]
+    if sample_path is not None:
+        dump_args.extend(["--sample", str(sample_path)])
+    completed = _run_dnslabctl_command(root_dir, dump_args)
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"dnsmasq adapter-dump-cache 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    if not output_file.is_file() or output_file.stat().st_size == 0:
+        raise TargetRegistryError(
+            f"cache dump 为空: {output_file}", exit_code=EXIT_SUBPROCESS
+        )
+    return 0
+
+
 _RESOLVER_SPECS: Tuple[ResolverSpec, ...] = (
     ResolverSpec(name="bind9", aliases=("named",)),
+    ResolverSpec(name="maradns"),
+    ResolverSpec(name="smartdns"),
     ResolverSpec(name="unbound"),
+    ResolverSpec(name="dnsmasq"),
 )
 
 _TARGET_SPECS: Tuple[TargetSpec, ...] = (
+    TargetSpec(
+        name="dnsmasq",
+        aliases=("dnsmasq-replay",),
+        fetcher=_fetch_dnsmasq_target,
+        cache_dumper=_dump_dnsmasq_cache,
+    ),
+    TargetSpec(
+        name="smartdns",
+        aliases=("smartdns-resolver",),
+        fetcher=_fetch_smartdns_target,
+        cache_dumper=_dump_smartdns_cache,
+    ),
+    TargetSpec(
+        name="maradns",
+        aliases=("deadwood",),
+        fetcher=_fetch_maradns_target,
+        cache_dumper=_dump_maradns_cache,
+    ),
+    TargetSpec(
+        name="knot-resolver",
+        aliases=("kresd",),
+        fetcher=_fetch_knot_resolver_target,
+        cache_dumper=None,
+    ),
     TargetSpec(
         name="unbound",
         aliases=("unbound-fuzzme",),

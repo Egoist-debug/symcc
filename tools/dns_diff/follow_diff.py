@@ -36,7 +36,6 @@ DEFAULT_BIND9_WORK_DIR_RELATIVE = Path("named_experiment") / "work"
 DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = Path("afl_out") / "master" / "queue"
 FOLLOW_DIFF_OUTPUT_DIR_NAME = "follow_diff"
 PRODUCER_SEED_PROVENANCE_FILE_NAME = "producer_seed_provenance.json"
-FOLLOW_DIFF_RESOLVER_PAIR = "bind9_vs_unbound"
 FOLLOW_DIFF_PRODUCER_PROFILE = "poison-stateful"
 FOLLOW_DIFF_INPUT_MODEL = "DST1 transcript"
 DEFAULT_SEED_TIMEOUT_SEC = 5
@@ -107,6 +106,57 @@ class FollowDiffError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int = EXIT_USAGE) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+def _secondary_resolver_name() -> str:
+    value = os.environ.get("DNS_DIFF_SECONDARY_RESOLVER", "unbound").strip().lower()
+    if value in {"", "unbound"}:
+        return "unbound"
+    return value
+
+
+def _follow_diff_resolver_pair() -> str:
+    return f"bind9_vs_{_secondary_resolver_name()}"
+
+
+def _secondary_before_cache_file() -> str:
+    resolver = _secondary_resolver_name()
+    return UNBOUND_BEFORE_CACHE_FILE if resolver == "unbound" else f"{resolver}.before.cache.txt"
+
+
+def _secondary_after_cache_file() -> str:
+    resolver = _secondary_resolver_name()
+    return UNBOUND_AFTER_CACHE_FILE if resolver == "unbound" else f"{resolver}.after.cache.txt"
+
+
+def _normalize_secondary_oracle_payload(
+    oracle_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(oracle_payload)
+    resolver = _secondary_resolver_name()
+    if resolver == "unbound":
+        return payload
+    for key in tuple(payload.keys()):
+        if not isinstance(key, str) or not key.startswith(f"{resolver}."):
+            continue
+        suffix = key[len(resolver) + 1 :]
+        payload.setdefault(f"unbound.{suffix}", payload[key])
+    return payload
+
+
+def _normalize_secondary_cache_rows(rows: List[Tuple[str, ...]]) -> List[Tuple[str, ...]]:
+    resolver = _secondary_resolver_name()
+    if resolver == "unbound":
+        return rows
+    normalized: List[Tuple[str, ...]] = []
+    for row in rows:
+        if len(row) != 10:
+            normalized.append(row)
+            continue
+        mutable = list(row)
+        mutable[0] = "unbound"
+        normalized.append(tuple(mutable))
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -448,11 +498,12 @@ def _oracle_diff_is_not_same(oracle_payload: Mapping[str, Any]) -> bool:
     if not oracle_payload:
         return False
 
+    normalized_oracle_payload = _normalize_secondary_oracle_payload(oracle_payload)
     bind9_status = oracle_payload.get("bind9.stderr_parse_status")
-    unbound_status = oracle_payload.get("unbound.stderr_parse_status")
+    unbound_status = normalized_oracle_payload.get("unbound.stderr_parse_status")
     if bind9_status == "ok" and unbound_status == "ok":
         for field in ORACLE_FIELDS:
-            if oracle_payload.get(f"bind9.{field}") != oracle_payload.get(
+            if normalized_oracle_payload.get(f"bind9.{field}") != normalized_oracle_payload.get(
                 f"unbound.{field}"
             ):
                 return True
@@ -483,7 +534,9 @@ def _write_cache_diff_artifact(
     queue_event_id: Optional[str],
 ) -> Path:
     sample_meta = _load_json_object(sample_dir / "sample.meta.json")
-    oracle_payload = _load_json_object(sample_dir / "oracle.json")
+    oracle_payload = _normalize_secondary_oracle_payload(
+        _load_json_object(sample_dir / "oracle.json")
+    )
     triggered = _cache_detail_triggered(
         sample_id,
         queue_event_id=queue_event_id,
@@ -495,8 +548,12 @@ def _write_cache_diff_artifact(
         sample_id,
         _parse_cache_rows("bind9", sample_dir / BIND9_BEFORE_CACHE_FILE),
         _parse_cache_rows("bind9", sample_dir / BIND9_AFTER_CACHE_FILE),
-        _parse_cache_rows("unbound", sample_dir / UNBOUND_BEFORE_CACHE_FILE),
-        _parse_cache_rows("unbound", sample_dir / UNBOUND_AFTER_CACHE_FILE),
+        _normalize_secondary_cache_rows(
+            _parse_cache_rows(_secondary_resolver_name(), sample_dir / _secondary_before_cache_file())
+        ),
+        _normalize_secondary_cache_rows(
+            _parse_cache_rows(_secondary_resolver_name(), sample_dir / _secondary_after_cache_file())
+        ),
         triggered,
     )
     return atomic_write_json(sample_dir / CACHE_DIFF_FILE, payload)
@@ -505,7 +562,9 @@ def _write_cache_diff_artifact(
 def _write_triage_artifact(*, sample_dir: Path, sample_id: str) -> Path:
     payload = build_triage(
         sample_id,
-        _load_json_object(sample_dir / "oracle.json"),
+        _normalize_secondary_oracle_payload(
+            _load_json_object(sample_dir / "oracle.json")
+        ),
         _load_json_object(sample_dir / CACHE_DIFF_FILE),
         _load_json_object(sample_dir / "state_fingerprint.json"),
         sample_meta=_load_json_object(sample_dir / "sample.meta.json"),
@@ -624,7 +683,7 @@ def _build_follow_diff_comparability_keys(
     ablation_status = _build_follow_diff_ablation_status(toggle_env)
 
     shared_fields: Dict[str, Any] = {
-        "resolver_pair": FOLLOW_DIFF_RESOLVER_PAIR,
+        "resolver_pair": _follow_diff_resolver_pair(),
         "producer_profile": FOLLOW_DIFF_PRODUCER_PROFILE,
         "input_model": FOLLOW_DIFF_INPUT_MODEL,
         "source_queue_dir": str(config.source_dir),

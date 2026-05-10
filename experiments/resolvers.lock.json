@@ -1,0 +1,60 @@
+{
+  "generated_at": "2026-05-09T14:56:08Z",
+  "generator": "dnslabctl lock-generate",
+  "resolvers": [
+    {
+      "commit_sha": "e6099075cd523b9715839000a28d32dae6640956",
+      "desired_tag": "v9.20.22",
+      "note": "producer 默认冻结当前 stable ESV，保留旧 stable 作为对照候选",
+      "repo_url": "https://gitlab.isc.org/isc-projects/bind9.git",
+      "resolved_tag": "v9.20.22",
+      "resolver": "bind9",
+      "status": "locked"
+    },
+    {
+      "commit_sha": "f6269baa605d31859f28770e01a24e3677e5f82c",
+      "desired_tag": "release-1.24.2",
+      "note": "论文主线沿用当前 Unbound baseline",
+      "repo_url": "https://github.com/NLnetLabs/unbound.git",
+      "resolved_tag": "release-1.24.2",
+      "resolver": "unbound",
+      "status": "locked"
+    },
+    {
+      "commit_sha": "bcd373c1a5233680b25595c81b72be70b6032773",
+      "desired_tag": "deadwood-3.3.02",
+      "note": "MaraDNS 递归解析器实际对应 Deadwood 组件",
+      "repo_url": "https://github.com/samboy/MaraDNS.git",
+      "resolved_tag": "deadwood-3.3.02",
+      "resolver": "maradns",
+      "status": "locked"
+    },
+    {
+      "commit_sha": "d8f66f4fda02ca50616f428d9c161c8ca1a0cb70",
+      "desired_tag": "v2.92",
+      "note": "优先稳定 tag，保留 test tag 供后续消融",
+      "repo_url": "https://github.com/imp/dnsmasq.git",
+      "resolved_tag": "v2.92",
+      "resolver": "dnsmasq",
+      "status": "locked"
+    },
+    {
+      "commit_sha": "3e48a94b9875b74509c5265d740915e7c8e60315",
+      "desired_tag": "Release47.1",
+      "note": "计划文档已点名的现行稳定 tag",
+      "repo_url": "https://github.com/pymumu/smartdns.git",
+      "resolved_tag": "Release47.1",
+      "resolver": "smartdns",
+      "status": "locked"
+    },
+    {
+      "commit_sha": "894ab7f9a490959a9175c65b5e50d44f1286e789",
+      "desired_tag": "v6.2.0",
+      "note": "Knot Resolver v6 主线",
+      "repo_url": "https://github.com/CZ-NIC/knot-resolver.git",
+      "resolved_tag": "v6.2.0",
+      "resolver": "knot-resolver",
+      "status": "locked"
+    }
+  ]
+}

@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+
+def parse_transcript(path: Path):
+    data = path.read_bytes()
+    if len(data) < 8 or data[:4] != b"DST1":
+        raise ValueError("invalid DST1 transcript header")
+    response_count = data[4]
+    version = data[5]
+    if version != 2:
+        raise ValueError(f"unsupported transcript version: {version}")
+    query_len = int.from_bytes(data[6:8], "little")
+    offset = 8
+    lengths = []
+    for _ in range(response_count):
+        if offset + 2 > len(data):
+            raise ValueError("truncated response length table")
+        lengths.append(int.from_bytes(data[offset : offset + 2], "little"))
+        offset += 2
+    if offset + query_len > len(data):
+        raise ValueError("truncated client query")
+    client_query = data[offset : offset + query_len]
+    offset += query_len
+    responses = []
+    for length in lengths:
+        if offset + length > len(data):
+            raise ValueError("truncated forged response")
+        responses.append(bytearray(data[offset : offset + length]))
+        offset += length
+    post_check = data[offset:]
+    return client_query, responses, post_check
+
+
+def choose_udp_port():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def build_preload_shim(work_dir: Path) -> Path:
+    source = work_dir / "deadwood_sandbox_shim.c"
+    output = work_dir / "deadwood_sandbox_shim.so"
+    source.write_text(
+        """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sys/types.h>
+#include <unistd.h>
+int chroot(const char *path) { (void)path; return 0; }
+int setgid(gid_t gid) { if (gid == 0) { errno = EPERM; return -1; } return 0; }
+int setuid(uid_t uid) { if (uid == 0) { errno = EPERM; return -1; } return 0; }
+int setgroups(size_t size, const gid_t *list) { (void)size; (void)list; return 0; }
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["cc", "-shared", "-fPIC", str(source), "-o", str(output)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return output
+
+
+def decode_deadwood_name(encoded: str) -> str:
+    raw = encoded.encode("latin1", errors="ignore")
+    out = bytearray()
+    index = 0
+    while index < len(raw):
+        if raw[index] == 0x5C and index + 3 < len(raw):
+            chunk = raw[index + 1 : index + 4]
+            if all(48 <= b <= 57 for b in chunk):
+                out.append(int(chunk.decode("ascii"), 10))
+                index += 4
+                continue
+        out.append(raw[index])
+        index += 1
+    labels = []
+    cursor = 0
+    while cursor < len(out):
+        length = out[cursor]
+        if length == 0:
+            break
+        cursor += 1
+        labels.append(out[cursor : cursor + length].decode("ascii", errors="replace"))
+        cursor += length
+    return ".".join(labels)
+
+
+def maradns_cache_dump(raw_log: str) -> str:
+    lines = ["MARADNS_CACHE_DUMP"]
+    for raw_line in raw_log.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Fetching ") and " from cache" in line:
+            encoded = line[len("Fetching ") : line.index(" from cache")]
+            try:
+                qname = decode_deadwood_name(encoded)
+            except Exception:
+                qname = encoded
+            lines.append(f"CACHE_ENTRY\t{qname}\tA\t_")
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deadwood-bin", required=True)
+    parser.add_argument("--mode", choices=("run", "dump"), required=True)
+    parser.add_argument("--transcript")
+    parser.add_argument("--cache-dump-path", required=True)
+    parser.add_argument("--maradns-log-path", required=True)
+    parser.add_argument("--timeout-sec", type=float, default=5.0)
+    args = parser.parse_args()
+
+    cache_dump_path = Path(args.cache_dump_path)
+    maradns_log_path = Path(args.maradns_log_path)
+    run_root = cache_dump_path.parent
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    parse_ok = False
+    resolver_fetch_started = False
+    response_accepted = False
+    second_query_hit = False
+    cache_entry_created = False
+    timeout_seen = False
+
+    client_query = b""
+    responses = []
+    post_check_query = b""
+    if args.mode == "run":
+        if not args.transcript:
+            raise SystemExit("run mode requires --transcript")
+        client_query, responses, post_check_query = parse_transcript(Path(args.transcript))
+        parse_ok = True
+
+    listen_port = choose_udp_port()
+    upstream_port = choose_udp_port()
+    cache_file = run_root / "dw_cache"
+    config_path = run_root / "dwood3rc"
+    preload = build_preload_shim(run_root)
+
+    upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    upstream_sock.bind(("127.0.0.1", upstream_port))
+    upstream_sock.settimeout(args.timeout_sec)
+    stop_flag = {"stop": False}
+    upstream_queries = []
+
+    def upstream_loop():
+        while not stop_flag["stop"]:
+            try:
+                packet, addr = upstream_sock.recvfrom(4096)
+            except Exception:
+                continue
+            upstream_queries.append(packet)
+            if responses:
+                index = min(len(upstream_queries) - 1, len(responses) - 1)
+                reply = bytearray(responses[index])
+                if len(reply) >= 2 and len(packet) >= 2:
+                    reply[0:2] = packet[0:2]
+                upstream_sock.sendto(reply, addr)
+
+    threading.Thread(target=upstream_loop, daemon=True).start()
+
+    uid = os.getuid()
+    gid = os.getgid()
+    config_path.write_text(
+        (
+            'bind_address="127.0.0.1"\n'
+            f'chroot_dir="{run_root}"\n'
+            f"dns_port = {listen_port}\n"
+            "upstream_servers = {}\n"
+            'upstream_servers["."]="127.0.0.1"\n'
+            f"upstream_port = {upstream_port}\n"
+            'recursive_acl = "127.0.0.1/16"\n'
+            "num_retries = 1\n"
+            "filter_rfc1918 = 0\n"
+            'cache_file = "dw_cache"\n'
+            "verbose_level = 1000\n"
+            f"maradns_uid = {uid}\n"
+            f"maradns_gid = {gid}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(preload)
+    proc = subprocess.Popen(
+        [args.deadwood_bin, "-f", str(config_path)],
+        cwd=run_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    time.sleep(1.0)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cli.settimeout(args.timeout_sec)
+    stdout_text = ""
+    try:
+        if args.mode == "run":
+            cli.sendto(client_query, ("127.0.0.1", listen_port))
+            response = cli.recv(4096)
+            resolver_fetch_started = len(upstream_queries) > 0
+            response_accepted = bool(response)
+            upstream_after_first = len(upstream_queries)
+            if post_check_query:
+                cli.sendto(post_check_query, ("127.0.0.1", listen_port))
+                post_response = cli.recv(4096)
+                second_query_hit = (
+                    bool(post_response) and len(upstream_queries) == upstream_after_first
+                )
+                cache_entry_created = second_query_hit
+        os.kill(proc.pid, signal.SIGUSR1)
+        time.sleep(0.3)
+    except socket.timeout:
+        timeout_seen = True
+    finally:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        stdout_text, _ = proc.communicate(timeout=5)
+        stop_flag["stop"] = True
+        upstream_sock.close()
+        cli.close()
+
+    write_text(maradns_log_path, stdout_text)
+    write_text(cache_dump_path, maradns_cache_dump(stdout_text))
+
+    if args.mode == "dump":
+        parse_ok = True
+
+    print(
+        "ORACLE_SUMMARY "
+        f"parse_ok={1 if parse_ok else 0} "
+        f"resolver_fetch_started={1 if resolver_fetch_started else 0} "
+        f"response_accepted={1 if response_accepted else 0} "
+        f"second_query_hit={1 if second_query_hit else 0} "
+        f"cache_entry_created={1 if cache_entry_created else 0} "
+        f"timeout={1 if timeout_seen else 0}"
+    )
+    print(f"maradns_native_log={maradns_log_path}")
+    print(f"maradns_cache_file={cache_file}")
+    print(f"maradns_upstream_queries={len(upstream_queries)}")
+    return 0 if not timeout_seen else 6
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

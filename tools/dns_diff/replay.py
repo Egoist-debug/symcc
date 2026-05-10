@@ -75,19 +75,22 @@ class ReplayPaths:
     output_dir: Path
     sample_src: Path
     sample_bin: Path
+    secondary_resolver: str
     bind9_stderr: Path
-    unbound_stderr: Path
+    secondary_stderr: Path
     bind9_before_cache: Path
     bind9_after_cache: Path
-    unbound_before_cache: Path
-    unbound_after_cache: Path
+    secondary_before_cache: Path
+    secondary_after_cache: Path
     bind9_runtime_dir: Path
     bind9_named_conf: Path
     bind9_named_conf_template: Path
     bind9_binary: Path
-    unbound_binary: Path
     bind9_afl_tree: Path
-    unbound_afl_tree: Path
+    secondary_binary: Optional[Path]
+    secondary_build_tree: Optional[Path]
+    secondary_harness: Optional[Path]
+    unbound_afl_tree: Optional[Path]
 
 
 def _resolve_root_dir() -> Path:
@@ -95,6 +98,17 @@ def _resolve_root_dir() -> Path:
     if env_root:
         return Path(env_root).expanduser().resolve()
     return Path(__file__).resolve().parents[2]
+
+
+def _resolve_secondary_resolver() -> str:
+    value = os.environ.get("DNS_DIFF_SECONDARY_RESOLVER", "unbound").strip().lower()
+    if value not in {"unbound", "dnsmasq", "smartdns", "maradns"}:
+        raise ReplayError(
+            f"不支持的第二 resolver: {value!r}",
+            exit_code=EXIT_USAGE,
+            reason="unsupported_secondary_resolver",
+        )
+    return value
 
 
 def _parse_positive_int(env_key: str, default: int) -> int:
@@ -120,7 +134,9 @@ def _resolver_from_stage(stage: Optional[str]) -> Optional[str]:
     if stage is None or "." not in stage:
         return None
     resolver, _ = stage.split(".", 1)
-    if resolver in {"bind9", "unbound"}:
+    if resolver in {"bind9", "unbound", "dnsmasq", "smartdns"}:
+        return resolver
+    if resolver in {"maradns"}:
         return resolver
     return None
 
@@ -153,6 +169,7 @@ def _require_executable(path: Path, *, message: str, resolver: str) -> Path:
 
 def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
     root_dir = _resolve_root_dir()
+    secondary_resolver = _resolve_secondary_resolver()
     work_dir = Path(
         os.environ.get(
             "WORK_DIR", str(root_dir / "unbound_experiment" / "work_stateful")
@@ -161,9 +178,58 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
     bind9_afl_tree = Path(
         os.environ.get("BIND9_AFL_TREE", str(root_dir / "bind-9.18.46-afl"))
     ).expanduser()
-    unbound_afl_tree = Path(
-        os.environ.get("AFL_TREE", str(root_dir / "unbound-1.24.2-afl"))
-    ).expanduser()
+    secondary_binary: Optional[Path] = None
+    secondary_build_tree: Optional[Path] = None
+    secondary_harness: Optional[Path] = None
+    unbound_afl_tree: Optional[Path] = None
+    if secondary_resolver == "unbound":
+        unbound_afl_tree = Path(
+            os.environ.get("AFL_TREE", str(root_dir / "unbound-1.24.2-afl"))
+        ).expanduser()
+        secondary_binary = unbound_afl_tree / ".libs" / "unbound-fuzzme"
+        secondary_build_tree = unbound_afl_tree.resolve()
+    elif secondary_resolver == "dnsmasq":
+        secondary_build_tree = Path(
+            os.environ.get(
+                "DNSMASQ_BUILD_TREE",
+                str(root_dir / "experiments" / "subjects" / "dnsmasq" / "v2.92-build"),
+            )
+        ).expanduser()
+        secondary_binary = secondary_build_tree / "dnsmasq"
+        secondary_harness = Path(
+            os.environ.get(
+                "DNSMASQ_HARNESS_SCRIPT",
+                str(root_dir / "tools" / "dnsmasq_replay_harness.py"),
+            )
+        ).expanduser()
+    elif secondary_resolver == "smartdns":
+        secondary_build_tree = Path(
+            os.environ.get(
+                "SMARTDNS_BUILD_TREE",
+                str(root_dir / "experiments" / "subjects" / "smartdns" / "Release47.1-build"),
+            )
+        ).expanduser()
+        secondary_binary = secondary_build_tree / "smartdns-build" / "src" / "smartdns"
+        secondary_harness = Path(
+            os.environ.get(
+                "SMARTDNS_HARNESS_SCRIPT",
+                str(root_dir / "tools" / "smartdns_replay_harness.py"),
+            )
+        ).expanduser()
+    elif secondary_resolver == "maradns":
+        secondary_build_tree = Path(
+            os.environ.get(
+                "MARADNS_BUILD_TREE",
+                str(root_dir / "experiments" / "subjects" / "maradns" / "deadwood-3.3.02-build"),
+            )
+        ).expanduser()
+        secondary_binary = secondary_build_tree / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"
+        secondary_harness = Path(
+            os.environ.get(
+                "MARADNS_HARNESS_SCRIPT",
+                str(root_dir / "tools" / "maradns_replay_harness.py"),
+            )
+        ).expanduser()
 
     sample_src = Path(sample).expanduser()
     if not sample_src.is_file():
@@ -193,6 +259,7 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
     )
 
     bind9_runtime_dir = out_dir / "bind9_runtime"
+    secondary_prefix = "unbound" if secondary_resolver == "unbound" else secondary_resolver
     return ReplayPaths(
         root_dir=root_dir,
         work_dir=work_dir.resolve(),
@@ -200,19 +267,24 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
         output_dir=out_dir,
         sample_src=sample_src,
         sample_bin=out_dir / "sample.bin",
+        secondary_resolver=secondary_resolver,
         bind9_stderr=out_dir / "bind9.stderr",
-        unbound_stderr=out_dir / "unbound.stderr",
+        secondary_stderr=out_dir / f"{secondary_prefix}.stderr",
         bind9_before_cache=out_dir / "bind9.before.cache.txt",
         bind9_after_cache=out_dir / "bind9.after.cache.txt",
-        unbound_before_cache=out_dir / "unbound.before.cache.txt",
-        unbound_after_cache=out_dir / "unbound.after.cache.txt",
+        secondary_before_cache=out_dir / f"{secondary_prefix}.before.cache.txt",
+        secondary_after_cache=out_dir / f"{secondary_prefix}.after.cache.txt",
         bind9_runtime_dir=bind9_runtime_dir,
         bind9_named_conf=bind9_runtime_dir / "named.conf",
         bind9_named_conf_template=bind9_named_conf_template,
         bind9_binary=bind9_afl_tree / "bin" / "named" / ".libs" / "named",
-        unbound_binary=unbound_afl_tree / ".libs" / "unbound-fuzzme",
         bind9_afl_tree=bind9_afl_tree.resolve(),
-        unbound_afl_tree=unbound_afl_tree.resolve(),
+        secondary_binary=secondary_binary.resolve() if secondary_binary else None,
+        secondary_build_tree=secondary_build_tree.resolve()
+        if secondary_build_tree
+        else None,
+        secondary_harness=secondary_harness.resolve() if secondary_harness else None,
+        unbound_afl_tree=unbound_afl_tree.resolve() if unbound_afl_tree else None,
     )
 
 
@@ -237,6 +309,15 @@ def _append_stage_stderr(stderr_path: Path, *, stage: str, payload: bytes) -> No
             handle.write(payload)
             if not payload.endswith(b"\n"):
                 handle.write(b"\n")
+
+
+def _append_stage_output(stderr_path: Path, *, stage: str, stdout_text: str, stderr_text: str) -> None:
+    combined = stdout_text
+    if stderr_text:
+        if combined and not combined.endswith("\n"):
+            combined += "\n"
+        combined += stderr_text
+    _append_stage_stderr(stderr_path, stage=stage, payload=combined.encode("utf-8"))
 
 
 def _run_stage(
@@ -299,6 +380,129 @@ def _run_stage(
     if completed.returncode in ok_returncodes:
         return
     if completed.returncode in (124, 137):
+        raise ReplayError(
+            f"{stage} 超时，退出码={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+            reason="timeout",
+            stage=stage,
+            resolver=resolver,
+            stderr_path=stderr_path.name,
+            returncode=completed.returncode,
+            process_started=True,
+        )
+    raise ReplayError(
+        f"{stage} 失败，退出码={completed.returncode}（详见 {stderr_path}）",
+        exit_code=EXIT_SUBPROCESS,
+        reason="subprocess_failed",
+        stage=stage,
+        resolver=resolver,
+        stderr_path=stderr_path.name,
+        returncode=completed.returncode,
+        process_started=True,
+    )
+
+
+def _run_secondary_harness_stage(
+    *,
+    resolver: str,
+    stage: str,
+    harness: Path,
+    binary: Path,
+    mode: str,
+    transcript: Optional[Path],
+    cache_dump_path: Path,
+    native_log_path: Path,
+    stderr_path: Path,
+) -> None:
+    command = ["python3", str(harness)]
+    if resolver == "dnsmasq":
+        command.extend(
+            [
+                "--dnsmasq-bin",
+                str(binary),
+                "--mode",
+                mode,
+                "--cache-dump-path",
+                str(cache_dump_path),
+                "--dnsmasq-stderr-path",
+                str(native_log_path),
+            ]
+        )
+    elif resolver == "smartdns":
+        command.extend(
+            [
+                "--smartdns-bin",
+                str(binary),
+                "--mode",
+                mode,
+                "--cache-dump-path",
+                str(cache_dump_path),
+                "--smartdns-log-path",
+                str(native_log_path),
+            ]
+        )
+    elif resolver == "maradns":
+        command.extend(
+            [
+                "--deadwood-bin",
+                str(binary),
+                "--mode",
+                mode,
+                "--cache-dump-path",
+                str(cache_dump_path),
+                "--maradns-log-path",
+                str(native_log_path),
+            ]
+        )
+    else:
+        raise ReplayError(
+            f"不支持的第二 resolver harness: {resolver!r}",
+            exit_code=EXIT_USAGE,
+            reason="unsupported_secondary_resolver",
+            resolver=resolver,
+            stage=stage,
+        )
+    if transcript is not None:
+        command.extend(["--transcript", str(transcript)])
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=dict(os.environ),
+        )
+    except FileNotFoundError as exc:
+        raise ReplayError(
+            f"子进程缺少可执行文件: {exc.filename}",
+            exit_code=EXIT_DEPENDENCY,
+            reason="missing_executable",
+            stage=stage,
+            resolver=resolver,
+            executable_path=exc.filename,
+            process_started=False,
+        ) from exc
+    except OSError as exc:
+        raise ReplayError(
+            f"子进程执行失败: {exc}",
+            exit_code=EXIT_SUBPROCESS,
+            reason="subprocess_launch_error",
+            stage=stage,
+            resolver=resolver,
+            executable_path=str(command[0]),
+            process_started=False,
+        ) from exc
+
+    _append_stage_output(
+        stderr_path,
+        stage=stage,
+        stdout_text=completed.stdout or "",
+        stderr_text=completed.stderr or "",
+    )
+    if completed.returncode == 0:
+        return
+    if completed.returncode in (6, 124, 137):
         raise ReplayError(
             f"{stage} 超时，退出码={completed.returncode}",
             exit_code=EXIT_SUBPROCESS,
@@ -389,53 +593,86 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
     paths = _collect_paths(sample, output_dir)
     timeout_sec = _parse_positive_int("SEED_TIMEOUT_SEC", 5)
 
-    _require_executable(
-        paths.unbound_binary,
-        message=f"缺少 Unbound AFL 目标或不可执行: {paths.unbound_binary}",
-        resolver="unbound",
-    )
+    secondary_resolver = paths.secondary_resolver
+    secondary_prefix = "unbound" if secondary_resolver == "unbound" else secondary_resolver
     _require_executable(
         paths.bind9_binary,
         message=f"缺少 BIND9 named 目标或不可执行: {paths.bind9_binary}",
         resolver="bind9",
     )
-    _require_dir(
-        paths.response_corpus_dir,
-        message=f"缺少 response 语料目录: {paths.response_corpus_dir}",
-        exit_code=EXIT_DEPENDENCY,
-    )
+    if secondary_resolver == "unbound":
+        _require_executable(
+            paths.secondary_binary,
+            message=f"缺少 Unbound AFL 目标或不可执行: {paths.secondary_binary}",
+            resolver="unbound",
+        )
+        _require_dir(
+            paths.response_corpus_dir,
+            message=f"缺少 response 语料目录: {paths.response_corpus_dir}",
+            exit_code=EXIT_DEPENDENCY,
+        )
+    else:
+        _require_executable(
+            paths.secondary_binary,
+            message=f"缺少 {secondary_resolver} 目标或不可执行: {paths.secondary_binary}",
+            resolver=secondary_resolver,
+        )
+        _require_file(
+            paths.secondary_harness,
+            message=f"缺少 {secondary_resolver} replay harness: {paths.secondary_harness}",
+            exit_code=EXIT_DEPENDENCY,
+        )
 
-    unbound_ld = _collect_dot_libs(paths.unbound_afl_tree)
     bind9_ld = _collect_dot_libs(paths.bind9_afl_tree)
+    unbound_ld: Optional[str] = None
+    if paths.unbound_afl_tree is not None:
+        unbound_ld = _collect_dot_libs(paths.unbound_afl_tree)
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(paths.sample_src, paths.sample_bin)
 
-    paths.unbound_stderr.unlink(missing_ok=True)
+    paths.secondary_stderr.unlink(missing_ok=True)
     paths.bind9_stderr.unlink(missing_ok=True)
     _prepare_bind9_conf(paths)
 
-    unbound_env = _unbound_env(paths, ld_library_path=unbound_ld)
     bind9_env = _bind9_env(paths, ld_library_path=bind9_ld)
+    unbound_env: Optional[Dict[str, str]] = None
+    if secondary_resolver == "unbound":
+        assert unbound_ld is not None
+        unbound_env = _unbound_env(paths, ld_library_path=unbound_ld)
 
     timeout_prefix = ["timeout", "-k", "2", str(timeout_sec)]
 
-    unbound_before_env = dict(unbound_env)
-    unbound_before_env["UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
-        paths.unbound_before_cache
-    )
-    _run_stage(
-        stage="unbound.before",
-        command=[*timeout_prefix, str(paths.unbound_binary)],
-        env=unbound_before_env,
-        stdin_file=None,
-        stderr_path=paths.unbound_stderr,
-        ok_returncodes=(0, 1),
-    )
+    if secondary_resolver == "unbound":
+        assert unbound_env is not None
+        unbound_before_env = dict(unbound_env)
+        unbound_before_env["UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
+            paths.secondary_before_cache
+        )
+        _run_stage(
+            stage="unbound.before",
+            command=[*timeout_prefix, str(paths.secondary_binary)],
+            env=unbound_before_env,
+            stdin_file=None,
+            stderr_path=paths.secondary_stderr,
+            ok_returncodes=(0, 1),
+        )
+    else:
+        _run_secondary_harness_stage(
+            resolver=secondary_resolver,
+            stage=f"{secondary_resolver}.before",
+            harness=paths.secondary_harness,
+            binary=paths.secondary_binary,
+            mode="dump",
+            transcript=None,
+            cache_dump_path=paths.secondary_before_cache,
+            native_log_path=paths.output_dir / f"{secondary_prefix}.native.stderr",
+            stderr_path=paths.secondary_stderr,
+        )
     _ensure_nonempty_file(
-        paths.unbound_before_cache,
-        stage="unbound.before",
-        stderr_path=paths.unbound_stderr,
+        paths.secondary_before_cache,
+        stage=f"{secondary_resolver}.before",
+        stderr_path=paths.secondary_stderr,
     )
 
     bind9_before_env = dict(bind9_env)
@@ -464,22 +701,36 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
         stderr_path=paths.bind9_stderr,
     )
 
-    unbound_after_env = dict(unbound_env)
-    unbound_after_env["UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
-        paths.unbound_after_cache
-    )
-    _run_stage(
-        stage="unbound.after",
-        command=[*timeout_prefix, str(paths.unbound_binary)],
-        env=unbound_after_env,
-        stdin_file=paths.sample_bin,
-        stderr_path=paths.unbound_stderr,
-        ok_returncodes=(0, 1),
-    )
+    if secondary_resolver == "unbound":
+        assert unbound_env is not None
+        unbound_after_env = dict(unbound_env)
+        unbound_after_env["UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH"] = str(
+            paths.secondary_after_cache
+        )
+        _run_stage(
+            stage="unbound.after",
+            command=[*timeout_prefix, str(paths.secondary_binary)],
+            env=unbound_after_env,
+            stdin_file=paths.sample_bin,
+            stderr_path=paths.secondary_stderr,
+            ok_returncodes=(0, 1),
+        )
+    else:
+        _run_secondary_harness_stage(
+            resolver=secondary_resolver,
+            stage=f"{secondary_resolver}.after",
+            harness=paths.secondary_harness,
+            binary=paths.secondary_binary,
+            mode="run",
+            transcript=paths.sample_bin,
+            cache_dump_path=paths.secondary_after_cache,
+            native_log_path=paths.output_dir / f"{secondary_prefix}.native.stderr",
+            stderr_path=paths.secondary_stderr,
+        )
     _ensure_nonempty_file(
-        paths.unbound_after_cache,
-        stage="unbound.after",
-        stderr_path=paths.unbound_stderr,
+        paths.secondary_after_cache,
+        stage=f"{secondary_resolver}.after",
+        stderr_path=paths.secondary_stderr,
     )
 
     bind9_after_env = dict(bind9_env)
@@ -517,11 +768,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
             "artifacts": {
                 "sample_bin": "sample.bin",
                 "bind9_stderr": "bind9.stderr",
-                "unbound_stderr": "unbound.stderr",
+                f"{secondary_prefix}_stderr": f"{secondary_prefix}.stderr",
                 "bind9_before_cache": "bind9.before.cache.txt",
                 "bind9_after_cache": "bind9.after.cache.txt",
-                "unbound_before_cache": "unbound.before.cache.txt",
-                "unbound_after_cache": "unbound.after.cache.txt",
+                f"{secondary_prefix}_before_cache": f"{secondary_prefix}.before.cache.txt",
+                f"{secondary_prefix}_after_cache": f"{secondary_prefix}.after.cache.txt",
                 "oracle": "oracle.json",
             },
             "oracle_provenance": {
@@ -531,10 +782,10 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
                     "after_cache": "bind9.after.cache.txt",
                     "stage_marker": "===== bind9.after =====",
                 },
-                "unbound": {
-                    "stderr": "unbound.stderr",
-                    "after_cache": "unbound.after.cache.txt",
-                    "stage_marker": "===== unbound.after =====",
+                secondary_prefix: {
+                    "stderr": f"{secondary_prefix}.stderr",
+                    "after_cache": f"{secondary_prefix}.after.cache.txt",
+                    "stage_marker": f"===== {secondary_resolver}.after =====",
                 },
             },
         },
@@ -543,10 +794,10 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
     atomic_write_json(paths.output_dir / "sample.meta.json", meta_payload)
 
     bind9_oracle = parse_oracle_summary(_load_stderr_text(paths.bind9_stderr), "bind9")
-    unbound_oracle = parse_oracle_summary(
-        _load_stderr_text(paths.unbound_stderr), "unbound"
+    secondary_oracle = parse_oracle_summary(
+        _load_stderr_text(paths.secondary_stderr), secondary_resolver
     )
     oracle_payload = dict(bind9_oracle)
-    oracle_payload.update(unbound_oracle)
+    oracle_payload.update(secondary_oracle)
     atomic_write_json(paths.output_dir / "oracle.json", oracle_payload)
     return 0

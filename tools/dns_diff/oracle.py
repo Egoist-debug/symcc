@@ -40,9 +40,6 @@ def _parse_bool_token(raw: str) -> Optional[bool]:
 def parse_oracle_summary(
     stderr_text: Optional[str], resolver: str
 ) -> Dict[str, OracleValue]:
-    if resolver not in {"bind9", "unbound"}:
-        raise ValueError(f"不支持的 resolver: {resolver!r}")
-
     if stderr_text is None or not stderr_text.strip():
         return _empty_oracle(resolver, "stderr_missing")
 

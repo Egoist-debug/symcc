@@ -80,6 +80,194 @@ path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 PY
 }
 
+write_fake_dnsmasq_binary() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
+write_fake_dnsmasq_harness() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(
+    """#!/usr/bin/env python3
+import argparse
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--mode', required=True)
+parser.add_argument('--cache-dump-path', required=True)
+parser.add_argument('--dnsmasq-stderr-path', required=True)
+parser.add_argument('--transcript')
+parser.add_argument('--dnsmasq-bin')
+args = parser.parse_args()
+Path(args.cache_dump_path).write_text(
+    'May 10 05:49:01 dnsmasq[250875]: Host                           Address                                  Flags      Expires                  Source\\n'
+    'May 10 05:49:01 dnsmasq[250875]: ------------------------------ ---------------------------------------- ---------- ------------------------ ------------\\n'
+    'May 10 05:49:01 dnsmasq[250875]: example.com                    1.2.3.4                                  4F         Sun May 10 05:50:01 2026\\n',
+    encoding='utf-8',
+)
+Path(args.dnsmasq_stderr_path).write_text('dnsmasq-native\\n', encoding='utf-8')
+print('ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=1 response_accepted=1 second_query_hit=1 cache_entry_created=1 timeout=0')
+""",
+    encoding="utf-8",
+)
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
+write_fake_smartdns_binary() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
+write_fake_smartdns_harness() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import struct
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(
+    """#!/usr/bin/env python3
+import argparse
+import struct
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--mode', required=True)
+parser.add_argument('--cache-dump-path', required=True)
+parser.add_argument('--smartdns-log-path', required=True)
+parser.add_argument('--transcript')
+parser.add_argument('--smartdns-bin')
+args = parser.parse_args()
+packet = (
+    b'\\x56\\x78\\x81\\x80\\x00\\x01\\x00\\x01\\x00\\x00\\x00\\x00'
+    b'\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01'
+    b'\\xc0\\x0c\\x00\\x01\\x00\\x01\\x00\\x00\\x02\\x58\\x00\\x04\\x01\\x02\\x03\\x04'
+)
+info = bytearray(344)
+info[0:len(b'example.com')] = b'example.com'
+struct.pack_into('<i', info, 256, 1)
+struct.pack_into('<I', info, 292, 0)
+struct.pack_into('<i', info, 296, 600)
+struct.pack_into('<i', info, 300, 0)
+struct.pack_into('<i', info, 304, 6)
+struct.pack_into('<i', info, 308, -1)
+struct.pack_into('<q', info, 328, 111)
+struct.pack_into('<q', info, 336, 222)
+payload = struct.pack('<Q32sI4x', 0x6548634163536E44, b'cache ver 1.3\\0', 1)
+payload += struct.pack('<I4x', 0x64526352)
+payload += bytes(info)
+payload += struct.pack('<i4xqI4x', 1, len(packet), 0x61546144)
+payload += packet
+Path(args.cache_dump_path).write_bytes(payload)
+Path(args.smartdns_log_path).write_text('smartdns-native\\n', encoding='utf-8')
+print('ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=1 response_accepted=1 second_query_hit=1 cache_entry_created=1 timeout=0')
+""",
+    encoding="utf-8",
+)
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
+write_fake_maradns_binary() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
+write_fake_maradns_harness() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(
+    """#!/usr/bin/env python3
+import argparse
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--mode', required=True)
+parser.add_argument('--cache-dump-path', required=True)
+parser.add_argument('--maradns-log-path', required=True)
+parser.add_argument('--transcript')
+parser.add_argument('--deadwood-bin')
+args = parser.parse_args()
+Path(args.cache_dump_path).write_text('MARADNS_CACHE_DUMP\\nCACHE_ENTRY\\texample.com\\tA\\t_\\n', encoding='utf-8')
+Path(args.maradns_log_path).write_text('maradns-native\\n', encoding='utf-8')
+print('ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=1 response_accepted=1 second_query_hit=1 cache_entry_created=1 timeout=0')
+""",
+    encoding="utf-8",
+)
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
+write_fake_dnslabctl() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(
+    """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+log_path = os.environ.get("FAKE_DNSLABCTL_LOG")
+if log_path:
+    pathlib.Path(log_path).write_text(" ".join(sys.argv[1:]) + "\\n", encoding="utf-8")
+if sys.argv[1:3] == ["prepare-subject", "--resolver"] and len(sys.argv) >= 4:
+    print('{"resolver": "%s"}' % sys.argv[3])
+    sys.exit(0)
+sys.exit(9)
+""",
+    encoding="utf-8",
+)
+path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+}
+
 HELP_OUT="$WORKDIR/python-help.txt"
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
@@ -116,7 +304,8 @@ if env \
 fi
 assert_file_contains "$FETCH_UNKNOWN_ERR" "dns-diff: fetch 失败"
 assert_file_contains "$FETCH_UNKNOWN_ERR" "未注册 target: 'not-registered'"
-assert_file_contains "$FETCH_UNKNOWN_ERR" "已注册: unbound"
+assert_file_contains "$FETCH_UNKNOWN_ERR" "dnsmasq"
+assert_file_contains "$FETCH_UNKNOWN_ERR" "unbound"
 
 PARSE_UNKNOWN_ERR="$WORKDIR/parse-unknown.err"
 if env \
@@ -128,17 +317,46 @@ if env \
 fi
 assert_file_contains "$PARSE_UNKNOWN_ERR" "dns-diff: parse-cache 失败"
 assert_file_contains "$PARSE_UNKNOWN_ERR" "未注册 resolver: 'not-registered'"
-assert_file_contains "$PARSE_UNKNOWN_ERR" "已注册: bind9, unbound"
+assert_file_contains "$PARSE_UNKNOWN_ERR" "bind9"
+assert_file_contains "$PARSE_UNKNOWN_ERR" "dnsmasq"
+assert_file_contains "$PARSE_UNKNOWN_ERR" "unbound"
 
 FAKE_AFL_TREE="$WORKDIR/unbound-afl"
 FAKE_TARGET="$FAKE_AFL_TREE/.libs/unbound-fuzzme"
 write_fake_unbound_binary "$FAKE_TARGET"
 mkdir -p "$FAKE_AFL_TREE/libworker/.libs" "$WORKDIR/work/response_corpus"
+FAKE_DNSMASQ_BUILD_TREE="$WORKDIR/dnsmasq-build"
+FAKE_DNSMASQ_TARGET="$FAKE_DNSMASQ_BUILD_TREE/dnsmasq"
+FAKE_DNSMASQ_HARNESS="$WORKDIR/dnsmasq-harness.py"
+FAKE_SMARTDNS_BUILD_TREE="$WORKDIR/smartdns-build"
+FAKE_SMARTDNS_TARGET="$FAKE_SMARTDNS_BUILD_TREE/src/smartdns"
+FAKE_SMARTDNS_HARNESS="$WORKDIR/smartdns-harness.py"
+FAKE_MARADNS_BUILD_TREE="$WORKDIR/maradns-build"
+FAKE_MARADNS_TARGET="$FAKE_MARADNS_BUILD_TREE/deadwood-build/deadwood-github/src/Deadwood"
+FAKE_MARADNS_HARNESS="$WORKDIR/maradns-harness.py"
+FAKE_DNSLABCTL="$WORKDIR/fake-dnslabctl.py"
+FAKE_DNSLABCTL_LOG="$WORKDIR/fake-dnslabctl.log"
+write_fake_dnsmasq_binary "$FAKE_DNSMASQ_TARGET"
+write_fake_dnsmasq_harness "$FAKE_DNSMASQ_HARNESS"
+write_fake_smartdns_binary "$FAKE_SMARTDNS_TARGET"
+write_fake_smartdns_harness "$FAKE_SMARTDNS_HARNESS"
+write_fake_maradns_binary "$FAKE_MARADNS_TARGET"
+write_fake_maradns_harness "$FAKE_MARADNS_HARNESS"
+write_fake_dnslabctl "$FAKE_DNSLABCTL"
+mkdir -p "$WORKDIR/dnsmasq-source"
+mkdir -p "$WORKDIR/smartdns-source"
+mkdir -p "$WORKDIR/maradns-source"
 SAMPLE_FILE="$WORKDIR/sample.bin"
 DIRECT_DUMP_OUT="$WORKDIR/direct.cache.txt"
 WRAPPER_DUMP_OUT="$WORKDIR/wrapper.cache.txt"
 DIRECT_LOG="$WORKDIR/direct.log"
 WRAPPER_LOG="$WORKDIR/wrapper.log"
+DNSMASQ_DUMP_OUT="$WORKDIR/dnsmasq.cache.txt"
+DNSMASQ_WRAPPER_DUMP_OUT="$WORKDIR/dnsmasq.wrapper.cache.txt"
+SMARTDNS_DUMP_OUT="$WORKDIR/smartdns.cache.bin"
+SMARTDNS_WRAPPER_DUMP_OUT="$WORKDIR/smartdns.wrapper.cache.bin"
+MARADNS_DUMP_OUT="$WORKDIR/maradns.cache.txt"
+MARADNS_WRAPPER_DUMP_OUT="$WORKDIR/maradns.wrapper.cache.txt"
 printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
 
 env \
@@ -167,6 +385,96 @@ assert_file_contains "$WRAPPER_DUMP_OUT" "START_RRSET_CACHE"
 assert_file_contains "$WRAPPER_LOG" "stdin=4"
 assert_file_contains "$WRAPPER_LOG" "response_dir=$WORKDIR/work/response_corpus"
 
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	DNSLABCTL_BIN="$FAKE_DNSLABCTL" \
+	FAKE_DNSLABCTL_LOG="$FAKE_DNSLABCTL_LOG" \
+	python3 -m tools.dns_diff.cli fetch --target dnsmasq >/dev/null
+assert_file_contains "$FAKE_DNSLABCTL_LOG" "prepare-subject --resolver dnsmasq"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	DNSLABCTL_BIN="$FAKE_DNSLABCTL" \
+	FAKE_DNSLABCTL_LOG="$FAKE_DNSLABCTL_LOG" \
+	python3 -m tools.dns_diff.cli fetch --target smartdns >/dev/null
+assert_file_contains "$FAKE_DNSLABCTL_LOG" "prepare-subject --resolver smartdns"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	DNSLABCTL_BIN="$FAKE_DNSLABCTL" \
+	FAKE_DNSLABCTL_LOG="$FAKE_DNSLABCTL_LOG" \
+	python3 -m tools.dns_diff.cli fetch --target maradns >/dev/null
+assert_file_contains "$FAKE_DNSLABCTL_LOG" "prepare-subject --resolver maradns"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	DNSLABCTL_BIN="$FAKE_DNSLABCTL" \
+	FAKE_DNSLABCTL_LOG="$FAKE_DNSLABCTL_LOG" \
+	python3 -m tools.dns_diff.cli fetch --target knot-resolver >/dev/null
+assert_file_contains "$FAKE_DNSLABCTL_LOG" "prepare-subject --resolver knot-resolver"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	ROOT_DIR="$ROOT_DIR" \
+	DNSMASQ_BUILD_TREE="$FAKE_DNSMASQ_BUILD_TREE" \
+	DNSMASQ_SRC_TREE="$WORKDIR/dnsmasq-source" \
+	DNSMASQ_HARNESS_SCRIPT="$FAKE_DNSMASQ_HARNESS" \
+	python3 -m tools.dns_diff.cli dump-cache --target dnsmasq "$SAMPLE_FILE" "$DNSMASQ_DUMP_OUT" >/dev/null
+assert_file_exists "$DNSMASQ_DUMP_OUT"
+assert_file_contains "$DNSMASQ_DUMP_OUT" "example.com"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	DNSMASQ_BUILD_TREE="$FAKE_DNSMASQ_BUILD_TREE" \
+	DNSMASQ_SRC_TREE="$WORKDIR/dnsmasq-source" \
+	DNSMASQ_HARNESS_SCRIPT="$FAKE_DNSMASQ_HARNESS" \
+	"$WRAPPER" dump-cache --target dnsmasq "$SAMPLE_FILE" "$DNSMASQ_WRAPPER_DUMP_OUT" >/dev/null
+assert_file_exists "$DNSMASQ_WRAPPER_DUMP_OUT"
+assert_file_contains "$DNSMASQ_WRAPPER_DUMP_OUT" "example.com"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	ROOT_DIR="$ROOT_DIR" \
+	SMARTDNS_BUILD_TREE="$FAKE_SMARTDNS_BUILD_TREE" \
+	SMARTDNS_SRC_TREE="$WORKDIR/smartdns-source" \
+	SMARTDNS_HARNESS_SCRIPT="$FAKE_SMARTDNS_HARNESS" \
+	python3 -m tools.dns_diff.cli dump-cache --target smartdns "$SAMPLE_FILE" "$SMARTDNS_DUMP_OUT" >/dev/null
+assert_file_exists "$SMARTDNS_DUMP_OUT"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	SMARTDNS_BUILD_TREE="$FAKE_SMARTDNS_BUILD_TREE" \
+	SMARTDNS_SRC_TREE="$WORKDIR/smartdns-source" \
+	SMARTDNS_HARNESS_SCRIPT="$FAKE_SMARTDNS_HARNESS" \
+	"$WRAPPER" dump-cache --target smartdns "$SAMPLE_FILE" "$SMARTDNS_WRAPPER_DUMP_OUT" >/dev/null
+assert_file_exists "$SMARTDNS_WRAPPER_DUMP_OUT"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$PYTHONPATH_VALUE" \
+	ROOT_DIR="$ROOT_DIR" \
+	MARADNS_BUILD_TREE="$FAKE_MARADNS_BUILD_TREE" \
+	MARADNS_SRC_TREE="$WORKDIR/maradns-source" \
+	MARADNS_HARNESS_SCRIPT="$FAKE_MARADNS_HARNESS" \
+	python3 -m tools.dns_diff.cli dump-cache --target maradns "$SAMPLE_FILE" "$MARADNS_DUMP_OUT" >/dev/null
+assert_file_exists "$MARADNS_DUMP_OUT"
+assert_file_contains "$MARADNS_DUMP_OUT" "CACHE_ENTRY"
+
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	MARADNS_BUILD_TREE="$FAKE_MARADNS_BUILD_TREE" \
+	MARADNS_SRC_TREE="$WORKDIR/maradns-source" \
+	MARADNS_HARNESS_SCRIPT="$FAKE_MARADNS_HARNESS" \
+	"$WRAPPER" dump-cache --target maradns "$SAMPLE_FILE" "$MARADNS_WRAPPER_DUMP_OUT" >/dev/null
+assert_file_exists "$MARADNS_WRAPPER_DUMP_OUT"
+assert_file_contains "$MARADNS_WRAPPER_DUMP_OUT" "CACHE_ENTRY"
+
 BIND_DUMP="$WORKDIR/bind.cache.txt"
 BIND_TSV="$WORKDIR/bind.norm.tsv"
 printf '%s\n' \
@@ -180,6 +488,30 @@ env \
 	"$WRAPPER" parse-cache bind9 "$BIND_DUMP" "$BIND_TSV" >/dev/null
 assert_file_exists "$BIND_TSV"
 assert_file_contains "$BIND_TSV" $'bind9\t_default\texample.com.\tA\tA\tRRSET\trrset\t300\t1.2.3.4\tclass=IN'
+
+DNSMASQ_PARSE_TSV="$WORKDIR/dnsmasq.norm.tsv"
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	WORK_DIR="$WORKDIR/work" \
+	"$WRAPPER" parse-cache dnsmasq "$DNSMASQ_DUMP_OUT" "$DNSMASQ_PARSE_TSV" >/dev/null
+assert_file_exists "$DNSMASQ_PARSE_TSV"
+assert_file_contains "$DNSMASQ_PARSE_TSV" $'dnsmasq\t_\texample.com\tA\tA\tCACHE\trrset\t_\t1.2.3.4\tflags=4F expires=Sun May 10 05:50:01 2026'
+
+SMARTDNS_PARSE_TSV="$WORKDIR/smartdns.norm.tsv"
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	WORK_DIR="$WORKDIR/work" \
+	"$WRAPPER" parse-cache smartdns "$SMARTDNS_DUMP_OUT" "$SMARTDNS_PARSE_TSV" >/dev/null
+assert_file_exists "$SMARTDNS_PARSE_TSV"
+assert_file_contains "$SMARTDNS_PARSE_TSV" $'smartdns\t_\texample.com\tA\tA\tCACHE\tpacket\t600\t1.2.3.4\tclass=1 rcode=0 hitnum=6 speed=-1 query_flag=0 insert_time=111 replace_time=222'
+
+MARADNS_PARSE_TSV="$WORKDIR/maradns.norm.tsv"
+env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	WORK_DIR="$WORKDIR/work" \
+	"$WRAPPER" parse-cache maradns "$MARADNS_DUMP_OUT" "$MARADNS_PARSE_TSV" >/dev/null
+assert_file_exists "$MARADNS_PARSE_TSV"
+assert_file_contains "$MARADNS_PARSE_TSV" $'maradns\t_\texample.com\tA\tA\tCACHE\trrset\t_\t_\tsource=deadwood-log'
 
 WINDOW_GUARD_ERR="$WORKDIR/window.guard.err"
 if env \

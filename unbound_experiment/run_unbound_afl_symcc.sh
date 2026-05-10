@@ -10,16 +10,21 @@ ENV_WORK_DIR="${WORK_DIR:-}"
 WORK_DIR="${ENV_WORK_DIR:-$DEFAULT_WORK_DIR}"
 BIND9_WORK_DIR="${BIND9_WORK_DIR:-${ENV_WORK_DIR:-$DEFAULT_BIND9_WORK_DIR}}"
 FOLLOW_DIFF_SOURCE_DIR="${FOLLOW_DIFF_SOURCE_DIR:-$BIND9_WORK_DIR/afl_out/master/queue}"
-SRC_TREE="${SRC_TREE:-$ROOT_DIR/unbound-1.24.2}"
-AFL_TREE="${AFL_TREE:-$ROOT_DIR/unbound-1.24.2-afl}"
-UNBOUND_TAG="${UNBOUND_TAG:-release-1.24.2}"
+RESOLVERS_LOCK_FILE="${RESOLVERS_LOCK_FILE:-$ROOT_DIR/experiments/resolvers.lock.json}"
+LEGACY_UNBOUND_SRC_TREE="$ROOT_DIR/unbound-1.24.2"
+LEGACY_UNBOUND_AFL_TREE="$ROOT_DIR/unbound-1.24.2-afl"
+LEGACY_BIND9_AFL_TREE="$ROOT_DIR/bind-9.18.46-afl"
+SRC_TREE="${SRC_TREE:-}"
+AFL_TREE="${AFL_TREE:-}"
+UNBOUND_TAG="${UNBOUND_TAG:-}"
+DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl"
 
 FUZZ_PROFILE="${FUZZ_PROFILE:-legacy-response-tail}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-5}"
 DNS_DIFF_CLI_TIMEOUT_SEC="${DNS_DIFF_CLI_TIMEOUT_SEC:-}"
 DNS_DIFF_CLI_TIMEOUT_GRACE_SEC="${DNS_DIFF_CLI_TIMEOUT_GRACE_SEC:-2}"
 
-BIND9_AFL_TREE="${BIND9_AFL_TREE:-$ROOT_DIR/bind-9.18.46-afl}"
+BIND9_AFL_TREE="${BIND9_AFL_TREE:-}"
 BIND9_NAMED_EXP="$ROOT_DIR/named_experiment"
 BIND9_NAMED_CONF_TEMPLATE="$BIND9_NAMED_EXP/runtime/named.conf"
 BIND9_TARGET_ADDR="${BIND9_TARGET_ADDR:-127.0.0.1:55301}"
@@ -85,6 +90,64 @@ require_dir() {
 	[ -d "$1" ] || die "缺少目录: $1"
 }
 
+locked_tag_for() {
+	local resolver="$1"
+
+	[ -f "$RESOLVERS_LOCK_FILE" ] || return 1
+	if [ -x "$DNSLABCTL_BIN" ]; then
+		if "$DNSLABCTL_BIN" lock-resolved-tag \
+			--lock-file "$RESOLVERS_LOCK_FILE" \
+			--resolver "$resolver"
+		then
+			return 0
+		fi
+	fi
+
+	command -v python3 >/dev/null 2>&1 || return 1
+
+	python3 - "$RESOLVERS_LOCK_FILE" "$resolver" <<'PY'
+import json
+import pathlib
+import sys
+
+lock_path = pathlib.Path(sys.argv[1])
+resolver = sys.argv[2]
+payload = json.loads(lock_path.read_text(encoding="utf-8"))
+for entry in payload.get("resolvers", []):
+    if entry.get("resolver") != resolver:
+        continue
+    tag = entry.get("resolved_tag") or entry.get("desired_tag")
+    if not isinstance(tag, str) or not tag:
+        raise SystemExit(1)
+    print(tag)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+resolve_subject_tree_defaults() {
+	local bind9_tag=""
+
+	if [ -z "$UNBOUND_TAG" ]; then
+		if UNBOUND_TAG="$(locked_tag_for unbound 2>/dev/null)"; then
+			:
+		else
+			UNBOUND_TAG="release-1.24.2"
+		fi
+	fi
+
+	[ -n "$SRC_TREE" ] || SRC_TREE="$ROOT_DIR/experiments/subjects/unbound/$UNBOUND_TAG"
+	[ -n "$AFL_TREE" ] || AFL_TREE="$ROOT_DIR/experiments/subjects/unbound/${UNBOUND_TAG}-afl"
+
+	if [ -z "$BIND9_AFL_TREE" ] && bind9_tag="$(locked_tag_for bind9 2>/dev/null)"; then
+		BIND9_AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/${bind9_tag}-afl"
+	fi
+
+	[ -n "$BIND9_AFL_TREE" ] || BIND9_AFL_TREE="$LEGACY_BIND9_AFL_TREE"
+	[ -n "$SRC_TREE" ] || SRC_TREE="$LEGACY_UNBOUND_SRC_TREE"
+	[ -n "$AFL_TREE" ] || AFL_TREE="$LEGACY_UNBOUND_AFL_TREE"
+}
+
 ensure_basic_dirs() {
 	mkdir -p "$WORK_DIR" "$CACHE_DUMP_DIR"
 }
@@ -134,6 +197,8 @@ forward_dns_diff_cli() {
 			WORK_DIR="$WORK_DIR" \
 			FOLLOW_DIFF_SOURCE_DIR="$FOLLOW_DIFF_SOURCE_DIR" \
 			FUZZ_PROFILE="$FUZZ_PROFILE" \
+			SRC_TREE="$SRC_TREE" \
+			AFL_TREE="$AFL_TREE" \
 			BIND9_AFL_TREE="$BIND9_AFL_TREE" \
 			BIND9_NAMED_EXP="$BIND9_NAMED_EXP" \
 			BIND9_NAMED_CONF_TEMPLATE="$BIND9_NAMED_CONF_TEMPLATE" \
@@ -154,6 +219,8 @@ forward_dns_diff_cli() {
 		WORK_DIR="$WORK_DIR" \
 		FOLLOW_DIFF_SOURCE_DIR="$FOLLOW_DIFF_SOURCE_DIR" \
 		FUZZ_PROFILE="$FUZZ_PROFILE" \
+		SRC_TREE="$SRC_TREE" \
+		AFL_TREE="$AFL_TREE" \
 		BIND9_AFL_TREE="$BIND9_AFL_TREE" \
 		BIND9_NAMED_EXP="$BIND9_NAMED_EXP" \
 		BIND9_NAMED_CONF_TEMPLATE="$BIND9_NAMED_CONF_TEMPLATE" \
@@ -189,4 +256,5 @@ main() {
 	esac
 }
 
+resolve_subject_tree_defaults
 main "$@"

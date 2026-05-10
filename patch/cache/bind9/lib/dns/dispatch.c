@@ -1002,7 +1002,6 @@ dns_dispatchmgr_create(isc_mem_t *mctx, isc_nm_t *nm,
 
 	REQUIRE(mctx != NULL);
 	REQUIRE(mgrp != NULL && *mgrp == NULL);
-
 	mgr = isc_mem_get(mctx, sizeof(dns_dispatchmgr_t));
 	*mgr = (dns_dispatchmgr_t){ .magic = 0 };
 

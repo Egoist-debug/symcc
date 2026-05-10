@@ -11,6 +11,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+locked_tag_for() {
+	local resolver="$1"
+
+	python3 - "$ROOT_DIR/experiments/resolvers.lock.json" "$resolver" <<'PY'
+import json
+import pathlib
+import sys
+
+lock_path = pathlib.Path(sys.argv[1])
+resolver = sys.argv[2]
+payload = json.loads(lock_path.read_text(encoding="utf-8"))
+for entry in payload.get("resolvers", []):
+    if entry.get("resolver") != resolver:
+        continue
+    print(entry.get("resolved_tag") or entry.get("desired_tag") or "")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 assert_file_contains() {
 	local path="$1"
 	local expected="$2"
@@ -33,6 +53,11 @@ assert_file_not_contains() {
 	fi
 }
 
+BIND9_TAG="$(locked_tag_for bind9)"
+EXPECTED_SRC_TREE="$ROOT_DIR/experiments/subjects/bind9/$BIND9_TAG"
+EXPECTED_AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/${BIND9_TAG}-afl"
+EXPECTED_SYMCC_TREE="$ROOT_DIR/experiments/subjects/bind9/${BIND9_TAG}-symcc"
+
 POISON_WORK="$WORKDIR/poison-work"
 POISON_MANIFEST_DIR="$WORKDIR/shared-manifests"
 POISON_TEXT_MANIFEST="$POISON_MANIFEST_DIR/high_value_samples.txt"
@@ -54,6 +79,9 @@ assert_file_contains "$POISON_TRACE" "export ENABLE_DST1_MUTATOR=1"
 assert_file_contains "$POISON_TRACE" "export DST1_MUTATOR_ONLY=0"
 assert_file_contains "$POISON_TRACE" "export SYMCC_FRONTIER_RELOAD_SEC=15"
 assert_file_contains "$POISON_TRACE" "export SYMCC_FRONTIER_RETRY_LIMIT=1"
+assert_file_contains "$POISON_TRACE" "SRC_TREE=$EXPECTED_SRC_TREE"
+assert_file_contains "$POISON_TRACE" "AFL_TREE=$EXPECTED_AFL_TREE"
+assert_file_contains "$POISON_TRACE" "SYMCC_TREE=$EXPECTED_SYMCC_TREE"
 assert_file_contains "$POISON_TRACE" "SYMCC_HIGH_VALUE_MANIFEST=$POISON_TEXT_MANIFEST"
 assert_file_contains "$POISON_TRACE" "export SYMCC_SEMANTIC_FRONTIER_MANIFEST=$POISON_MANIFEST_DIR/semantic_frontier_manifest.json"
 assert_file_not_contains "$POISON_TRACE" "export SYMCC_SEMANTIC_FRONTIER_MANIFEST=$POISON_WORK/semantic_frontier_manifest.json"

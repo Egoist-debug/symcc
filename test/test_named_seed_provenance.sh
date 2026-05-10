@@ -91,7 +91,7 @@ SIDE_CAR="$SCENARIO_WORK/producer_seed_provenance.json"
 STATUS_OUT="$WORKDIR/status.txt"
 
 mkdir -p "$STABLE_INPUT_DIR" "$SOURCE_DIR" "$RESPONSE_DIR"
-printf '\x01\x02\x03\x04' >"$STABLE_INPUT_DIR/id_000000_seed"
+printf 'DST1\x00\x02\x00\x00' >"$STABLE_INPUT_DIR/id_000000_seed"
 printf '\xaa\xbb\xcc\xdd' >"$SOURCE_DIR/source-seed"
 
 env \

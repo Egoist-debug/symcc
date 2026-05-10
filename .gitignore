@@ -23,9 +23,8 @@ AGENTS.md
 .serena
 .claude
 .vscode
-
-# bind9 test
-bind-9.18.46*
+.codex
+.agents
 
 # named experiment artifacts
 named_experiment/work*
@@ -33,3 +32,6 @@ named_experiment/work*
 # unbound test
 unbound-1.24*
 unbound_experiment/work*
+
+experiments/subjects
+experiments/runs

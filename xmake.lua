@@ -69,6 +69,7 @@ option_end()
 includes("runtime")
 includes("util/symcc_fuzzing_cpp")
 includes("gen_input")
+includes("dnslab_core")
 
 target("SymCC")
     set_kind("shared")

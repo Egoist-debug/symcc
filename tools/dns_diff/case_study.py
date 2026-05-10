@@ -42,6 +42,18 @@ class CaseStudyCandidate:
     triage_payload: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class ResolverEvidenceContext:
+    primary: str
+    secondary: str
+    primary_stderr_name: str
+    secondary_stderr_name: str
+    primary_before_cache_name: str
+    primary_after_cache_name: str
+    secondary_before_cache_name: str
+    secondary_after_cache_name: str
+
+
 def _coerce_text(value: Any, fallback: str) -> str:
     if isinstance(value, str) and value:
         return value
@@ -136,10 +148,11 @@ def collect_case_study_candidates(root: Path) -> List[CaseStudyCandidate]:
 
 
 def _oracle_diff_fields(oracle_payload: Mapping[str, Any]) -> List[str]:
+    secondary_resolver = _infer_secondary_resolver_name(None, oracle_payload)
     fields: List[str] = []
     for field in ORACLE_FIELDS:
         if oracle_payload.get(f"bind9.{field}") != oracle_payload.get(
-            f"unbound.{field}"
+            f"{secondary_resolver}.{field}"
         ):
             fields.append(field)
     return fields
@@ -161,6 +174,46 @@ def _resolver_int(
     if not isinstance(resolver_payload, Mapping):
         return 0
     return _coerce_int(resolver_payload.get(key), 0)
+
+
+def _infer_secondary_resolver_name(
+    sample_meta_payload: Mapping[str, Any] | None,
+    oracle_payload: Mapping[str, Any],
+) -> str:
+    if isinstance(sample_meta_payload, Mapping):
+        artifacts = sample_meta_payload.get("artifacts")
+        if isinstance(artifacts, Mapping):
+            for key in artifacts.keys():
+                if (
+                    isinstance(key, str)
+                    and key.endswith("_stderr")
+                    and key != "bind9_stderr"
+                ):
+                    return key[: -len("_stderr")]
+    for key in oracle_payload.keys():
+        if not isinstance(key, str) or "." not in key:
+            continue
+        prefix, _ = key.split(".", 1)
+        if prefix != "bind9":
+            return prefix
+    return "unbound"
+
+
+def _resolver_context(
+    sample_meta_payload: Mapping[str, Any] | None,
+    oracle_payload: Mapping[str, Any],
+) -> ResolverEvidenceContext:
+    secondary = _infer_secondary_resolver_name(sample_meta_payload, oracle_payload)
+    return ResolverEvidenceContext(
+        primary="bind9",
+        secondary=secondary,
+        primary_stderr_name="bind9.stderr",
+        secondary_stderr_name=f"{secondary}.stderr",
+        primary_before_cache_name="bind9.before.cache.txt",
+        primary_after_cache_name="bind9.after.cache.txt",
+        secondary_before_cache_name=f"{secondary}.before.cache.txt",
+        secondary_after_cache_name=f"{secondary}.after.cache.txt",
+    )
 
 
 def _stderr_preview(path: Path, *, max_lines: int = 20) -> Dict[str, Any]:
@@ -203,6 +256,7 @@ def _sample_bin_evidence(path: Path) -> Dict[str, Any]:
 def _build_automated_summary(
     *,
     semantic_outcome: str,
+    resolver_context: ResolverEvidenceContext,
     triage_payload: Mapping[str, Any],
     oracle_payload: Mapping[str, Any],
     cache_diff_payload: Mapping[str, Any],
@@ -238,15 +292,16 @@ def _build_automated_summary(
         "bind9_has_cache_diff": _resolver_bool(
             cache_diff_payload, "bind9", "has_cache_diff"
         ),
-        "unbound_has_cache_diff": _resolver_bool(
-            cache_diff_payload, "unbound", "has_cache_diff"
+        f"{resolver_context.secondary}_has_cache_diff": _resolver_bool(
+            cache_diff_payload, resolver_context.secondary, "has_cache_diff"
         ),
         "bind9_interesting_delta_count": _resolver_int(
             cache_diff_payload, "bind9", "interesting_delta_count"
         ),
-        "unbound_interesting_delta_count": _resolver_int(
-            cache_diff_payload, "unbound", "interesting_delta_count"
+        f"{resolver_context.secondary}_interesting_delta_count": _resolver_int(
+            cache_diff_payload, resolver_context.secondary, "interesting_delta_count"
         ),
+        "secondary_resolver": resolver_context.secondary,
         "summary_text": summary_text,
     }
 
@@ -258,10 +313,21 @@ def _build_raw_evidence(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     cache_diff_path = _resolve_sample_artifact(sample_dir, "cache_diff.json")
     triage_path = _resolve_sample_artifact(sample_dir, "triage.json")
     sample_bin_path = _resolve_sample_artifact(sample_dir, "sample.bin")
-    bind9_stderr_path = _resolve_sample_artifact(sample_dir, "bind9.stderr")
-    unbound_stderr_path = _resolve_sample_artifact(sample_dir, "unbound.stderr")
+    sample_meta_payload = _load_json_artifact(sample_meta_path, label="sample.meta.json")
+    oracle_payload = _load_json_artifact(oracle_path, label="oracle.json")
+    resolver_context = _resolver_context(sample_meta_payload, oracle_payload)
+    bind9_stderr_path = _resolve_sample_artifact(
+        sample_dir, resolver_context.primary_stderr_name
+    )
+    secondary_stderr_path = _resolve_sample_artifact(
+        sample_dir, resolver_context.secondary_stderr_name
+    )
 
     return {
+        "resolver_context": {
+            "primary": resolver_context.primary,
+            "secondary": resolver_context.secondary,
+        },
         "paths": {
             "sample_meta_path": str(sample_meta_path),
             "oracle_path": str(oracle_path),
@@ -269,16 +335,16 @@ def _build_raw_evidence(candidate: CaseStudyCandidate) -> Dict[str, Any]:
             "triage_path": str(triage_path),
             "sample_bin_path": str(sample_bin_path),
             "bind9_stderr_path": str(bind9_stderr_path),
-            "unbound_stderr_path": str(unbound_stderr_path),
+            f"{resolver_context.secondary}_stderr_path": str(secondary_stderr_path),
         },
-        "sample_meta": _load_json_artifact(sample_meta_path, label="sample.meta.json"),
-        "oracle": _load_json_artifact(oracle_path, label="oracle.json"),
+        "sample_meta": sample_meta_payload,
+        "oracle": oracle_payload,
         "cache_diff": _load_json_artifact(cache_diff_path, label="cache_diff.json"),
         "triage": dict(candidate.triage_payload),
         "sample_bin": _sample_bin_evidence(sample_bin_path),
         "stderr": {
             "bind9": _stderr_preview(bind9_stderr_path),
-            "unbound": _stderr_preview(unbound_stderr_path),
+            resolver_context.secondary: _stderr_preview(secondary_stderr_path),
         },
     }
 
@@ -288,9 +354,11 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     triage_payload = raw_evidence["triage"]
     oracle_payload = raw_evidence["oracle"]
     cache_diff_payload = raw_evidence["cache_diff"]
+    resolver_context = _resolver_context(raw_evidence["sample_meta"], oracle_payload)
 
     automated_summary = _build_automated_summary(
         semantic_outcome=candidate.semantic_outcome,
+        resolver_context=resolver_context,
         triage_payload=triage_payload,
         oracle_payload=oracle_payload,
         cache_diff_payload=cache_diff_payload,
@@ -312,7 +380,7 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
         },
         "claim_scope": [
             "选样仅消费 triage.json 中已冻结的 analysis_state 与 semantic_outcome，不重算 publication 语义。",
-            "原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、sample.bin、bind9.stderr、unbound.stderr。",
+            f"原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、sample.bin、bind9.stderr、{resolver_context.secondary}.stderr。",
         ],
         "limitations": [
             "manual_truth 仅为 not_started scaffold，当前尚无人工双评或 adjudication 结论。",
