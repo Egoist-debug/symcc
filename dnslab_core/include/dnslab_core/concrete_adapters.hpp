@@ -56,6 +56,7 @@ struct MaradnsAdapterConfig {
 
 struct KnotResolverAdapterConfig {
   std::filesystem::path WorkspaceRoot;
+  std::filesystem::path HarnessScriptPath;
   std::optional<std::filesystem::path> SourceFallbackPath;
   std::optional<std::filesystem::path> BinaryPathOverride;
 };

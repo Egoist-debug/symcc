@@ -1,0 +1,6 @@
+resolver	resolver_pair	full_stack_oracle_audit_candidate_count_mean	full_stack_semantic_diff_count_mean	full_stack_semantic_counts_json
+dnsmasq	bind9_vs_dnsmasq	0.000000	0.000000	{"runtime_or_parse_failure": 1.0}
+knot-resolver	bind9_vs_knot-resolver	0.000000	0.000000	{"runtime_or_parse_failure": 1.0}
+maradns	bind9_vs_maradns	0.000000	0.000000	{"runtime_or_parse_failure": 1.0}
+smartdns	bind9_vs_smartdns	0.000000	0.000000	{"runtime_or_parse_failure": 1.0}
+unbound	bind9_vs_unbound	1.000000	1.000000	{"oracle_and_cache_diff": 1.0}

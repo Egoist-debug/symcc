@@ -83,6 +83,7 @@ class MatrixConfig:
     matrix_name: str
     matrix_file: Path
     source_queue_dir: Path
+    runtime_env: Dict[str, str]
     resolver_pair: str
     producer_profile: str
     input_model: str
@@ -162,6 +163,22 @@ def _normalize_env_payload(variant_name: str, payload: Any) -> Dict[str, str]:
         raise CampaignMatrixError(
             f"variants[{variant_name}].env 包含未支持键: {', '.join(extra_keys)}"
         )
+    return normalized
+
+
+def _normalize_runtime_env(payload: Any) -> Dict[str, str]:
+    if payload is None:
+        return {}
+    env_payload = _require_mapping(payload, "runtime_env")
+    normalized: Dict[str, str] = {}
+    for raw_key, raw_value in env_payload.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise CampaignMatrixError("runtime_env 键必须是非空字符串")
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise CampaignMatrixError(
+                f"runtime_env.{raw_key} 必须是非空字符串"
+            )
+        normalized[raw_key.strip()] = raw_value
     return normalized
 
 
@@ -278,6 +295,7 @@ def _load_matrix_config(matrix_file: Path, work_root: Path) -> MatrixConfig:
         matrix_name=matrix_name,
         matrix_file=matrix_path,
         source_queue_dir=source_queue_dir,
+        runtime_env=_normalize_runtime_env(root_payload.get("runtime_env")),
         resolver_pair=_require_text(
             comparability_payload.get("resolver_pair"), "comparability.resolver_pair"
         ),
@@ -376,12 +394,9 @@ def _run_single_matrix_entry(
     _ensure_empty_run_dir(run_dir)
 
     env_overrides = dict(variant.env)
-    env_overrides.update(
-        {
-            "WORK_DIR": str(run_dir),
-            "FOLLOW_DIFF_SOURCE_DIR": str(config.source_queue_dir),
-        }
-    )
+    env_overrides.update(config.runtime_env)
+    env_overrides["WORK_DIR"] = str(run_dir)
+    env_overrides["FOLLOW_DIFF_SOURCE_DIR"] = str(config.source_queue_dir)
 
     try:
         with _temporary_environ(env_overrides):
@@ -574,7 +589,13 @@ def _write_matrix_manifest(
         "budget_sec": _normalize_key_number(float(budget_sec)),
         "repeat_count": int(repeat_count),
         "work_root": str(work_root),
+        "resolver_pair": config.resolver_pair,
+        "producer_profile": config.producer_profile,
+        "input_model": config.input_model,
+        "seed_timeout_sec": config.seed_timeout_sec,
+        "contract_version": config.contract_version,
         "source_queue_dir": str(config.source_queue_dir),
+        "runtime_env": dict(config.runtime_env),
         "variants": [],
         "summary_outputs": {
             "matrix_manifest_json": str(output_dir / "matrix_manifest.json"),

@@ -15,11 +15,18 @@ def parse_transcript(path: Path):
     if len(data) < 8 or data[:4] != b"DST1":
         raise ValueError("invalid DST1 transcript header")
     response_count = data[4]
-    version = data[5]
-    if version != 2:
-        raise ValueError(f"unsupported transcript version: {version}")
-    query_len = int.from_bytes(data[6:8], "little")
-    offset = 8
+    if response_count > 16:
+        raise ValueError(f"unsupported response count: {response_count}")
+    if len(data) >= 10 and data[5] == 0:
+        query_len = int.from_bytes(data[6:8], "little")
+        post_len = int.from_bytes(data[8:10], "little")
+        offset = 10
+    elif data[5] == 2:
+        query_len = int.from_bytes(data[6:8], "little")
+        post_len = len(data)
+        offset = 8
+    else:
+        raise ValueError(f"unsupported transcript header flag: {data[5]}")
     lengths = []
     for _ in range(response_count):
         if offset + 2 > len(data):
@@ -36,7 +43,12 @@ def parse_transcript(path: Path):
             raise ValueError("truncated forged response")
         responses.append(bytearray(data[offset : offset + length]))
         offset += length
-    post_check = data[offset:]
+    if post_len == len(data):
+        post_check = data[offset:]
+    else:
+        if offset + post_len != len(data):
+            raise ValueError("truncated post-check query")
+        post_check = data[offset : offset + post_len]
     return client_query, responses, post_check
 
 
@@ -54,8 +66,15 @@ def write_text(path: Path, text: str):
 
 
 def build_preload_shim(work_dir: Path) -> Path:
-    source = work_dir / "deadwood_sandbox_shim.c"
-    output = work_dir / "deadwood_sandbox_shim.so"
+    preferred_tmp = Path.home() / "tmp"
+    shim_root = Path(
+        tempfile.mkdtemp(
+            prefix="deadwood_shim_",
+            dir=str(preferred_tmp) if preferred_tmp.is_dir() else None,
+        )
+    )
+    source = shim_root / "deadwood_sandbox_shim.c"
+    output = shim_root / "deadwood_sandbox_shim.so"
     source.write_text(
         """
 #define _GNU_SOURCE

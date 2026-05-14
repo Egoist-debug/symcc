@@ -3,6 +3,7 @@
 #include "dnslab_core/oracle.hpp"
 
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -84,6 +85,27 @@ std::filesystem::path firstExisting(
     }
   }
   return {};
+}
+
+std::string collectDotLibs(const std::filesystem::path &TreeRoot) {
+  std::set<std::string> LibDirs;
+  if (!std::filesystem::is_directory(TreeRoot)) {
+    return "";
+  }
+  for (const auto &Entry : std::filesystem::recursive_directory_iterator(TreeRoot)) {
+    if (!Entry.is_directory() || Entry.path().filename() != ".libs") {
+      continue;
+    }
+    LibDirs.insert(std::filesystem::absolute(Entry.path()).string());
+  }
+  std::ostringstream Output;
+  for (auto It = LibDirs.begin(); It != LibDirs.end(); ++It) {
+    if (It != LibDirs.begin()) {
+      Output << ':';
+    }
+    Output << *It;
+  }
+  return Output.str();
 }
 
 std::filesystem::path bind9BinaryPath(const Bind9AdapterConfig &Config,
@@ -191,8 +213,17 @@ std::filesystem::path knotResolverBinaryPath(
   if (Config.BinaryPathOverride.has_value()) {
     return *Config.BinaryPathOverride;
   }
+  const char *EnvBuildRoot = std::getenv("DNSLAB_KNOT_RESOLVER_BUILD_ROOT");
   return firstExisting({BuildRoot / "knot-build" / "daemon" / "kresd",
                         BuildRoot / "daemon" / "kresd",
+                        EnvBuildRoot != nullptr
+                            ? std::filesystem::path(EnvBuildRoot) / "knot-build" /
+                                  "daemon" / "kresd"
+                            : std::filesystem::path(),
+                        EnvBuildRoot != nullptr
+                            ? std::filesystem::path(EnvBuildRoot) / "daemon" /
+                                  "kresd"
+                            : std::filesystem::path(),
                         Config.WorkspaceRoot / "experiments" / "subjects" /
                             "knot-resolver" / "v6.2.0-build" / "knot-build" /
                             "daemon" / "kresd"});
@@ -369,6 +400,7 @@ Bind9ResolverAdapter::runSample(const RunSampleRequest &Request) const {
                                       "缺少 bind9 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 bind9 response 语料目录");
+  const auto LdLibraryPath = collectDotLibs(Request.BuildRoot);
   const auto RuntimeDir = Request.RunRoot / "bind9_runtime";
   const auto NamedConf = RuntimeDir / "named.conf";
 
@@ -381,6 +413,7 @@ Bind9ResolverAdapter::runSample(const RunSampleRequest &Request) const {
            Request.TranscriptPath.string()},
       Request.SourceRoot,
       {
+          {"LD_LIBRARY_PATH", LdLibraryPath},
           {"NAMED_RESOLVER_AFL_SYMCC_TARGET", Config_.TargetAddr},
           {"NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
            ResponseCorpusDir.string()},
@@ -403,6 +436,12 @@ Bind9ResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
       bind9BinaryPath(Config_, RunRoot), "缺少 bind9 dump-cache 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 bind9 response 语料目录");
+  const auto BuildRoot = std::filesystem::path(
+      std::getenv("DNSLAB_BIND9_BUILD_ROOT") != nullptr
+          ? std::getenv("DNSLAB_BIND9_BUILD_ROOT")
+          : "");
+  const auto LdLibraryPath = collectDotLibs(
+      BuildRoot.empty() ? Config_.WorkspaceRoot / "bind-9.18.46-afl" : BuildRoot);
   const auto RuntimeDir = RunRoot / "bind9_runtime";
   const auto NamedConf = RuntimeDir / "named.conf";
 
@@ -413,6 +452,7 @@ Bind9ResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
        "resolver-afl-symcc:" + Config_.MutatorAddr},
       std::nullopt,
       {
+          {"LD_LIBRARY_PATH", LdLibraryPath},
           {"NAMED_RESOLVER_AFL_SYMCC_TARGET", Config_.TargetAddr},
           {"NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
            ResponseCorpusDir.string()},
@@ -523,12 +563,14 @@ UnboundResolverAdapter::runSample(const RunSampleRequest &Request) const {
                                       "缺少 unbound 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 unbound response 语料目录");
+  const auto LdLibraryPath = collectDotLibs(Request.BuildRoot);
   std::filesystem::create_directories(Request.RunRoot);
   const CommandResult Result = runProcess({
       {"timeout", "-k", "2", std::to_string(Config_.SeedTimeoutSec),
        Binary.string()},
       Request.SourceRoot,
       {
+          {"LD_LIBRARY_PATH", LdLibraryPath},
           {"UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
            ResponseCorpusDir.string()},
           {"UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH",
@@ -548,11 +590,18 @@ UnboundResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
       unboundBinaryPath(Config_, RunRoot), "缺少 unbound dump-cache 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 unbound response 语料目录");
+  const auto BuildRoot = std::filesystem::path(
+      std::getenv("DNSLAB_UNBOUND_BUILD_ROOT") != nullptr
+          ? std::getenv("DNSLAB_UNBOUND_BUILD_ROOT")
+          : "");
+  const auto LdLibraryPath = collectDotLibs(
+      BuildRoot.empty() ? Config_.WorkspaceRoot / "unbound-1.24.2-afl" : BuildRoot);
   const CommandResult Result = runProcess({
       {"timeout", "-k", "2", std::to_string(Config_.SeedTimeoutSec),
        Binary.string()},
       std::nullopt,
       {
+          {"LD_LIBRARY_PATH", LdLibraryPath},
           {"UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
            ResponseCorpusDir.string()},
           {"UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH", OutputFile.string()},
@@ -1075,30 +1124,41 @@ CommandResult
 KnotResolverAdapter::build(const std::filesystem::path &SourceRoot,
                            const std::filesystem::path &BuildRoot) const {
   const auto TargetRoot = BuildRoot / "knot-build";
+  const auto RuntimePrefix = BuildRoot / "knot-runtime";
   std::filesystem::create_directories(TargetRoot.parent_path());
   if (std::filesystem::exists(TargetRoot / "meson.build") &&
       !std::filesystem::exists(TargetRoot / "build.ninja")) {
     std::filesystem::remove_all(TargetRoot);
   }
+  std::vector<std::string> SetupArgs = {
+      "meson",
+      "setup",
+      TargetRoot.string(),
+      SourceRoot.string(),
+      "--prefix",
+      RuntimePrefix.string(),
+      "--libdir",
+      "lib",
+      "-Ddoc=disabled",
+      "-Dextra_tests=disabled",
+      "-Dconfig_tests=disabled",
+      "-Dutils=disabled",
+      "-Dsystemd_files=disabled",
+      "-Dquic=disabled",
+      "-Ddnstap=disabled",
+      "-Dmanaged_ta=disabled",
+  };
+  if (std::filesystem::exists(TargetRoot / "build.ninja")) {
+    SetupArgs.insert(SetupArgs.begin() + 2, "--reconfigure");
+  }
   const auto SetupResult = runProcess({
-      {"meson",
-       "setup",
-       TargetRoot.string(),
-       SourceRoot.string(),
-       "-Ddoc=disabled",
-       "-Dextra_tests=disabled",
-       "-Dconfig_tests=disabled",
-       "-Dutils=disabled",
-       "-Dsystemd_files=disabled",
-       "-Dquic=disabled",
-       "-Ddnstap=disabled",
-       "-Dmanaged_ta=disabled"},
+      SetupArgs,
       std::nullopt,
       {},
       std::nullopt,
   });
-  if (SetupResult.ExitCode != 0 && !std::filesystem::exists(TargetRoot / "build.ninja")) {
-      return SetupResult;
+  if (SetupResult.ExitCode != 0) {
+    return SetupResult;
   }
   const auto BuildResult = runProcess({
       {"ninja", "daemon/kresd"},
@@ -1109,6 +1169,46 @@ KnotResolverAdapter::build(const std::filesystem::path &SourceRoot,
   if (BuildResult.ExitCode != 0) {
     return BuildResult;
   }
+  const auto InstallResult = runProcess({
+      {"meson", "install", "-C", TargetRoot.string()},
+      std::nullopt,
+      {},
+      std::nullopt,
+  });
+  if (InstallResult.ExitCode != 0) {
+    return InstallResult;
+  }
+  const auto RuntimeLuaDir = RuntimePrefix / "lib" / "knot-resolver";
+  const auto RuntimeEtcDir = RuntimePrefix / "etc" / "knot-resolver";
+  std::filesystem::create_directories(RuntimeLuaDir);
+  std::filesystem::create_directories(RuntimeEtcDir);
+  const auto copyLuaDir = [&](const std::filesystem::path &LuaDir) {
+    if (!std::filesystem::is_directory(LuaDir)) {
+      return;
+    }
+    for (const auto &Entry : std::filesystem::directory_iterator(LuaDir)) {
+      if (!Entry.is_regular_file()) {
+        continue;
+      }
+      std::filesystem::copy_file(
+          Entry.path(), RuntimeLuaDir / Entry.path().filename(),
+          std::filesystem::copy_options::overwrite_existing);
+    }
+  };
+  copyLuaDir(SourceRoot / "daemon" / "lua");
+  copyLuaDir(TargetRoot / "daemon" / "lua");
+  const auto RootKeysSource = SourceRoot / "etc" / "root.keys";
+  if (std::filesystem::is_regular_file(RootKeysSource)) {
+    std::filesystem::copy_file(
+        RootKeysSource, RuntimeEtcDir / "root.keys",
+        std::filesystem::copy_options::overwrite_existing);
+  }
+  requireExisting(RuntimeLuaDir / "sandbox.lua",
+                  "缺少 knot-resolver Lua runtime");
+  requireExisting(RuntimeLuaDir / "kres_modules" / "ta_update.lua",
+                  "缺少 knot-resolver 内置模块");
+  requireExisting(RuntimeEtcDir / "root.keys",
+                  "缺少 knot-resolver trust anchor");
   requireExisting(knotResolverBinaryPath(Config_, BuildRoot),
                   "缺少 knot-resolver 可执行文件");
   return BuildResult;
@@ -1116,22 +1216,61 @@ KnotResolverAdapter::build(const std::filesystem::path &SourceRoot,
 
 CommandResult
 KnotResolverAdapter::runSample(const RunSampleRequest &Request) const {
+  const auto Binary =
+      requireExisting(knotResolverBinaryPath(Config_, Request.BuildRoot),
+                      "缺少 knot-resolver 可执行文件");
+  const auto Harness = requireExisting(Config_.HarnessScriptPath,
+                                       "缺少 knot-resolver replay harness");
   std::filesystem::create_directories(Request.RunRoot);
-  const std::string Message =
-      "resolver scaffold only: knot-resolver stage=run-sample";
-  std::ofstream(Request.RunRoot / "knot-resolver.stderr") << Message << '\n';
-  return {95, "", Message};
+  const auto CacheDumpPath = Request.RunRoot / "knot-resolver.after.cache.txt";
+  const auto NativeLogPath = Request.RunRoot / "knot-resolver.native.log";
+  const CommandResult Result = runProcess({
+      {"python3",
+       Harness.string(),
+       "--kresd-bin",
+       Binary.string(),
+       "--mode",
+       "run",
+       "--transcript",
+       Request.TranscriptPath.string(),
+       "--cache-dump-path",
+       CacheDumpPath.string(),
+       "--kresd-log-path",
+       NativeLogPath.string()},
+      std::nullopt,
+      {},
+      std::nullopt,
+  });
+  std::ofstream(Request.RunRoot / "knot-resolver.stderr") << Result.StdoutText;
+  return Result;
 }
 
 CommandResult
 KnotResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                const std::filesystem::path &OutputFile) const {
+  const auto Binary = requireExisting(knotResolverBinaryPath(Config_, RunRoot),
+                                      "缺少 knot-resolver 可执行文件");
+  const auto Harness = requireExisting(Config_.HarnessScriptPath,
+                                       "缺少 knot-resolver replay harness");
   std::filesystem::create_directories(RunRoot);
-  std::ofstream(OutputFile) << "";
-  const std::string Message =
-      "resolver scaffold only: knot-resolver stage=dump-cache";
-  std::ofstream(RunRoot / "knot-resolver.stderr") << Message << '\n';
-  return {95, "", Message};
+  const auto NativeLogPath = RunRoot / "knot-resolver.native.log";
+  const CommandResult Result = runProcess({
+      {"python3",
+       Harness.string(),
+       "--kresd-bin",
+       Binary.string(),
+       "--mode",
+       "dump",
+       "--cache-dump-path",
+       OutputFile.string(),
+       "--kresd-log-path",
+       NativeLogPath.string()},
+      std::nullopt,
+      {},
+      std::nullopt,
+  });
+  std::ofstream(RunRoot / "knot-resolver.stderr") << Result.StdoutText;
+  return Result;
 }
 
 CommandResult
@@ -1142,22 +1281,22 @@ KnotResolverAdapter::flushCache(const std::filesystem::path &RunRoot) const {
 
 OracleArtifact
 KnotResolverAdapter::parseOracle(const std::filesystem::path &OraclePath) const {
-  (void)OraclePath;
-  OracleArtifact Output;
-  Output.ResolverName = "knot-resolver";
-  Output.ParseOk = false;
-  Output.Fields["resolver"] = "knot-resolver";
-  Output.Fields["parse_ok"] = false;
-  Output.Fields["reason"] = "resolver scaffold only";
-  return Output;
+  std::ifstream Input(OraclePath);
+  std::ostringstream Buffer;
+  Buffer << Input.rdbuf();
+  return makeOracleArtifact(parseOracleSummary(Buffer.str(), "knot-resolver"));
 }
 
 std::vector<std::filesystem::path>
 KnotResolverAdapter::collectLogs(const std::filesystem::path &RunRoot) const {
-  if (std::filesystem::exists(RunRoot / "knot-resolver.stderr")) {
-    return {RunRoot / "knot-resolver.stderr"};
+  std::vector<std::filesystem::path> Output;
+  for (const auto &Candidate :
+       {RunRoot / "knot-resolver.stderr", RunRoot / "knot-resolver.native.log"}) {
+    if (std::filesystem::exists(Candidate)) {
+      Output.push_back(Candidate);
+    }
   }
-  return {};
+  return Output;
 }
 
 ResolverRegistry
@@ -1229,21 +1368,16 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
 
   KnotResolverAdapterConfig KnotConfig;
   KnotConfig.WorkspaceRoot = WorkspaceRoot;
+  if (const char *HarnessEnv = std::getenv("KNOT_RESOLVER_HARNESS_SCRIPT")) {
+    KnotConfig.HarnessScriptPath = std::filesystem::path(HarnessEnv);
+  } else {
+    KnotConfig.HarnessScriptPath =
+        WorkspaceRoot / "tools" / "knot_resolver_replay_harness.py";
+  }
   KnotConfig.SourceFallbackPath = std::nullopt;
   KnotConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
       std::make_shared<KnotResolverAdapter>(std::move(KnotConfig)));
-
-  const auto registerScaffold = [&](const std::string &ResolverName,
-                                    const std::string &RepoUrl) {
-    ScaffoldResolverAdapterConfig Config;
-    Config.WorkspaceRoot = WorkspaceRoot;
-    Config.ResolverName = ResolverName;
-    Config.RepoUrl = RepoUrl;
-    Config.SourceFallbackPath = std::nullopt;
-    Registry.registerAdapter(
-        std::make_shared<ScaffoldResolverAdapter>(std::move(Config)));
-  };
 
   return Registry;
 }

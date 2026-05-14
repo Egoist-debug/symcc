@@ -1,0 +1,5 @@
+model_name	sample_count	parse_ok_count	parse_accept_rate	resolver_fetch_started_count	recursive_or_cache_path_rate	response_accepted_count	response_accept_rate	post_check_capable_count	second_query_hit_count	effective_post_check_rate
+dst1_transcript	1	1	1.000000	1	1.000000	1	1.000000	1	0	0.000000
+query_only	1	1	1.000000	1	1.000000	1	1.000000	0	0	
+random_packet	1	0	0.000000	0	0.000000	0	0.000000	0	0	
+legacy_response_tail	1	1	1.000000	1	1.000000	1	1.000000	0	0	

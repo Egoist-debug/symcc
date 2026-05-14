@@ -1,5 +1,9 @@
 {
   "matrix_name": "poison_stateful_longbudget",
+  "runtime_env": {
+    "FOLLOW_DIFF_INTERVAL_SEC": "0.05",
+    "FOLLOW_DIFF_WINDOW_IDLE_ROUNDS": "1"
+  },
   "comparability": {
     "resolver_pair": "bind9_vs_unbound",
     "producer_profile": "poison-stateful",

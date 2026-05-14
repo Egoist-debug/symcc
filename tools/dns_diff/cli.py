@@ -14,9 +14,23 @@ from .follow_diff import (
     follow_diff_once,
     follow_diff_window,
 )
+from .input_model_eval import InputModelEvalError, run_input_model_eval
 from .matrix import CampaignMatrixError, run_campaign_matrix
 from .report import ReportError, default_follow_diff_root, generate_report
 from .replay import ReplayError, replay_diff_cache
+from .rq3_snapshot import RQ3SnapshotError, run_rq3_snapshot
+from .resolver_backend_matrix_compare import (
+    ResolverBackendMatrixCompareError,
+    run_resolver_backend_matrix_compare,
+)
+from .resolver_capability_report import (
+    ResolverCapabilityReportError,
+    run_resolver_capability_report,
+)
+from .resolver_matrix_aggregate import (
+    ResolverMatrixAggregateError,
+    run_resolver_matrix_aggregate,
+)
 from .targets import (
     TargetRegistryError,
     dump_cache,
@@ -81,6 +95,25 @@ def _cmd_follow_diff_window(args: argparse.Namespace) -> int:
         return exc.exit_code
 
 
+def _cmd_input_model_eval(args: argparse.Namespace) -> int:
+    try:
+        return run_input_model_eval(
+            output_dir=Path(args.output_dir),
+            bind9_tree=Path(args.bind9_tree),
+            named_conf_template=Path(args.named_conf_template),
+            dst1_input=Path(args.dst1_input),
+            query_only_input=Path(args.query_only_input),
+            random_input=Path(args.random_input),
+            legacy_input=Path(args.legacy_input),
+            legacy_response_dir=Path(args.legacy_response_dir),
+            seed_timeout_sec=args.seed_timeout_sec,
+            reply_timeout_ms=args.reply_timeout_ms,
+        )
+    except InputModelEvalError as exc:
+        sys.stderr.write(f"dns-diff: input-model-eval 失败: {exc}\n")
+        return exc.exit_code
+
+
 def _cmd_parse_cache(args: argparse.Namespace) -> int:
     try:
         resolver = resolve_cache_resolver(args.resolver)
@@ -132,6 +165,17 @@ def _cmd_report(args: argparse.Namespace) -> int:
         return generate_report(args.root)
     except ReportError as exc:
         sys.stderr.write(f"dns-diff: report 失败: {exc}\n")
+        return exc.exit_code
+
+
+def _cmd_rq3_snapshot(args: argparse.Namespace) -> int:
+    try:
+        return run_rq3_snapshot(
+            resolver_variant_summary_tsv=Path(args.resolver_variant_summary_tsv),
+            output_dir=Path(args.output_dir),
+        )
+    except RQ3SnapshotError as exc:
+        sys.stderr.write(f"dns-diff: rq3-snapshot 失败: {exc}\n")
         return exc.exit_code
 
 
@@ -191,6 +235,43 @@ def _cmd_campaign_matrix(args: argparse.Namespace) -> int:
         return exc.exit_code
 
 
+def _cmd_resolver_matrix_aggregate(args: argparse.Namespace) -> int:
+    try:
+        return run_resolver_matrix_aggregate(
+            matrix_roots=[Path(path) for path in args.matrix_root],
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+    except ResolverMatrixAggregateError as exc:
+        sys.stderr.write(f"dns-diff: resolver-matrix-aggregate 失败: {exc}\n")
+        return exc.exit_code
+
+
+def _cmd_resolver_capability_report(args: argparse.Namespace) -> int:
+    try:
+        return run_resolver_capability_report(
+            replay_matrix_dir=Path(args.replay_matrix_dir),
+            matrix_batch_dir=Path(args.matrix_batch_dir),
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+    except ResolverCapabilityReportError as exc:
+        sys.stderr.write(f"dns-diff: resolver-capability-report 失败: {exc}\n")
+        return exc.exit_code
+
+
+def _cmd_resolver_backend_matrix_compare(args: argparse.Namespace) -> int:
+    try:
+        return run_resolver_backend_matrix_compare(
+            baseline_batch_dir=Path(args.baseline_batch_dir),
+            candidate_batch_dir=Path(args.candidate_batch_dir),
+            baseline_label=args.baseline_label,
+            candidate_label=args.candidate_label,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+    except ResolverBackendMatrixCompareError as exc:
+        sys.stderr.write(f"dns-diff: resolver-backend-matrix-compare 失败: {exc}\n")
+        return exc.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m tools.dns_diff.cli",
@@ -240,6 +321,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     follow_diff_window.set_defaults(handler=_cmd_follow_diff_window)
 
+    input_model_eval = subparsers.add_parser(
+        "input-model-eval",
+        help="对比 DST1/query-only/random/legacy-response-tail 的输入有效性指标",
+    )
+    input_model_eval.add_argument("--output-dir", required=True, help="输出目录")
+    input_model_eval.add_argument(
+        "--bind9-tree",
+        required=True,
+        help="bind9 AFL 构建树，需包含 bin/named/.libs/named",
+    )
+    input_model_eval.add_argument(
+        "--named-conf-template",
+        required=True,
+        help="named.conf 模板路径",
+    )
+    input_model_eval.add_argument("--dst1-input", required=True, help="DST1 transcript 文件或目录")
+    input_model_eval.add_argument("--query-only-input", required=True, help="query-only 文件或目录")
+    input_model_eval.add_argument("--random-input", required=True, help="random packet 文件或目录")
+    input_model_eval.add_argument("--legacy-input", required=True, help="legacy-response-tail 使用的 query 文件或目录")
+    input_model_eval.add_argument(
+        "--legacy-response-dir",
+        required=True,
+        help="legacy-response-tail 使用的 response 目录",
+    )
+    input_model_eval.add_argument(
+        "--seed-timeout-sec",
+        type=int,
+        default=5,
+        help="单样本运行超时秒数",
+    )
+    input_model_eval.add_argument(
+        "--reply-timeout-ms",
+        type=int,
+        default=80,
+        help="reply timeout 毫秒数",
+    )
+    input_model_eval.set_defaults(handler=_cmd_input_model_eval)
+
     parse_cache = subparsers.add_parser("parse-cache", help="解析 resolver cache dump")
     parse_cache.add_argument("resolver", help=_resolver_help())
     parse_cache.add_argument("dump_file", help="cache dump 文件路径")
@@ -268,6 +387,22 @@ def build_parser() -> argparse.ArgumentParser:
     report = subparsers.add_parser("report", help="离线汇总 triage 报告产物")
     report.add_argument("--root", required=True, help="follow_diff 根目录")
     report.set_defaults(handler=_cmd_report)
+
+    rq3_snapshot = subparsers.add_parser(
+        "rq3-snapshot",
+        help="从 resolver_variant_summary.tsv 导出 RQ3 Hybrid 增益快照",
+    )
+    rq3_snapshot.add_argument(
+        "--resolver-variant-summary-tsv",
+        required=True,
+        help="resolver_variant_summary.tsv 路径",
+    )
+    rq3_snapshot.add_argument(
+        "--output-dir",
+        required=True,
+        help="输出目录",
+    )
+    rq3_snapshot.set_defaults(handler=_cmd_rq3_snapshot)
 
     campaign_report = subparsers.add_parser(
         "campaign-report", help="汇总 campaign 指标"
@@ -347,6 +482,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="矩阵工作根目录；输出写入 matrix_runs/ 与 _summary/",
     )
     campaign_matrix.set_defaults(handler=_cmd_campaign_matrix)
+
+    resolver_matrix_aggregate = subparsers.add_parser(
+        "resolver-matrix-aggregate",
+        help="汇总多个 resolver campaign-matrix 输出为统一对比表",
+    )
+    resolver_matrix_aggregate.add_argument(
+        "--matrix-root",
+        action="append",
+        required=True,
+        help="单个 resolver 的 campaign-matrix work root，可重复传入",
+    )
+    resolver_matrix_aggregate.add_argument(
+        "--output-dir",
+        help="可选输出目录；默认写入首个 matrix-root 同级 resolver_matrix_aggregates/<ts>/",
+    )
+    resolver_matrix_aggregate.set_defaults(handler=_cmd_resolver_matrix_aggregate)
+
+    resolver_capability_report = subparsers.add_parser(
+        "resolver-capability-report",
+        help="合并真实 replay 能力矩阵与 campaign-matrix 结果为 resolver 总表",
+    )
+    resolver_capability_report.add_argument(
+        "--replay-matrix-dir",
+        required=True,
+        help="真实 replay 能力矩阵目录，需包含 matrix.tsv",
+    )
+    resolver_capability_report.add_argument(
+        "--matrix-batch-dir",
+        required=True,
+        help="真实 multi-resolver campaign matrix 目录，需包含 matrix_run_status.tsv 和 _resolver_summary/",
+    )
+    resolver_capability_report.add_argument(
+        "--output-dir",
+        help="可选输出目录；默认写入 <matrix-batch-dir>/_resolver_capability/",
+    )
+    resolver_capability_report.set_defaults(handler=_cmd_resolver_capability_report)
+
+    resolver_backend_matrix_compare = subparsers.add_parser(
+        "resolver-backend-matrix-compare",
+        help="比较 Python backend 与 dnslabctl backend 的 resolver matrix 结果",
+    )
+    resolver_backend_matrix_compare.add_argument(
+        "--baseline-batch-dir",
+        required=True,
+        help="基线 batch 目录，例如 Python backend 的真实 batch",
+    )
+    resolver_backend_matrix_compare.add_argument(
+        "--candidate-batch-dir",
+        required=True,
+        help="候选 batch 目录，例如 dnslabctl backend 的真实 batch",
+    )
+    resolver_backend_matrix_compare.add_argument(
+        "--baseline-label",
+        required=True,
+        help="基线标签，例如 python",
+    )
+    resolver_backend_matrix_compare.add_argument(
+        "--candidate-label",
+        required=True,
+        help="候选标签，例如 dnslabctl",
+    )
+    resolver_backend_matrix_compare.add_argument(
+        "--output-dir",
+        help="可选输出目录；默认写入 <candidate-batch-dir>/_backend_compare/",
+    )
+    resolver_backend_matrix_compare.set_defaults(
+        handler=_cmd_resolver_backend_matrix_compare
+    )
 
     return parser
 

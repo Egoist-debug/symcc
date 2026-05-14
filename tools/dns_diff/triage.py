@@ -8,7 +8,8 @@ from .oracle import ORACLE_FIELDS
 from .schema import STATE_FINGERPRINT_REQUIRED_FIELDS, stamp_with_shared_meta
 from .taxonomy import infer_replay_failure_reason, normalize_failure_taxonomy
 
-RESOLVERS: Tuple[str, str] = ("bind9", "unbound")
+BASE_RESOLVER = "bind9"
+DEFAULT_SECONDARY_RESOLVER = "unbound"
 TRIAGE_REQUIRED_FIELDS: Sequence[str] = (
     "schema_version",
     "generated_at",
@@ -79,23 +80,51 @@ def _interesting_delta_count(resolver_payload: Mapping[str, Any]) -> int:
 def _cache_has_diff(cache_diff: Mapping[str, Any]) -> bool:
     return any(
         bool(_resolver_payload(cache_diff, resolver).get("has_cache_diff"))
-        for resolver in RESOLVERS
+        for resolver in (BASE_RESOLVER, DEFAULT_SECONDARY_RESOLVER)
     )
 
 
 def _cache_interesting_delta_count(cache_diff: Mapping[str, Any]) -> int:
     return sum(
         _interesting_delta_count(_resolver_payload(cache_diff, resolver))
-        for resolver in RESOLVERS
+        for resolver in (BASE_RESOLVER, DEFAULT_SECONDARY_RESOLVER)
     )
 
 
-def _oracle_statuses(oracle: Mapping[str, Any]) -> Dict[str, Optional[str]]:
+def _triage_resolvers(
+    oracle: Mapping[str, Any], sample_meta: Optional[Mapping[str, Any]] = None
+) -> Tuple[str, str]:
+    secondary_candidates: List[str] = []
+    if isinstance(sample_meta, Mapping):
+        artifacts = sample_meta.get("artifacts")
+        if isinstance(artifacts, Mapping):
+            for key in artifacts.keys():
+                if not isinstance(key, str) or not key.endswith("_stderr"):
+                    continue
+                resolver = key[: -len("_stderr")]
+                if resolver and resolver != BASE_RESOLVER:
+                    secondary_candidates.append(resolver)
+    for key in oracle.keys():
+        if not isinstance(key, str) or not key.endswith(".stderr_parse_status"):
+            continue
+        resolver = key.split(".", 1)[0]
+        if resolver and resolver != BASE_RESOLVER:
+            secondary_candidates.append(resolver)
+
+    for resolver in secondary_candidates:
+        if resolver:
+            return BASE_RESOLVER, resolver
+    return BASE_RESOLVER, DEFAULT_SECONDARY_RESOLVER
+
+
+def _oracle_statuses(
+    oracle: Mapping[str, Any], resolvers: Tuple[str, str]
+) -> Dict[str, Optional[str]]:
     return {
         resolver: oracle.get(f"{resolver}.stderr_parse_status")
         if isinstance(oracle.get(f"{resolver}.stderr_parse_status"), str)
         else None
-        for resolver in RESOLVERS
+        for resolver in resolvers
     }
 
 
@@ -160,10 +189,13 @@ def _replay_failure_note(failure: Mapping[str, Any]) -> Optional[str]:
     return "replay 失败证据: " + ", ".join(parts)
 
 
-def _oracle_diff_fields(oracle: Mapping[str, Any]) -> List[str]:
+def _oracle_diff_fields(
+    oracle: Mapping[str, Any], resolvers: Tuple[str, str]
+) -> List[str]:
     differing_fields: List[str] = []
+    primary, secondary = resolvers
     for field in ORACLE_FIELDS:
-        if oracle.get(f"bind9.{field}") != oracle.get(f"unbound.{field}"):
+        if oracle.get(f"{primary}.{field}") != oracle.get(f"{secondary}.{field}"):
             differing_fields.append(field)
     return differing_fields
 
@@ -194,6 +226,7 @@ def _classify_triage_branch(
     oracle: Mapping[str, Any],
     cache_diff: Mapping[str, Any],
 ) -> str:
+    resolvers = _triage_resolvers(oracle)
     if status == "failed_replay" or diff_class == "replay_incomplete":
         return "oracle_missing"
     if status == "failed_parse" or diff_class == "oracle_parse_incomplete":
@@ -214,12 +247,12 @@ def _classify_triage_branch(
     ):
         return "cache_diff_benign"
 
-    statuses = _oracle_statuses(oracle)
+    statuses = _oracle_statuses(oracle, resolvers)
     if _oracle_artifact_missing(statuses):
         return "oracle_missing"
     if _oracle_parse_incomplete(statuses):
         return "oracle_parse_incomplete"
-    if _oracle_diff_fields(oracle):
+    if _oracle_diff_fields(oracle, resolvers):
         return "oracle_diff"
 
     if _cache_has_diff(cache_diff):
@@ -362,7 +395,8 @@ def build_triage(
     fingerprint: dict,
     sample_meta: Optional[Mapping[str, Any]] = None,
 ) -> dict:
-    statuses = _oracle_statuses(oracle)
+    resolvers = _triage_resolvers(oracle, sample_meta)
+    statuses = _oracle_statuses(oracle, resolvers)
     cache_delta_triggered = bool(cache_diff.get("cache_delta_triggered"))
     cache_has_diff = _cache_has_diff(cache_diff)
     interesting_delta_count = _cache_interesting_delta_count(cache_diff)
@@ -398,12 +432,12 @@ def build_triage(
             "oracle 解析不完整: "
             + ", ".join(
                 f"{resolver}={statuses[resolver] or 'missing'}"
-                for resolver in RESOLVERS
+                for resolver in resolvers
             )
         )
         needs_manual_review = True
     else:
-        oracle_diff_fields = _oracle_diff_fields(oracle)
+        oracle_diff_fields = _oracle_diff_fields(oracle, resolvers)
         if oracle_diff_fields:
             status = "completed_oracle_diff"
             diff_class = "oracle_and_cache_diff" if cache_has_diff else "oracle_diff"

@@ -55,24 +55,26 @@ PY
 	--build-root "$ROOT_DIR/experiments/subjects/maradns/deadwood-3.3.02-build" \
 	>"$WORKDIR/adapter-build.json"
 
+RUN_ROOT="$WORKDIR/run:id"
+
 "$DNSLABCTL_BIN" adapter-replay \
 	--resolver maradns \
 	--sample "$WORKDIR/sample.bin" \
 	--build-root "$ROOT_DIR/experiments/subjects/maradns/deadwood-3.3.02-build" \
-	--run-root "$WORKDIR/run" \
+	--run-root "$RUN_ROOT" \
 	>"$WORKDIR/adapter-replay.json"
 
-assert_file_exists "$WORKDIR/run/maradns.stderr"
-assert_file_exists "$WORKDIR/run/maradns.native.log"
-assert_file_exists "$WORKDIR/run/maradns.after.cache.txt"
+assert_file_exists "$RUN_ROOT/maradns.stderr"
+assert_file_exists "$RUN_ROOT/maradns.native.log"
+assert_file_exists "$RUN_ROOT/maradns.after.cache.txt"
 
 PYTHONPATH="$ROOT_DIR" python3 -m tools.dns_diff.cli parse-cache maradns \
-	"$WORKDIR/run/maradns.after.cache.txt" "$PARSED_TSV" >/dev/null
+	"$RUN_ROOT/maradns.after.cache.txt" "$PARSED_TSV" >/dev/null
 
 assert_file_exists "$PARSED_TSV"
 assert_file_contains "$PARSED_TSV" $'maradns\t_\texample.com\tA\tA\tCACHE\trrset\t_\t_\tsource=deadwood-log'
-assert_file_contains "$WORKDIR/run/maradns.stderr" "ORACLE_SUMMARY parse_ok=1"
-assert_file_contains "$WORKDIR/run/maradns.stderr" "second_query_hit=1"
-assert_file_contains "$WORKDIR/run/maradns.stderr" "cache_entry_created=1"
+assert_file_contains "$RUN_ROOT/maradns.stderr" "ORACLE_SUMMARY parse_ok=1"
+assert_file_contains "$RUN_ROOT/maradns.stderr" "second_query_hit=1"
+assert_file_contains "$RUN_ROOT/maradns.stderr" "cache_entry_created=1"
 
 printf 'PASS: dnslabctl maradns replay smoke test passed\n'

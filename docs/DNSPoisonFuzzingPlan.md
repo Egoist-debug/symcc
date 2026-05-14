@@ -28,6 +28,22 @@
   - RQ4 状态指纹降噪：比较无过滤、启发式过滤、fingerprint 聚类、人工审计后真值，指标为假阳性率、cluster 数、每个真值 case 的定位成本。
   - RQ5 多 resolver 泛化：比较 BIND9/Unbound/MaraDNS/dnsmasq/SmartDNS/Knot Resolver，报告 adapter 成本、构建成功率、cache 可观测性、差异类型分布。
 
+  ## 当前 RQ1 实证快照
+
+  - 当前真实 RQ1 最小快照已经落盘到 [DNSPoisonRQ1Snapshot.md](./DNSPoisonRQ1Snapshot.md)。
+  - 当前 repo 内 RQ1 正式表：`docs/RQ1InputModelSnapshot.tsv`
+  - 当前原始真实产物：`/home/ubuntu/tmp/rq1_input_model_snapshot/20260514_084505/out/summary.tsv`
+  - 当前快照只覆盖单样本/模型的最小验证，还不能替代正式大样本输入模型对照实验。
+
+  ## 当前 RQ5 实证快照
+
+  - 当前真实 RQ5 快照已经落盘到 [DNSPoisonRQ5Snapshot.md](./DNSPoisonRQ5Snapshot.md)。
+  - 当前真实 multi-resolver batch 目录：`/home/ubuntu/tmp/real_campaign_matrix_batch/20260514_072657`
+  - 当前真实 capability 总表：`/home/ubuntu/tmp/real_campaign_matrix_batch/20260514_072657/_resolver_capability/resolver_capability_summary.tsv`
+  - 当前 repo 内 RQ5 正式表：`docs/RQ5ResolverAdapterCost.tsv`、`docs/RQ5ResolverBuildReplayMatrix.tsv`、`docs/RQ5ResolverSemanticDistribution.tsv`
+  - 当前 5 个 secondary resolver 的真实 `build/replay/campaign-matrix` 都已经通过，说明“多 resolver 泛化”的工程闭环已经成立。
+  - 当前快照仍是单样本、`repeat=2`、`budget-sec=5` 的最小真实验证，后续还需要扩大 queue、提高 repeat 并补论文口径表。
+
   ## 论文证据与验收
 
   - 每次正式实验使用固定预算，例如 1h/6h/24h 三档；每个配置至少 5 次独立重复，报告均值、方差、最小值、最大值。

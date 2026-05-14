@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,7 +29,18 @@ void writeExecutable(const std::filesystem::path &Path, const std::string &Body)
       std::filesystem::perm_options::add);
 }
 
+void require(bool Condition, const char *Message) {
+  if (Condition) {
+    return;
+  }
+  std::fprintf(stderr, "%s\n", Message);
+  std::abort();
+}
+
 } // namespace
+
+#undef assert
+#define assert(Expr) require((Expr), #Expr)
 
 int main() {
   const auto Root = makeTempDir("dnslab_concrete_adapter_test");
@@ -44,6 +56,8 @@ int main() {
   const auto MaradnsSource = Root / "maradns-source";
   const auto MaradnsBuild = Root / "maradns-build";
   const auto MaradnsHarness = Root / "maradns-harness.py";
+  const auto KnotBinary = Root / "knot-build" / "daemon" / "kresd";
+  const auto KnotHarness = Root / "knot-harness.py";
   const auto Sample = Root / "sample.bin";
   const auto ResponseCorpus = Root / "response_corpus";
   const auto NamedTemplate = Root / "named.conf.in";
@@ -158,6 +172,29 @@ int main() {
           std::filesystem::perms::owner_write |
           std::filesystem::perms::group_exec | std::filesystem::perms::group_read,
       std::filesystem::perm_options::add);
+  writeExecutable(KnotBinary, "#!/bin/sh\nexit 0\n");
+  {
+    std::ofstream Harness(KnotHarness);
+    Harness << "#!/usr/bin/env python3\n"
+               "import argparse\n"
+               "from pathlib import Path\n"
+               "p=argparse.ArgumentParser();\n"
+               "p.add_argument('--kresd-bin', required=True);\n"
+               "p.add_argument('--mode', required=True);\n"
+               "p.add_argument('--cache-dump-path', required=True);\n"
+               "p.add_argument('--kresd-log-path', required=True);\n"
+               "p.add_argument('--transcript');\n"
+               "a=p.parse_args();\n"
+               "Path(a.cache_dump_path).write_text('KNOT_RESOLVER_CACHE_DUMP\\nCACHE_ENTRY\\texample.com\\tA\\t_\\n', encoding='utf-8')\n"
+               "Path(a.kresd_log_path).write_text('knot-native\\n', encoding='utf-8')\n"
+               "print('ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=1 response_accepted=1 second_query_hit=1 cache_entry_created=1 timeout=0')\n";
+  }
+  std::filesystem::permissions(
+      KnotHarness,
+      std::filesystem::perms::owner_exec | std::filesystem::perms::owner_read |
+          std::filesystem::perms::owner_write |
+          std::filesystem::perms::group_exec | std::filesystem::perms::group_read,
+      std::filesystem::perm_options::add);
 
   dnslab::Bind9ResolverAdapter Bind9(dnslab::Bind9AdapterConfig{
       Root, Root / "unused.sh", NamedTemplate, ResponseCorpus,
@@ -171,6 +208,8 @@ int main() {
       Root, 2, SmartdnsHarness, SmartdnsSource, std::nullopt});
   dnslab::MaradnsResolverAdapter Maradns(dnslab::MaradnsAdapterConfig{
       Root, 2, MaradnsHarness, MaradnsSource, std::nullopt});
+  dnslab::KnotResolverAdapter Knot(dnslab::KnotResolverAdapterConfig{
+      Root, KnotHarness, std::nullopt, KnotBinary});
 
   const auto Bind9Before = RunRoot / "bind9.before.cache.txt";
   const auto Bind9Dump = Bind9.dumpCache(RunRoot, Bind9Before);
@@ -248,6 +287,18 @@ int main() {
   const auto MaradnsDump = Maradns.dumpCache(RunRoot, MaradnsBefore);
   assert(MaradnsDump.ExitCode == 0);
   assert(std::filesystem::exists(MaradnsBefore));
+
+  const auto KnotBefore = RunRoot / "knot-resolver.before.cache.txt";
+  const auto KnotDump = Knot.dumpCache(RunRoot, KnotBefore);
+  assert(KnotDump.ExitCode == 0);
+  assert(std::filesystem::exists(KnotBefore));
+  dnslab::RunSampleRequest KnotRequest{
+      Root, Root, RunRoot, Sample, "sample-1", {}};
+  const auto KnotRun = Knot.runSample(KnotRequest);
+  assert(KnotRun.ExitCode == 0);
+  assert(std::filesystem::exists(RunRoot / "knot-resolver.after.cache.txt"));
+  const auto KnotOracle = Knot.parseOracle(RunRoot / "knot-resolver.stderr");
+  assert(KnotOracle.ParseOk);
 
   const auto Registry = dnslab::makeDefaultResolverRegistry(Root);
   const auto Names = Registry.names();

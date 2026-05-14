@@ -336,6 +336,7 @@ def run_campaign_close(*, budget_sec: float) -> int:
             try:
                 phase_exit_code = follow_diff_window(
                     budget_sec=remaining_budget,
+                    comparability_budget_sec=budget_sec,
                     queue_tail_id=queue_tail_id,
                 )
             except FollowDiffError as exc:

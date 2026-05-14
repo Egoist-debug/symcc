@@ -389,6 +389,101 @@ def run_non_comparable_scenario() -> None:
         )
 
 
+def run_runtime_env_scenario() -> None:
+    with tempfile.TemporaryDirectory(prefix="symcc-campaign-matrix-runtime-env.") as tmp:
+        work_root = pathlib.Path(tmp)
+        queue_dir = work_root / "afl_out" / "master" / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        runtime_build_root = work_root / "subjects" / "knot-resolver-build"
+        runtime_harness = work_root / "tools" / "knot_harness.py"
+
+        matrix_payload = json.loads(DEFAULT_MATRIX_FILE.read_text(encoding="utf-8"))
+        matrix_payload["comparability"]["resolver_pair"] = "bind9_vs_knot-resolver"
+        matrix_payload["runtime_env"] = {
+            "DNS_DIFF_SECONDARY_RESOLVER": "knot-resolver",
+            "KNOT_RESOLVER_BUILD_TREE": str(runtime_build_root),
+            "KNOT_RESOLVER_HARNESS_SCRIPT": str(runtime_harness),
+        }
+        custom_matrix_file = work_root / "runtime_env_matrix.json"
+        custom_matrix_file.write_text(
+            json.dumps(matrix_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        def fake_close(*, budget_sec: float) -> int:
+            env = dict(os.environ)
+            variant_name = detect_variant(env)
+            assert_true(
+                env.get("DNS_DIFF_SECONDARY_RESOLVER") == "knot-resolver",
+                f"runtime_env 未透传 DNS_DIFF_SECONDARY_RESOLVER: {env.get('DNS_DIFF_SECONDARY_RESOLVER')!r}",
+            )
+            assert_true(
+                env.get("KNOT_RESOLVER_BUILD_TREE") == str(runtime_build_root),
+                f"runtime_env 未透传 KNOT_RESOLVER_BUILD_TREE: {env.get('KNOT_RESOLVER_BUILD_TREE')!r}",
+            )
+            assert_true(
+                env.get("KNOT_RESOLVER_HARNESS_SCRIPT") == str(runtime_harness),
+                f"runtime_env 未透传 KNOT_RESOLVER_HARNESS_SCRIPT: {env.get('KNOT_RESOLVER_HARNESS_SCRIPT')!r}",
+            )
+            work_dir = pathlib.Path(env["WORK_DIR"])
+            repeat_index = repeat_index_from_work_dir(work_dir)
+            summary = base_summary(60 + repeat_index, 11 + repeat_index, 0.5)
+            summary["comparability"] = {
+                "status": "comparable",
+                "reason": "ok",
+                "aggregation_key": {
+                    **expected_aggregation_key(
+                        work_root=work_root,
+                        variant_name=variant_name,
+                        budget_sec=5,
+                    ),
+                    "resolver_pair": "bind9_vs_knot-resolver",
+                },
+                "baseline_compare_key": {
+                    **expected_baseline_compare_key(
+                        work_root=work_root,
+                        budget_sec=5,
+                        repeat_count=1,
+                    ),
+                    "resolver_pair": "bind9_vs_knot-resolver",
+                },
+            }
+            report_dir = work_dir / "campaign_reports" / f"report-{repeat_index:02d}"
+            write_summary(report_dir, summary)
+            (work_dir / "campaign_close.summary.json").write_text(
+                json.dumps({"status": "success"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            return 0
+
+        with patched_close(fake_close):
+            exit_code = cli_main(
+                [
+                    "campaign-matrix",
+                    "--matrix-file",
+                    str(custom_matrix_file),
+                    "--budget-sec",
+                    "5",
+                    "--repeat",
+                    "1",
+                    "--work-root",
+                    str(work_root),
+                ]
+            )
+        assert_true(exit_code == 0, f"runtime_env 场景 exit_code={exit_code!r} != 0")
+
+        manifest = json.loads(
+            (work_root / "_summary" / "matrix_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        runtime_env = manifest.get("runtime_env")
+        assert_true(
+            runtime_env == matrix_payload["runtime_env"],
+            f"manifest.runtime_env 非预期: {runtime_env!r}",
+        )
+
+
 def run_missing_comparability_scenario() -> None:
     with tempfile.TemporaryDirectory(prefix="symcc-campaign-matrix-missing-meta.") as tmp:
         work_root = pathlib.Path(tmp)
@@ -469,6 +564,7 @@ def run_missing_comparability_scenario() -> None:
 
 run_comparable_scenario()
 run_non_comparable_scenario()
+run_runtime_env_scenario()
 run_missing_comparability_scenario()
 print("PASS: campaign matrix regression test passed")
 PY

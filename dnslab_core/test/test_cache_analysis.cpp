@@ -1,7 +1,8 @@
 #include "dnslab_core/cache_analysis.hpp"
 
-#include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +15,14 @@ std::filesystem::path writeTempFile(const std::string &Name,
   std::ofstream Output(Path);
   Output << Content;
   return Path;
+}
+
+void require(bool Condition, const char *Message) {
+  if (Condition) {
+    return;
+  }
+  std::fprintf(stderr, "%s\n", Message);
+  std::abort();
 }
 
 } // namespace
@@ -105,22 +114,33 @@ int main() {
       "MARADNS_CACHE_DUMP\n"
       "Fetching \\007example\\003com\\000\\000\\001 from cache\n");
   const auto MaradnsRows = dnslab::parseCacheDump("maradns", MaradnsPath);
-  assert(!BindRows.empty());
-  assert(!UnboundRows.empty());
-  assert(!DnsmasqRows.empty());
-  assert(!SmartdnsRows.empty());
-  assert(!MaradnsRows.empty());
-  assert(DnsmasqRows[0].Resolver == "dnsmasq");
-  assert(DnsmasqRows[0].QName == "example.com");
-  assert(SmartdnsRows[0].Resolver == "smartdns");
-  assert(SmartdnsRows[0].QName == "example.com");
-  assert(MaradnsRows[0].Resolver == "maradns");
-  assert(MaradnsRows[0].QName == "example.com");
+  const auto KnotPath = writeTempFile(
+      "dnslab_knot_cache.txt",
+      "KNOT_RESOLVER_CACHE_DUMP\n"
+      "CACHE_ENTRY\texample.com\tA\t_\n");
+  const auto KnotRows = dnslab::parseCacheDump("knot-resolver", KnotPath);
+  require(!BindRows.empty(), "Bind cache 解析为空");
+  require(!UnboundRows.empty(), "Unbound cache 解析为空");
+  require(!DnsmasqRows.empty(), "dnsmasq cache 解析为空");
+  require(!SmartdnsRows.empty(), "SmartDNS cache 解析为空");
+  require(!MaradnsRows.empty(), "MaraDNS cache 解析为空");
+  require(!KnotRows.empty(), "Knot cache 解析为空");
+  require(DnsmasqRows[0].Resolver == "dnsmasq", "dnsmasq resolver 名不匹配");
+  require(DnsmasqRows[0].QName == "example.com", "dnsmasq qname 不匹配");
+  require(SmartdnsRows[0].Resolver == "smartdns",
+          "smartdns resolver 名不匹配");
+  require(SmartdnsRows[0].QName == "example.com", "smartdns qname 不匹配");
+  require(MaradnsRows[0].Resolver == "maradns",
+          "maradns resolver 名不匹配");
+  require(MaradnsRows[0].QName == "example.com", "maradns qname 不匹配");
+  require(KnotRows[0].Resolver == "knot-resolver",
+          "knot resolver 名不匹配");
+  require(KnotRows[0].QName == "example.com", "knot qname 不匹配");
 
   const auto Diff =
       dnslab::buildCacheDiff("sample-1", BindRows, {}, UnboundRows, UnboundRows, true);
-  assert(Diff.Bind9.HasCacheDiff);
-  assert(!Diff.Unbound.HasCacheDiff);
+  require(Diff.Bind9.HasCacheDiff, "Bind9 cache diff 未命中");
+  require(!Diff.Unbound.HasCacheDiff, "Unbound cache diff 误报");
 
   dnslab::json::Value::Object Oracle;
   Oracle["bind9.stderr_parse_status"] = "ok";
@@ -145,14 +165,16 @@ int main() {
 
   const auto Triage =
       dnslab::buildTriageRecord("sample-1", Oracle, Diff, Fingerprint, std::nullopt);
-  assert(Triage.Status == "completed_oracle_diff");
-  assert(Triage.AnalysisState == "included");
-  assert(Triage.OracleAuditCandidate);
+  require(Triage.Status == "completed_oracle_diff", "Triage status 不匹配");
+  require(Triage.AnalysisState == "included",
+          "Triage analysis_state 不匹配");
+  require(Triage.OracleAuditCandidate, "Triage 未标为 oracle audit candidate");
 
   std::filesystem::remove(BindPath);
   std::filesystem::remove(UnboundPath);
   std::filesystem::remove(DnsmasqPath);
   std::filesystem::remove(SmartdnsPath);
   std::filesystem::remove(MaradnsPath);
+  std::filesystem::remove(KnotPath);
   return 0;
 }

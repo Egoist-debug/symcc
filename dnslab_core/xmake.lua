@@ -32,72 +32,74 @@ target("dnslabctl")
     add_includedirs("include")
     add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
 
-target("dnslab_core_transcript_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_transcript.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include", "../gen_input/include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+local function configure_test_target(name, source_file, deps, include_dirs)
+    target(name)
+        set_kind("binary")
+        set_default(false)
+        set_group("tests")
+        set_languages("c++17")
+        add_files(source_file)
+        if deps then
+            add_deps(table.unpack(deps))
+        end
+        if include_dirs then
+            add_includedirs(table.unpack(include_dirs))
+        end
+        add_cxxflags("-Wall", "-Wextra", "-Wpedantic", "-UNDEBUG")
+end
 
-target("dnslab_core_contract_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_evidence_contract.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+configure_test_target(
+    "dnslab_core_transcript_test",
+    "test/test_transcript.cpp",
+    {"dnslab_core"},
+    {"include", "../gen_input/include"}
+)
 
-target("dnslab_core_lock_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_resolver_lock.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+configure_test_target(
+    "dnslab_core_contract_test",
+    "test/test_evidence_contract.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
 
-target("dnslab_core_reporting_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_reporting.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+configure_test_target(
+    "dnslab_core_lock_test",
+    "test/test_resolver_lock.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
 
-target("dnslab_core_oracle_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_oracle.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+configure_test_target(
+    "dnslab_core_reporting_test",
+    "test/test_reporting.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
 
-target("dnslab_core_concrete_adapters_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_concrete_adapters.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+configure_test_target(
+    "dnslab_core_oracle_test",
+    "test/test_oracle.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
 
-target("dnslab_core_cache_analysis_test")
-    set_kind("binary")
-    set_default(false)
-    set_group("tests")
-    set_languages("c++17")
-    add_files("test/test_cache_analysis.cpp")
-    add_deps("dnslab_core")
-    add_includedirs("include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+configure_test_target(
+    "dnslab_core_concrete_adapters_test",
+    "test/test_concrete_adapters.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
+
+configure_test_target(
+    "dnslab_core_cache_analysis_test",
+    "test/test_cache_analysis.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
+
+configure_test_target(
+    "dnslabctl_batch_secondary_test",
+    "test/test_batch_secondary.cpp",
+    {"dnslabctl"},
+    nil
+)

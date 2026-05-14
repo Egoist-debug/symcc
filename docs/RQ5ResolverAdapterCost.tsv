@@ -1,0 +1,6 @@
+resolver	resolver_pair	integration_mode	adapter_cost_proxy	build_real_status	build_real_duration_sec
+dnsmasq	bind9_vs_dnsmasq	python_harness	low	pass	0.000000
+knot-resolver	bind9_vs_knot-resolver	python_harness_with_selfcontained_runtime	medium	pass	1.000000
+maradns	bind9_vs_maradns	python_harness_with_preload_shim	medium	pass	0.000000
+smartdns	bind9_vs_smartdns	python_harness	low	pass	0.000000
+unbound	bind9_vs_unbound	native_orchestrator	high	pass	9.000000

@@ -554,6 +554,35 @@ std::vector<CacheRecord> iterMaradnsRecords(const std::vector<std::string> &Line
   return Records;
 }
 
+std::vector<CacheRecord>
+iterKnotResolverRecords(const std::vector<std::string> &Lines) {
+  std::vector<CacheRecord> Records;
+  for (const auto &Raw : Lines) {
+    const auto Line = trim(Raw);
+    if (Line.rfind("CACHE_ENTRY\t", 0) != 0) {
+      continue;
+    }
+    const auto Tokens =
+        splitWhitespace(std::regex_replace(Line, std::regex("\t"), " "));
+    if (Tokens.size() < 4U) {
+      continue;
+    }
+    Records.push_back(CacheRecord{
+        "knot-resolver",
+        "_",
+        Tokens[1],
+        Tokens[2],
+        Tokens[2],
+        "CACHE",
+        "rrset",
+        "_",
+        Tokens[3],
+        "source=kresd-harness",
+    });
+  }
+  return Records;
+}
+
 std::vector<CacheRecord> iterSmartdnsRecords(
     const std::vector<std::uint8_t> &Bytes) {
   if (Bytes.size() < 48U) {
@@ -775,6 +804,9 @@ std::string canonicalResolver(std::string Resolver) {
   if (Resolver == "named") {
     return "bind9";
   }
+  if (Resolver == "kresd") {
+    return "knot-resolver";
+  }
   return Resolver;
 }
 
@@ -987,6 +1019,9 @@ std::vector<CacheRecord> parseCacheDump(const std::string &Resolver,
   }
   if (Canonical == "dnsmasq") {
     return iterDnsmasqRecords(Lines);
+  }
+  if (Canonical == "knot-resolver") {
+    return iterKnotResolverRecords(Lines);
   }
   throw std::runtime_error("未知 resolver: " + Resolver);
 }

@@ -1,6 +1,8 @@
 import hashlib
+import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -24,11 +26,13 @@ from .schema import (
     validate_follow_diff_window_summary_fields,
 )
 from .triage import build_triage
+from .targets import _resolve_dnslabctl_bin
 
 EXIT_USAGE = 2
 EXIT_DEADLINE_EXCEEDED = 6
 FOLLOW_DIFF_STATE_SCHEMA_VERSION = 1
 DEFAULT_FOLLOW_DIFF_INTERVAL_SEC = 60.0
+DEFAULT_FOLLOW_DIFF_WINDOW_IDLE_ROUNDS = 2
 FOLLOW_DIFF_STATE_FILE_NAME = "follow_diff.state.json"
 FOLLOW_DIFF_WINDOW_SUMMARY_FILE_NAME = "follow_diff.window.summary.json"
 DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = Path("unbound_experiment") / "work_stateful"
@@ -88,7 +92,7 @@ STATUS_SKIPPED = "skipped"
 COMPLETED_PREFIX = "completed"
 WINDOW_EXIT_REASON_QUIESCENT = "quiescent"
 WINDOW_EXIT_REASON_DEADLINE_EXCEEDED = "deadline_exceeded"
-WINDOW_IDLE_CONVERGENCE_ROUNDS = 2
+WINDOW_IDLE_CONVERGENCE_ROUNDS = DEFAULT_FOLLOW_DIFF_WINDOW_IDLE_ROUNDS
 
 BIND9_BEFORE_CACHE_FILE = "bind9.before.cache.txt"
 BIND9_AFTER_CACHE_FILE = "bind9.after.cache.txt"
@@ -784,6 +788,36 @@ def _format_interval_sec(interval_sec: float) -> str:
     return f"{interval_sec:g}"
 
 
+def _use_dnslabctl_replay_backend() -> bool:
+    raw_value = os.environ.get("DNS_DIFF_REPLAY_BACKEND", "").strip().lower()
+    if raw_value in {"", "python"}:
+        return False
+    if raw_value in {"dnslabctl", "sync-replay"}:
+        return True
+    raise FollowDiffError(
+        f"DNS_DIFF_REPLAY_BACKEND 只能是 python/dnslabctl，当前值: {raw_value!r}"
+    )
+
+
+def _resolve_follow_diff_window_idle_rounds() -> int:
+    raw_value = os.environ.get("FOLLOW_DIFF_WINDOW_IDLE_ROUNDS")
+    if raw_value is None or raw_value == "":
+        return DEFAULT_FOLLOW_DIFF_WINDOW_IDLE_ROUNDS
+
+    try:
+        rounds = int(raw_value)
+    except ValueError as exc:
+        raise FollowDiffError(
+            f"FOLLOW_DIFF_WINDOW_IDLE_ROUNDS 必须是正整数，当前值: {raw_value!r}"
+        ) from exc
+
+    if rounds <= 0:
+        raise FollowDiffError(
+            f"FOLLOW_DIFF_WINDOW_IDLE_ROUNDS 必须大于 0，当前值: {raw_value!r}"
+        )
+    return rounds
+
+
 def _status_is_completed(status: Any) -> bool:
     return isinstance(status, str) and (
         status == STATUS_COMPLETED or status.startswith(COMPLETED_PREFIX)
@@ -1113,6 +1147,313 @@ def _process_one_sample_with_state(
     return result
 
 
+def _resolve_bind9_build_root(root_dir: Path) -> Path:
+    return (
+        Path(os.environ.get("BIND9_AFL_TREE", str(root_dir / "bind-9.18.46-afl")))
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
+    if resolver == "unbound":
+        return (
+            Path(os.environ.get("AFL_TREE", str(root_dir / "unbound-1.24.2-afl")))
+            .expanduser()
+            .resolve()
+        )
+    if resolver == "dnsmasq":
+        return (
+            Path(
+                os.environ.get(
+                    "DNSMASQ_BUILD_TREE",
+                    str(
+                        root_dir
+                        / "experiments"
+                        / "subjects"
+                        / "dnsmasq"
+                        / "v2.92-build"
+                    ),
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+    if resolver == "smartdns":
+        return (
+            Path(
+                os.environ.get(
+                    "SMARTDNS_BUILD_TREE",
+                    str(
+                        root_dir
+                        / "experiments"
+                        / "subjects"
+                        / "smartdns"
+                        / "Release47.1-build"
+                    ),
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+    if resolver == "maradns":
+        return (
+            Path(
+                os.environ.get(
+                    "MARADNS_BUILD_TREE",
+                    str(
+                        root_dir
+                        / "experiments"
+                        / "subjects"
+                        / "maradns"
+                        / "deadwood-3.3.02-build"
+                    ),
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+    if resolver == "knot-resolver":
+        return (
+            Path(
+                os.environ.get(
+                    "KNOT_RESOLVER_BUILD_TREE",
+                    str(
+                        root_dir
+                        / "experiments"
+                        / "subjects"
+                        / "knot-resolver"
+                        / "v6.2.0-build"
+                    ),
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+    raise FollowDiffError(f"不支持的 secondary resolver: {resolver!r}")
+
+
+def _resolve_bind9_source_root(root_dir: Path, build_root: Path) -> Path:
+    return (
+        Path(os.environ.get("BIND9_SRC_TREE", str(build_root)))
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_secondary_source_root(resolver: str, build_root: Path) -> Path:
+    env_map = {
+        "unbound": ("UNBOUND_SRC_TREE", "SRC_TREE"),
+        "dnsmasq": ("DNSMASQ_SRC_TREE",),
+        "smartdns": ("SMARTDNS_SRC_TREE",),
+        "maradns": ("MARADNS_SRC_TREE",),
+        "knot-resolver": ("KNOT_RESOLVER_SRC_TREE",),
+    }
+    for env_name in env_map.get(resolver, ()):
+        raw_value = os.environ.get(env_name)
+        if raw_value:
+            return Path(raw_value).expanduser().resolve()
+    return build_root
+
+
+def _copy_existing_file(src: Path, dst: Path) -> None:
+    if not src.is_file():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def _normalize_dnslabctl_sync_replay_outputs(
+    *,
+    sample_dir: Path,
+    secondary_resolver: str,
+    payload: Mapping[str, Any],
+) -> None:
+    secondary_key = secondary_resolver
+    bind9_payload = payload.get("bind9")
+    secondary_payload = payload.get(secondary_key)
+    if not isinstance(bind9_payload, Mapping) or not isinstance(
+        secondary_payload, Mapping
+    ):
+        raise FollowDiffError("dnslabctl sync-replay 输出缺少 resolver payload")
+
+    artifact_map = {
+        Path(bind9_payload.get("stderr", "")): sample_dir / "bind9.stderr",
+        Path(bind9_payload.get("before_cache", "")): sample_dir / BIND9_BEFORE_CACHE_FILE,
+        Path(bind9_payload.get("after_cache", "")): sample_dir / BIND9_AFTER_CACHE_FILE,
+        Path(secondary_payload.get("stderr", "")): sample_dir
+        / f"{secondary_resolver}.stderr",
+        Path(secondary_payload.get("before_cache", "")): sample_dir
+        / _secondary_before_cache_file(),
+        Path(secondary_payload.get("after_cache", "")): sample_dir
+        / _secondary_after_cache_file(),
+    }
+    for src, dst in artifact_map.items():
+        if str(src):
+            _copy_existing_file(src, dst)
+
+    for resolver_name, resolver_payload in (
+        ("bind9", bind9_payload),
+        (secondary_resolver, secondary_payload),
+    ):
+        logs = resolver_payload.get("logs")
+        if not isinstance(logs, list):
+            continue
+        for raw_log_path in logs:
+            if not isinstance(raw_log_path, str) or not raw_log_path:
+                continue
+            src = Path(raw_log_path)
+            if not src.is_file():
+                continue
+            filename = src.name
+            top_level_target = sample_dir / filename
+            if top_level_target.resolve() == src.resolve():
+                continue
+            _copy_existing_file(src, top_level_target)
+
+    sample_meta_path = sample_dir / "sample.meta.json"
+    sample_meta = _load_json_object(sample_meta_path)
+    artifacts = {
+        "sample_bin": "sample.bin",
+        "bind9_stderr": "bind9.stderr",
+        f"{secondary_resolver}_stderr": f"{secondary_resolver}.stderr",
+        "bind9_before_cache": BIND9_BEFORE_CACHE_FILE,
+        "bind9_after_cache": BIND9_AFTER_CACHE_FILE,
+        f"{secondary_resolver}_before_cache": _secondary_before_cache_file(),
+        f"{secondary_resolver}_after_cache": _secondary_after_cache_file(),
+        "oracle": "oracle.json",
+    }
+    oracle_provenance = {
+        "mode": "same_replay_after_cache",
+        "bind9": {
+            "stderr": "bind9.stderr",
+            "after_cache": BIND9_AFTER_CACHE_FILE,
+            "stage_marker": "===== bind9.after =====",
+        },
+        secondary_resolver: {
+            "stderr": f"{secondary_resolver}.stderr",
+            "after_cache": _secondary_after_cache_file(),
+            "stage_marker": f"===== {secondary_resolver}.after =====",
+        },
+    }
+    sample_meta["artifacts"] = artifacts
+    sample_meta["oracle_provenance"] = oracle_provenance
+    sample_meta["output_dir"] = str(sample_dir)
+    atomic_write_json(sample_meta_path, sample_meta)
+
+
+def _run_dnslabctl_sync_replay(queue_file: Path, sample_dir: Path) -> None:
+    root_dir = _resolve_root_dir()
+    dnslabctl_bin = _resolve_dnslabctl_bin(root_dir)
+    if not dnslabctl_bin.is_file() or not os.access(dnslabctl_bin, os.X_OK):
+        raise ReplayError(
+            f"缺少 dnslabctl 可执行文件: {dnslabctl_bin}",
+            exit_code=3,
+            reason="missing_executable",
+            stage="sync-replay.preflight",
+            executable_path=str(dnslabctl_bin),
+            process_started=False,
+        )
+
+    secondary_resolver = _secondary_resolver_name()
+    bind9_build_root = _resolve_bind9_build_root(root_dir)
+    secondary_build_root = _resolve_secondary_build_root(root_dir, secondary_resolver)
+    bind9_source_root = _resolve_bind9_source_root(root_dir, bind9_build_root)
+    secondary_source_root = _resolve_secondary_source_root(
+        secondary_resolver, secondary_build_root
+    )
+
+    command = [
+        str(dnslabctl_bin),
+        "sync-replay",
+        "--sample",
+        str(queue_file),
+        "--run-root",
+        str(sample_dir),
+        "--bind9-build-root",
+        str(bind9_build_root),
+        "--bind9-source-root",
+        str(bind9_source_root),
+        "--secondary-resolver",
+        secondary_resolver,
+        "--secondary-build-root",
+        str(secondary_build_root),
+        "--secondary-source-root",
+        str(secondary_source_root),
+        "--unbound-build-root",
+        str(secondary_build_root),
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=dict(os.environ),
+        )
+    except FileNotFoundError as exc:
+        raise ReplayError(
+            f"缺少命令或目标: {exc.filename}",
+            exit_code=3,
+            reason="missing_executable",
+            stage="sync-replay.preflight",
+            executable_path=exc.filename,
+            process_started=False,
+        ) from exc
+    except OSError as exc:
+        raise ReplayError(
+            f"dnslabctl sync-replay 执行失败: {exc}",
+            exit_code=4,
+            reason="subprocess_launch_error",
+            stage="sync-replay.preflight",
+            executable_path=str(dnslabctl_bin),
+            process_started=False,
+        ) from exc
+
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or (
+            f"dnslabctl sync-replay 返回 {completed.returncode}"
+        )
+        raise ReplayError(
+            message,
+            exit_code=4,
+            reason="subprocess_failed",
+            stage="sync-replay",
+            executable_path=str(dnslabctl_bin),
+            returncode=completed.returncode,
+            process_started=True,
+        )
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReplayError(
+            f"dnslabctl sync-replay 输出 JSON 解析失败: {exc}",
+            exit_code=5,
+            reason="missing_artifact",
+            stage="sync-replay",
+            executable_path=str(dnslabctl_bin),
+            process_started=True,
+        ) from exc
+
+    if not isinstance(payload, Mapping):
+        raise ReplayError(
+            "dnslabctl sync-replay 输出顶层必须是对象",
+            exit_code=5,
+            reason="missing_artifact",
+            stage="sync-replay",
+            executable_path=str(dnslabctl_bin),
+            process_started=True,
+        )
+    _normalize_dnslabctl_sync_replay_outputs(
+        sample_dir=sample_dir,
+        secondary_resolver=secondary_resolver,
+        payload=payload,
+    )
+
+
 def _process_one_sample(
     *,
     queue_file: Path,
@@ -1191,7 +1532,10 @@ def _process_one_sample(
     )
 
     try:
-        replay_diff_cache(str(queue_file), str(sample_dir))
+        if _use_dnslabctl_replay_backend():
+            _run_dnslabctl_sync_replay(queue_file, sample_dir)
+        else:
+            replay_diff_cache(str(queue_file), str(sample_dir))
     except ReplayError as exc:
         _write_sample_meta(
             sample_dir=sample_dir,
@@ -1465,6 +1809,7 @@ def follow_diff() -> int:
     config.output_root.mkdir(parents=True, exist_ok=True)
 
     interval_sec = _resolve_follow_diff_interval_sec()
+    idle_convergence_rounds = _resolve_follow_diff_window_idle_rounds()
     state_path = _follow_diff_state_path(config)
     state = _load_follow_diff_state(state_path)
     state.run_id = None
@@ -1542,22 +1887,30 @@ def follow_diff_once() -> int:
 def follow_diff_window(
     *,
     budget_sec: float,
+    comparability_budget_sec: Optional[float] = None,
     queue_tail_id: Optional[str] = None,
     retry_failed: bool = False,
 ) -> int:
     if budget_sec <= 0:
         raise FollowDiffError("--budget-sec 必须大于 0")
+    if comparability_budget_sec is not None and comparability_budget_sec <= 0:
+        raise FollowDiffError("comparability_budget_sec 必须大于 0")
 
     config = _collect_config()
     config.output_root.mkdir(parents=True, exist_ok=True)
 
     interval_sec = _resolve_follow_diff_interval_sec()
+    idle_convergence_rounds = _resolve_follow_diff_window_idle_rounds()
     state_path = _follow_diff_state_path(config)
     state = _load_follow_diff_state(state_path)
     bounded_run_id = _new_bounded_run_id()
     aggregation_key, baseline_compare_key = _build_follow_diff_comparability_keys(
         config,
-        budget_sec=budget_sec,
+        budget_sec=(
+            comparability_budget_sec
+            if comparability_budget_sec is not None
+            else budget_sec
+        ),
     )
     state.run_id = bounded_run_id
     state.retry_count = 0
@@ -1636,7 +1989,7 @@ def follow_diff_window(
         if (
             reached_frozen_tail
             and state.running_sample_id is None
-            and idle_rounds >= WINDOW_IDLE_CONVERGENCE_ROUNDS
+            and idle_rounds >= idle_convergence_rounds
         ):
             state.last_exit_reason = WINDOW_EXIT_REASON_QUIESCENT
             state.run_id = None

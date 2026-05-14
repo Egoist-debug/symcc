@@ -91,8 +91,7 @@
   --run-root experiments/runs/<timestamp>/sync_replay_dnsmasq \
   --bind9-build-root <bind9-afl-tree> \
   --secondary-resolver dnsmasq \
-  --secondary-build-root experiments/subjects/dnsmasq/v2.92-build \
-  --unbound-build-root experiments/subjects/dnsmasq/v2.92-build
+  --secondary-build-root experiments/subjects/dnsmasq/v2.92-build
 ```
 
 ```bash
@@ -100,8 +99,84 @@
   --sample-dir <stable-corpus-dir> \
   --run-root experiments/runs/<timestamp> \
   --bind9-build-root <bind9-afl-tree> \
-  --unbound-build-root <unbound-afl-tree>
+  --secondary-resolver knot-resolver \
+  --secondary-build-root experiments/subjects/knot-resolver/v6.2.0-build
 ```
+
+```bash
+python3 -m tools.dns_diff.cli campaign-matrix \
+  --matrix-file tools/dns_diff/config/poison_stateful_knot_matrix.json \
+  --budget-sec 3600 \
+  --repeat 5 \
+  --work-root experiments/matrix_runs/knot
+```
+
+```bash
+python3 -m tools.dns_diff.cli resolver-matrix-aggregate \
+  --matrix-root experiments/matrix_runs/unbound \
+  --matrix-root experiments/matrix_runs/dnsmasq \
+  --matrix-root experiments/matrix_runs/smartdns \
+  --matrix-root experiments/matrix_runs/maradns \
+  --matrix-root experiments/matrix_runs/knot \
+  --output-dir experiments/matrix_runs/_resolver_summary
+```
+
+```bash
+bash test/test_real_resolver_replay_matrix.sh
+```
+
+该脚本会在 `/home/ubuntu/tmp/real_resolver_replay_matrix/<timestamp>/` 下生成：
+
+- `matrix.tsv`
+- `manifest.json`
+- `logs/*.log`
+
+```bash
+bash test/test_real_campaign_matrix_multi_resolver.sh
+```
+
+该脚本会在 `/home/ubuntu/tmp/real_campaign_matrix_batch/<timestamp>/` 下生成：
+
+- `matrix_run_status.tsv`
+- `<resolver>/_summary/*.tsv`
+- `_resolver_summary/resolver_full_stack.tsv`
+- `_resolver_summary/resolver_variant_summary.tsv`
+
+```bash
+python3 -m tools.dns_diff.cli resolver-capability-report \
+  --replay-matrix-dir /home/ubuntu/tmp/real_resolver_replay_matrix/<timestamp> \
+  --matrix-batch-dir /home/ubuntu/tmp/real_campaign_matrix_batch/<timestamp> \
+  --output-dir /home/ubuntu/tmp/real_campaign_matrix_batch/<timestamp>/_resolver_capability
+```
+
+该命令会生成：
+
+- `_resolver_capability/resolver_capability_summary.tsv`
+- `_resolver_capability/resolver_capability_summary.json`
+- `_resolver_capability/resolver_adapter_cost.tsv`
+- `_resolver_capability/resolver_build_replay_matrix.tsv`
+- `_resolver_capability/resolver_semantic_distribution.tsv`
+
+```bash
+python3 -m tools.dns_diff.cli resolver-backend-matrix-compare \
+  --baseline-batch-dir /home/ubuntu/tmp/real_campaign_matrix_batch/<timestamp> \
+  --candidate-batch-dir /home/ubuntu/tmp/real_campaign_matrix_batch_dnslabctl/<timestamp> \
+  --baseline-label python \
+  --candidate-label dnslabctl \
+  --output-dir /home/ubuntu/tmp/real_campaign_matrix_batch_dnslabctl/<timestamp>/_backend_compare
+```
+
+```bash
+bash test/test_real_campaign_matrix_multi_resolver_dnslabctl.sh
+```
+
+可直接复用的 resolver matrix 配置：
+
+- `tools/dns_diff/config/poison_stateful_longbudget_matrix.json`：`bind9_vs_unbound`
+- `tools/dns_diff/config/poison_stateful_dnsmasq_matrix.json`：`bind9_vs_dnsmasq`
+- `tools/dns_diff/config/poison_stateful_smartdns_matrix.json`：`bind9_vs_smartdns`
+- `tools/dns_diff/config/poison_stateful_maradns_matrix.json`：`bind9_vs_maradns`
+- `tools/dns_diff/config/poison_stateful_knot_matrix.json`：`bind9_vs_knot-resolver`
 
 ```bash
 ./build/linux/x86_64/release/dnslabctl adapter-list

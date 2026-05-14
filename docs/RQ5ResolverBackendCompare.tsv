@@ -1,0 +1,6 @@
+resolver	resolver_pair	python_matrix_status	dnslabctl_matrix_status	python_run_count	dnslabctl_run_count	python_variance_status	dnslabctl_variance_status	python_semantic_counts_json	dnslabctl_semantic_counts_json
+dnsmasq	bind9_vs_dnsmasq	pass	pass	2	2	ok	ok	{"runtime_or_parse_failure": 1}	{"oracle_and_cache_diff": 1}
+knot-resolver	bind9_vs_knot-resolver	pass	pass	2	2	ok	ok	{"runtime_or_parse_failure": 1}	{"oracle_diff": 1}
+maradns	bind9_vs_maradns	pass	pass	2	2	ok	ok	{"runtime_or_parse_failure": 1}	{"oracle_and_cache_diff": 1}
+smartdns	bind9_vs_smartdns	pass	pass	2	2	ok	ok	{"runtime_or_parse_failure": 1}	{"oracle_and_cache_diff": 1}
+unbound	bind9_vs_unbound	pass	pass	2	2	ok	ok	{"oracle_and_cache_diff": 1}	{"oracle_and_cache_diff": 1}

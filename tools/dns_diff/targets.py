@@ -159,6 +159,28 @@ def _resolve_maradns_tag(root_dir: Path) -> str:
     return "deadwood-3.3.02"
 
 
+def _resolve_knot_resolver_tag(root_dir: Path) -> str:
+    raw = os.environ.get("KNOT_RESOLVER_TAG")
+    if raw and raw.strip():
+        return raw.strip()
+    dnslabctl = _resolve_dnslabctl_bin(root_dir)
+    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
+        try:
+            completed = subprocess.run(
+                [str(dnslabctl), "lock-resolved-tag", "--resolver", "knot-resolver"],
+                check=True,
+                cwd=root_dir,
+                capture_output=True,
+                text=True,
+            )
+            value = completed.stdout.strip()
+            if value:
+                return value
+        except subprocess.SubprocessError:
+            pass
+    return "v6.2.0"
+
+
 def _resolve_dnsmasq_src_tree(root_dir: Path) -> Path:
     default_tag = _resolve_dnsmasq_tag(root_dir)
     return (
@@ -236,6 +258,46 @@ def _resolve_maradns_build_tree(root_dir: Path) -> Path:
             os.environ.get(
                 "MARADNS_BUILD_TREE",
                 str(root_dir / "experiments" / "subjects" / "maradns" / f"{default_tag}-build"),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_knot_resolver_src_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_knot_resolver_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "KNOT_RESOLVER_SRC_TREE",
+                str(
+                    root_dir
+                    / "experiments"
+                    / "subjects"
+                    / "knot-resolver"
+                    / default_tag
+                ),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+
+
+def _resolve_knot_resolver_build_tree(root_dir: Path) -> Path:
+    default_tag = _resolve_knot_resolver_tag(root_dir)
+    return (
+        Path(
+            os.environ.get(
+                "KNOT_RESOLVER_BUILD_TREE",
+                str(
+                    root_dir
+                    / "experiments"
+                    / "subjects"
+                    / "knot-resolver"
+                    / f"{default_tag}-build"
+                ),
             )
         )
         .expanduser()
@@ -475,6 +537,79 @@ def _dump_maradns_cache(sample: Optional[str], output_path: Optional[str]) -> in
     if completed.returncode != 0:
         raise TargetRegistryError(
             f"maradns adapter-dump-cache 失败: rc={completed.returncode}",
+            exit_code=EXIT_SUBPROCESS,
+        )
+    if not output_file.is_file() or output_file.stat().st_size == 0:
+        raise TargetRegistryError(
+            f"cache dump 为空: {output_file}", exit_code=EXIT_SUBPROCESS
+        )
+    return 0
+
+
+def _dump_knot_resolver_cache(sample: Optional[str], output_path: Optional[str]) -> int:
+    root_dir = _resolve_root_dir()
+    work_dir = _resolve_work_dir(root_dir)
+    cache_dump_dir = _resolve_cache_dump_dir(work_dir)
+    build_root = _resolve_knot_resolver_build_tree(root_dir)
+    source_root = _resolve_knot_resolver_src_tree(root_dir)
+    runtime_root = (work_dir / "knot_resolver_dump_runtime").resolve()
+
+    sample_path: Optional[Path] = None
+    base_name = "empty"
+    if sample is not None:
+        sample_path = Path(sample).expanduser().resolve()
+        if not sample_path.is_file():
+            raise TargetRegistryError(
+                f"样本不存在或不可读: {sample}", exit_code=EXIT_USAGE
+            )
+        base_name = sample_path.name
+
+    if output_path:
+        output_file = Path(output_path).expanduser().resolve()
+    else:
+        output_file = (cache_dump_dir / f"{base_name}.knot-resolver.cache.txt").resolve()
+
+    cache_dump_dir.mkdir(parents=True, exist_ok=True)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    binary = build_root / "knot-build" / "daemon" / "kresd"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        build_args = [
+            "adapter-build",
+            "--resolver",
+            "knot-resolver",
+            "--source-root",
+            str(source_root),
+            "--build-root",
+            str(build_root),
+        ]
+        completed = _run_dnslabctl_command(root_dir, build_args)
+        if completed.returncode != 0:
+            raise TargetRegistryError(
+                f"knot-resolver adapter-build 失败: rc={completed.returncode}",
+                exit_code=EXIT_SUBPROCESS,
+            )
+
+    dump_args = [
+        "adapter-dump-cache",
+        "--resolver",
+        "knot-resolver",
+        "--source-root",
+        str(source_root),
+        "--build-root",
+        str(build_root),
+        "--run-root",
+        str(runtime_root),
+        "--output-file",
+        str(output_file),
+    ]
+    if sample_path is not None:
+        dump_args.extend(["--sample", str(sample_path)])
+    completed = _run_dnslabctl_command(root_dir, dump_args)
+    if completed.returncode != 0:
+        raise TargetRegistryError(
+            f"knot-resolver adapter-dump-cache 失败: rc={completed.returncode}",
             exit_code=EXIT_SUBPROCESS,
         )
     if not output_file.is_file() or output_file.stat().st_size == 0:
@@ -734,6 +869,7 @@ _RESOLVER_SPECS: Tuple[ResolverSpec, ...] = (
     ResolverSpec(name="bind9", aliases=("named",)),
     ResolverSpec(name="maradns"),
     ResolverSpec(name="smartdns"),
+    ResolverSpec(name="knot-resolver", aliases=("kresd",)),
     ResolverSpec(name="unbound"),
     ResolverSpec(name="dnsmasq"),
 )
@@ -761,7 +897,7 @@ _TARGET_SPECS: Tuple[TargetSpec, ...] = (
         name="knot-resolver",
         aliases=("kresd",),
         fetcher=_fetch_knot_resolver_target,
-        cache_dumper=None,
+        cache_dumper=_dump_knot_resolver_cache,
     ),
     TargetSpec(
         name="unbound",

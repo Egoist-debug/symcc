@@ -522,6 +522,32 @@ def _iter_maradns_records(lines: Iterable[str]) -> List[CacheRecord]:
     return records
 
 
+def _iter_knot_resolver_records(lines: Iterable[str]) -> List[CacheRecord]:
+    records: List[CacheRecord] = []
+    for raw_line in lines:
+        line = _trim(raw_line.rstrip("\n"))
+        if not line.startswith("CACHE_ENTRY\t"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 4:
+            continue
+        records.append(
+            CacheRecord(
+                resolver="knot-resolver",
+                view="_",
+                qname=fields[1],
+                qtype=fields[2],
+                rrtype=fields[2],
+                section="CACHE",
+                cache_type="rrset",
+                ttl="_",
+                rdata_norm=fields[3],
+                flags="source=kresd-harness",
+            )
+        )
+    return records
+
+
 def _smartdns_qtype_name(qtype: int) -> str:
     mapping = {
         1: "A",
@@ -712,6 +738,8 @@ def _canonical_resolver_name(resolver: str) -> str:
         return "maradns"
     if normalized == "smartdns":
         return "smartdns"
+    if normalized in {"knot-resolver", "kresd"}:
+        return "knot-resolver"
     if normalized in {"bind9", "named"}:
         return "bind9"
     raise CacheParseError(f"未知 resolver: {resolver}")
@@ -735,6 +763,10 @@ def parse_cache_dump(resolver: str, dump_file: Union[str, Path]) -> List[CacheRe
         with dump_path.open("r", encoding="utf-8", errors="replace") as handle:
             lines = list(handle)
         return _iter_maradns_records(lines)
+    if resolved_resolver == "knot-resolver":
+        with dump_path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = list(handle)
+        return _iter_knot_resolver_records(lines)
     if resolved_resolver == "smartdns":
         return _iter_smartdns_records(dump_path.read_bytes())
     with dump_path.open("r", encoding="utf-8", errors="replace") as handle:

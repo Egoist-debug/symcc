@@ -1,0 +1,6 @@
+resolver	resolver_pair	build_real_status	replay_real_status	sync_secondary_real_status	matrix_status	cache_observable_status	full_stack_run_count	full_stack_variance_status
+dnsmasq	bind9_vs_dnsmasq	pass	pass		pass	observable	2	ok
+knot-resolver	bind9_vs_knot-resolver	pass	pass	pass	pass	observable	2	ok
+maradns	bind9_vs_maradns	pass	pass		pass	observable	2	ok
+smartdns	bind9_vs_smartdns	pass	pass		pass	observable	2	ok
+unbound	bind9_vs_unbound	pass	pass		pass	observable	2	ok

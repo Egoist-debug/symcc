@@ -94,8 +94,11 @@ void printUsage() {
          " [--secondary-resolver <name>] [--secondary-build-root <path>]"
          " [--secondary-source-root <path>]\n"
       << "  dnslabctl batch-sync-replay --sample-dir <path> --run-root <path>"
-         " --bind9-build-root <path> --unbound-build-root <path>"
+         " --bind9-build-root <path>"
+         " [--unbound-build-root <path>] [--secondary-resolver <name>]"
+         " [--secondary-build-root <path>]"
          " [--bind9-source-root <path>] [--unbound-source-root <path>]"
+         " [--secondary-source-root <path>]"
          " [--limit <n>]\n"
       << "  dnslabctl oracle-parse --resolver <name> --stderr-file <path>\n"
       << "  dnslabctl evidence-bundle --output <path> --summary <path>"
@@ -182,6 +185,10 @@ int main(int argc, char **argv) {
             ::setenv("DNSLAB_DNSMASQ_BUILD_ROOT", BuildRoot.c_str(), 1);
           } else if (ResolverName == "smartdns") {
             ::setenv("DNSLAB_SMARTDNS_BUILD_ROOT", BuildRoot.c_str(), 1);
+          } else if (ResolverName == "maradns") {
+            ::setenv("DNSLAB_MARADNS_BUILD_ROOT", BuildRoot.c_str(), 1);
+          } else if (ResolverName == "knot-resolver") {
+            ::setenv("DNSLAB_KNOT_RESOLVER_BUILD_ROOT", BuildRoot.c_str(), 1);
           }
         };
 
@@ -642,17 +649,7 @@ int main(int argc, char **argv) {
           dnslab::makeDefaultResolverRegistry(std::filesystem::current_path());
       const auto &Adapter = Registry.require(ResolverName);
       std::filesystem::create_directories(RunRoot);
-      if (ResolverName == "bind9") {
-        ::setenv("DNSLAB_BIND9_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "unbound") {
-        ::setenv("DNSLAB_UNBOUND_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "dnsmasq") {
-        ::setenv("DNSLAB_DNSMASQ_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "smartdns") {
-        ::setenv("DNSLAB_SMARTDNS_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "maradns") {
-        ::setenv("DNSLAB_MARADNS_BUILD_ROOT", BuildRoot.c_str(), 1);
-      }
+      setResolverBuildEnv(ResolverName, BuildRoot);
 
       dnslab::CommandResult DumpResult;
       std::filesystem::path EffectiveOutput;
@@ -712,17 +709,7 @@ int main(int argc, char **argv) {
           dnslab::makeDefaultResolverRegistry(std::filesystem::current_path());
       const auto &Adapter = Registry.require(ResolverName);
       std::filesystem::create_directories(RunRoot);
-      if (ResolverName == "bind9") {
-        ::setenv("DNSLAB_BIND9_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "unbound") {
-        ::setenv("DNSLAB_UNBOUND_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "dnsmasq") {
-        ::setenv("DNSLAB_DNSMASQ_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "smartdns") {
-        ::setenv("DNSLAB_SMARTDNS_BUILD_ROOT", BuildRoot.c_str(), 1);
-      } else if (ResolverName == "maradns") {
-        ::setenv("DNSLAB_MARADNS_BUILD_ROOT", BuildRoot.c_str(), 1);
-      }
+      setResolverBuildEnv(ResolverName, BuildRoot);
 
       const auto BeforeCache = RunRoot / (ResolverName + ".before.cache.txt");
       const auto DumpResult = Adapter.dumpCache(RunRoot, BeforeCache);
@@ -824,18 +811,29 @@ int main(int argc, char **argv) {
       const auto RunRoot = std::filesystem::path(requireOption(Args, "--run-root"));
       const auto Bind9BuildRoot =
           std::filesystem::path(requireOption(Args, "--bind9-build-root"));
-      const auto UnboundBuildRoot =
-          std::filesystem::path(requireOption(Args, "--unbound-build-root"));
+      const auto SecondaryResolverName =
+          optionalOption(Args, "--secondary-resolver").value_or("unbound");
+      const auto SecondaryBuildRootArg = optionalOption(Args, "--secondary-build-root");
+      const auto LegacyUnboundBuildRootArg = optionalOption(Args, "--unbound-build-root");
+      if (!SecondaryBuildRootArg.has_value() &&
+          !LegacyUnboundBuildRootArg.has_value()) {
+        throw std::runtime_error(
+            "缺少参数: --secondary-build-root 或 --unbound-build-root");
+      }
+      const auto SecondaryBuildRoot = std::filesystem::path(
+          SecondaryBuildRootArg.value_or(*LegacyUnboundBuildRootArg));
       std::filesystem::path Bind9SourceRoot =
           resolveDefaultSourceRoot("bind9", Bind9BuildRoot);
-      std::filesystem::path UnboundSourceRoot =
-          resolveDefaultSourceRoot("unbound", UnboundBuildRoot);
+      std::filesystem::path SecondarySourceRoot =
+          resolveDefaultSourceRoot(SecondaryResolverName, SecondaryBuildRoot);
       std::optional<size_t> Limit;
       for (size_t Index = 0; Index + 1 < Args.size(); ++Index) {
         if (Args[Index] == "--bind9-source-root") {
           Bind9SourceRoot = Args[Index + 1];
         } else if (Args[Index] == "--unbound-source-root") {
-          UnboundSourceRoot = Args[Index + 1];
+          SecondarySourceRoot = Args[Index + 1];
+        } else if (Args[Index] == "--secondary-source-root") {
+          SecondarySourceRoot = Args[Index + 1];
         } else if (Args[Index] == "--limit") {
           Limit = static_cast<size_t>(std::stoul(Args[Index + 1]));
         }
@@ -863,9 +861,9 @@ int main(int argc, char **argv) {
       Results.reserve(Samples.size());
       for (const auto &SamplePath : Samples) {
         Results.push_back(executeSyncReplay(SamplePath, RunRoot / "samples", true,
-                                            Bind9BuildRoot, UnboundBuildRoot,
-                                            Bind9SourceRoot, UnboundSourceRoot,
-                                            "unbound"));
+                                            Bind9BuildRoot, SecondaryBuildRoot,
+                                            Bind9SourceRoot, SecondarySourceRoot,
+                                            SecondaryResolverName));
       }
 
       const auto boolText = [](const std::optional<bool> &Value) {
@@ -890,7 +888,12 @@ int main(int argc, char **argv) {
 
       std::ofstream OracleAudit(RunRoot / "oracle_audit.tsv");
       OracleAudit
-          << "sample_id\tanalysis_state\tstatus\tsemantic_outcome\toracle_audit_candidate\tcase_study_candidate\tbind9.response_accepted\tunbound.response_accepted\tbind9.second_query_hit\tunbound.second_query_hit\tbind9.cache_entry_created\tunbound.cache_entry_created\n";
+          << "sample_id\tanalysis_state\tstatus\tsemantic_outcome\toracle_audit_candidate\tcase_study_candidate\tbind9.response_accepted\t"
+          << SecondaryResolverName
+          << ".response_accepted\tbind9.second_query_hit\t"
+          << SecondaryResolverName
+          << ".second_query_hit\tbind9.cache_entry_created\t"
+          << SecondaryResolverName << ".cache_entry_created\n";
 
       std::ofstream FailureTaxonomy(RunRoot / "failure_taxonomy.tsv");
       FailureTaxonomy
@@ -950,12 +953,18 @@ int main(int argc, char **argv) {
           ++CaseStudyCount;
           const auto CaseStudyPath =
               RunRoot / "case_studies" / (Result.Identity.SampleId + ".md");
-          const std::string ReplayCommand =
+          std::string ReplayCommand =
               "./build/linux/x86_64/release/dnslabctl sync-replay --sample " +
               Result.Meta.SourceQueueFile.value_or("_") + " --run-root " +
               Result.ArtifactDir.string() + " --bind9-build-root " +
-              Bind9BuildRoot.string() + " --unbound-build-root " +
-              UnboundBuildRoot.string();
+              Bind9BuildRoot.string();
+          if (Result.SecondaryResolver == "unbound") {
+            ReplayCommand += " --unbound-build-root " + SecondaryBuildRoot.string();
+          } else {
+            ReplayCommand += " --secondary-resolver " + Result.SecondaryResolver +
+                             " --secondary-build-root " +
+                             SecondaryBuildRoot.string();
+          }
           std::ofstream CaseStudyFile(CaseStudyPath);
           CaseStudyFile << "# " << Result.Identity.SampleId << "\n\n";
           CaseStudyFile << "- semantic_outcome: " << Result.Triage.SemanticOutcome
@@ -982,15 +991,17 @@ int main(int argc, char **argv) {
                         << Result.Bind9.BeforeCache.string() << "\n";
           CaseStudyFile << "- bind9_after_cache: "
                         << Result.Bind9.AfterCache.string() << "\n";
-          CaseStudyFile << "- unbound_before_cache: "
+          CaseStudyFile << "- " << Result.SecondaryResolver
+                        << "_before_cache: "
                         << Result.Secondary.BeforeCache.string() << "\n";
-          CaseStudyFile << "- unbound_after_cache: "
+          CaseStudyFile << "- " << Result.SecondaryResolver
+                        << "_after_cache: "
                         << Result.Secondary.AfterCache.string() << "\n";
           CaseStudyFile << "- bind9_logs:\n";
           for (const auto &Path : Result.Bind9.Logs) {
             CaseStudyFile << "  - " << Path.string() << "\n";
           }
-          CaseStudyFile << "- unbound_logs:\n";
+          CaseStudyFile << "- " << Result.SecondaryResolver << "_logs:\n";
           for (const auto &Path : Result.Secondary.Logs) {
             CaseStudyFile << "  - " << Path.string() << "\n";
           }
@@ -1005,36 +1016,40 @@ int main(int argc, char **argv) {
 
         const bool OracleEligible = Result.Triage.AnalysisState == "included" &&
                                     Result.Triage.OracleAuditCandidate;
+        const std::string SecondaryPrefix = Result.SecondaryResolver + ".";
         const auto bind9ResponseAccepted =
             objectBool(Result.OraclePayload, "bind9.response_accepted")
                 .value_or(false);
-        const auto unboundResponseAccepted =
-            objectBool(Result.OraclePayload, "unbound.response_accepted")
+        const auto secondaryResponseAccepted =
+            objectBool(Result.OraclePayload,
+                       SecondaryPrefix + "response_accepted")
                 .value_or(false);
         const auto bind9SecondHit =
             objectBool(Result.OraclePayload, "bind9.second_query_hit")
                 .value_or(false);
-        const auto unboundSecondHit =
-            objectBool(Result.OraclePayload, "unbound.second_query_hit")
+        const auto secondarySecondHit =
+            objectBool(Result.OraclePayload, SecondaryPrefix + "second_query_hit")
                 .value_or(false);
         const auto bind9CacheCreated =
             objectBool(Result.OraclePayload, "bind9.cache_entry_created")
                 .value_or(false);
-        const auto unboundCacheCreated =
-            objectBool(Result.OraclePayload, "unbound.cache_entry_created")
+        const auto secondaryCacheCreated =
+            objectBool(Result.OraclePayload,
+                       SecondaryPrefix + "cache_entry_created")
                 .value_or(false);
-        const bool OracleDiffAny = bind9ResponseAccepted != unboundResponseAccepted ||
-                                   bind9SecondHit != unboundSecondHit ||
-                                   bind9CacheCreated != unboundCacheCreated;
+        const bool OracleDiffAny =
+            bind9ResponseAccepted != secondaryResponseAccepted ||
+            bind9SecondHit != secondarySecondHit ||
+            bind9CacheCreated != secondaryCacheCreated;
         const bool CacheDiffAny = Result.CacheDiff.Bind9.HasCacheDiff ||
                                   Result.CacheDiff.Unbound.HasCacheDiff;
         updateSignal("response_accepted_any",
                      OracleEligible &&
-                         (bind9ResponseAccepted || unboundResponseAccepted));
+                         (bind9ResponseAccepted || secondaryResponseAccepted));
         updateSignal("second_query_hit_any",
-                     OracleEligible && (bind9SecondHit || unboundSecondHit));
+                     OracleEligible && (bind9SecondHit || secondarySecondHit));
         updateSignal("cache_entry_created_any",
-                     OracleEligible && (bind9CacheCreated || unboundCacheCreated));
+                     OracleEligible && (bind9CacheCreated || secondaryCacheCreated));
         updateSignal("oracle_diff_any", OracleEligible && OracleDiffAny);
         updateSignal("oracle_diff_plus_cache_diff",
                      OracleEligible && OracleDiffAny && CacheDiffAny);
@@ -1050,20 +1065,20 @@ int main(int argc, char **argv) {
                     << boolText(objectBool(Result.OraclePayload,
                                            "bind9.response_accepted"))
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload,
-                                           "unbound.response_accepted"))
+                    << boolText(objectBool(Result.OraclePayload, SecondaryPrefix +
+                                           "response_accepted"))
                     << '\t'
                     << boolText(objectBool(Result.OraclePayload,
                                            "bind9.second_query_hit"))
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload,
-                                           "unbound.second_query_hit"))
+                    << boolText(objectBool(Result.OraclePayload, SecondaryPrefix +
+                                           "second_query_hit"))
                     << '\t'
                     << boolText(objectBool(Result.OraclePayload,
                                            "bind9.cache_entry_created"))
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload,
-                                           "unbound.cache_entry_created"))
+                    << boolText(objectBool(Result.OraclePayload, SecondaryPrefix +
+                                           "cache_entry_created"))
                     << '\n';
 
         FailureTaxonomy
@@ -1174,6 +1189,7 @@ int main(int argc, char **argv) {
       dnslab::json::Value::Object Summary;
       Summary["generated_at"] = dnslab::utcTimestampNow();
       Summary["status"] = FailedCount == 0 ? "success" : "partial_failure";
+      Summary["secondary_resolver"] = SecondaryResolverName;
       Summary["sample_count"] = static_cast<std::int64_t>(Results.size());
       Summary["completed_count"] = static_cast<std::int64_t>(CompletedCount);
       Summary["failed_count"] = static_cast<std::int64_t>(FailedCount);

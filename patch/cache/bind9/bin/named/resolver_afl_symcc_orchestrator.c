@@ -60,7 +60,6 @@ static unsigned char named_afl_fuzz_buf[65536];
 __AFL_FUZZ_INIT();
 
 #define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAGIC "DST1"
-#define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION 2
 #define NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES 16
 #define NAMED_RESOLVER_AFL_SYMCC_MAX_LEGACY_INPUT 4096
 #define NAMED_RESOLVER_AFL_SYMCC_MAX_TRANSCRIPT_INPUT 16384
@@ -80,6 +79,8 @@ typedef struct named_resolver_afl_symcc_request_context {
 typedef struct named_resolver_afl_symcc_transcript {
 	const uint8_t *client_query;
 	size_t client_query_len;
+	const uint8_t *post_check_query;
+	size_t post_check_query_len;
 	const uint8_t *responses[NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES];
 	size_t response_lens[NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES];
 	size_t response_count;
@@ -406,7 +407,7 @@ parse_transcript_input(const uint8_t *input, size_t input_len,
 	size_t header_len = 0;
 	size_t index;
 
-	if (input == NULL || transcript == NULL || input_len < 8 ||
+	if (input == NULL || transcript == NULL || input_len < 10 ||
 	    !looks_like_transcript(input, input_len))
 	{
 		return false;
@@ -414,22 +415,20 @@ parse_transcript_input(const uint8_t *input, size_t input_len,
 
 	memset(transcript, 0, sizeof(*transcript));
 	transcript->response_count = input[4];
-	if (input[5] != NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION) {
-		return false;
-	}
 	if (transcript->response_count >
 	    NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES)
 	{
 		return false;
 	}
 
-	header_len = 8 + transcript->response_count * 2;
+	header_len = 10 + transcript->response_count * 2;
 	if (header_len > input_len) {
 		return false;
 	}
 
 	cursor = header_len;
 	transcript->client_query_len = read_u16le(input + 6);
+	transcript->post_check_query_len = read_u16le(input + 8);
 	if (transcript->client_query_len == 0 ||
 	    cursor + transcript->client_query_len > input_len)
 	{
@@ -440,7 +439,7 @@ parse_transcript_input(const uint8_t *input, size_t input_len,
 	cursor += transcript->client_query_len;
 
 	for (index = 0; index < transcript->response_count; index++) {
-		size_t response_len = read_u16le(input + 8 + index * 2);
+		size_t response_len = read_u16le(input + 10 + index * 2);
 
 		if (response_len == 0 || cursor + response_len > input_len) {
 			return false;
@@ -451,7 +450,13 @@ parse_transcript_input(const uint8_t *input, size_t input_len,
 		cursor += response_len;
 	}
 
-	if (cursor != input_len) {
+	if (transcript->post_check_query_len > 0) {
+		if (cursor + transcript->post_check_query_len != input_len) {
+			return false;
+		}
+
+		transcript->post_check_query = input + cursor;
+	} else if (cursor != input_len) {
 		return false;
 	}
 
@@ -981,8 +986,6 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	named_resolver_afl_symcc_mutator_counters_t counters_after_second;
 	isc_result_t result = ISC_R_FAILURE;
 	char response_dir[PATH_MAX];
-	uint8_t *second_query = NULL;
-	size_t second_query_len = 0;
 	char *saved_tail = NULL;
 	char *saved_tail_dir = NULL;
 	const char *tail_env = getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
@@ -1005,16 +1008,15 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 		saved_tail_dir = strdup(tail_dir_env);
 	}
 
-	if (transcript.client_query_len < 2) {
-		orchestrator->send_failures++;
-		goto done;
-	}
-
 	if (!materialize_transcript_responses(&transcript, response_dir,
 					      sizeof(response_dir)))
 	{
 		orchestrator->send_failures++;
-		goto done;
+		restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL",
+				saved_tail);
+		restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
+				saved_tail_dir);
+		return ISC_R_FAILURE;
 	}
 
 	unsetenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
@@ -1045,27 +1047,18 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	}
 
 	counters_after_second = counters_after_first;
-	second_query = malloc(transcript.client_query_len);
-	if (second_query == NULL) {
-		orchestrator->send_failures++;
-		goto done;
-	}
-	if (!build_second_query_from_client_query(transcript.client_query,
-						     transcript.client_query_len,
-						     second_query)) {
-		orchestrator->send_failures++;
-		goto done;
-	}
-	second_query_len = transcript.client_query_len;
-
+	if (transcript.post_check_query != NULL &&
+	    transcript.post_check_query_len > 0)
 	{
-		bool second_query_hit = false;
+		bool post_check_hit = false;
 
-		result = execute_legacy_request(orchestrator, second_query,
-						second_query_len, timeout_ms);
+		result = execute_legacy_request(orchestrator,
+						transcript.post_check_query,
+						transcript.post_check_query_len,
+						timeout_ms);
 		named_resolver_afl_symcc_mutator_server_get_counters(
 			&counters_after_second);
-		second_query_hit =
+		post_check_hit =
 			result == ISC_R_SUCCESS &&
 			counters_after_second.received ==
 				counters_after_first.received &&
@@ -1073,7 +1066,13 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 				counters_after_first.replied &&
 			counters_after_second.parse_errors ==
 				counters_after_first.parse_errors;
-		if (second_query_hit) {
+		if (post_check_hit) {
+			/*
+			 * second_query_hit 现在要求第一轮 query 至少发生过一次
+			 * 上游抓取，避免把“从未进入 fetch 路径”误标成
+			 * post-check 命中代理；cache_entry_created 则进一步要求
+			 * 第一轮已接受过伪造响应。
+			 */
 			oracle.second_query_hit =
 				oracle.resolver_fetch_started;
 			oracle.cache_entry_created =
@@ -1086,7 +1085,6 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	}
 
 done:
-	free(second_query);
 	update_transcript_oracle(orchestrator, &oracle);
 	restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL", saved_tail);
 	restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",

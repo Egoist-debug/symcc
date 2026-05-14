@@ -102,7 +102,9 @@ def _resolve_root_dir() -> Path:
 
 def _resolve_secondary_resolver() -> str:
     value = os.environ.get("DNS_DIFF_SECONDARY_RESOLVER", "unbound").strip().lower()
-    if value not in {"unbound", "dnsmasq", "smartdns", "maradns"}:
+    if value == "kresd":
+        value = "knot-resolver"
+    if value not in {"unbound", "dnsmasq", "smartdns", "maradns", "knot-resolver"}:
         raise ReplayError(
             f"不支持的第二 resolver: {value!r}",
             exit_code=EXIT_USAGE,
@@ -134,7 +136,7 @@ def _resolver_from_stage(stage: Optional[str]) -> Optional[str]:
     if stage is None or "." not in stage:
         return None
     resolver, _ = stage.split(".", 1)
-    if resolver in {"bind9", "unbound", "dnsmasq", "smartdns"}:
+    if resolver in {"bind9", "unbound", "dnsmasq", "smartdns", "knot-resolver"}:
         return resolver
     if resolver in {"maradns"}:
         return resolver
@@ -228,6 +230,26 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             os.environ.get(
                 "MARADNS_HARNESS_SCRIPT",
                 str(root_dir / "tools" / "maradns_replay_harness.py"),
+            )
+        ).expanduser()
+    elif secondary_resolver == "knot-resolver":
+        secondary_build_tree = Path(
+            os.environ.get(
+                "KNOT_RESOLVER_BUILD_TREE",
+                str(
+                    root_dir
+                    / "experiments"
+                    / "subjects"
+                    / "knot-resolver"
+                    / "v6.2.0-build"
+                ),
+            )
+        ).expanduser()
+        secondary_binary = secondary_build_tree / "knot-build" / "daemon" / "kresd"
+        secondary_harness = Path(
+            os.environ.get(
+                "KNOT_RESOLVER_HARNESS_SCRIPT",
+                str(root_dir / "tools" / "knot_resolver_replay_harness.py"),
             )
         ).expanduser()
 
@@ -451,6 +473,19 @@ def _run_secondary_harness_stage(
                 "--cache-dump-path",
                 str(cache_dump_path),
                 "--maradns-log-path",
+                str(native_log_path),
+            ]
+        )
+    elif resolver == "knot-resolver":
+        command.extend(
+            [
+                "--kresd-bin",
+                str(binary),
+                "--mode",
+                mode,
+                "--cache-dump-path",
+                str(cache_dump_path),
+                "--kresd-log-path",
                 str(native_log_path),
             ]
         )
