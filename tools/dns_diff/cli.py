@@ -1,4 +1,6 @@
 import argparse
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -42,6 +44,84 @@ from .targets import (
 from .triage import TriageError, rewrite_triage_root
 
 
+class DnslabctlForwardError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int,
+        stdout_text: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.stdout_text = stdout_text
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_dnslabctl_bin() -> Path:
+    explicit = os.environ.get("DNSLABCTL_BIN", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return (_repo_root() / "build/linux/x86_64/release/dnslabctl").resolve()
+
+
+def _resolve_cli_backend() -> str:
+    raw = os.environ.get("DNS_DIFF_CLI_BACKEND", "").strip().lower()
+    if not raw:
+        return ""
+    if raw in {"python", "dnslabctl"}:
+        return raw
+    raise RuntimeError(
+        f"DNS_DIFF_CLI_BACKEND 只能是 python/dnslabctl，当前值: {raw!r}"
+    )
+
+
+def _use_dnslabctl_backend(*, default: bool = False) -> bool:
+    backend = _resolve_cli_backend()
+    if not backend:
+        return default
+    return backend == "dnslabctl"
+
+
+def _run_dnslabctl(command: Sequence[str]) -> int:
+    dnslabctl_bin = _resolve_dnslabctl_bin()
+    if not dnslabctl_bin.is_file():
+        raise RuntimeError(f"缺少 dnslabctl 可执行文件: {dnslabctl_bin}")
+
+    completed = subprocess.run(
+        [str(dnslabctl_bin), *command],
+        cwd=_repo_root(),
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+        check=False,
+    )
+    if completed.returncode == 0:
+        if completed.stdout:
+            sys.stdout.write(completed.stdout)
+        if completed.stderr:
+            sys.stderr.write(completed.stderr)
+        return 0
+
+    message = completed.stderr.strip() or completed.stdout.strip() or (
+        f"dnslabctl 返回 {completed.returncode}"
+    )
+    raise DnslabctlForwardError(
+        message,
+        exit_code=int(completed.returncode),
+        stdout_text=completed.stdout,
+    )
+
+
+def _write_forward_failure_stdout(exc: BaseException) -> None:
+    stdout_text = getattr(exc, "stdout_text", "")
+    if isinstance(stdout_text, str) and stdout_text:
+        sys.stdout.write(stdout_text)
+
+
 def _target_help() -> str:
     registered = ", ".join(registered_target_names())
     return f"目标名（已注册: {registered}；默认: unbound）"
@@ -78,21 +158,33 @@ def _cmd_follow_diff(_: argparse.Namespace) -> int:
 
 def _cmd_follow_diff_once(_: argparse.Namespace) -> int:
     try:
+        if _use_dnslabctl_backend():
+            return _run_dnslabctl(["follow-diff-once"])
         return follow_diff_once()
-    except FollowDiffError as exc:
+    except (FollowDiffError, DnslabctlForwardError, RuntimeError) as exc:
+        _write_forward_failure_stdout(exc)
         sys.stderr.write(f"dns-diff: follow-diff-once 失败: {exc}\n")
-        return exc.exit_code
+        return getattr(exc, "exit_code", 2)
 
 
 def _cmd_follow_diff_window(args: argparse.Namespace) -> int:
     try:
+        if _use_dnslabctl_backend():
+            command = ["follow-diff-window", "--budget-sec", str(args.budget_sec)]
+            if args.retry_failed:
+                command.append("--retry-failed")
+            if args.queue_tail_id:
+                command.extend(["--queue-tail-id", args.queue_tail_id])
+            return _run_dnslabctl(command)
         return follow_diff_window(
             budget_sec=args.budget_sec,
+            queue_tail_id=args.queue_tail_id,
             retry_failed=bool(args.retry_failed),
         )
-    except FollowDiffError as exc:
+    except (FollowDiffError, DnslabctlForwardError, RuntimeError) as exc:
+        _write_forward_failure_stdout(exc)
         sys.stderr.write(f"dns-diff: follow-diff-window 失败: {exc}\n")
-        return exc.exit_code
+        return getattr(exc, "exit_code", 2)
 
 
 def _cmd_input_model_eval(args: argparse.Namespace) -> int:
@@ -162,10 +254,18 @@ def _cmd_triage_report(_: argparse.Namespace) -> int:
 
 def _cmd_report(args: argparse.Namespace) -> int:
     try:
+        if _use_dnslabctl_backend(default=True):
+            command = ["report", "--root", str(args.root)]
+            if args.high_value_manifest:
+                command.extend(
+                    ["--high-value-manifest", str(args.high_value_manifest)]
+                )
+            return _run_dnslabctl(command)
         return generate_report(args.root)
-    except ReportError as exc:
+    except (ReportError, DnslabctlForwardError, RuntimeError) as exc:
+        _write_forward_failure_stdout(exc)
         sys.stderr.write(f"dns-diff: report 失败: {exc}\n")
-        return exc.exit_code
+        return getattr(exc, "exit_code", 2)
 
 
 def _cmd_rq3_snapshot(args: argparse.Namespace) -> int:
@@ -182,10 +282,18 @@ def _cmd_rq3_snapshot(args: argparse.Namespace) -> int:
 def _cmd_campaign_report(args: argparse.Namespace) -> int:
     root = Path(args.root) if args.root else default_follow_diff_root()
     try:
+        if _use_dnslabctl_backend(default=True):
+            command = ["campaign-report", "--root", str(root)]
+            if args.output_dir:
+                command.extend(["--output-dir", str(args.output_dir)])
+            return _run_dnslabctl(command)
+        if args.output_dir:
+            raise RuntimeError("Python backend 暂不支持 --output-dir")
         return generate_campaign_report(root, is_custom_root=bool(args.root))
-    except ReportError as exc:
+    except (ReportError, DnslabctlForwardError, RuntimeError) as exc:
+        _write_forward_failure_stdout(exc)
         sys.stderr.write(f"dns-diff: campaign-report 失败: {exc}\n")
-        return exc.exit_code
+        return getattr(exc, "exit_code", 2)
     except CampaignReportError as exc:
         sys.stderr.write(f"dns-diff: campaign-report 失败: {exc}\n")
         return exc.exit_code
@@ -205,10 +313,15 @@ def _cmd_case_study_export(args: argparse.Namespace) -> int:
 
 def _cmd_campaign_close(args: argparse.Namespace) -> int:
     try:
+        if _use_dnslabctl_backend(default=True):
+            return _run_dnslabctl(
+                ["campaign-close", "--budget-sec", str(args.budget_sec)]
+            )
         return run_campaign_close(budget_sec=args.budget_sec)
-    except CampaignCloseError as exc:
+    except (CampaignCloseError, DnslabctlForwardError, RuntimeError) as exc:
+        _write_forward_failure_stdout(exc)
         sys.stderr.write(f"dns-diff: campaign-close 失败: {exc}\n")
-        return exc.exit_code
+        return getattr(exc, "exit_code", 2)
 
 
 def _cmd_campaign_aggregate(args: argparse.Namespace) -> int:
@@ -278,6 +391,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "dns-diff Python 真入口；target/resolver 选择统一走 registry，"
             "thin wrapper 只做兼容转发与环境注入。"
+            "默认由 Python 处理 follow-diff/onetime/window，"
+            "默认由 dnslabctl 处理 report、campaign-report、campaign-close。"
+            "设置 DNS_DIFF_CLI_BACKEND=python/dnslabctl 可显式覆盖。"
         ),
     )
     if hasattr(parser, "suggest_on_error"):
@@ -318,6 +434,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--retry-failed",
         action="store_true",
         help="显式允许在同一 bounded run 内重试 failed 样本（默认关闭）",
+    )
+    follow_diff_window.add_argument(
+        "--queue-tail-id",
+        help="可选冻结 tail queue id；默认在启动时自动探测",
     )
     follow_diff_window.set_defaults(handler=_cmd_follow_diff_window)
 
@@ -386,6 +506,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = subparsers.add_parser("report", help="离线汇总 triage 报告产物")
     report.add_argument("--root", required=True, help="follow_diff 根目录")
+    report.add_argument(
+        "--high-value-manifest",
+        help="可选高价值样本文本清单输出路径",
+    )
     report.set_defaults(handler=_cmd_report)
 
     rq3_snapshot = subparsers.add_parser(
@@ -408,6 +532,10 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign-report", help="汇总 campaign 指标"
     )
     campaign_report.add_argument("--root", help="可选 follow_diff 根目录")
+    campaign_report.add_argument(
+        "--output-dir",
+        help="可选输出根目录；dnslabctl backend 下写入 <output-dir>/<timestamp>/",
+    )
     campaign_report.set_defaults(handler=_cmd_campaign_report)
 
     case_study_export = subparsers.add_parser(

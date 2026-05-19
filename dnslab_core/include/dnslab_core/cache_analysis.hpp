@@ -5,6 +5,7 @@
 #include "dnslab_core/oracle.hpp"
 
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -42,11 +43,29 @@ struct ResolverCacheDiff {
   std::vector<CacheDeltaItem> DeltaItems;
 };
 
+struct ResolverPairCacheDifference {
+  std::string LeftResolver;
+  std::string RightResolver;
+  std::vector<std::string> DifferenceFields;
+};
+
+struct ResolverPairDifference {
+  std::string LeftResolver;
+  std::string RightResolver;
+  std::vector<std::string> OracleDiffFields;
+  std::vector<std::string> CacheDiffFields;
+};
+
 struct CacheDiffResult {
   std::string SampleId;
   bool CacheDeltaTriggered = false;
+  bool DiffDetected = false;
+  std::string CompatibilitySecondaryResolver = "unbound";
+  std::vector<std::string> ExecutedResolvers;
   ResolverCacheDiff Bind9;
   ResolverCacheDiff Unbound;
+  std::map<std::string, ResolverCacheDiff> Resolvers;
+  std::vector<ResolverPairCacheDifference> ResolverDifferences;
 };
 
 struct TriageRecord {
@@ -63,11 +82,14 @@ struct TriageRecord {
   std::vector<std::string> FilterLabels;
   std::string ClusterKey;
   bool CacheDeltaTriggered = false;
+  bool DiffDetected = false;
   int InterestingDeltaCount = 0;
   bool NeedsManualReview = false;
   bool OracleAuditCandidate = false;
   bool CaseStudyCandidate = false;
   std::string ManualTruthStatus = "not_started";
+  std::vector<std::string> ExecutedResolvers;
+  std::vector<ResolverPairDifference> ResolverDifferences;
   std::vector<std::string> Notes;
 };
 
@@ -79,14 +101,27 @@ CacheDiffResult buildCacheDiff(const std::string &SampleId,
                                const std::vector<CacheRecord> &UnboundBefore,
                                const std::vector<CacheRecord> &UnboundAfter,
                                bool Triggered);
+CacheDiffResult buildCacheDiff(
+    const std::string &SampleId,
+    const std::map<std::string, std::vector<CacheRecord>> &BeforeByResolver,
+    const std::map<std::string, std::vector<CacheRecord>> &AfterByResolver,
+    bool Triggered,
+    const std::string &CompatibilitySecondaryResolver);
 TriageRecord buildTriageRecord(const std::string &SampleId,
                                const json::Value::Object &OraclePayload,
                                const CacheDiffResult &CacheDiff,
                                const StateFingerprint &Fingerprint,
                                const std::optional<FailureEvidence> &Failure);
+TriageRecord buildTriageRecord(
+    const std::string &SampleId,
+    const std::map<std::string, json::Value::Object> &OracleByResolver,
+    const CacheDiffResult &CacheDiff, const StateFingerprint &Fingerprint,
+    const std::optional<FailureEvidence> &Failure);
 
 json::Value toJson(const CacheDeltaItem &Input);
 json::Value toJson(const ResolverCacheDiff &Input);
+json::Value toJson(const ResolverPairCacheDifference &Input);
+json::Value toJson(const ResolverPairDifference &Input);
 json::Value toJson(const CacheDiffResult &Input);
 json::Value toJson(const TriageRecord &Input);
 

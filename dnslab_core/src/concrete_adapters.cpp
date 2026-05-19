@@ -1306,10 +1306,18 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   Bind9Config.WorkspaceRoot = WorkspaceRoot;
   Bind9Config.ScriptPath =
       WorkspaceRoot / "named_experiment" / "run_named_afl_symcc.sh";
-  Bind9Config.NamedConfTemplate =
-      WorkspaceRoot / "named_experiment" / "runtime" / "named.conf";
-  Bind9Config.ResponseCorpusDir =
-      WorkspaceRoot / "named_experiment" / "work" / "response_corpus";
+  if (const char *NamedConfEnv = std::getenv("BIND9_NAMED_CONF_TEMPLATE")) {
+    Bind9Config.NamedConfTemplate = std::filesystem::path(NamedConfEnv);
+  } else {
+    Bind9Config.NamedConfTemplate =
+        WorkspaceRoot / "named_experiment" / "runtime" / "named.conf";
+  }
+  if (const char *ResponseCorpusEnv = std::getenv("RESPONSE_CORPUS_DIR")) {
+    Bind9Config.ResponseCorpusDir = std::filesystem::path(ResponseCorpusEnv);
+  } else {
+    Bind9Config.ResponseCorpusDir =
+        WorkspaceRoot / "named_experiment" / "work" / "response_corpus";
+  }
   Bind9Config.SourceFallbackPath = std::nullopt;
   Bind9Config.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1317,8 +1325,13 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
 
   UnboundAdapterConfig UnboundConfig;
   UnboundConfig.WorkspaceRoot = WorkspaceRoot;
-  UnboundConfig.ResponseCorpusDir =
-      WorkspaceRoot / "unbound_experiment" / "work_stateful" / "response_corpus";
+  if (const char *ResponseCorpusEnv = std::getenv("RESPONSE_CORPUS_DIR")) {
+    UnboundConfig.ResponseCorpusDir = std::filesystem::path(ResponseCorpusEnv);
+  } else {
+    UnboundConfig.ResponseCorpusDir =
+        WorkspaceRoot / "unbound_experiment" / "work_stateful" /
+        "response_corpus";
+  }
   UnboundConfig.SourceFallbackPath = std::nullopt;
   UnboundConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(

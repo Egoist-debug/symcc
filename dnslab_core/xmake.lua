@@ -11,6 +11,7 @@ target("dnslab_core")
         "src/concrete_adapters.cpp",
         "src/oracle.cpp",
         "src/reporting.cpp",
+        "src/follow_diff.cpp",
         "src/resolver_lock.cpp",
         "../gen_input/src/DST1Mutator.cpp",
         "../gen_input/src/FormatAwareGenerator.cpp",

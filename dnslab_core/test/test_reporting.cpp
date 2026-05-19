@@ -1,6 +1,8 @@
 #include "dnslab_core/reporting.hpp"
 
 #include <cassert>
+#include <filesystem>
+#include <fstream>
 
 namespace {
 
@@ -41,6 +43,13 @@ dnslab::ClusterRecord makeRecord(const std::string &SampleId,
   return Record;
 }
 
+void writeTextFile(const std::filesystem::path &Path, const std::string &Content) {
+  std::filesystem::create_directories(Path.parent_path());
+  std::ofstream Output(Path);
+  assert(Output.good());
+  Output << Content;
+}
+
 } // namespace
 
 int main() {
@@ -64,5 +73,40 @@ int main() {
   const auto Json = dnslab::toJson(Bundle).dump(2);
   assert(Json.find("\"run_id\": \"run-001\"") != std::string::npos);
   assert(Json.find("\"kind\": \"summary\"") != std::string::npos);
+
+  const auto TempRoot =
+      std::filesystem::temp_directory_path() / "dnslab_core_reporting_test";
+  std::filesystem::remove_all(TempRoot);
+  std::filesystem::create_directories(TempRoot);
+  writeTextFile(TempRoot / "sample-a" / "sample.meta.json",
+                "{\n"
+                "  \"sample_id\": \"sample-a\"\n"
+                "}\n");
+  writeTextFile(TempRoot / "sample-a" / "triage.json",
+                "{\n"
+                "  \"sample_id\": \"sample-a\",\n"
+                "  \"status\": \"completed\",\n"
+                "  \"cluster_key\": \"cluster-a\",\n"
+                "  \"analysis_state\": \"included\",\n"
+                "  \"semantic_outcome\": \"oracle_diff\",\n"
+                "  \"oracle_audit_candidate\": true,\n"
+                "  \"needs_manual_review\": true,\n"
+                "  \"filter_labels\": []\n"
+                "}\n");
+  writeTextFile(TempRoot / "sample-a" / "sample.bin", "sample-a");
+
+  const auto ReportArtifacts = dnslab::generateTriageReportArtifacts(TempRoot);
+  assert(std::filesystem::is_regular_file(ReportArtifacts.ClusterSummaryPath));
+  assert(std::filesystem::is_regular_file(ReportArtifacts.StatusSummaryPath));
+  assert(std::filesystem::is_regular_file(ReportArtifacts.HighValueManifestPath));
+  assert(std::filesystem::is_regular_file(
+      ReportArtifacts.SemanticFrontierManifestPath));
+  assert(std::filesystem::is_regular_file(
+      ReportArtifacts.TriageReportMarkdownPath));
+  assert(ReportArtifacts.SampleCount == 1U);
+  assert(ReportArtifacts.SemanticFrontierEntryCount == 1U);
+  const auto ReportJson = dnslab::toJson(ReportArtifacts).dump(2);
+  assert(ReportJson.find("\"sample_count\": 1") != std::string::npos);
+  std::filesystem::remove_all(TempRoot);
   return 0;
 }

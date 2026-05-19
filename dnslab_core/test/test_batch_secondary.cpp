@@ -104,6 +104,7 @@ int main() {
   const auto KnotBuildRoot = Root / "knot-build";
   const auto KnotBinary = KnotBuildRoot / "knot-build" / "daemon" / "kresd";
   const auto KnotHarness = Root / "knot-harness.py";
+  const auto ResponseCorpusDir = Root / "response-corpus";
   const auto SampleDir = Root / "samples";
   const auto RunRoot = Root / "run";
   const auto StdoutPath = Root / "batch.stdout.json";
@@ -145,8 +146,10 @@ int main() {
       std::filesystem::perm_options::add);
 
   writeDst1Sample(SampleDir / "sample-1.dst1");
+  std::filesystem::create_directories(ResponseCorpusDir);
 
   ::setenv("KNOT_RESOLVER_HARNESS_SCRIPT", KnotHarness.c_str(), 1);
+  ::setenv("RESPONSE_CORPUS_DIR", ResponseCorpusDir.c_str(), 1);
   const std::string Command =
       "./build/linux/x86_64/release/dnslabctl batch-sync-replay --sample-dir " +
       quote(SampleDir) + " --run-root " + quote(RunRoot) +
@@ -164,20 +167,33 @@ int main() {
   require(!CaseStudyPath.empty(), "未生成 case study 文件");
   const auto CaseStudyText = readTextFile(CaseStudyPath);
 
-  require(SummaryText.find("\"secondary_resolver\": \"knot-resolver\"") !=
+  require(SummaryText.find(
+              "\"compatibility_secondary_resolver\": \"knot-resolver\"") !=
               std::string::npos,
-          "summary.json 未记录 secondary_resolver");
+          "summary.json 未记录 compatibility_secondary_resolver");
+  require(SummaryText.find("\"executed_resolvers\": [") != std::string::npos,
+          "summary.json 未记录 executed_resolvers");
   require(StdoutText.find("\"sample_count\": 1") != std::string::npos,
           "stdout 未输出正确 sample_count");
-  require(OracleAuditText.find("knot-resolver.response_accepted") !=
+  require(OracleAuditText.find("executed_resolvers\tskipped_resolvers_json\t"
+                               "diff_detected\tresolver_diffs_json") !=
               std::string::npos,
-          "oracle_audit.tsv 未切换到 knot-resolver 列");
-  require(OracleAuditText.find("unbound.response_accepted") ==
+          "oracle_audit.tsv 未切到多 resolver 表头");
+  require(OracleAuditText.find("knot-resolver.response_accepted") ==
               std::string::npos,
-          "oracle_audit.tsv 仍残留 unbound 列");
-  require(IndexText.find("--secondary-resolver knot-resolver --secondary-build-root") !=
+          "oracle_audit.tsv 仍残留旧 secondary 列");
+  require(IndexText.find("\texecuted_resolvers\tdiff_detected\tresolver_diffs_json") !=
               std::string::npos,
-          "case_studies/index.tsv 未写入通用 secondary replay 命令");
+          "case_studies/index.tsv 未切到多 resolver 表头");
+  require(IndexText.find("--resolvers bind9,knot-resolver") !=
+              std::string::npos,
+          "case_studies/index.tsv 未写入多 resolver replay 命令");
+  require(CaseStudyText.find("- executed_resolvers: bind9,knot-resolver") !=
+              std::string::npos,
+          "case study 未写入 executed_resolvers");
+  require(CaseStudyText.find("- resolver_diffs_json: ") !=
+              std::string::npos,
+          "case study 未写入 resolver_diffs_json");
   require(CaseStudyText.find("- knot-resolver_before_cache: ") !=
               std::string::npos,
           "case study 未写入 knot-resolver cache 标签");

@@ -1270,32 +1270,53 @@ def _normalize_dnslabctl_sync_replay_outputs(
     payload: Mapping[str, Any],
 ) -> None:
     secondary_key = secondary_resolver
+    resolver_payloads: Dict[str, Mapping[str, Any]] = {}
+    raw_resolvers = payload.get("resolvers")
+    if isinstance(raw_resolvers, Mapping):
+        for resolver_name, resolver_payload in raw_resolvers.items():
+            if isinstance(resolver_name, str) and isinstance(resolver_payload, Mapping):
+                resolver_payloads[resolver_name] = resolver_payload
+
     bind9_payload = payload.get("bind9")
     secondary_payload = payload.get(secondary_key)
-    if not isinstance(bind9_payload, Mapping) or not isinstance(
-        secondary_payload, Mapping
-    ):
+    if isinstance(bind9_payload, Mapping):
+        resolver_payloads.setdefault("bind9", bind9_payload)
+    if isinstance(secondary_payload, Mapping):
+        resolver_payloads.setdefault(secondary_key, secondary_payload)
+    if "bind9" not in resolver_payloads or secondary_key not in resolver_payloads:
         raise FollowDiffError("dnslabctl sync-replay 输出缺少 resolver payload")
 
-    artifact_map = {
-        Path(bind9_payload.get("stderr", "")): sample_dir / "bind9.stderr",
-        Path(bind9_payload.get("before_cache", "")): sample_dir / BIND9_BEFORE_CACHE_FILE,
-        Path(bind9_payload.get("after_cache", "")): sample_dir / BIND9_AFTER_CACHE_FILE,
-        Path(secondary_payload.get("stderr", "")): sample_dir
-        / f"{secondary_resolver}.stderr",
-        Path(secondary_payload.get("before_cache", "")): sample_dir
-        / _secondary_before_cache_file(),
-        Path(secondary_payload.get("after_cache", "")): sample_dir
-        / _secondary_after_cache_file(),
-    }
+    executed_resolvers_raw = payload.get("executed_resolvers")
+    executed_resolvers = [
+        item
+        for item in executed_resolvers_raw
+        if isinstance(item, str) and item in resolver_payloads
+    ] if isinstance(executed_resolvers_raw, list) else []
+    if not executed_resolvers:
+        executed_resolvers = sorted(resolver_payloads)
+
+    artifact_map: Dict[Path, Path] = {}
+    for resolver_name in executed_resolvers:
+        resolver_payload = resolver_payloads.get(resolver_name, {})
+        if not isinstance(resolver_payload, Mapping):
+            continue
+        artifact_map[Path(resolver_payload.get("stderr", ""))] = (
+            sample_dir / f"{resolver_name}.stderr"
+        )
+        artifact_map[Path(resolver_payload.get("before_cache", ""))] = (
+            sample_dir / f"{resolver_name}.before.cache.txt"
+        )
+        artifact_map[Path(resolver_payload.get("after_cache", ""))] = (
+            sample_dir / f"{resolver_name}.after.cache.txt"
+        )
     for src, dst in artifact_map.items():
         if str(src):
             _copy_existing_file(src, dst)
 
-    for resolver_name, resolver_payload in (
-        ("bind9", bind9_payload),
-        (secondary_resolver, secondary_payload),
-    ):
+    for resolver_name in executed_resolvers:
+        resolver_payload = resolver_payloads.get(resolver_name)
+        if not isinstance(resolver_payload, Mapping):
+            continue
         logs = resolver_payload.get("logs")
         if not isinstance(logs, list):
             continue
@@ -1313,31 +1334,37 @@ def _normalize_dnslabctl_sync_replay_outputs(
 
     sample_meta_path = sample_dir / "sample.meta.json"
     sample_meta = _load_json_object(sample_meta_path)
-    artifacts = {
+    artifacts: Dict[str, Any] = {
         "sample_bin": "sample.bin",
-        "bind9_stderr": "bind9.stderr",
-        f"{secondary_resolver}_stderr": f"{secondary_resolver}.stderr",
-        "bind9_before_cache": BIND9_BEFORE_CACHE_FILE,
-        "bind9_after_cache": BIND9_AFTER_CACHE_FILE,
-        f"{secondary_resolver}_before_cache": _secondary_before_cache_file(),
-        f"{secondary_resolver}_after_cache": _secondary_after_cache_file(),
         "oracle": "oracle.json",
     }
-    oracle_provenance = {
+    oracle_provenance: Dict[str, Any] = {
         "mode": "same_replay_after_cache",
-        "bind9": {
-            "stderr": "bind9.stderr",
-            "after_cache": BIND9_AFTER_CACHE_FILE,
-            "stage_marker": "===== bind9.after =====",
-        },
-        secondary_resolver: {
-            "stderr": f"{secondary_resolver}.stderr",
-            "after_cache": _secondary_after_cache_file(),
-            "stage_marker": f"===== {secondary_resolver}.after =====",
-        },
     }
+    for resolver_name in executed_resolvers:
+        artifacts[f"{resolver_name}_stderr"] = f"{resolver_name}.stderr"
+        artifacts[f"{resolver_name}_before_cache"] = (
+            f"{resolver_name}.before.cache.txt"
+        )
+        artifacts[f"{resolver_name}_after_cache"] = (
+            f"{resolver_name}.after.cache.txt"
+        )
+        oracle_provenance[resolver_name] = {
+            "stderr": f"{resolver_name}.stderr",
+            "after_cache": f"{resolver_name}.after.cache.txt",
+            "stage_marker": f"===== {resolver_name}.after =====",
+        }
+    skipped_resolvers = payload.get("skipped_resolvers")
+    if not isinstance(skipped_resolvers, Mapping):
+        skipped_resolvers = {}
     sample_meta["artifacts"] = artifacts
     sample_meta["oracle_provenance"] = oracle_provenance
+    sample_meta["secondary_resolver"] = secondary_resolver
+    sample_meta["executed_resolvers"] = executed_resolvers
+    sample_meta["skipped_resolvers"] = dict(skipped_resolvers)
+    sample_meta["diff_detected"] = bool(payload.get("diff_detected"))
+    if isinstance(payload.get("resolver_diffs"), list):
+        sample_meta["resolver_diffs"] = list(payload["resolver_diffs"])
     sample_meta["output_dir"] = str(sample_dir)
     atomic_write_json(sample_meta_path, sample_meta)
 

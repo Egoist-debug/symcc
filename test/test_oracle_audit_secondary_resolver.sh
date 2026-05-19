@@ -107,10 +107,12 @@ if len(rows) != 1:
 row = rows[0]
 if row["sample_id"] != "sample-dnsmasq":
     raise SystemExit(f"ASSERT FAIL: sample_id={row['sample_id']!r}")
-if row["unbound.parse_ok"] != "false":
-    raise SystemExit(f"ASSERT FAIL: secondary parse_ok 未映射到列: {row['unbound.parse_ok']!r}")
-if row["unbound.second_query_hit"] != "true":
-    raise SystemExit(f"ASSERT FAIL: secondary second_query_hit 未映射到列: {row['unbound.second_query_hit']!r}")
+parse_ok = json.loads(row["parse_ok_by_resolver_json"])
+if parse_ok.get("dnsmasq") is not False:
+    raise SystemExit(f"ASSERT FAIL: dnsmasq parse_ok 未映射到列: {parse_ok!r}")
+second_hit = json.loads(row["second_query_hit_by_resolver_json"])
+if second_hit.get("dnsmasq") is not True:
+    raise SystemExit(f"ASSERT FAIL: dnsmasq second_query_hit 未映射到列: {second_hit!r}")
 if row["oracle_diff_fields"] != "parse_ok,second_query_hit,cache_entry_created":
     raise SystemExit(f"ASSERT FAIL: oracle_diff_fields={row['oracle_diff_fields']!r}")
 

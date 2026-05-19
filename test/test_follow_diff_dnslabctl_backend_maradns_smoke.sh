@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-follow-diff-dnslabctl-maradns.XXXXXX")"
+ROOT_ENV="$WORKDIR/root"
 QUEUE_DIR="$WORKDIR/bind9-work/afl_out/master/queue"
 WORK_STATEFUL="$WORKDIR/work"
 export PYTHONDONTWRITEBYTECODE=1
@@ -112,9 +113,18 @@ MARADNS_BUILD="$WORKDIR/maradns-build"
 MARADNS_BIN="$MARADNS_BUILD/deadwood-build/deadwood-github/src/Deadwood"
 MARADNS_SRC="$WORKDIR/maradns-src"
 MARADNS_HARNESS="$WORKDIR/maradns-harness.py"
+NAMED_CONF_TEMPLATE="$ROOT_ENV/named_experiment/runtime/named.conf"
+RESPONSE_CORPUS_DIR="$ROOT_ENV/named_experiment/work/response_corpus"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
 
-mkdir -p "$QUEUE_DIR" "$BIND9_SRC" "$MARADNS_SRC"
+mkdir -p \
+	"$QUEUE_DIR" \
+	"$BIND9_SRC" \
+	"$MARADNS_SRC" \
+	"$RESPONSE_CORPUS_DIR" \
+	"$ROOT_ENV/named_experiment/runtime"
+printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
+printf 'seed\n' >"$RESPONSE_CORPUS_DIR/seed.txt"
 write_fake_bind9_binary "$BIND9_BIN"
 write_fake_maradns_binary "$MARADNS_BIN"
 write_fake_maradns_harness "$MARADNS_HARNESS"
@@ -123,7 +133,8 @@ printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
 	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-	ROOT_DIR="$ROOT_DIR" \
+	DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl" \
+	ROOT_DIR="$ROOT_ENV" \
 	WORK_DIR="$WORK_STATEFUL" \
 	BIND9_WORK_DIR="$WORKDIR/bind9-work" \
 	DNS_DIFF_SECONDARY_RESOLVER=maradns \

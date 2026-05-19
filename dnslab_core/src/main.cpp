@@ -1,6 +1,7 @@
 #include "dnslab_core/concrete_adapters.hpp"
 #include "dnslab_core/cache_analysis.hpp"
 #include "dnslab_core/evidence_contract.hpp"
+#include "dnslab_core/follow_diff.hpp"
 #include "dnslab_core/oracle.hpp"
 #include "dnslab_core/reporting.hpp"
 #include "dnslab_core/resolver_lock.hpp"
@@ -9,11 +10,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <cstdlib>
 #include <algorithm>
+#include <cctype>
 #include <vector>
 
 namespace {
@@ -66,6 +69,166 @@ std::optional<std::string> optionalOption(const std::vector<std::string> &Args,
   return std::nullopt;
 }
 
+std::vector<std::string> splitCsv(const std::string &Input) {
+  std::vector<std::string> Output;
+  std::stringstream Stream(Input);
+  std::string Token;
+  while (std::getline(Stream, Token, ',')) {
+    Token.erase(Token.begin(),
+                std::find_if(Token.begin(), Token.end(),
+                             [](unsigned char Ch) { return !std::isspace(Ch); }));
+    Token.erase(
+        std::find_if(Token.rbegin(), Token.rend(),
+                     [](unsigned char Ch) { return !std::isspace(Ch); })
+            .base(),
+        Token.end());
+    if (!Token.empty()) {
+      Output.push_back(Token);
+    }
+  }
+  return Output;
+}
+
+std::filesystem::path defaultBuildRootForResolver(
+    const std::filesystem::path &WorkspaceRoot, const std::string &ResolverName) {
+  if (ResolverName == "bind9") {
+    if (const char *Env = std::getenv("BIND9_AFL_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return WorkspaceRoot / "bind-9.18.46-afl";
+  }
+  if (ResolverName == "unbound") {
+    if (const char *Env = std::getenv("AFL_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return WorkspaceRoot / "unbound-1.24.2-afl";
+  }
+  if (ResolverName == "dnsmasq") {
+    if (const char *Env = std::getenv("DNSMASQ_BUILD_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return WorkspaceRoot / "experiments" / "subjects" / "dnsmasq" /
+           "v2.92-build";
+  }
+  if (ResolverName == "smartdns") {
+    if (const char *Env = std::getenv("SMARTDNS_BUILD_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return WorkspaceRoot / "experiments" / "subjects" / "smartdns" /
+           "Release47.1-build";
+  }
+  if (ResolverName == "maradns") {
+    if (const char *Env = std::getenv("MARADNS_BUILD_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return WorkspaceRoot / "experiments" / "subjects" / "maradns" /
+           "deadwood-3.3.02-build";
+  }
+  if (ResolverName == "knot-resolver") {
+    if (const char *Env = std::getenv("KNOT_RESOLVER_BUILD_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return WorkspaceRoot / "experiments" / "subjects" / "knot-resolver" /
+           "v6.2.0-build";
+  }
+  throw std::runtime_error("不支持的 resolver: " + ResolverName);
+}
+
+std::filesystem::path defaultSourceRootForResolver(
+    const std::filesystem::path &BuildRoot, const std::string &ResolverName) {
+  if (ResolverName == "bind9") {
+    if (const char *Env = std::getenv("BIND9_SRC_TREE")) {
+      return std::filesystem::path(Env);
+    }
+    return BuildRoot;
+  }
+  const std::map<std::string, std::vector<std::string>> EnvMap = {
+      {"unbound", {"UNBOUND_SRC_TREE", "SRC_TREE"}},
+      {"dnsmasq", {"DNSMASQ_SRC_TREE"}},
+      {"smartdns", {"SMARTDNS_SRC_TREE"}},
+      {"maradns", {"MARADNS_SRC_TREE"}},
+      {"knot-resolver", {"KNOT_RESOLVER_SRC_TREE"}},
+  };
+  const auto Found = EnvMap.find(ResolverName);
+  if (Found != EnvMap.end()) {
+    for (const auto &EnvName : Found->second) {
+      if (const char *Env = std::getenv(EnvName.c_str())) {
+        return std::filesystem::path(Env);
+      }
+    }
+  }
+  return BuildRoot;
+}
+
+std::optional<std::string>
+buildRootEnvNameForResolver(const std::string &ResolverName) {
+  if (ResolverName == "unbound") {
+    return "AFL_TREE";
+  }
+  if (ResolverName == "dnsmasq") {
+    return "DNSMASQ_BUILD_TREE";
+  }
+  if (ResolverName == "smartdns") {
+    return "SMARTDNS_BUILD_TREE";
+  }
+  if (ResolverName == "maradns") {
+    return "MARADNS_BUILD_TREE";
+  }
+  if (ResolverName == "knot-resolver") {
+    return "KNOT_RESOLVER_BUILD_TREE";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
+sourceRootEnvNameForResolver(const std::string &ResolverName) {
+  if (ResolverName == "unbound") {
+    return "UNBOUND_SRC_TREE";
+  }
+  if (ResolverName == "dnsmasq") {
+    return "DNSMASQ_SRC_TREE";
+  }
+  if (ResolverName == "smartdns") {
+    return "SMARTDNS_SRC_TREE";
+  }
+  if (ResolverName == "maradns") {
+    return "MARADNS_SRC_TREE";
+  }
+  if (ResolverName == "knot-resolver") {
+    return "KNOT_RESOLVER_SRC_TREE";
+  }
+  return std::nullopt;
+}
+
+std::vector<std::string> orderedResolversForReplay(
+    const std::vector<std::string> &AvailableResolvers,
+    const std::string &CompatibilitySecondaryResolver,
+    const std::optional<std::string> &RequestedResolversCsv) {
+  std::vector<std::string> Requested =
+      RequestedResolversCsv.has_value() ? splitCsv(*RequestedResolversCsv)
+                                        : AvailableResolvers;
+  if (std::find(Requested.begin(), Requested.end(), "bind9") == Requested.end()) {
+    Requested.push_back("bind9");
+  }
+  if (std::find(Requested.begin(), Requested.end(), CompatibilitySecondaryResolver) ==
+      Requested.end()) {
+    Requested.push_back(CompatibilitySecondaryResolver);
+  }
+  std::sort(Requested.begin(), Requested.end());
+  Requested.erase(std::unique(Requested.begin(), Requested.end()),
+                  Requested.end());
+  auto MoveToFront = [&](const std::string &Resolver) {
+    const auto Found = std::find(Requested.begin(), Requested.end(), Resolver);
+    if (Found == Requested.end()) {
+      return;
+    }
+    std::rotate(Requested.begin(), Found, Found + 1);
+  };
+  MoveToFront(CompatibilitySecondaryResolver);
+  MoveToFront("bind9");
+  return Requested;
+}
+
 void printUsage() {
   std::cerr
       << "用法:\n"
@@ -92,14 +255,20 @@ void printUsage() {
          " --bind9-build-root <path> --unbound-build-root <path>"
          " [--bind9-source-root <path>] [--unbound-source-root <path>]"
          " [--secondary-resolver <name>] [--secondary-build-root <path>]"
-         " [--secondary-source-root <path>]\n"
+         " [--secondary-source-root <path>] [--resolvers <csv>]\n"
       << "  dnslabctl batch-sync-replay --sample-dir <path> --run-root <path>"
          " --bind9-build-root <path>"
          " [--unbound-build-root <path>] [--secondary-resolver <name>]"
          " [--secondary-build-root <path>]"
          " [--bind9-source-root <path>] [--unbound-source-root <path>]"
-         " [--secondary-source-root <path>]"
+         " [--secondary-source-root <path>] [--resolvers <csv>]"
          " [--limit <n>]\n"
+      << "  dnslabctl follow-diff-once\n"
+      << "  dnslabctl follow-diff-window --budget-sec <sec>"
+         " [--retry-failed] [--queue-tail-id <id>]\n"
+      << "  dnslabctl campaign-close --budget-sec <sec>\n"
+      << "  dnslabctl campaign-report --root <path> [--output-dir <path>]\n"
+      << "  dnslabctl report --root <path> [--high-value-manifest <path>]\n"
       << "  dnslabctl oracle-parse --resolver <name> --stderr-file <path>\n"
       << "  dnslabctl evidence-bundle --output <path> --summary <path>"
          " --oracle-audit <path> --failure-taxonomy <path> --cluster <path>"
@@ -144,7 +313,11 @@ int main(int argc, char **argv) {
       const auto &LockFile = tryLoadDefaultResolverLock();
       if (LockFile.has_value()) {
         if (const auto Tag = dnslab::resolveLockedTag(*LockFile, ResolverName)) {
-          return dnslab::defaultSubjectRoot(WorkspaceRoot, ResolverName, *Tag);
+          const auto LockedSourceRoot =
+              dnslab::defaultSubjectRoot(WorkspaceRoot, ResolverName, *Tag);
+          if (std::filesystem::exists(LockedSourceRoot)) {
+            return LockedSourceRoot;
+          }
         }
       }
       return FallbackRoot;
@@ -167,6 +340,12 @@ int main(int argc, char **argv) {
       dnslab::CacheDiffResult CacheDiff;
       dnslab::TriageRecord Triage;
       dnslab::json::Value::Object OraclePayload;
+      std::map<std::string, dnslab::json::Value::Object> OracleByResolver;
+      std::map<std::string, ResolverRunResult> ResolverRuns;
+      std::map<std::string, std::string> SkippedResolvers;
+      std::map<std::string, std::filesystem::path> ResolverBuildRoots;
+      std::map<std::string, std::filesystem::path> ResolverSourceRoots;
+      std::vector<std::string> ExecutedResolvers;
       ResolverRunResult Bind9;
       ResolverRunResult Secondary;
       std::string SecondaryResolver = "unbound";
@@ -199,14 +378,13 @@ int main(int argc, char **argv) {
             const std::filesystem::path &SecondaryBuildRoot,
             const std::filesystem::path &Bind9SourceRoot,
             const std::filesystem::path &SecondarySourceRoot,
-            const std::string &SecondaryResolverName) {
+            const std::string &SecondaryResolverName,
+            const std::optional<std::string> &RequestedResolversCsv =
+                std::nullopt) {
           const auto Registry =
               dnslab::makeDefaultResolverRegistry(std::filesystem::current_path());
-          const auto &Bind9Adapter = Registry.require("bind9");
-          const auto &SecondaryAdapter = Registry.require(SecondaryResolverName);
-
-          setResolverBuildEnv("bind9", Bind9BuildRoot);
-          setResolverBuildEnv(SecondaryResolverName, SecondaryBuildRoot);
+          const auto RequestedResolvers = orderedResolversForReplay(
+              Registry.names(), SecondaryResolverName, RequestedResolversCsv);
 
           const auto SampleBytes = readBinaryFile(SamplePath);
           const auto SampleIdentity =
@@ -242,58 +420,110 @@ int main(int argc, char **argv) {
                 return Result;
               };
 
-          const auto Bind9Result = runSingleResolver(
-              "bind9", Bind9Adapter, Bind9SourceRoot, Bind9BuildRoot);
-          const auto SecondaryResult = runSingleResolver(
-              SecondaryResolverName, SecondaryAdapter, SecondarySourceRoot,
-              SecondaryBuildRoot);
-
-          dnslab::json::Value::Object OraclePayload = Bind9Result.Oracle.Fields;
-          for (const auto &[Key, Value] : SecondaryResult.Oracle.Fields) {
-            OraclePayload[Key] = Value;
+          std::map<std::string, std::filesystem::path> BuildRoots;
+          std::map<std::string, std::filesystem::path> SourceRoots;
+          for (const auto &ResolverName : RequestedResolvers) {
+            auto BuildRoot = defaultBuildRootForResolver(WorkspaceRoot, ResolverName);
+            if (ResolverName == "bind9") {
+              BuildRoot = Bind9BuildRoot;
+            } else if (ResolverName == SecondaryResolverName) {
+              BuildRoot = SecondaryBuildRoot;
+            }
+            BuildRoots[ResolverName] = BuildRoot;
+            auto SourceRoot =
+                resolveDefaultSourceRoot(ResolverName,
+                                         defaultSourceRootForResolver(BuildRoot,
+                                                                      ResolverName));
+            if (ResolverName == "bind9") {
+              SourceRoot = Bind9SourceRoot;
+            } else if (ResolverName == SecondaryResolverName) {
+              SourceRoot = SecondarySourceRoot;
+            }
+            SourceRoots[ResolverName] = SourceRoot;
           }
 
-          auto NormalizedOraclePayload = OraclePayload;
-          if (SecondaryResolverName != "unbound") {
-            for (const auto &[Key, Value] : SecondaryResult.Oracle.Fields) {
-              const std::string Prefix = SecondaryResolverName + ".";
-              if (Key.rfind(Prefix, 0) != 0) {
-                continue;
+          struct ResolverExecution {
+            ResolverRunResult Run;
+            std::vector<dnslab::CacheRecord> BeforeRows;
+            std::vector<dnslab::CacheRecord> AfterRows;
+            dnslab::json::Value::Object OracleFields;
+          };
+
+          const auto parseRowsIfPresent =
+              [&](const std::string &ResolverName,
+                  const std::filesystem::path &DumpPath) {
+                if (!std::filesystem::is_regular_file(DumpPath)) {
+                  return std::vector<dnslab::CacheRecord>{};
+                }
+                return dnslab::parseCacheDump(ResolverName, DumpPath);
+              };
+
+          std::map<std::string, ResolverExecution> ExecutedResolvers;
+          std::map<std::string, std::string> SkippedResolvers;
+          for (const auto &ResolverName : RequestedResolvers) {
+            const bool RequiredResolver =
+                ResolverName == "bind9" || ResolverName == SecondaryResolverName;
+            try {
+              setResolverBuildEnv(ResolverName, BuildRoots.at(ResolverName));
+              const auto &Adapter = Registry.require(ResolverName);
+              auto Run = runSingleResolver(ResolverName, Adapter,
+                                           SourceRoots.at(ResolverName),
+                                           BuildRoots.at(ResolverName));
+              ResolverExecution Execution;
+              Execution.BeforeRows =
+                  parseRowsIfPresent(ResolverName, Run.BeforeCache);
+              Execution.AfterRows =
+                  parseRowsIfPresent(ResolverName, Run.AfterCache);
+              Execution.OracleFields = Run.Oracle.Fields;
+              Execution.Run = std::move(Run);
+              ExecutedResolvers.emplace(ResolverName, std::move(Execution));
+            } catch (const std::exception &Error) {
+              if (RequiredResolver) {
+                throw;
               }
-              const auto Suffix = Key.substr(Prefix.size());
-              NormalizedOraclePayload.emplace("unbound." + Suffix, Value);
+              SkippedResolvers[ResolverName] = Error.what();
             }
           }
 
-          const auto normalizeSecondaryRows =
-              [&](std::vector<dnslab::CacheRecord> Rows) {
-                if (SecondaryResolverName == "unbound") {
-                  return Rows;
-                }
-                for (auto &Row : Rows) {
-                  Row.Resolver = "unbound";
-                }
-                return Rows;
-              };
+          const auto Bind9Found = ExecutedResolvers.find("bind9");
+          const auto SecondaryFound = ExecutedResolvers.find(SecondaryResolverName);
+          if (Bind9Found == ExecutedResolvers.end() ||
+              SecondaryFound == ExecutedResolvers.end()) {
+            throw std::runtime_error("缺少必要 resolver 执行结果");
+          }
 
-          const auto Bind9BeforeRows =
-              dnslab::parseCacheDump("bind9", Bind9Result.BeforeCache);
-          const auto Bind9AfterRows =
-              dnslab::parseCacheDump("bind9", Bind9Result.AfterCache);
-          const auto SecondaryBeforeRows = normalizeSecondaryRows(
-              dnslab::parseCacheDump(SecondaryResolverName,
-                                     SecondaryResult.BeforeCache));
-          const auto SecondaryAfterRows = normalizeSecondaryRows(
-              dnslab::parseCacheDump(SecondaryResolverName,
-                                     SecondaryResult.AfterCache));
+          std::map<std::string, std::vector<dnslab::CacheRecord>> BeforeByResolver;
+          std::map<std::string, std::vector<dnslab::CacheRecord>> AfterByResolver;
+          std::map<std::string, dnslab::json::Value::Object> OracleByResolver;
+          for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
+            BeforeByResolver[ResolverName] = Execution.BeforeRows;
+            AfterByResolver[ResolverName] = Execution.AfterRows;
+            OracleByResolver[ResolverName] = Execution.OracleFields;
+          }
+
           const auto PreliminaryCacheDiff = dnslab::buildCacheDiff(
-              SampleIdentity.SampleId, Bind9BeforeRows, Bind9AfterRows,
-              SecondaryBeforeRows, SecondaryAfterRows, false);
-          const bool Triggered = PreliminaryCacheDiff.Bind9.HasCacheDiff ||
-                                 PreliminaryCacheDiff.Unbound.HasCacheDiff;
+              SampleIdentity.SampleId, BeforeByResolver, AfterByResolver, false,
+              SecondaryResolverName);
+          bool Triggered = false;
+          for (const auto &[ResolverName, Diff] : PreliminaryCacheDiff.Resolvers) {
+            (void)ResolverName;
+            if (Diff.HasCacheDiff) {
+              Triggered = true;
+              break;
+            }
+          }
           const auto CacheDiff = dnslab::buildCacheDiff(
-              SampleIdentity.SampleId, Bind9BeforeRows, Bind9AfterRows,
-              SecondaryBeforeRows, SecondaryAfterRows, Triggered);
+              SampleIdentity.SampleId, BeforeByResolver, AfterByResolver,
+              Triggered, SecondaryResolverName);
+
+          dnslab::json::Value::Object OraclePayload = Bind9Found->second.OracleFields;
+          for (const auto &[Key, Value] : SecondaryFound->second.OracleFields) {
+            OraclePayload[Key] = Value;
+            const std::string Prefix = SecondaryResolverName + ".";
+            if (SecondaryResolverName != "unbound" && Key.rfind(Prefix, 0) == 0) {
+              OraclePayload["unbound." + Key.substr(Prefix.size())] = Value;
+            }
+          }
 
           dnslab::StateFingerprint Fingerprint;
           Fingerprint.SchemaVersion = dnslab::kSchemaVersion;
@@ -304,22 +534,62 @@ int main(int argc, char **argv) {
           std::filesystem::copy_file(
               SamplePath, ArtifactRoot / "sample.bin",
               std::filesystem::copy_options::overwrite_existing);
-          writeJsonFile(ArtifactRoot / "oracle.json",
-                        dnslab::json::Value(OraclePayload));
+
+          const auto buildArtifactsPayload = [&]() {
+            dnslab::json::Value::Object Artifacts;
+            Artifacts["sample_bin"] = "sample.bin";
+            Artifacts["oracle"] = "oracle.json";
+            for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
+              const auto ResolverPrefix = ResolverName + "/";
+              Artifacts[ResolverName + "_stderr"] =
+                  ResolverPrefix + Execution.Run.StderrPath.filename().string();
+              Artifacts[ResolverName + "_before_cache"] =
+                  ResolverPrefix + Execution.Run.BeforeCache.filename().string();
+              Artifacts[ResolverName + "_after_cache"] =
+                  ResolverPrefix + Execution.Run.AfterCache.filename().string();
+            }
+            return Artifacts;
+          };
+
+          const auto buildOracleProvenancePayload = [&]() {
+            dnslab::json::Value::Object Provenance;
+            Provenance["mode"] = "same_replay_after_cache";
+            for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
+              dnslab::json::Value::Object ResolverProvenance;
+              const auto ResolverPrefix = ResolverName + "/";
+              ResolverProvenance["stderr"] =
+                  ResolverPrefix + Execution.Run.StderrPath.filename().string();
+              ResolverProvenance["after_cache"] =
+                  ResolverPrefix + Execution.Run.AfterCache.filename().string();
+              ResolverProvenance["stage_marker"] =
+                  "===== " + ResolverName + ".after =====";
+              Provenance[ResolverName] = dnslab::json::Value(ResolverProvenance);
+            }
+            return Provenance;
+          };
 
           SyncReplayResult Result;
           Result.Identity = SampleIdentity;
           Result.Fingerprint = Fingerprint;
           Result.OraclePayload = OraclePayload;
-          Result.Bind9 = Bind9Result;
-          Result.Secondary = SecondaryResult;
+          Result.OracleByResolver = OracleByResolver;
+          Result.ResolverRuns = {};
+          for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
+            Result.ResolverRuns.emplace(ResolverName, Execution.Run);
+          }
+          Result.SkippedResolvers = SkippedResolvers;
+          Result.ResolverBuildRoots = BuildRoots;
+          Result.ResolverSourceRoots = SourceRoots;
+          Result.ExecutedResolvers = CacheDiff.ExecutedResolvers;
+          Result.Bind9 = Bind9Found->second.Run;
+          Result.Secondary = SecondaryFound->second.Run;
           Result.SecondaryResolver = SecondaryResolverName;
           Result.ArtifactDir = ArtifactRoot;
-          Result.Failed = Bind9Result.RunResult.ExitCode != 0 ||
-                          SecondaryResult.RunResult.ExitCode != 0;
+          Result.Failed = Bind9Found->second.Run.RunResult.ExitCode != 0 ||
+                          SecondaryFound->second.Run.RunResult.ExitCode != 0;
 
           std::optional<dnslab::FailureEvidence> Failure;
-          if (Bind9Result.RunResult.ExitCode != 0) {
+          if (Bind9Found->second.Run.RunResult.ExitCode != 0) {
             dnslab::FailureEvidence Evidence;
             Evidence.Kind = "replay_error";
             Evidence.Reason = "subprocess_failed";
@@ -327,7 +597,7 @@ int main(int argc, char **argv) {
             Evidence.Resolver = "bind9";
             Evidence.ProcessStarted = true;
             Failure = Evidence;
-          } else if (SecondaryResult.RunResult.ExitCode != 0) {
+          } else if (SecondaryFound->second.Run.RunResult.ExitCode != 0) {
             dnslab::FailureEvidence Evidence;
             Evidence.Kind = "replay_error";
             Evidence.Reason = "subprocess_failed";
@@ -338,8 +608,38 @@ int main(int argc, char **argv) {
           }
 
           const auto Triage = dnslab::buildTriageRecord(
-              SampleIdentity.SampleId, NormalizedOraclePayload, CacheDiff,
-              Fingerprint, Failure);
+              SampleIdentity.SampleId, OracleByResolver, CacheDiff, Fingerprint,
+              Failure);
+
+          dnslab::json::Value::Object OracleDocument = OraclePayload;
+          OracleDocument["secondary_resolver"] = SecondaryResolverName;
+          dnslab::json::Value::Array OracleExecutedResolvers;
+          for (const auto &ResolverName : CacheDiff.ExecutedResolvers) {
+            OracleExecutedResolvers.emplace_back(ResolverName);
+          }
+          OracleDocument["executed_resolvers"] = OracleExecutedResolvers;
+          dnslab::json::Value::Object OracleSkippedResolvers;
+          for (const auto &[ResolverName, Reason] : SkippedResolvers) {
+            OracleSkippedResolvers[ResolverName] = Reason;
+          }
+          OracleDocument["skipped_resolvers"] =
+              dnslab::json::Value(OracleSkippedResolvers);
+          OracleDocument["diff_detected"] = Triage.DiffDetected;
+          dnslab::json::Value::Object OracleResolvers;
+          for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
+            OracleResolvers[ResolverName] =
+                dnslab::json::Value(Execution.OracleFields);
+          }
+          OracleDocument["resolvers"] = dnslab::json::Value(OracleResolvers);
+          {
+            dnslab::json::Value::Array ResolverDiffs;
+            for (const auto &Difference : Triage.ResolverDifferences) {
+              ResolverDiffs.emplace_back(dnslab::toJson(Difference));
+            }
+            OracleDocument["resolver_diffs"] = ResolverDiffs;
+          }
+          writeJsonFile(ArtifactRoot / "oracle.json",
+                        dnslab::json::Value(OracleDocument));
 
           auto Meta = dnslab::buildSampleMeta(SampleIdentity.SampleId);
           Meta.QueueEventId = "manual";
@@ -367,7 +667,34 @@ int main(int argc, char **argv) {
           Meta.BaselineCompare.SeedTimeoutSec = 5;
           Meta.BaselineCompare.RepeatCount = 1;
           Meta.Failure = Failure;
-          writeJsonFile(ArtifactRoot / "sample.meta.json", dnslab::toJson(Meta));
+          auto MetaPayload =
+              std::get<dnslab::json::Value::Object>(dnslab::toJson(Meta).storage());
+          MetaPayload["secondary_resolver"] = SecondaryResolverName;
+          MetaPayload["artifacts"] = dnslab::json::Value(buildArtifactsPayload());
+          MetaPayload["oracle_provenance"] =
+              dnslab::json::Value(buildOracleProvenancePayload());
+          MetaPayload["output_dir"] = ArtifactRoot.string();
+          dnslab::json::Value::Array MetaExecutedResolvers;
+          for (const auto &ResolverName : CacheDiff.ExecutedResolvers) {
+            MetaExecutedResolvers.emplace_back(ResolverName);
+          }
+          MetaPayload["executed_resolvers"] = MetaExecutedResolvers;
+          dnslab::json::Value::Object MetaSkippedResolvers;
+          for (const auto &[ResolverName, Reason] : SkippedResolvers) {
+            MetaSkippedResolvers[ResolverName] = Reason;
+          }
+          MetaPayload["skipped_resolvers"] =
+              dnslab::json::Value(MetaSkippedResolvers);
+          MetaPayload["diff_detected"] = Triage.DiffDetected;
+          {
+            dnslab::json::Value::Array ResolverDiffs;
+            for (const auto &Difference : Triage.ResolverDifferences) {
+              ResolverDiffs.emplace_back(dnslab::toJson(Difference));
+            }
+            MetaPayload["resolver_diffs"] = ResolverDiffs;
+          }
+          writeJsonFile(ArtifactRoot / "sample.meta.json",
+                        dnslab::json::Value(MetaPayload));
           writeJsonFile(ArtifactRoot / "cache_diff.json", dnslab::toJson(CacheDiff));
           writeJsonFile(ArtifactRoot / "state_fingerprint.json",
                         dnslab::toJson(Fingerprint));
@@ -759,6 +1086,7 @@ int main(int argc, char **argv) {
           resolveDefaultSourceRoot("bind9", Bind9BuildRoot);
       std::filesystem::path SecondarySourceRoot =
           resolveDefaultSourceRoot(SecondaryResolverName, SecondaryBuildRoot);
+      const auto RequestedResolversCsv = optionalOption(Args, "--resolvers");
       for (size_t Index = 0; Index + 1 < Args.size(); ++Index) {
         if (Args[Index] == "--bind9-source-root") {
           Bind9SourceRoot = Args[Index + 1];
@@ -771,7 +1099,8 @@ int main(int argc, char **argv) {
 
       const auto ReplayResult = executeSyncReplay(
           SamplePath, RunRoot, false, Bind9BuildRoot, SecondaryBuildRoot,
-          Bind9SourceRoot, SecondarySourceRoot, SecondaryResolverName);
+          Bind9SourceRoot, SecondarySourceRoot, SecondaryResolverName,
+          RequestedResolversCsv);
 
       dnslab::json::Value::Object Output;
       Output["sample_id"] = ReplayResult.Identity.SampleId;
@@ -800,6 +1129,31 @@ int main(int argc, char **argv) {
       Output["secondary_resolver"] = ReplayResult.SecondaryResolver;
       Output[ReplayResult.SecondaryResolver] =
           toResolverJson(ReplayResult.SecondaryResolver, ReplayResult.Secondary);
+      dnslab::json::Value::Object Resolvers;
+      for (const auto &[ResolverName, ResolverResult] : ReplayResult.ResolverRuns) {
+        Resolvers[ResolverName] = toResolverJson(ResolverName, ResolverResult);
+      }
+      Output["resolvers"] = dnslab::json::Value(Resolvers);
+      dnslab::json::Value::Array ExecutedResolvers;
+      for (const auto &ResolverName : ReplayResult.ExecutedResolvers) {
+        ExecutedResolvers.emplace_back(ResolverName);
+      }
+      Output["executed_resolvers"] = ExecutedResolvers;
+      dnslab::json::Value::Object SkippedResolvers;
+      for (const auto &[ResolverName, Reason] : ReplayResult.SkippedResolvers) {
+        SkippedResolvers[ResolverName] = Reason;
+      }
+      Output["skipped_resolvers"] = dnslab::json::Value(SkippedResolvers);
+      Output["diff_detected"] = ReplayResult.Triage.DiffDetected;
+      const auto TriageJsonObject =
+          std::get<dnslab::json::Value::Object>(dnslab::toJson(ReplayResult.Triage)
+                                                    .storage());
+      const auto ResolverDiffs = TriageJsonObject.find("resolver_diffs");
+      if (ResolverDiffs != TriageJsonObject.end()) {
+        Output["resolver_diffs"] = ResolverDiffs->second;
+      } else {
+        Output["resolver_diffs"] = dnslab::json::Value::Array{};
+      }
       Output["artifact_dir"] = ReplayResult.ArtifactDir.string();
       std::cout << dnslab::json::Value(Output).dump(2) << '\n';
       return ReplayResult.Failed ? 4 : 0;
@@ -827,6 +1181,7 @@ int main(int argc, char **argv) {
       std::filesystem::path SecondarySourceRoot =
           resolveDefaultSourceRoot(SecondaryResolverName, SecondaryBuildRoot);
       std::optional<size_t> Limit;
+      const auto RequestedResolversCsv = optionalOption(Args, "--resolvers");
       for (size_t Index = 0; Index + 1 < Args.size(); ++Index) {
         if (Args[Index] == "--bind9-source-root") {
           Bind9SourceRoot = Args[Index + 1];
@@ -863,15 +1218,9 @@ int main(int argc, char **argv) {
         Results.push_back(executeSyncReplay(SamplePath, RunRoot / "samples", true,
                                             Bind9BuildRoot, SecondaryBuildRoot,
                                             Bind9SourceRoot, SecondarySourceRoot,
-                                            SecondaryResolverName));
+                                            SecondaryResolverName,
+                                            RequestedResolversCsv));
       }
-
-      const auto boolText = [](const std::optional<bool> &Value) {
-        if (!Value.has_value()) {
-          return std::string("null");
-        }
-        return *Value ? std::string("true") : std::string("false");
-      };
 
       const auto objectBool = [](const dnslab::json::Value::Object &Object,
                                  const std::string &Key) -> std::optional<bool> {
@@ -886,14 +1235,25 @@ int main(int argc, char **argv) {
         return std::nullopt;
       };
 
+      const auto joinValues = [](const std::vector<std::string> &Values,
+                                 const std::string &Separator) {
+        std::ostringstream Stream;
+        for (size_t Index = 0; Index < Values.size(); ++Index) {
+          if (Index != 0) {
+            Stream << Separator;
+          }
+          Stream << Values[Index];
+        }
+        return Stream.str();
+      };
+
+      const auto compactJson = [](const dnslab::json::Value &Value) {
+        return Value.dump(0);
+      };
+
       std::ofstream OracleAudit(RunRoot / "oracle_audit.tsv");
       OracleAudit
-          << "sample_id\tanalysis_state\tstatus\tsemantic_outcome\toracle_audit_candidate\tcase_study_candidate\tbind9.response_accepted\t"
-          << SecondaryResolverName
-          << ".response_accepted\tbind9.second_query_hit\t"
-          << SecondaryResolverName
-          << ".second_query_hit\tbind9.cache_entry_created\t"
-          << SecondaryResolverName << ".cache_entry_created\n";
+          << "sample_id\tanalysis_state\tstatus\tsemantic_outcome\toracle_audit_candidate\tcase_study_candidate\texecuted_resolvers\tskipped_resolvers_json\tdiff_detected\tresolver_diffs_json\tresponse_accepted_any\tsecond_query_hit_any\tcache_entry_created_any\tresponse_accepted_by_resolver_json\tsecond_query_hit_by_resolver_json\tcache_entry_created_by_resolver_json\n";
 
       std::ofstream FailureTaxonomy(RunRoot / "failure_taxonomy.tsv");
       FailureTaxonomy
@@ -905,7 +1265,7 @@ int main(int argc, char **argv) {
 
       std::ofstream CaseStudyIndex(RunRoot / "case_studies" / "index.tsv");
       CaseStudyIndex
-          << "sample_id\tsemantic_outcome\tselection_reason\tcase_study_path\treplay_command\n";
+          << "sample_id\tsemantic_outcome\tselection_reason\tcase_study_path\treplay_command\texecuted_resolvers\tdiff_detected\tresolver_diffs_json\n";
 
       std::vector<dnslab::SampleMeta> MetaRecords;
       std::vector<dnslab::ClusterRecord> ClusterRecords;
@@ -916,9 +1276,13 @@ int main(int argc, char **argv) {
       size_t UnknownCount = 0;
       size_t OracleAuditCount = 0;
       size_t CaseStudyCount = 0;
+      size_t DiffDetectedCount = 0;
       std::map<std::string, int> FailurePrimaryCounts;
       std::map<std::string, int> SignalEligibleCounts;
       std::map<std::string, int> SignalPendingCounts;
+      std::map<std::string, int> ExecutedResolverSampleCounts;
+      std::map<std::string, int> SkippedResolverSampleCounts;
+      std::map<std::string, int> ResolverPairDiffCounts;
 
       const auto updateSignal = [&](const std::string &Name,
                                     bool EligibleCondition) {
@@ -949,28 +1313,136 @@ int main(int argc, char **argv) {
         if (Result.Triage.OracleAuditCandidate) {
           ++OracleAuditCount;
         }
+        if (Result.Triage.DiffDetected) {
+          ++DiffDetectedCount;
+        }
+        for (const auto &ResolverName : Result.ExecutedResolvers) {
+          ++ExecutedResolverSampleCounts[ResolverName];
+        }
+        for (const auto &[ResolverName, Reason] : Result.SkippedResolvers) {
+          (void)Reason;
+          ++SkippedResolverSampleCounts[ResolverName];
+        }
+        for (const auto &Difference : Result.Triage.ResolverDifferences) {
+          const std::string PairName =
+              Difference.LeftResolver + "_vs_" + Difference.RightResolver;
+          ++ResolverPairDiffCounts[PairName];
+        }
+
+        const auto buildResolverBoolMap =
+            [&](const std::string &FieldSuffix) {
+              dnslab::json::Value::Object Output;
+              for (const auto &ResolverName : Result.ExecutedResolvers) {
+                const auto OracleFound = Result.OracleByResolver.find(ResolverName);
+                const auto Value =
+                    OracleFound == Result.OracleByResolver.end()
+                        ? std::optional<bool>()
+                        : objectBool(OracleFound->second,
+                                     ResolverName + "." + FieldSuffix);
+                if (Value.has_value()) {
+                  Output[ResolverName] = *Value;
+                } else {
+                  Output[ResolverName] = dnslab::json::Value();
+                }
+              }
+              return Output;
+            };
+
+        const auto responseAcceptedByResolver =
+            buildResolverBoolMap("response_accepted");
+        const auto secondQueryHitByResolver =
+            buildResolverBoolMap("second_query_hit");
+        const auto cacheEntryCreatedByResolver =
+            buildResolverBoolMap("cache_entry_created");
+        const auto anyResolverTrue =
+            [&](const dnslab::json::Value::Object &Object) {
+              for (const auto &[ResolverName, Value] : Object) {
+                (void)ResolverName;
+                if (const auto *BoolValue =
+                        std::get_if<bool>(&Value.storage())) {
+                  if (*BoolValue) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            };
+        const auto executedResolversText =
+            joinValues(Result.ExecutedResolvers, ",");
+        const auto skippedResolversJson = [&]() {
+          dnslab::json::Value::Object Output;
+          for (const auto &[ResolverName, Reason] : Result.SkippedResolvers) {
+            Output[ResolverName] = Reason;
+          }
+          return dnslab::json::Value(Output);
+        }();
+        const auto resolverDiffsJson = [&]() {
+          dnslab::json::Value::Array Output;
+          for (const auto &Difference : Result.Triage.ResolverDifferences) {
+            Output.emplace_back(dnslab::toJson(Difference));
+          }
+          return dnslab::json::Value(Output);
+        }();
+
         if (Result.Triage.CaseStudyCandidate) {
           ++CaseStudyCount;
           const auto CaseStudyPath =
               RunRoot / "case_studies" / (Result.Identity.SampleId + ".md");
-          std::string ReplayCommand =
+          std::string ReplayCommand;
+          for (const auto &ResolverName : Result.ExecutedResolvers) {
+            if (ResolverName == "bind9" || ResolverName == Result.SecondaryResolver) {
+              continue;
+            }
+            if (ResolverName == "unbound") {
+              continue;
+            }
+            if (const auto EnvName = buildRootEnvNameForResolver(ResolverName);
+                EnvName.has_value()) {
+              ReplayCommand += *EnvName + "=" +
+                               Result.ResolverBuildRoots.at(ResolverName).string() +
+                               " ";
+            }
+            if (const auto EnvName = sourceRootEnvNameForResolver(ResolverName);
+                EnvName.has_value()) {
+              ReplayCommand += *EnvName + "=" +
+                               Result.ResolverSourceRoots.at(ResolverName).string() +
+                               " ";
+            }
+          }
+          ReplayCommand +=
               "./build/linux/x86_64/release/dnslabctl sync-replay --sample " +
               Result.Meta.SourceQueueFile.value_or("_") + " --run-root " +
               Result.ArtifactDir.string() + " --bind9-build-root " +
-              Bind9BuildRoot.string();
-          if (Result.SecondaryResolver == "unbound") {
-            ReplayCommand += " --unbound-build-root " + SecondaryBuildRoot.string();
+              Bind9BuildRoot.string() + " --bind9-source-root " +
+              Result.ResolverSourceRoots.at("bind9").string();
+          if (Result.ResolverBuildRoots.count("unbound")) {
+            ReplayCommand += " --unbound-build-root " +
+                             Result.ResolverBuildRoots.at("unbound").string();
           } else {
+            ReplayCommand += " --unbound-build-root " + SecondaryBuildRoot.string();
+          }
+          if (Result.SecondaryResolver != "unbound") {
             ReplayCommand += " --secondary-resolver " + Result.SecondaryResolver +
                              " --secondary-build-root " +
-                             SecondaryBuildRoot.string();
+                             Result.ResolverBuildRoots.at(Result.SecondaryResolver).string() +
+                             " --secondary-source-root " +
+                             Result.ResolverSourceRoots.at(Result.SecondaryResolver).string();
           }
+          ReplayCommand += " --resolvers " + executedResolversText;
           std::ofstream CaseStudyFile(CaseStudyPath);
           CaseStudyFile << "# " << Result.Identity.SampleId << "\n\n";
           CaseStudyFile << "- semantic_outcome: " << Result.Triage.SemanticOutcome
                         << "\n";
           CaseStudyFile << "- manual_truth_status: "
                         << Result.Triage.ManualTruthStatus << "\n";
+          CaseStudyFile << "- executed_resolvers: " << executedResolversText
+                        << "\n";
+          CaseStudyFile << "- skipped_resolvers_json: "
+                        << compactJson(skippedResolversJson) << "\n";
+          CaseStudyFile << "- diff_detected: "
+                        << (Result.Triage.DiffDetected ? "true" : "false") << "\n";
+          CaseStudyFile << "- resolver_diffs_json: "
+                        << compactJson(resolverDiffsJson) << "\n";
           CaseStudyFile << "- notes: ";
           if (Result.Triage.Notes.empty()) {
             CaseStudyFile << "_\n";
@@ -987,23 +1459,27 @@ int main(int argc, char **argv) {
                         << (Result.ArtifactDir / "sample.bin").string() << "\n";
           CaseStudyFile << "- oracle: "
                         << (Result.ArtifactDir / "oracle.json").string() << "\n";
-          CaseStudyFile << "- bind9_before_cache: "
-                        << Result.Bind9.BeforeCache.string() << "\n";
-          CaseStudyFile << "- bind9_after_cache: "
-                        << Result.Bind9.AfterCache.string() << "\n";
-          CaseStudyFile << "- " << Result.SecondaryResolver
-                        << "_before_cache: "
-                        << Result.Secondary.BeforeCache.string() << "\n";
-          CaseStudyFile << "- " << Result.SecondaryResolver
-                        << "_after_cache: "
-                        << Result.Secondary.AfterCache.string() << "\n";
-          CaseStudyFile << "- bind9_logs:\n";
-          for (const auto &Path : Result.Bind9.Logs) {
-            CaseStudyFile << "  - " << Path.string() << "\n";
+          for (const auto &ResolverName : Result.ExecutedResolvers) {
+            const auto ResolverFound = Result.ResolverRuns.find(ResolverName);
+            if (ResolverFound == Result.ResolverRuns.end()) {
+              continue;
+            }
+            CaseStudyFile << "- " << ResolverName
+                          << "_before_cache: "
+                          << ResolverFound->second.BeforeCache.string() << "\n";
+            CaseStudyFile << "- " << ResolverName
+                          << "_after_cache: "
+                          << ResolverFound->second.AfterCache.string() << "\n";
           }
-          CaseStudyFile << "- " << Result.SecondaryResolver << "_logs:\n";
-          for (const auto &Path : Result.Secondary.Logs) {
-            CaseStudyFile << "  - " << Path.string() << "\n";
+          for (const auto &ResolverName : Result.ExecutedResolvers) {
+            const auto ResolverFound = Result.ResolverRuns.find(ResolverName);
+            if (ResolverFound == Result.ResolverRuns.end()) {
+              continue;
+            }
+            CaseStudyFile << "- " << ResolverName << "_logs:\n";
+            for (const auto &Path : ResolverFound->second.Logs) {
+              CaseStudyFile << "  - " << Path.string() << "\n";
+            }
           }
           CaseStudyFile << "- replay_command: `" << ReplayCommand << "`\n";
 
@@ -1011,45 +1487,27 @@ int main(int argc, char **argv) {
                          << Result.Triage.SemanticOutcome << '\t'
                          << "oracle_audit_candidate" << '\t'
                          << CaseStudyPath.string() << '\t' << ReplayCommand
+                         << '\t' << executedResolversText << '\t'
+                         << (Result.Triage.DiffDetected ? "true" : "false")
+                         << '\t' << compactJson(resolverDiffsJson)
                          << '\n';
         }
 
         const bool OracleEligible = Result.Triage.AnalysisState == "included" &&
                                     Result.Triage.OracleAuditCandidate;
-        const std::string SecondaryPrefix = Result.SecondaryResolver + ".";
-        const auto bind9ResponseAccepted =
-            objectBool(Result.OraclePayload, "bind9.response_accepted")
-                .value_or(false);
-        const auto secondaryResponseAccepted =
-            objectBool(Result.OraclePayload,
-                       SecondaryPrefix + "response_accepted")
-                .value_or(false);
-        const auto bind9SecondHit =
-            objectBool(Result.OraclePayload, "bind9.second_query_hit")
-                .value_or(false);
-        const auto secondarySecondHit =
-            objectBool(Result.OraclePayload, SecondaryPrefix + "second_query_hit")
-                .value_or(false);
-        const auto bind9CacheCreated =
-            objectBool(Result.OraclePayload, "bind9.cache_entry_created")
-                .value_or(false);
-        const auto secondaryCacheCreated =
-            objectBool(Result.OraclePayload,
-                       SecondaryPrefix + "cache_entry_created")
-                .value_or(false);
-        const bool OracleDiffAny =
-            bind9ResponseAccepted != secondaryResponseAccepted ||
-            bind9SecondHit != secondarySecondHit ||
-            bind9CacheCreated != secondaryCacheCreated;
-        const bool CacheDiffAny = Result.CacheDiff.Bind9.HasCacheDiff ||
-                                  Result.CacheDiff.Unbound.HasCacheDiff;
+        const bool OracleDiffAny = std::any_of(
+            Result.Triage.ResolverDifferences.begin(),
+            Result.Triage.ResolverDifferences.end(),
+            [](const dnslab::ResolverPairDifference &Difference) {
+              return !Difference.OracleDiffFields.empty();
+            });
+        const bool CacheDiffAny = Result.CacheDiff.DiffDetected;
         updateSignal("response_accepted_any",
-                     OracleEligible &&
-                         (bind9ResponseAccepted || secondaryResponseAccepted));
+                     OracleEligible && anyResolverTrue(responseAcceptedByResolver));
         updateSignal("second_query_hit_any",
-                     OracleEligible && (bind9SecondHit || secondarySecondHit));
+                     OracleEligible && anyResolverTrue(secondQueryHitByResolver));
         updateSignal("cache_entry_created_any",
-                     OracleEligible && (bind9CacheCreated || secondaryCacheCreated));
+                     OracleEligible && anyResolverTrue(cacheEntryCreatedByResolver));
         updateSignal("oracle_diff_any", OracleEligible && OracleDiffAny);
         updateSignal("oracle_diff_plus_cache_diff",
                      OracleEligible && OracleDiffAny && CacheDiffAny);
@@ -1062,23 +1520,24 @@ int main(int argc, char **argv) {
                     << '\t'
                     << (Result.Triage.CaseStudyCandidate ? "true" : "false")
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload,
-                                           "bind9.response_accepted"))
+                    << executedResolversText << '\t'
+                    << compactJson(skippedResolversJson) << '\t'
+                    << (Result.Triage.DiffDetected ? "true" : "false") << '\t'
+                    << compactJson(resolverDiffsJson) << '\t'
+                    << (anyResolverTrue(responseAcceptedByResolver) ? "true"
+                                                                  : "false")
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload, SecondaryPrefix +
-                                           "response_accepted"))
+                    << (anyResolverTrue(secondQueryHitByResolver) ? "true"
+                                                                 : "false")
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload,
-                                           "bind9.second_query_hit"))
+                    << (anyResolverTrue(cacheEntryCreatedByResolver) ? "true"
+                                                                    : "false")
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload, SecondaryPrefix +
-                                           "second_query_hit"))
+                    << compactJson(dnslab::json::Value(responseAcceptedByResolver))
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload,
-                                           "bind9.cache_entry_created"))
+                    << compactJson(dnslab::json::Value(secondQueryHitByResolver))
                     << '\t'
-                    << boolText(objectBool(Result.OraclePayload, SecondaryPrefix +
-                                           "cache_entry_created"))
+                    << compactJson(dnslab::json::Value(cacheEntryCreatedByResolver))
                     << '\n';
 
         FailureTaxonomy
@@ -1189,15 +1648,43 @@ int main(int argc, char **argv) {
       dnslab::json::Value::Object Summary;
       Summary["generated_at"] = dnslab::utcTimestampNow();
       Summary["status"] = FailedCount == 0 ? "success" : "partial_failure";
-      Summary["secondary_resolver"] = SecondaryResolverName;
+      Summary["compatibility_secondary_resolver"] = SecondaryResolverName;
       Summary["sample_count"] = static_cast<std::int64_t>(Results.size());
       Summary["completed_count"] = static_cast<std::int64_t>(CompletedCount);
       Summary["failed_count"] = static_cast<std::int64_t>(FailedCount);
+      Summary["diff_detected_sample_count"] =
+          static_cast<std::int64_t>(DiffDetectedCount);
       dnslab::json::Value::Object AnalysisStateCounts;
       AnalysisStateCounts["included"] = static_cast<std::int64_t>(IncludedCount);
       AnalysisStateCounts["excluded"] = static_cast<std::int64_t>(ExcludedCount);
       AnalysisStateCounts["unknown"] = static_cast<std::int64_t>(UnknownCount);
       Summary["analysis_state"] = AnalysisStateCounts;
+      dnslab::json::Value::Array ExecutedResolversSummary;
+      for (const auto &[ResolverName, Count] : ExecutedResolverSampleCounts) {
+        (void)Count;
+        ExecutedResolversSummary.emplace_back(ResolverName);
+      }
+      Summary["executed_resolvers"] = ExecutedResolversSummary;
+      dnslab::json::Value::Object ExecutedResolverCounts;
+      for (const auto &[ResolverName, Count] : ExecutedResolverSampleCounts) {
+        ExecutedResolverCounts[ResolverName] =
+            static_cast<std::int64_t>(Count);
+      }
+      Summary["executed_resolver_sample_counts"] =
+          dnslab::json::Value(ExecutedResolverCounts);
+      dnslab::json::Value::Object SkippedResolverCounts;
+      for (const auto &[ResolverName, Count] : SkippedResolverSampleCounts) {
+        SkippedResolverCounts[ResolverName] =
+            static_cast<std::int64_t>(Count);
+      }
+      Summary["skipped_resolver_sample_counts"] =
+          dnslab::json::Value(SkippedResolverCounts);
+      dnslab::json::Value::Object ResolverDiffCounts;
+      for (const auto &[ResolverPair, Count] : ResolverPairDiffCounts) {
+        ResolverDiffCounts[ResolverPair] = static_cast<std::int64_t>(Count);
+      }
+      Summary["resolver_pair_diff_counts"] =
+          dnslab::json::Value(ResolverDiffCounts);
       Summary["oracle_audit_candidate_count"] =
           static_cast<std::int64_t>(OracleAuditCount);
       Summary["case_study_candidate_count"] =
@@ -1251,6 +1738,65 @@ int main(int argc, char **argv) {
           readTextFile(requireOption(Args, "--stderr-file")),
           requireOption(Args, "--resolver"));
       std::cout << dnslab::toJson(Parsed).dump(2) << '\n';
+      return 0;
+    }
+
+    if (Command == "report") {
+      const auto Root = std::filesystem::path(requireOption(Args, "--root"));
+      std::optional<std::filesystem::path> HighValueManifestPath;
+      for (size_t Index = 0; Index + 1 < Args.size(); ++Index) {
+        if (Args[Index] == "--high-value-manifest") {
+          HighValueManifestPath = std::filesystem::path(Args[Index + 1]);
+        }
+      }
+      if (!HighValueManifestPath.has_value()) {
+        if (const char *EnvManifest = std::getenv("SYMCC_HIGH_VALUE_MANIFEST")) {
+          if (*EnvManifest != '\0') {
+            HighValueManifestPath = std::filesystem::path(EnvManifest);
+          }
+        }
+      }
+      const auto Artifacts =
+          dnslab::generateTriageReportArtifacts(Root, HighValueManifestPath);
+      std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
+      return 0;
+    }
+
+    if (Command == "follow-diff-once") {
+      const auto Artifacts = dnslab::runFollowDiffOnce();
+      std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
+      return Artifacts.ExitCode;
+    }
+
+    if (Command == "follow-diff-window") {
+      const double BudgetSec =
+          std::stod(requireOption(Args, "--budget-sec"));
+      const bool RetryFailed =
+          std::find(Args.begin(), Args.end(), "--retry-failed") != Args.end();
+      const auto QueueTailId = optionalOption(Args, "--queue-tail-id");
+      const auto Artifacts =
+          dnslab::runFollowDiffWindow(BudgetSec, RetryFailed, QueueTailId);
+      std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
+      return Artifacts.ExitCode;
+    }
+
+    if (Command == "campaign-close") {
+      const double BudgetSec =
+          std::stod(requireOption(Args, "--budget-sec"));
+      const auto Artifacts = dnslab::runCampaignClose(BudgetSec);
+      std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
+      return Artifacts.ExitCode;
+    }
+
+    if (Command == "campaign-report") {
+      const auto Root = std::filesystem::path(requireOption(Args, "--root"));
+      std::optional<std::filesystem::path> OutputDir;
+      if (const auto Option = optionalOption(Args, "--output-dir")) {
+        OutputDir = std::filesystem::path(*Option);
+      }
+      const auto Artifacts =
+          dnslab::generateCampaignReportArtifacts(Root, OutputDir);
+      std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
       return 0;
     }
 

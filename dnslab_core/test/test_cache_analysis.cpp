@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 
 namespace {
 
@@ -141,6 +142,25 @@ int main() {
       dnslab::buildCacheDiff("sample-1", BindRows, {}, UnboundRows, UnboundRows, true);
   require(Diff.Bind9.HasCacheDiff, "Bind9 cache diff 未命中");
   require(!Diff.Unbound.HasCacheDiff, "Unbound cache diff 误报");
+  require(Diff.DiffDetected, "pairwise cache diff 应识别为 resolver 差异");
+
+  std::map<std::string, std::vector<dnslab::CacheRecord>> MultiBefore = {
+      {"bind9", BindRows},
+      {"unbound", UnboundRows},
+      {"dnsmasq", DnsmasqRows},
+  };
+  std::map<std::string, std::vector<dnslab::CacheRecord>> MultiAfter = {
+      {"bind9", BindRows},
+      {"unbound", UnboundRows},
+      {"dnsmasq", {}},
+  };
+  const auto MultiDiff = dnslab::buildCacheDiff("sample-2", MultiBefore, MultiAfter,
+                                                true, "unbound");
+  require(MultiDiff.ExecutedResolvers.size() == 3U,
+          "multi resolver cache diff 未保留全部 resolver");
+  require(MultiDiff.DiffDetected, "multi resolver cache diff 未标记差异");
+  require(!MultiDiff.ResolverDifferences.empty(),
+          "multi resolver cache diff 未记录 pair 差异");
 
   dnslab::json::Value::Object Oracle;
   Oracle["bind9.stderr_parse_status"] = "ok";
@@ -169,6 +189,42 @@ int main() {
   require(Triage.AnalysisState == "included",
           "Triage analysis_state 不匹配");
   require(Triage.OracleAuditCandidate, "Triage 未标为 oracle audit candidate");
+
+  std::map<std::string, dnslab::json::Value::Object> OracleByResolver;
+  OracleByResolver["bind9"] = {
+      {"bind9.stderr_parse_status", "ok"},
+      {"bind9.parse_ok", true},
+      {"bind9.resolver_fetch_started", true},
+      {"bind9.response_accepted", true},
+      {"bind9.second_query_hit", false},
+      {"bind9.cache_entry_created", true},
+      {"bind9.timeout", false},
+  };
+  OracleByResolver["unbound"] = {
+      {"unbound.stderr_parse_status", "ok"},
+      {"unbound.parse_ok", true},
+      {"unbound.resolver_fetch_started", true},
+      {"unbound.response_accepted", true},
+      {"unbound.second_query_hit", false},
+      {"unbound.cache_entry_created", true},
+      {"unbound.timeout", false},
+  };
+  OracleByResolver["dnsmasq"] = {
+      {"dnsmasq.stderr_parse_status", "ok"},
+      {"dnsmasq.parse_ok", true},
+      {"dnsmasq.resolver_fetch_started", true},
+      {"dnsmasq.response_accepted", false},
+      {"dnsmasq.second_query_hit", true},
+      {"dnsmasq.cache_entry_created", false},
+      {"dnsmasq.timeout", false},
+  };
+  const auto MultiTriage = dnslab::buildTriageRecord(
+      "sample-2", OracleByResolver, MultiDiff, Fingerprint, std::nullopt);
+  require(MultiTriage.DiffDetected, "multi resolver triage 未标记差异");
+  require(MultiTriage.ExecutedResolvers.size() == 3U,
+          "multi resolver triage 未保留 resolver 列表");
+  require(!MultiTriage.ResolverDifferences.empty(),
+          "multi resolver triage 未记录 resolver_diffs");
 
   std::filesystem::remove(BindPath);
   std::filesystem::remove(UnboundPath);

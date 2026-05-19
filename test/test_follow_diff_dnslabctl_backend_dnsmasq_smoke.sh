@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-follow-diff-dnslabctl-dnsmasq.XXXXXX")"
+ROOT_ENV="$WORKDIR/root"
 QUEUE_DIR="$WORKDIR/bind9-work/afl_out/master/queue"
 WORK_STATEFUL="$WORKDIR/work"
 export PYTHONDONTWRITEBYTECODE=1
@@ -117,9 +118,18 @@ DNSMASQ_BUILD="$WORKDIR/dnsmasq-build"
 DNSMASQ_BIN="$DNSMASQ_BUILD/dnsmasq"
 DNSMASQ_SRC="$WORKDIR/dnsmasq-src"
 DNSMASQ_HARNESS="$WORKDIR/dnsmasq-harness.py"
+NAMED_CONF_TEMPLATE="$ROOT_ENV/named_experiment/runtime/named.conf"
+RESPONSE_CORPUS_DIR="$ROOT_ENV/named_experiment/work/response_corpus"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
 
-mkdir -p "$QUEUE_DIR" "$BIND9_SRC" "$DNSMASQ_SRC"
+mkdir -p \
+	"$QUEUE_DIR" \
+	"$BIND9_SRC" \
+	"$DNSMASQ_SRC" \
+	"$RESPONSE_CORPUS_DIR" \
+	"$ROOT_ENV/named_experiment/runtime"
+printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
+printf 'seed\n' >"$RESPONSE_CORPUS_DIR/seed.txt"
 write_fake_bind9_binary "$BIND9_BIN"
 write_fake_dnsmasq_binary "$DNSMASQ_BIN"
 write_fake_dnsmasq_harness "$DNSMASQ_HARNESS"
@@ -128,7 +138,8 @@ printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
 	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-	ROOT_DIR="$ROOT_DIR" \
+	DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl" \
+	ROOT_DIR="$ROOT_ENV" \
 	WORK_DIR="$WORK_STATEFUL" \
 	BIND9_WORK_DIR="$WORKDIR/bind9-work" \
 	DNS_DIFF_SECONDARY_RESOLVER=dnsmasq \
@@ -165,6 +176,19 @@ if artifacts.get("dnsmasq_stderr") != "dnsmasq.stderr":
     raise SystemExit(f"ASSERT FAIL: artifacts 未保留 dnsmasq_stderr: {artifacts!r}")
 if meta.get("status") != "completed":
     raise SystemExit(f"ASSERT FAIL: sample.meta.status={meta.get('status')!r}")
+executed = meta.get("executed_resolvers")
+if not isinstance(executed, list) or "dnsmasq" not in executed or "bind9" not in executed:
+    raise SystemExit(f"ASSERT FAIL: sample.meta.executed_resolvers={executed!r}")
+if "unbound" in executed and artifacts.get("unbound_stderr") != "unbound.stderr":
+    raise SystemExit(f"ASSERT FAIL: artifacts 未保留 unbound_stderr: {artifacts!r}")
+skipped = meta.get("skipped_resolvers")
+if not isinstance(skipped, dict):
+    raise SystemExit(f"ASSERT FAIL: sample.meta.skipped_resolvers={skipped!r}")
+if meta.get("diff_detected") is not True:
+    raise SystemExit(f"ASSERT FAIL: sample.meta.diff_detected={meta.get('diff_detected')!r}")
+resolver_diffs = meta.get("resolver_diffs")
+if not isinstance(resolver_diffs, list) or not resolver_diffs:
+    raise SystemExit(f"ASSERT FAIL: sample.meta.resolver_diffs={resolver_diffs!r}")
 if triage.get("status") != "completed_oracle_diff":
     raise SystemExit(f"ASSERT FAIL: triage.status={triage.get('status')!r}")
 PY

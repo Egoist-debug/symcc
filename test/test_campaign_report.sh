@@ -344,15 +344,18 @@ expected = "\t".join(
         "semantic_outcome",
         "oracle_audit_candidate",
         "manual_truth_status",
-        "bind9.parse_ok",
-        "unbound.parse_ok",
-        "bind9.response_accepted",
-        "unbound.response_accepted",
-        "bind9.second_query_hit",
-        "unbound.second_query_hit",
-        "bind9.cache_entry_created",
-        "unbound.cache_entry_created",
+        "executed_resolvers",
+        "skipped_resolvers_json",
+        "diff_detected",
         "oracle_diff_fields",
+        "response_accepted_any",
+        "second_query_hit_any",
+        "cache_entry_created_any",
+        "resolver_diffs_json",
+        "parse_ok_by_resolver_json",
+        "response_accepted_by_resolver_json",
+        "second_query_hit_by_resolver_json",
+        "cache_entry_created_by_resolver_json",
         "sample_meta_path",
         "oracle_path",
         "cache_diff_path",
@@ -384,12 +387,9 @@ for row in rows:
     if row.get("oracle_audit_candidate") != "false":
         continue
     signal_hit = (
-        row.get("bind9.response_accepted") == "true"
-        or row.get("unbound.response_accepted") == "true"
-        or row.get("bind9.second_query_hit") == "true"
-        or row.get("unbound.second_query_hit") == "true"
-        or row.get("bind9.cache_entry_created") == "true"
-        or row.get("unbound.cache_entry_created") == "true"
+        row.get("response_accepted_any") == "true"
+        or row.get("second_query_hit_any") == "true"
+        or row.get("cache_entry_created_any") == "true"
         or row.get("oracle_diff_fields") != "-"
     )
     if signal_hit:

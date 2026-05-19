@@ -873,18 +873,6 @@ ResolverCacheDiff buildResolverCacheDiff(const std::vector<CacheRecord> &Before,
   return Output;
 }
 
-std::optional<bool> objectBool(const json::Value::Object &Object,
-                               const std::string &Key) {
-  const auto Found = Object.find(Key);
-  if (Found == Object.end()) {
-    return std::nullopt;
-  }
-  if (const auto *BoolValue = std::get_if<bool>(&Found->second.storage())) {
-    return *BoolValue;
-  }
-  return std::nullopt;
-}
-
 std::optional<std::string> objectString(const json::Value::Object &Object,
                                         const std::string &Key) {
   const auto Found = Object.find(Key);
@@ -898,25 +886,127 @@ std::optional<std::string> objectString(const json::Value::Object &Object,
   return std::nullopt;
 }
 
-std::vector<std::string> oracleDiffFields(const json::Value::Object &Oracle) {
+const std::vector<std::string> kOracleDiffFieldNames = {
+    "parse_ok",          "resolver_fetch_started", "response_accepted",
+    "second_query_hit",  "cache_entry_created",    "timeout",
+};
+
+std::string stableJsonText(const json::Value &Value) { return Value.dump(0); }
+
+const json::Value *findObjectValue(const json::Value::Object &Object,
+                                   const std::string &Key) {
+  const auto Found = Object.find(Key);
+  if (Found == Object.end()) {
+    return nullptr;
+  }
+  return &Found->second;
+}
+
+std::vector<std::string> oracleDiffFields(const json::Value::Object &Oracle,
+                                          const std::string &LeftResolver,
+                                          const std::string &RightResolver) {
   std::vector<std::string> Fields;
-  for (const auto &Field : {"parse_ok", "resolver_fetch_started",
-                            "response_accepted", "second_query_hit",
-                            "cache_entry_created", "timeout"}) {
-    if (objectBool(Oracle, "bind9." + std::string(Field)) !=
-        objectBool(Oracle, "unbound." + std::string(Field))) {
+  for (const auto &Field : kOracleDiffFieldNames) {
+    const auto *LeftValue =
+        findObjectValue(Oracle, LeftResolver + "." + Field);
+    const auto *RightValue =
+        findObjectValue(Oracle, RightResolver + "." + Field);
+    const auto LeftText = LeftValue ? stableJsonText(*LeftValue) : "null";
+    const auto RightText = RightValue ? stableJsonText(*RightValue) : "null";
+    if (LeftText != RightText) {
       Fields.push_back(Field);
     }
   }
   return Fields;
 }
 
+std::vector<std::string>
+resolverPairOracleDiffFields(
+    const std::map<std::string, json::Value::Object> &OracleByResolver,
+    const std::string &LeftResolver, const std::string &RightResolver) {
+  const auto LeftFound = OracleByResolver.find(LeftResolver);
+  const auto RightFound = OracleByResolver.find(RightResolver);
+  if (LeftFound == OracleByResolver.end() || RightFound == OracleByResolver.end()) {
+    return {};
+  }
+
+  json::Value::Object Combined;
+  for (const auto &[Key, Value] : LeftFound->second) {
+    Combined[Key] = Value;
+  }
+  for (const auto &[Key, Value] : RightFound->second) {
+    Combined[Key] = Value;
+  }
+  return oracleDiffFields(Combined, LeftResolver, RightResolver);
+}
+
+std::vector<std::string> cacheDiffMismatchFields(const ResolverCacheDiff &Left,
+                                                 const ResolverCacheDiff &Right) {
+  std::vector<std::string> Output;
+  if (Left.EntriesBefore != Right.EntriesBefore) {
+    Output.push_back("entries_before");
+  }
+  if (Left.EntriesAfter != Right.EntriesAfter) {
+    Output.push_back("entries_after");
+  }
+  if (Left.HasCacheDiff != Right.HasCacheDiff) {
+    Output.push_back("has_cache_diff");
+  }
+  if (Left.InterestingDeltaCount != Right.InterestingDeltaCount) {
+    Output.push_back("interesting_delta_count");
+  }
+  if (stableJsonText(toJson(Left)) != stableJsonText(toJson(Right))) {
+    Output.push_back("delta_items");
+  }
+  if (!Output.empty()) {
+    std::sort(Output.begin(), Output.end());
+    Output.erase(std::unique(Output.begin(), Output.end()), Output.end());
+  }
+  return Output;
+}
+
 bool cacheHasDiff(const CacheDiffResult &Input) {
+  if (!Input.ResolverDifferences.empty()) {
+    return true;
+  }
   return Input.Bind9.HasCacheDiff || Input.Unbound.HasCacheDiff;
 }
 
 int interestingDeltaCount(const CacheDiffResult &Input) {
+  if (!Input.Resolvers.empty()) {
+    int Count = 0;
+    for (const auto &[Resolver, Diff] : Input.Resolvers) {
+      (void)Resolver;
+      Count += Diff.InterestingDeltaCount;
+    }
+    return Count;
+  }
   return Input.Bind9.InterestingDeltaCount + Input.Unbound.InterestingDeltaCount;
+}
+
+std::vector<std::string>
+orderedExecutedResolvers(const std::map<std::string, ResolverCacheDiff> &Resolvers) {
+  std::vector<std::string> Output;
+  Output.reserve(Resolvers.size());
+  for (const auto &[Resolver, Diff] : Resolvers) {
+    (void)Diff;
+    Output.push_back(Resolver);
+  }
+  return Output;
+}
+
+bool allResolversParseOk(
+    const std::map<std::string, json::Value::Object> &OracleByResolver) {
+  if (OracleByResolver.empty()) {
+    return false;
+  }
+  for (const auto &[Resolver, Payload] : OracleByResolver) {
+    const auto Status = objectString(Payload, Resolver + ".stderr_parse_status");
+    if (Status != std::optional<std::string>("ok")) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::string clusterToken(const std::string &Value) {
@@ -1032,11 +1122,87 @@ CacheDiffResult buildCacheDiff(const std::string &SampleId,
                                const std::vector<CacheRecord> &UnboundBefore,
                                const std::vector<CacheRecord> &UnboundAfter,
                                bool Triggered) {
+  std::map<std::string, std::vector<CacheRecord>> BeforeByResolver = {
+      {"bind9", Bind9Before},
+      {"unbound", UnboundBefore},
+  };
+  std::map<std::string, std::vector<CacheRecord>> AfterByResolver = {
+      {"bind9", Bind9After},
+      {"unbound", UnboundAfter},
+  };
+  return buildCacheDiff(SampleId, BeforeByResolver, AfterByResolver, Triggered,
+                        "unbound");
+}
+
+CacheDiffResult buildCacheDiff(
+    const std::string &SampleId,
+    const std::map<std::string, std::vector<CacheRecord>> &BeforeByResolver,
+    const std::map<std::string, std::vector<CacheRecord>> &AfterByResolver,
+    bool Triggered, const std::string &CompatibilitySecondaryResolver) {
   CacheDiffResult Output;
   Output.SampleId = SampleId;
   Output.CacheDeltaTriggered = Triggered;
-  Output.Bind9 = buildResolverCacheDiff(Bind9Before, Bind9After, Triggered);
-  Output.Unbound = buildResolverCacheDiff(UnboundBefore, UnboundAfter, Triggered);
+  Output.CompatibilitySecondaryResolver = CompatibilitySecondaryResolver;
+
+  std::set<std::string> ResolverNames;
+  for (const auto &[Resolver, Rows] : BeforeByResolver) {
+    (void)Rows;
+    ResolverNames.insert(Resolver);
+  }
+  for (const auto &[Resolver, Rows] : AfterByResolver) {
+    (void)Rows;
+    ResolverNames.insert(Resolver);
+  }
+
+  for (const auto &Resolver : ResolverNames) {
+    const auto BeforeFound = BeforeByResolver.find(Resolver);
+    const auto AfterFound = AfterByResolver.find(Resolver);
+    const std::vector<CacheRecord> EmptyRows;
+    const auto &BeforeRows =
+        BeforeFound == BeforeByResolver.end() ? EmptyRows : BeforeFound->second;
+    const auto &AfterRows =
+        AfterFound == AfterByResolver.end() ? EmptyRows : AfterFound->second;
+    auto Diff = buildResolverCacheDiff(BeforeRows, AfterRows, Triggered);
+    if (Resolver == "bind9") {
+      Output.Bind9 = Diff;
+    }
+    if (Resolver == CompatibilitySecondaryResolver ||
+        (CompatibilitySecondaryResolver == "unbound" && Resolver == "unbound")) {
+      Output.Unbound = Diff;
+    }
+    Output.Resolvers.emplace(Resolver, std::move(Diff));
+  }
+
+  if (!Output.Resolvers.empty()) {
+    Output.ExecutedResolvers = orderedExecutedResolvers(Output.Resolvers);
+    if (!Output.Resolvers.count("bind9")) {
+      Output.Bind9 = ResolverCacheDiff{};
+    }
+    if (!Output.Resolvers.count(CompatibilitySecondaryResolver) &&
+        Output.Resolvers.count("unbound")) {
+      Output.Unbound = Output.Resolvers.at("unbound");
+    }
+  }
+
+  for (size_t LeftIndex = 0; LeftIndex < Output.ExecutedResolvers.size();
+       ++LeftIndex) {
+    for (size_t RightIndex = LeftIndex + 1;
+         RightIndex < Output.ExecutedResolvers.size(); ++RightIndex) {
+      const auto &LeftResolver = Output.ExecutedResolvers[LeftIndex];
+      const auto &RightResolver = Output.ExecutedResolvers[RightIndex];
+      const auto MismatchFields = cacheDiffMismatchFields(
+          Output.Resolvers.at(LeftResolver), Output.Resolvers.at(RightResolver));
+      if (MismatchFields.empty()) {
+        continue;
+      }
+      ResolverPairCacheDifference Difference;
+      Difference.LeftResolver = LeftResolver;
+      Difference.RightResolver = RightResolver;
+      Difference.DifferenceFields = MismatchFields;
+      Output.ResolverDifferences.push_back(std::move(Difference));
+      Output.DiffDetected = true;
+    }
+  }
   return Output;
 }
 
@@ -1045,16 +1211,98 @@ TriageRecord buildTriageRecord(const std::string &SampleId,
                                const CacheDiffResult &CacheDiff,
                                const StateFingerprint &Fingerprint,
                                const std::optional<FailureEvidence> &Failure) {
+  std::map<std::string, json::Value::Object> OracleByResolver;
+  for (const auto &Resolver : CacheDiff.ExecutedResolvers) {
+    json::Value::Object ResolverPayload;
+    const auto Prefix = Resolver + ".";
+    for (const auto &[Key, Value] : OraclePayload) {
+      if (Key.rfind(Prefix, 0) == 0) {
+        ResolverPayload[Key] = Value;
+      }
+    }
+    if (!ResolverPayload.empty()) {
+      OracleByResolver.emplace(Resolver, std::move(ResolverPayload));
+    }
+  }
+  if (OracleByResolver.empty()) {
+    for (const auto &Resolver : {std::string("bind9"), std::string("unbound")}) {
+      json::Value::Object ResolverPayload;
+      const auto Prefix = Resolver + ".";
+      for (const auto &[Key, Value] : OraclePayload) {
+        if (Key.rfind(Prefix, 0) == 0) {
+          ResolverPayload[Key] = Value;
+        }
+      }
+      if (!ResolverPayload.empty()) {
+        OracleByResolver.emplace(Resolver, std::move(ResolverPayload));
+      }
+    }
+  }
+  return buildTriageRecord(SampleId, OracleByResolver, CacheDiff, Fingerprint,
+                           Failure);
+}
+
+TriageRecord buildTriageRecord(
+    const std::string &SampleId,
+    const std::map<std::string, json::Value::Object> &OracleByResolver,
+    const CacheDiffResult &CacheDiff, const StateFingerprint &Fingerprint,
+    const std::optional<FailureEvidence> &Failure) {
   TriageRecord Output;
   Output.SampleId = SampleId;
   Output.GeneratedAt = utcTimestampNow();
   Output.CacheDeltaTriggered = CacheDiff.CacheDeltaTriggered;
+  Output.DiffDetected = CacheDiff.DiffDetected;
   Output.InterestingDeltaCount = interestingDeltaCount(CacheDiff);
+  Output.ExecutedResolvers = CacheDiff.ExecutedResolvers;
+  if (Output.ExecutedResolvers.empty()) {
+    for (const auto &[Resolver, Payload] : OracleByResolver) {
+      (void)Payload;
+      Output.ExecutedResolvers.push_back(Resolver);
+    }
+  }
 
-  const auto Bind9Status = objectString(OraclePayload, "bind9.stderr_parse_status");
-  const auto UnboundStatus =
-      objectString(OraclePayload, "unbound.stderr_parse_status");
-  const auto DiffFields = oracleDiffFields(OraclePayload);
+  std::vector<std::string> DiffFields;
+  for (size_t LeftIndex = 0; LeftIndex < Output.ExecutedResolvers.size();
+       ++LeftIndex) {
+    for (size_t RightIndex = LeftIndex + 1;
+         RightIndex < Output.ExecutedResolvers.size(); ++RightIndex) {
+      const auto &LeftResolver = Output.ExecutedResolvers[LeftIndex];
+      const auto &RightResolver = Output.ExecutedResolvers[RightIndex];
+      const auto OracleFields = resolverPairOracleDiffFields(
+          OracleByResolver, LeftResolver, RightResolver);
+      std::vector<std::string> CacheFields;
+      for (const auto &Difference : CacheDiff.ResolverDifferences) {
+        const bool SamePair =
+            Difference.LeftResolver == LeftResolver &&
+            Difference.RightResolver == RightResolver;
+        const bool ReversePair =
+            Difference.LeftResolver == RightResolver &&
+            Difference.RightResolver == LeftResolver;
+        if (SamePair || ReversePair) {
+          CacheFields = Difference.DifferenceFields;
+          break;
+        }
+      }
+      if (OracleFields.empty() && CacheFields.empty()) {
+        continue;
+      }
+      ResolverPairDifference Difference;
+      Difference.LeftResolver = LeftResolver;
+      Difference.RightResolver = RightResolver;
+      Difference.OracleDiffFields = OracleFields;
+      Difference.CacheDiffFields = CacheFields;
+      Output.ResolverDifferences.push_back(Difference);
+      DiffFields.insert(DiffFields.end(), OracleFields.begin(), OracleFields.end());
+      if (!OracleFields.empty() || !CacheFields.empty()) {
+        Output.DiffDetected = true;
+      }
+    }
+  }
+  if (!DiffFields.empty()) {
+    std::sort(DiffFields.begin(), DiffFields.end());
+    DiffFields.erase(std::unique(DiffFields.begin(), DiffFields.end()),
+                     DiffFields.end());
+  }
 
   std::vector<std::string> Notes;
   std::vector<std::string> Labels;
@@ -1062,7 +1310,7 @@ TriageRecord buildTriageRecord(const std::string &SampleId,
   std::string Status;
   std::string DiffClass;
 
-  if (!Bind9Status.has_value() && !UnboundStatus.has_value()) {
+  if (OracleByResolver.empty()) {
     Status = "failed_replay";
     if (Failure.has_value() && Failure->Reason.has_value()) {
       if (*Failure->Reason == "missing_artifact") {
@@ -1082,8 +1330,7 @@ TriageRecord buildTriageRecord(const std::string &SampleId,
     Labels.push_back("oracle_missing");
     Notes.push_back("oracle.json 缺失，当前样本按 replay 失败处理");
     NeedsManualReview = true;
-  } else if (Bind9Status != std::optional<std::string>("ok") ||
-             UnboundStatus != std::optional<std::string>("ok")) {
+  } else if (!allResolversParseOk(OracleByResolver)) {
     Status = "failed_parse";
     DiffClass = "oracle_parse_incomplete";
     Labels.push_back("oracle_parse_incomplete");
@@ -1120,6 +1367,9 @@ TriageRecord buildTriageRecord(const std::string &SampleId,
   }
   if (Output.InterestingDeltaCount > 0) {
     Labels.push_back("cache_delta_items_present");
+  }
+  if (Output.ExecutedResolvers.size() > 2 && Output.DiffDetected) {
+    Labels.push_back("multi_resolver_diff");
   }
 
   const auto Bind9Forwarding = Fingerprint.Bind9ForwardingPath.value_or("_");
@@ -1203,14 +1453,61 @@ json::Value toJson(const ResolverCacheDiff &Input) {
   return Output;
 }
 
+json::Value toJson(const ResolverPairCacheDifference &Input) {
+  json::Value::Object Output;
+  Output["left_resolver"] = Input.LeftResolver;
+  Output["right_resolver"] = Input.RightResolver;
+  json::Value::Array Fields;
+  for (const auto &Field : Input.DifferenceFields) {
+    Fields.emplace_back(Field);
+  }
+  Output["difference_fields"] = Fields;
+  return Output;
+}
+
+json::Value toJson(const ResolverPairDifference &Input) {
+  json::Value::Object Output;
+  Output["left_resolver"] = Input.LeftResolver;
+  Output["right_resolver"] = Input.RightResolver;
+  json::Value::Array OracleFields;
+  for (const auto &Field : Input.OracleDiffFields) {
+    OracleFields.emplace_back(Field);
+  }
+  Output["oracle_diff_fields"] = OracleFields;
+  json::Value::Array CacheFields;
+  for (const auto &Field : Input.CacheDiffFields) {
+    CacheFields.emplace_back(Field);
+  }
+  Output["cache_diff_fields"] = CacheFields;
+  return Output;
+}
+
 json::Value toJson(const CacheDiffResult &Input) {
   json::Value::Object Output;
   Output["schema_version"] = kSchemaVersion;
   Output["generated_at"] = utcTimestampNow();
   Output["sample_id"] = Input.SampleId;
   Output["cache_delta_triggered"] = Input.CacheDeltaTriggered;
+  Output["diff_detected"] = Input.DiffDetected;
+  Output["compatibility_secondary_resolver"] =
+      Input.CompatibilitySecondaryResolver;
+  json::Value::Array ExecutedResolvers;
+  for (const auto &Resolver : Input.ExecutedResolvers) {
+    ExecutedResolvers.emplace_back(Resolver);
+  }
+  Output["executed_resolvers"] = ExecutedResolvers;
   Output["bind9"] = toJson(Input.Bind9);
   Output["unbound"] = toJson(Input.Unbound);
+  json::Value::Object Resolvers;
+  for (const auto &[Resolver, Diff] : Input.Resolvers) {
+    Resolvers[Resolver] = toJson(Diff);
+  }
+  Output["resolvers"] = Resolvers;
+  json::Value::Array Differences;
+  for (const auto &Difference : Input.ResolverDifferences) {
+    Differences.emplace_back(toJson(Difference));
+  }
+  Output["resolver_diffs"] = Differences;
   return Output;
 }
 
@@ -1234,11 +1531,22 @@ json::Value toJson(const TriageRecord &Input) {
   Output["filter_labels"] = Labels;
   Output["cluster_key"] = Input.ClusterKey;
   Output["cache_delta_triggered"] = Input.CacheDeltaTriggered;
+  Output["diff_detected"] = Input.DiffDetected;
   Output["interesting_delta_count"] = Input.InterestingDeltaCount;
   Output["needs_manual_review"] = Input.NeedsManualReview;
   Output["oracle_audit_candidate"] = Input.OracleAuditCandidate;
   Output["case_study_candidate"] = Input.CaseStudyCandidate;
   Output["manual_truth_status"] = Input.ManualTruthStatus;
+  json::Value::Array ExecutedResolvers;
+  for (const auto &Resolver : Input.ExecutedResolvers) {
+    ExecutedResolvers.emplace_back(Resolver);
+  }
+  Output["executed_resolvers"] = ExecutedResolvers;
+  json::Value::Array ResolverDiffs;
+  for (const auto &Difference : Input.ResolverDifferences) {
+    ResolverDiffs.emplace_back(toJson(Difference));
+  }
+  Output["resolver_diffs"] = ResolverDiffs;
   json::Value::Array Notes;
   for (const auto &Note : Input.Notes) {
     Notes.emplace_back(Note);

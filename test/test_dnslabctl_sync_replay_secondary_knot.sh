@@ -108,6 +108,7 @@ BIND9_BIN="$BIND9_TREE/bin/named/.libs/named"
 KNOT_BUILD="$WORKDIR/knot-build"
 KNOT_BIN="$KNOT_BUILD/knot-build/daemon/kresd"
 KNOT_HARNESS="$WORKDIR/knot-harness.py"
+RESPONSE_CORPUS_DIR="$WORKDIR/response-corpus"
 mkdir -p "$WORKDIR/bind9-source" "$WORKDIR/knot-source"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
 RUN_ROOT="$WORKDIR/run"
@@ -117,6 +118,7 @@ write_fake_bind9_binary "$BIND9_BIN"
 write_fake_knot_binary "$KNOT_BIN"
 write_fake_knot_harness "$KNOT_HARNESS"
 printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
+mkdir -p "$RESPONSE_CORPUS_DIR"
 
 python3 - "$SAMPLE_FILE" <<'PY'
 from pathlib import Path
@@ -140,6 +142,7 @@ PY
 
 env \
 	KNOT_RESOLVER_HARNESS_SCRIPT="$KNOT_HARNESS" \
+	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
 	"$DNSLABCTL_BIN" sync-replay \
 		--sample "$SAMPLE_FILE" \
 		--run-root "$RUN_ROOT" \

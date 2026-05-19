@@ -164,8 +164,9 @@ if comparability.get("baseline_compare_key", {}).get("resolver_pair") != "bind9_
 if len(audit_rows) != 1:
     raise SystemExit(f"ASSERT FAIL: 期望 1 条 oracle_audit 记录，实际 {len(audit_rows)}")
 row = audit_rows[0]
-if row["unbound.parse_ok"] != "true":
-    raise SystemExit(f"ASSERT FAIL: secondary parse_ok 未映射到 audit 列: {row['unbound.parse_ok']!r}")
+parse_ok = json.loads(row["parse_ok_by_resolver_json"])
+if parse_ok.get("maradns") is not True:
+    raise SystemExit(f"ASSERT FAIL: maradns parse_ok 未映射到 audit 列: {parse_ok!r}")
 artifacts = bundle["raw_sample_root"]["claim_review_artifacts"]
 if "maradns.stderr" not in artifacts:
     raise SystemExit(f"ASSERT FAIL: evidence bundle 缺少 maradns.stderr: {artifacts!r}")
