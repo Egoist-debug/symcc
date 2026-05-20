@@ -268,6 +268,8 @@ void printUsage() {
          " [--retry-failed] [--queue-tail-id <id>]\n"
       << "  dnslabctl campaign-close --budget-sec <sec>\n"
       << "  dnslabctl campaign-report --root <path> [--output-dir <path>]\n"
+      << "  dnslabctl case-study-export --root <path>"
+         " --campaign-report-dir <path> [--top-n <n>]\n"
       << "  dnslabctl report --root <path> [--high-value-manifest <path>]\n"
       << "  dnslabctl oracle-parse --resolver <name> --stderr-file <path>\n"
       << "  dnslabctl evidence-bundle --output <path> --summary <path>"
@@ -641,6 +643,16 @@ int main(int argc, char **argv) {
           writeJsonFile(ArtifactRoot / "oracle.json",
                         dnslab::json::Value(OracleDocument));
 
+          double ReplayBudgetSec = 0.0;
+          if (const char *BudgetEnv =
+                  std::getenv("DNSLAB_SYNC_REPLAY_BUDGET_SEC")) {
+            try {
+              ReplayBudgetSec = std::stod(BudgetEnv);
+            } catch (const std::exception &) {
+              ReplayBudgetSec = 0.0;
+            }
+          }
+
           auto Meta = dnslab::buildSampleMeta(SampleIdentity.SampleId);
           Meta.QueueEventId = "manual";
           Meta.SourceQueueFile = SamplePath.string();
@@ -655,7 +667,7 @@ int main(int argc, char **argv) {
           Meta.Aggregation.ProducerProfile = "poison-stateful";
           Meta.Aggregation.InputModel = "DST1 transcript";
           Meta.Aggregation.SourceQueueDir = SamplePath.parent_path().string();
-          Meta.Aggregation.BudgetSec = 0;
+          Meta.Aggregation.BudgetSec = ReplayBudgetSec;
           Meta.Aggregation.SeedTimeoutSec = 5;
           Meta.Aggregation.VariantName = "full_stack";
           Meta.Aggregation.AblationStatus = "enabled";
@@ -663,7 +675,7 @@ int main(int argc, char **argv) {
           Meta.BaselineCompare.ProducerProfile = "poison-stateful";
           Meta.BaselineCompare.InputModel = "DST1 transcript";
           Meta.BaselineCompare.SourceQueueDir = SamplePath.parent_path().string();
-          Meta.BaselineCompare.BudgetSec = 0;
+          Meta.BaselineCompare.BudgetSec = ReplayBudgetSec;
           Meta.BaselineCompare.SeedTimeoutSec = 5;
           Meta.BaselineCompare.RepeatCount = 1;
           Meta.Failure = Failure;
@@ -1796,6 +1808,24 @@ int main(int argc, char **argv) {
       }
       const auto Artifacts =
           dnslab::generateCampaignReportArtifacts(Root, OutputDir);
+      std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
+      return 0;
+    }
+
+    if (Command == "case-study-export") {
+      const auto Root = std::filesystem::path(requireOption(Args, "--root"));
+      const auto ReportDir =
+          std::filesystem::path(requireOption(Args, "--campaign-report-dir"));
+      size_t TopN = 5;
+      if (const auto Option = optionalOption(Args, "--top-n")) {
+        const auto Parsed = std::stoll(*Option);
+        if (Parsed < 0) {
+          throw std::runtime_error("--top-n 不能为负数: " + *Option);
+        }
+        TopN = static_cast<size_t>(Parsed);
+      }
+      const auto Artifacts =
+          dnslab::exportCaseStudies(Root, ReportDir, TopN);
       std::cout << dnslab::toJson(Artifacts).dump(2) << '\n';
       return 0;
     }

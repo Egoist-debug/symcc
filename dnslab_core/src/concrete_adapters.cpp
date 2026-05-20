@@ -59,6 +59,89 @@ std::filesystem::path cloneIfMissing(const std::filesystem::path &WorkspaceRoot,
   return SubjectRoot;
 }
 
+std::optional<std::filesystem::path>
+prepareBind9ReleaseTarballIfAvailable(const std::filesystem::path &WorkspaceRoot,
+                                      const std::string &Tag) {
+  if (Tag.empty() || Tag.front() != 'v') {
+    return std::nullopt;
+  }
+
+  const auto Version = Tag.substr(1);
+  const auto SubjectRoot = defaultSubjectRoot(WorkspaceRoot, "bind9", Tag);
+  if (std::filesystem::exists(SubjectRoot)) {
+    return SubjectRoot;
+  }
+
+  const auto ParentRoot = SubjectRoot.parent_path();
+  const auto ExtractedRoot = ParentRoot / ("bind-" + Version);
+  const auto ArchivePath = ParentRoot / ("bind-" + Version + ".tar.xz");
+  const auto ReleaseUrl =
+      "https://downloads.isc.org/isc/bind9/" + Version + "/bind-" + Version +
+      ".tar.xz";
+
+  auto cleanupPath = [](const std::filesystem::path &Path) {
+    std::error_code Error;
+    std::filesystem::remove_all(Path, Error);
+  };
+
+  cleanupPath(SubjectRoot);
+  cleanupPath(ExtractedRoot);
+  cleanupPath(ArchivePath);
+  std::filesystem::create_directories(ParentRoot);
+
+  const CommandResult DownloadResult = runProcess({
+      {"curl", "-fsSL", ReleaseUrl, "-o", ArchivePath.string()},
+      std::nullopt,
+      {},
+      std::nullopt,
+  });
+  if (DownloadResult.ExitCode != 0) {
+    cleanupPath(ArchivePath);
+    return std::nullopt;
+  }
+
+  const CommandResult ExtractResult = runProcess({
+      {"tar", "-xJf", ArchivePath.string(), "-C", ParentRoot.string()},
+      std::nullopt,
+      {},
+      std::nullopt,
+  });
+  cleanupPath(ArchivePath);
+  if (ExtractResult.ExitCode != 0 || !std::filesystem::exists(ExtractedRoot)) {
+    cleanupPath(ExtractedRoot);
+    return std::nullopt;
+  }
+
+  std::filesystem::rename(ExtractedRoot, SubjectRoot);
+
+  const CommandResult GitInitResult = runProcess({
+      {"git", "-C", SubjectRoot.string(), "init", "-q"},
+      std::nullopt,
+      {},
+      std::nullopt,
+  });
+  if (GitInitResult.ExitCode == 0) {
+    runProcess({
+        {"git", "-C", SubjectRoot.string(), "add", "-A"},
+        std::nullopt,
+        {},
+        std::nullopt,
+    });
+    runProcess({
+        {"git", "-C", SubjectRoot.string(),
+         "-c", "user.name=dnslabctl",
+         "-c", "user.email=dnslabctl@example.invalid",
+         "commit", "-q", "-m",
+         "Import bind9 " + Tag + " release tarball"},
+        std::nullopt,
+        {},
+        std::nullopt,
+    });
+  }
+
+  return SubjectRoot;
+}
+
 void renderNamedConf(const std::filesystem::path &TemplatePath,
                      const std::filesystem::path &RuntimeDir,
                      const std::filesystem::path &OutputPath) {
@@ -358,6 +441,11 @@ Bind9ResolverAdapter::prepareSource(const std::filesystem::path &WorkspaceRoot,
   const auto Legacy = WorkspaceRoot / "bind-9.18.46";
   if (std::filesystem::exists(Legacy)) {
     return Legacy;
+  }
+  if (const auto ReleaseTarballRoot =
+          prepareBind9ReleaseTarballIfAvailable(WorkspaceRoot, Tag);
+      ReleaseTarballRoot.has_value()) {
+    return *ReleaseTarballRoot;
   }
   return cloneIfMissing(WorkspaceRoot, "bind9", Tag,
                         "https://gitlab.isc.org/isc-projects/bind9.git");

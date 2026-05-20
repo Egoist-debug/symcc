@@ -103,6 +103,7 @@ MARADNS_BUILD="$WORKDIR/maradns-build"
 MARADNS_BIN="$MARADNS_BUILD/deadwood-build/deadwood-github/src/Deadwood"
 MARADNS_HARNESS="$WORKDIR/maradns-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
+RESPONSE_CORPUS_DIR="$WORKDIR/response_corpus"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
 
 mkdir -p "$QUEUE_DIR"
@@ -110,7 +111,27 @@ write_fake_bind9_binary "$BIND9_BIN"
 write_fake_maradns_binary "$MARADNS_BIN"
 write_fake_maradns_harness "$MARADNS_HARNESS"
 printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
-printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
+mkdir -p "$RESPONSE_CORPUS_DIR"
+printf 'seed\n' >"$RESPONSE_CORPUS_DIR/seed.txt"
+python3 - "$SAMPLE_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+query = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
+response = (
+    b'\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00'
+    b'\x07example\x03com\x00\x00\x01\x00\x01'
+    b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04'
+)
+post = b'\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
+wire = bytearray(b'DST1')
+wire += bytes([1, 2])
+wire += len(query).to_bytes(2, 'little')
+wire += len(response).to_bytes(2, 'little')
+wire += query + response + post
+path.write_bytes(wire)
+PY
 
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
@@ -123,9 +144,12 @@ env \
 	MARADNS_BUILD_TREE="$MARADNS_BUILD" \
 	MARADNS_HARNESS_SCRIPT="$MARADNS_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
+	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
 	python3 -m tools.dns_diff.cli follow-diff-once >/dev/null
 
-SAMPLE_DIR="$(find "$WORK_STATEFUL/follow_diff" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+SAMPLE_META="$(find "$WORK_STATEFUL/follow_diff" -maxdepth 2 -mindepth 2 -type f -name sample.meta.json | sort | head -n 1)"
+assert_file_exists "$SAMPLE_META"
+SAMPLE_DIR="$(dirname "$SAMPLE_META")"
 assert_file_exists "$SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$SAMPLE_DIR/oracle.json"
 assert_file_exists "$SAMPLE_DIR/cache_diff.json"
@@ -143,7 +167,7 @@ triage = json.loads((sample_dir / "triage.json").read_text(encoding="utf-8"))
 cache_diff = json.loads((sample_dir / "cache_diff.json").read_text(encoding="utf-8"))
 
 artifacts = meta.get("artifacts", {})
-if artifacts.get("maradns_stderr") != "maradns.stderr":
+if artifacts.get("maradns_stderr") != "maradns/maradns.stderr":
     raise SystemExit(f"ASSERT FAIL: sample.meta.artifacts 未保留 maradns stderr: {artifacts!r}")
 if oracle.get("maradns.parse_ok") is not True:
     raise SystemExit(f"ASSERT FAIL: oracle 缺少 maradns.parse_ok: {oracle!r}")

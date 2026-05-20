@@ -25,10 +25,10 @@
 #include <isc/net.h>
 #include <isc/netmgr.h>
 #include <isc/portset.h>
-#include <isc/print.h>
 #include <isc/random.h>
 #include <isc/stats.h>
 #include <isc/string.h>
+#include <isc/tid.h>
 #include <isc/time.h>
 #include <isc/util.h>
 
@@ -37,7 +37,19 @@
 #include <dns/log.h>
 #include <dns/message.h>
 #include <dns/stats.h>
+#include <dns/transport.h>
 #include <dns/types.h>
+
+#ifndef TIME_NOW
+#define TIME_NOW(tp) (*(tp) = isc_time_now())
+#endif
+
+#define isc_nm_tid isc_tid
+#define isc_net_getudpportrange isc_net_getportrange
+#define isc_nm_udpconnect_compat(mgr, local, peer, cb, cbarg, timeout, flags) \
+	isc_nm_udpconnect(mgr, local, peer, cb, cbarg, timeout)
+#define isc_nm_tcpdnsconnect_compat(mgr, local, peer, cb, cbarg, timeout, flags) \
+	isc_nm_tcpconnect(mgr, local, peer, cb, cbarg, timeout)
 
 extern void named_resolver_afl_symcc_orchestrator_dispatchmgr_ready(
 	dns_dispatchmgr_t *mgr) __attribute__((weak));
@@ -994,13 +1006,14 @@ setavailports(dns_dispatchmgr_t *mgr, isc_portset_t *v4portset,
  */
 
 isc_result_t
-dns_dispatchmgr_create(isc_mem_t *mctx, isc_nm_t *nm,
+dns_dispatchmgr_create(isc_mem_t *mctx, isc_loopmgr_t *loopmgr, isc_nm_t *nm,
 		       dns_dispatchmgr_t **mgrp) {
 	dns_dispatchmgr_t *mgr = NULL;
 	isc_portset_t *v4portset = NULL;
 	isc_portset_t *v6portset = NULL;
 
 	REQUIRE(mctx != NULL);
+	UNUSED(loopmgr);
 	REQUIRE(mgrp != NULL && *mgrp == NULL);
 	mgr = isc_mem_get(mctx, sizeof(dns_dispatchmgr_t));
 	*mgr = (dns_dispatchmgr_t){ .magic = 0 };
@@ -1193,11 +1206,15 @@ dispatch_allocate(dns_dispatchmgr_t *mgr, isc_socktype_t type,
 
 isc_result_t
 dns_dispatch_createtcp(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *localaddr,
-		       const isc_sockaddr_t *destaddr, dns_dispatch_t **dispp) {
+		       const isc_sockaddr_t *destaddr,
+		       dns_transport_t *transport, dns_dispatchopt_t options,
+		       dns_dispatch_t **dispp) {
 	dns_dispatch_t *disp = NULL;
 
 	REQUIRE(VALID_DISPATCHMGR(mgr));
 	REQUIRE(destaddr != NULL);
+	UNUSED(transport);
+	UNUSED(options);
 
 	LOCK(&mgr->lock);
 
@@ -1240,7 +1257,8 @@ dns_dispatch_createtcp(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *localaddr,
 
 isc_result_t
 dns_dispatch_gettcp(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *destaddr,
-		    const isc_sockaddr_t *localaddr, dns_dispatch_t **dispp) {
+		    const isc_sockaddr_t *localaddr, dns_transport_t *transport,
+		    dns_dispatch_t **dispp) {
 	dns_dispatch_t *disp_connected = NULL;
 	dns_dispatch_t *disp_fallback = NULL;
 	isc_result_t result = ISC_R_NOTFOUND;
@@ -1248,6 +1266,7 @@ dns_dispatch_gettcp(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *destaddr,
 	REQUIRE(VALID_DISPATCHMGR(mgr));
 	REQUIRE(destaddr != NULL);
 	REQUIRE(dispp != NULL && *dispp == NULL);
+	UNUSED(transport);
 
 	LOCK(&mgr->lock);
 
@@ -1455,11 +1474,12 @@ ISC_REFCOUNT_IMPL(dns_dispatch, dispatch_destroy);
 #endif
 
 isc_result_t
-dns_dispatch_add(dns_dispatch_t *disp, unsigned int options,
-		 unsigned int timeout, const isc_sockaddr_t *dest,
-		 dispatch_cb_t connected, dispatch_cb_t sent,
-		 dispatch_cb_t response, void *arg, dns_messageid_t *idp,
-		 dns_dispentry_t **respp) {
+dns_dispatch_add(dns_dispatch_t *disp, isc_loop_t *loop,
+		 dns_dispatchopt_t options, unsigned int timeout,
+		 const isc_sockaddr_t *dest, dns_transport_t *transport,
+		 isc_tlsctx_cache_t *tlsctx_cache, dispatch_cb_t connected,
+		 dispatch_cb_t sent, dispatch_cb_t response, void *arg,
+		 dns_messageid_t *idp, dns_dispentry_t **respp) {
 	dns_dispentry_t *resp = NULL;
 	dns_qid_t *qid = NULL;
 	in_port_t localport;
@@ -1477,6 +1497,9 @@ dns_dispatch_add(dns_dispatch_t *disp, unsigned int options,
 	REQUIRE(connected != NULL);
 	REQUIRE(response != NULL);
 	REQUIRE(sent != NULL);
+	UNUSED(loop);
+	UNUSED(transport);
+	UNUSED(tlsctx_cache);
 
 	LOCK(&disp->lock);
 
@@ -1997,8 +2020,8 @@ udp_dispatch_connect(dns_dispatch_t *disp, dns_dispentry_t *resp) {
 	ISC_LIST_APPEND(disp->pending, resp, plink);
 	UNLOCK(&disp->lock);
 
-	isc_nm_udpconnect(disp->mgr->nm, &resp->local, &resp->peer,
-			  udp_connected, resp, resp->timeout, 0);
+	isc_nm_udpconnect_compat(disp->mgr->nm, &resp->local, &resp->peer,
+				 udp_connected, resp, resp->timeout, 0);
 }
 
 static isc_result_t
@@ -2028,8 +2051,9 @@ tcp_dispatch_connect(dns_dispatch_t *disp, dns_dispentry_t *resp) {
 			      "connecting from %s to %s, timeout %u", localbuf,
 			      peerbuf, resp->timeout);
 
-		isc_nm_tcpdnsconnect(disp->mgr->nm, &disp->local, &disp->peer,
-				     tcp_connected, disp, resp->timeout, 0);
+		isc_nm_tcpdnsconnect_compat(disp->mgr->nm, &disp->local,
+					    &disp->peer, tcp_connected, disp,
+					    resp->timeout, 0);
 		break;
 
 	case DNS_DISPATCHSTATE_CONNECTING:
@@ -2361,4 +2385,15 @@ dns_dispatchset_destroy(dns_dispatchset_t **dsetp) {
 		    sizeof(dns_dispatch_t *) * dset->ndisp);
 	isc_mutex_destroy(&dset->lock);
 	isc_mem_putanddetach(&dset->mctx, dset, sizeof(dns_dispatchset_t));
+}
+
+isc_result_t
+dns_dispatch_checkperm(dns_dispatch_t *disp) {
+	REQUIRE(VALID_DISPATCH(disp));
+
+	if (disp->handle == NULL || disp->socktype == isc_socktype_udp) {
+		return ISC_R_NOPERM;
+	}
+
+	return isc_nm_xfr_checkperm(disp->handle);
 }

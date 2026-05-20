@@ -1,3 +1,5 @@
+import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -12,6 +14,7 @@ from .follow_diff import (
 )
 from .io import atomic_write_json, load_json_with_fallback
 from .report import (
+    _resolve_root_dir,
     ReportError,
     collect_report_snapshot,
     default_follow_diff_root,
@@ -35,6 +38,48 @@ class CampaignCloseError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int = EXIT_USAGE) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+def _resolve_dnslabctl_bin() -> Path:
+    explicit = os.environ.get("DNSLABCTL_BIN", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return (_resolve_root_dir() / "build/linux/x86_64/release/dnslabctl").resolve()
+
+
+def _resolve_campaign_close_backend() -> str:
+    raw = os.environ.get("DNS_DIFF_CAMPAIGN_CLOSE_BACKEND", "").strip().lower()
+    if not raw:
+        raw = os.environ.get("DNS_DIFF_CLI_BACKEND", "").strip().lower()
+    if not raw:
+        return "dnslabctl"
+    if raw in {"python", "dnslabctl"}:
+        return raw
+    raise CampaignCloseError(
+        f"DNS_DIFF_CAMPAIGN_CLOSE_BACKEND 只能是 python/dnslabctl，当前值: {raw!r}"
+    )
+
+
+def _run_dnslabctl_campaign_close(*, budget_sec: float) -> int:
+    dnslabctl_bin = _resolve_dnslabctl_bin()
+    if not dnslabctl_bin.is_file():
+        raise CampaignCloseError(f"缺少 dnslabctl 可执行文件: {dnslabctl_bin}")
+
+    completed = subprocess.run(
+        [str(dnslabctl_bin), "campaign-close", "--budget-sec", str(budget_sec)],
+        cwd=_resolve_root_dir(),
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+        check=False,
+    )
+    if completed.returncode == 0:
+        return 0
+
+    message = completed.stderr.strip() or completed.stdout.strip() or (
+        f"dnslabctl campaign-close 返回 {completed.returncode}"
+    )
+    raise CampaignCloseError(message, exit_code=int(completed.returncode))
 
 
 def _format_deadline_ts(deadline_epoch_sec: float) -> str:
@@ -284,6 +329,9 @@ def _validate_campaign_report_artifacts(work_dir: Path) -> None:
 
 
 def run_campaign_close(*, budget_sec: float) -> int:
+    if _resolve_campaign_close_backend() == "dnslabctl":
+        return _run_dnslabctl_campaign_close(budget_sec=budget_sec)
+
     if budget_sec <= 0:
         raise CampaignCloseError("--budget-sec 必须大于 0")
 

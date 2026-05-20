@@ -158,7 +158,7 @@ def _cmd_follow_diff(_: argparse.Namespace) -> int:
 
 def _cmd_follow_diff_once(_: argparse.Namespace) -> int:
     try:
-        if _use_dnslabctl_backend():
+        if _use_dnslabctl_backend(default=True):
             return _run_dnslabctl(["follow-diff-once"])
         return follow_diff_once()
     except (FollowDiffError, DnslabctlForwardError, RuntimeError) as exc:
@@ -169,7 +169,7 @@ def _cmd_follow_diff_once(_: argparse.Namespace) -> int:
 
 def _cmd_follow_diff_window(args: argparse.Namespace) -> int:
     try:
-        if _use_dnslabctl_backend():
+        if _use_dnslabctl_backend(default=True):
             command = ["follow-diff-window", "--budget-sec", str(args.budget_sec)]
             if args.retry_failed:
                 command.append("--retry-failed")
@@ -301,14 +301,26 @@ def _cmd_campaign_report(args: argparse.Namespace) -> int:
 
 def _cmd_case_study_export(args: argparse.Namespace) -> int:
     try:
+        if _use_dnslabctl_backend(default=True):
+            command = [
+                "case-study-export",
+                "--root",
+                str(args.root),
+                "--campaign-report-dir",
+                str(args.campaign_report_dir),
+            ]
+            if args.top_n != 5:
+                command.extend(["--top-n", str(args.top_n)])
+            return _run_dnslabctl(command)
         return export_case_studies(
             Path(args.root),
             Path(args.campaign_report_dir),
             top_n=args.top_n,
         )
-    except CaseStudyError as exc:
+    except (CaseStudyError, DnslabctlForwardError, RuntimeError) as exc:
+        _write_forward_failure_stdout(exc)
         sys.stderr.write(f"dns-diff: case-study-export 失败: {exc}\n")
-        return exc.exit_code
+        return getattr(exc, "exit_code", 2)
 
 
 def _cmd_campaign_close(args: argparse.Namespace) -> int:
@@ -391,8 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "dns-diff Python 真入口；target/resolver 选择统一走 registry，"
             "thin wrapper 只做兼容转发与环境注入。"
-            "默认由 Python 处理 follow-diff/onetime/window，"
-            "默认由 dnslabctl 处理 report、campaign-report、campaign-close。"
+            "默认优先由 dnslabctl 处理 follow-diff-once/window、report、"
+            "campaign-report、case-study-export、campaign-close。"
             "设置 DNS_DIFF_CLI_BACKEND=python/dnslabctl 可显式覆盖。"
         ),
     )

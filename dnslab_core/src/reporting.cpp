@@ -20,6 +20,7 @@ constexpr const char *kSemanticFrontierManifestContractName =
     "semantic_frontier_manifest";
 constexpr const char *kPublicationEvidenceBundleContractName =
     "publication_evidence_bundle";
+constexpr size_t kMaxCaseStudies = 5;
 
 const std::vector<std::string> kOracleFields = {
     "parse_ok",          "resolver_fetch_started", "response_accepted",
@@ -784,6 +785,24 @@ struct TriageReportSnapshot {
   size_t TotalSamples = 0;
 };
 
+struct ResolverEvidenceContext {
+  std::string Primary = "bind9";
+  std::string Secondary = "unbound";
+  std::string PrimaryStderrName = "bind9.stderr";
+  std::string SecondaryStderrName = "unbound.stderr";
+};
+
+struct CaseStudyCandidateRecord {
+  std::string SampleId;
+  std::filesystem::path SampleDir;
+  std::string SemanticOutcome;
+  std::string SelectionReason;
+  json::Value::Object TriagePayload;
+};
+
+std::vector<std::string> coerceStringList(const json::Value *Value);
+json::Value::Object coerceObjectOrEmpty(const json::Value *Value);
+
 TriageReportSnapshot
 collectTriageReportSnapshot(const std::filesystem::path &Root) {
   if (!std::filesystem::exists(Root) || !std::filesystem::is_directory(Root)) {
@@ -943,6 +962,358 @@ std::string buildTriageReportMarkdown(const TriageReportSnapshot &Snapshot) {
     }
   }
   return Stream.str() + '\n';
+}
+
+std::string buildCaseStudySelectionReason(const std::string &SemanticOutcome) {
+  if (SemanticOutcome == "oracle_and_cache_diff" ||
+      SemanticOutcome == "oracle_diff") {
+    return "analysis_state=included 且 semantic_outcome=" + SemanticOutcome +
+           "，属于高优先级 oracle 语义差异 case study 候选";
+  }
+  return "analysis_state=included 且 semantic_outcome=cache_diff_interesting，"
+         "属于次优先级 cache 差异兴趣样本候选";
+}
+
+int caseStudyPriority(const std::string &SemanticOutcome) {
+  if (SemanticOutcome == "oracle_and_cache_diff" ||
+      SemanticOutcome == "oracle_diff") {
+    return 0;
+  }
+  if (SemanticOutcome == "cache_diff_interesting") {
+    return 1;
+  }
+  return 2;
+}
+
+bool caseStudyCandidateLess(const CaseStudyCandidateRecord &Left,
+                            const CaseStudyCandidateRecord &Right) {
+  const int LeftPriority = caseStudyPriority(Left.SemanticOutcome);
+  const int RightPriority = caseStudyPriority(Right.SemanticOutcome);
+  if (LeftPriority != RightPriority) {
+    return LeftPriority < RightPriority;
+  }
+  if (Left.SampleId != Right.SampleId) {
+    return Left.SampleId < Right.SampleId;
+  }
+  return Left.SampleDir < Right.SampleDir;
+}
+
+bool hasSuffix(const std::string &Value, const std::string &Suffix) {
+  return Value.size() >= Suffix.size() &&
+         Value.compare(Value.size() - Suffix.size(), Suffix.size(), Suffix) == 0;
+}
+
+std::string inferSecondaryResolverName(
+    const json::Value::Object *SampleMetaPayload,
+    const json::Value::Object &OraclePayload) {
+  if (SampleMetaPayload != nullptr) {
+    const auto *ArtifactsValue = findObjectValue(*SampleMetaPayload, "artifacts");
+    const auto *ArtifactsObject =
+        ArtifactsValue
+            ? std::get_if<json::Value::Object>(&ArtifactsValue->storage())
+            : nullptr;
+    if (ArtifactsObject != nullptr) {
+      for (const auto &[Key, Value] : *ArtifactsObject) {
+        (void)Value;
+        if (hasSuffix(Key, "_stderr") && Key != "bind9_stderr") {
+          return Key.substr(0, Key.size() - std::string("_stderr").size());
+        }
+      }
+    }
+  }
+
+  for (const auto &[Key, Value] : OraclePayload) {
+    (void)Value;
+    const auto Separator = Key.find('.');
+    if (Separator == std::string::npos) {
+      continue;
+    }
+    const auto Prefix = Key.substr(0, Separator);
+    if (Prefix != "bind9") {
+      return Prefix;
+    }
+  }
+  return "unbound";
+}
+
+ResolverEvidenceContext buildResolverEvidenceContext(
+    const json::Value::Object *SampleMetaPayload,
+    const json::Value::Object &OraclePayload) {
+  ResolverEvidenceContext Output;
+  Output.Secondary = inferSecondaryResolverName(SampleMetaPayload, OraclePayload);
+  Output.SecondaryStderrName = Output.Secondary + ".stderr";
+  return Output;
+}
+
+json::Value::Array buildStringArray(const std::vector<std::string> &Items) {
+  json::Value::Array Output;
+  for (const auto &Item : Items) {
+    Output.emplace_back(Item);
+  }
+  return Output;
+}
+
+std::string valueOrNullText(const json::Value *Value) {
+  return Value == nullptr ? "null" : stableJsonText(*Value);
+}
+
+std::vector<std::string>
+buildOracleDiffFields(const json::Value::Object &OraclePayload,
+                      const std::string &SecondaryResolver) {
+  std::vector<std::string> Output;
+  for (const auto &Field : kOracleFields) {
+    const auto Left = valueOrNullText(
+        findObjectValue(OraclePayload, "bind9." + Field));
+    const auto Right = valueOrNullText(
+        findObjectValue(OraclePayload, SecondaryResolver + "." + Field));
+    if (Left != Right) {
+      Output.push_back(Field);
+    }
+  }
+  return Output;
+}
+
+bool caseStudyResolverBool(const json::Value::Object &CacheDiffPayload,
+                           const std::string &Resolver,
+                           const std::string &Key) {
+  const auto *ResolverValue = findObjectValue(CacheDiffPayload, Resolver);
+  const auto ResolverObject = coerceObjectOrEmpty(ResolverValue);
+  return coerceBool(findObjectValue(ResolverObject, Key));
+}
+
+std::int64_t caseStudyResolverInt(const json::Value::Object &CacheDiffPayload,
+                                  const std::string &Resolver,
+                                  const std::string &Key) {
+  const auto *ResolverValue = findObjectValue(CacheDiffPayload, Resolver);
+  const auto ResolverObject = coerceObjectOrEmpty(ResolverValue);
+  return coerceInt64(findObjectValue(ResolverObject, Key), 0);
+}
+
+json::Value::Object buildStderrPreview(const std::filesystem::path &Path,
+                                       size_t MaxLines = 20) {
+  json::Value::Object Output;
+  Output["path"] = normalizePath(Path).string();
+  if (!std::filesystem::is_regular_file(Path)) {
+    Output["exists"] = false;
+    Output["tail_preview"] = json::Value::Array{};
+    return Output;
+  }
+
+  Output["exists"] = true;
+  std::istringstream Stream(readTextFile(Path));
+  std::vector<std::string> Lines;
+  std::string Line;
+  while (std::getline(Stream, Line)) {
+    Lines.push_back(Line);
+  }
+  const size_t Start =
+      Lines.size() > MaxLines ? Lines.size() - MaxLines : 0U;
+  json::Value::Array Preview;
+  for (size_t Index = Start; Index < Lines.size(); ++Index) {
+    Preview.emplace_back(Lines[Index]);
+  }
+  Output["tail_preview"] = Preview;
+  return Output;
+}
+
+json::Value::Object buildSampleBinEvidence(const std::filesystem::path &Path) {
+  json::Value::Object Output;
+  Output["path"] = normalizePath(Path).string();
+  if (!std::filesystem::is_regular_file(Path)) {
+    Output["exists"] = false;
+    Output["size"] = static_cast<std::int64_t>(0);
+    return Output;
+  }
+  Output["exists"] = true;
+  Output["size"] = static_cast<std::int64_t>(std::filesystem::file_size(Path));
+  return Output;
+}
+
+std::vector<CaseStudyCandidateRecord>
+collectCaseStudyCandidates(const std::filesystem::path &Root) {
+  std::vector<CaseStudyCandidateRecord> Output;
+  for (const auto &SampleDir : collectSampleDirs(Root)) {
+    const auto TriagePayload = loadTriagePayload(SampleDir);
+    const auto AnalysisState =
+        coerceAnalysisState(findObjectValue(TriagePayload, "analysis_state"));
+    const auto SemanticOutcome =
+        coerceText(findObjectValue(TriagePayload, "semantic_outcome"),
+                   "unknown");
+    if (AnalysisState != "included") {
+      continue;
+    }
+    if (SemanticOutcome != "oracle_diff" &&
+        SemanticOutcome != "oracle_and_cache_diff" &&
+        SemanticOutcome != "cache_diff_interesting") {
+      continue;
+    }
+
+    CaseStudyCandidateRecord Candidate;
+    Candidate.SampleId =
+        coerceText(findObjectValue(TriagePayload, "sample_id"),
+                   SampleDir.filename().string());
+    Candidate.SampleDir = normalizePath(SampleDir);
+    Candidate.SemanticOutcome = SemanticOutcome;
+    Candidate.SelectionReason = buildCaseStudySelectionReason(SemanticOutcome);
+    Candidate.TriagePayload = TriagePayload;
+    Output.push_back(std::move(Candidate));
+  }
+
+  std::sort(Output.begin(), Output.end(), caseStudyCandidateLess);
+  return Output;
+}
+
+json::Value::Object
+buildCaseStudyAutomatedSummary(const std::string &SemanticOutcome,
+                               const ResolverEvidenceContext &ResolverContext,
+                               const json::Value::Object &TriagePayload,
+                               const json::Value::Object &OraclePayload,
+                               const json::Value::Object &CacheDiffPayload) {
+  const auto OracleDiffFields =
+      buildOracleDiffFields(OraclePayload, ResolverContext.Secondary);
+  const auto TriageStatus =
+      coerceText(findObjectValue(TriagePayload, "status"), "unknown");
+  const auto InterestingDeltaCount =
+      coerceInt64(findObjectValue(TriagePayload, "interesting_delta_count"), 0);
+  const bool NeedsManualReview =
+      coerceBool(findObjectValue(TriagePayload, "needs_manual_review"));
+  std::string SummaryText;
+  if (SemanticOutcome == "oracle_and_cache_diff") {
+    SummaryText =
+        "oracle 与 cache_diff 同时命中结构化差异，按固定规则属于最高优先级 case study。";
+  } else if (SemanticOutcome == "oracle_diff") {
+    SummaryText =
+        "oracle 存在 resolver 间字段差异，按固定规则属于最高优先级 case study。";
+  } else {
+    SummaryText =
+        "oracle 未命中优先差异，但 cache_diff 达到 interesting 阈值，按固定规则作为次优先级 case study。";
+  }
+
+  json::Value::Object Output;
+  Output["triage_status"] = TriageStatus;
+  Output["semantic_outcome"] = SemanticOutcome;
+  Output["oracle_diff_fields"] = buildStringArray(OracleDiffFields);
+  Output["cache_delta_triggered"] =
+      coerceBool(findObjectValue(CacheDiffPayload, "cache_delta_triggered"));
+  Output["interesting_delta_count"] = InterestingDeltaCount;
+  Output["needs_manual_review"] = NeedsManualReview;
+  Output["filter_labels"] =
+      buildStringArray(coerceStringList(findObjectValue(TriagePayload,
+                                                       "filter_labels")));
+  Output["notes"] =
+      buildStringArray(coerceStringList(findObjectValue(TriagePayload, "notes")));
+  Output["bind9_has_cache_diff"] =
+      caseStudyResolverBool(CacheDiffPayload, "bind9", "has_cache_diff");
+  Output[ResolverContext.Secondary + "_has_cache_diff"] =
+      caseStudyResolverBool(CacheDiffPayload, ResolverContext.Secondary,
+                            "has_cache_diff");
+  Output["bind9_interesting_delta_count"] =
+      caseStudyResolverInt(CacheDiffPayload, "bind9",
+                           "interesting_delta_count");
+  Output[ResolverContext.Secondary + "_interesting_delta_count"] =
+      caseStudyResolverInt(CacheDiffPayload, ResolverContext.Secondary,
+                           "interesting_delta_count");
+  Output["secondary_resolver"] = ResolverContext.Secondary;
+  Output["summary_text"] = SummaryText;
+  return Output;
+}
+
+json::Value::Object buildCaseStudyPayload(
+    const CaseStudyCandidateRecord &Candidate) {
+  const auto SampleDir = Candidate.SampleDir;
+  const auto SampleMetaPath = normalizePath(SampleDir / "sample.meta.json");
+  const auto OraclePath = normalizePath(SampleDir / "oracle.json");
+  const auto CacheDiffPath = normalizePath(SampleDir / "cache_diff.json");
+  const auto TriagePath = normalizePath(SampleDir / "triage.json");
+  const auto SampleBinPath = normalizePath(SampleDir / "sample.bin");
+  const auto SampleMetaPayload = loadSampleMetaPayload(SampleDir);
+  const auto OraclePayload =
+      loadRequiredObject(SampleDir, "oracle.json", "oracle.json");
+  const auto CacheDiffPayload =
+      loadRequiredObject(SampleDir, "cache_diff.json", "cache_diff.json");
+  const auto ResolverContext =
+      buildResolverEvidenceContext(&SampleMetaPayload, OraclePayload);
+  const auto Bind9StderrPath =
+      normalizePath(SampleDir / ResolverContext.PrimaryStderrName);
+  const auto SecondaryStderrPath =
+      normalizePath(SampleDir / ResolverContext.SecondaryStderrName);
+
+  json::Value::Object Paths;
+  Paths["sample_meta_path"] = SampleMetaPath.string();
+  Paths["oracle_path"] = OraclePath.string();
+  Paths["cache_diff_path"] = CacheDiffPath.string();
+  Paths["triage_path"] = TriagePath.string();
+  Paths["sample_bin_path"] = SampleBinPath.string();
+  Paths["bind9_stderr_path"] = Bind9StderrPath.string();
+  Paths[ResolverContext.Secondary + "_stderr_path"] =
+      SecondaryStderrPath.string();
+
+  json::Value::Object ResolverContextValue;
+  ResolverContextValue["primary"] = ResolverContext.Primary;
+  ResolverContextValue["secondary"] = ResolverContext.Secondary;
+
+  json::Value::Object RawEvidence;
+  RawEvidence["resolver_context"] = ResolverContextValue;
+  RawEvidence["paths"] = Paths;
+  RawEvidence["sample_meta"] = SampleMetaPayload;
+  RawEvidence["oracle"] = OraclePayload;
+  RawEvidence["cache_diff"] = CacheDiffPayload;
+  RawEvidence["triage"] = Candidate.TriagePayload;
+  RawEvidence["sample_bin"] = buildSampleBinEvidence(SampleBinPath);
+  json::Value::Object Stderr;
+  Stderr["bind9"] = buildStderrPreview(Bind9StderrPath);
+  Stderr[ResolverContext.Secondary] = buildStderrPreview(SecondaryStderrPath);
+  RawEvidence["stderr"] = Stderr;
+
+  json::Value::Object ManualTruth;
+  ManualTruth["status"] = "not_started";
+  ManualTruth["reviewer_primary"] = "";
+  ManualTruth["reviewer_secondary"] = "";
+  ManualTruth["adjudicator"] = "";
+  ManualTruth["judgment"] = "";
+  ManualTruth["notes"] = "";
+  ManualTruth["decided_at"] = "";
+
+  json::Value::Array ClaimScope;
+  ClaimScope.emplace_back(
+      "选样仅消费 triage.json 中已冻结的 analysis_state 与 semantic_outcome，不重算 publication 语义。");
+  ClaimScope.emplace_back(
+      "原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、sample.bin、bind9.stderr、" +
+      ResolverContext.Secondary + ".stderr。");
+
+  json::Value::Array Limitations;
+  Limitations.emplace_back(
+      "manual_truth 仅为 not_started scaffold，当前尚无人工双评或 adjudication 结论。");
+  Limitations.emplace_back(
+      "stderr 仅收录尾部预览；如需完整上下文，必须回看 raw_evidence.paths 指向的原始文件。");
+  Limitations.emplace_back(
+      "automated_summary 仅基于现有 triage/oracle/cache_diff 工件自动整理，不能替代人工判断。");
+
+  json::Value::Object Output;
+  Output["sample_id"] = Candidate.SampleId;
+  Output["selection_reason"] = Candidate.SelectionReason;
+  Output["raw_evidence"] = RawEvidence;
+  Output["automated_summary"] = buildCaseStudyAutomatedSummary(
+      Candidate.SemanticOutcome, ResolverContext, Candidate.TriagePayload,
+      OraclePayload, CacheDiffPayload);
+  Output["manual_truth"] = ManualTruth;
+  Output["claim_scope"] = ClaimScope;
+  Output["limitations"] = Limitations;
+  return Output;
+}
+
+std::string buildCaseStudyIndexContent(
+    const std::filesystem::path &OutputDir,
+    const std::vector<CaseStudyCandidateRecord> &Candidates) {
+  std::ostringstream Stream;
+  Stream << "sample_id\tsemantic_outcome\tselection_reason\tcase_study_path\n";
+  for (const auto &Candidate : Candidates) {
+    Stream << Candidate.SampleId << '\t' << Candidate.SemanticOutcome << '\t'
+           << Candidate.SelectionReason << '\t'
+           << normalizePath(OutputDir / (Candidate.SampleId + ".json")).string()
+           << '\n';
+  }
+  return Stream.str();
 }
 
 std::optional<std::filesystem::path>
@@ -1807,7 +2178,7 @@ buildRegenerationCommands(const std::filesystem::path &Root,
     Commands["campaign_report"] += " --output-dir " + ReportBase->string();
   }
   Commands["case_study_export"] =
-      "python3 -m tools.dns_diff.cli case-study-export --root " + Root.string() +
+      DnslabctlBin + " case-study-export --root " + Root.string() +
       " --campaign-report-dir " + ReportDir.string();
   return Commands;
 }
@@ -2098,6 +2469,44 @@ generateTriageReportArtifacts(const std::filesystem::path &Root,
   Output.TriageReportMarkdownPath = TriageReportMarkdownPath;
   Output.SampleCount = Snapshot.TotalSamples;
   Output.SemanticFrontierEntryCount = Snapshot.SemanticFrontierEntries.size();
+  return Output;
+}
+
+CaseStudyExportArtifacts
+exportCaseStudies(const std::filesystem::path &Root,
+                  const std::filesystem::path &CampaignReportDir,
+                  size_t TopN) {
+  const auto ResolvedRoot = normalizePath(Root);
+  if (!std::filesystem::exists(ResolvedRoot) ||
+      !std::filesystem::is_directory(ResolvedRoot)) {
+    throw std::runtime_error("follow_diff 根目录不存在或不是目录: " +
+                             ResolvedRoot.string());
+  }
+
+  const auto ReportDir = normalizePath(CampaignReportDir);
+  const auto OutputDir = normalizePath(ReportDir / "case_studies");
+  std::filesystem::create_directories(OutputDir);
+
+  auto Candidates = collectCaseStudyCandidates(ResolvedRoot);
+  const auto Limit = std::min(TopN, kMaxCaseStudies);
+  if (Candidates.size() > Limit) {
+    Candidates.resize(Limit);
+  }
+
+  for (const auto &Candidate : Candidates) {
+    writeJsonFile(OutputDir / (Candidate.SampleId + ".json"),
+                  buildCaseStudyPayload(Candidate));
+  }
+
+  const auto IndexPath = normalizePath(OutputDir / "index.tsv");
+  writeTextFile(IndexPath, buildCaseStudyIndexContent(OutputDir, Candidates));
+
+  CaseStudyExportArtifacts Output;
+  Output.Root = ResolvedRoot;
+  Output.ReportDir = ReportDir;
+  Output.OutputDir = OutputDir;
+  Output.IndexPath = IndexPath;
+  Output.SelectedCount = Candidates.size();
   return Output;
 }
 
@@ -2569,6 +2978,16 @@ json::Value toJson(const TriageReportArtifacts &Input) {
   Output["sample_count"] = static_cast<std::int64_t>(Input.SampleCount);
   Output["semantic_frontier_entry_count"] =
       static_cast<std::int64_t>(Input.SemanticFrontierEntryCount);
+  return Output;
+}
+
+json::Value toJson(const CaseStudyExportArtifacts &Input) {
+  json::Value::Object Output;
+  Output["root"] = Input.Root.string();
+  Output["report_dir"] = Input.ReportDir.string();
+  Output["output_dir"] = Input.OutputDir.string();
+  Output["index"] = Input.IndexPath.string();
+  Output["selected_count"] = static_cast<std::int64_t>(Input.SelectedCount);
   return Output;
 }
 

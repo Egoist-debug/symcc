@@ -26,11 +26,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <isc/app.h>
 #include <isc/netmgr.h>
 #include <isc/result.h>
 #include <isc/util.h>
 
+#include <dns/cache.h>
 #include <dns/dispatch.h>
 #include <dns/view.h>
 
@@ -155,13 +155,7 @@ maybe_dump_cache(void) {
 			dumped_shared_cache = true;
 		}
 
-		result = dns_view_dumpdbtostream(view, fp);
-		if (result != ISC_R_SUCCESS) {
-			fprintf(stderr,
-				"[resolver-afl-symcc] cache dump failed: %s\n",
-				isc_result_totext(result));
-			break;
-		}
+		dns_cache_dumpstats(view->cache, fp);
 	}
 
 	fclose(fp);
@@ -339,7 +333,9 @@ shutdown_named(void) {
 	if (named_g_server != NULL) {
 		named_server_flushonshutdown(named_g_server, false);
 	}
-	isc_app_shutdown();
+	if (named_g_loopmgr != NULL) {
+		isc_loopmgr_shutdown(named_g_loopmgr);
+	}
 }
 
 static void
@@ -731,7 +727,6 @@ cancel_request_client(ns_client_t *client) {
 	}
 
 	client->sendcb = NULL;
-	client->shuttingdown = true;
 	ns_query_cancel(client);
 }
 
@@ -798,12 +793,9 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 
 	ifp.mgr = named_g_server->interfacemgr;
 	clientmgr = ns_interfacemgr_getclientmgr(ifp.mgr);
-	client = isc_nmhandle_getextra(handle);
-	result = ns__client_setup(client, clientmgr, true);
-	if (result != ISC_R_SUCCESS) {
-		finish_request_context(ctx, result);
-		return;
-	}
+	client = isc_nmhandle_getdata(handle);
+	ns__client_setup(client, clientmgr, true);
+	result = ISC_R_SUCCESS;
 	isc_nmhandle_setdata(handle, client, ns__client_reset_cb,
 			     ns__client_put_cb);
 	client->handle = handle;
@@ -817,7 +809,6 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 	pthread_mutex_unlock(&ctx->mutex);
 
 	if (timed_out) {
-		client->shuttingdown = true;
 		isc_nmhandle_detach(&handle);
 		finish_request_context(ctx, ISC_R_TIMEDOUT);
 		return;
@@ -827,7 +818,7 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 	region.base = (unsigned char *)ctx->request;
 	region.length = (unsigned int)ctx->request_len;
 
-	ns__client_request(handle, ISC_R_SUCCESS, &region, &ifp);
+	ns_client_request(handle, ISC_R_SUCCESS, &region, &ifp);
 }
 
 static isc_result_t
@@ -887,7 +878,7 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 	set_request_context(ctx);
 	isc_nm_udpconnect(named_g_netmgr, &local, &peer,
 			  resolver_afl_symcc_request_connected, ctx,
-			  (unsigned int)timeout_ms, sizeof(ns_client_t));
+			  (unsigned int)timeout_ms);
 
 	clock_gettime(CLOCK_REALTIME, &deadline);
 	deadline.tv_sec += timeout_ms / 1000;

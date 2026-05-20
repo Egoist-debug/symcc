@@ -150,7 +150,25 @@ printf 'seed\n' >"$RESPONSE_CORPUS_DIR/seed.txt"
 write_fake_bind9_binary "$BIND9_BIN"
 write_fake_smartdns_binary "$SMARTDNS_BIN"
 write_fake_smartdns_harness "$SMARTDNS_HARNESS"
-printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
+python3 - "$SAMPLE_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+query = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
+response = (
+    b'\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00'
+    b'\x07example\x03com\x00\x00\x01\x00\x01'
+    b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04'
+)
+post = b'\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
+wire = bytearray(b'DST1')
+wire += bytes([1, 2])
+wire += len(query).to_bytes(2, 'little')
+wire += len(response).to_bytes(2, 'little')
+wire += query + response + post
+path.write_bytes(wire)
+PY
 
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
@@ -168,15 +186,17 @@ env \
 	SMARTDNS_HARNESS_SCRIPT="$SMARTDNS_HARNESS" \
 	python3 -m tools.dns_diff.cli follow-diff-once >/dev/null
 
-SAMPLE_DIR="$(find "$WORK_STATEFUL/follow_diff" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+SAMPLE_META="$(find "$WORK_STATEFUL/follow_diff" -maxdepth 2 -mindepth 2 -type f -name sample.meta.json | sort | head -n 1)"
+assert_file_exists "$SAMPLE_META"
+SAMPLE_DIR="$(dirname "$SAMPLE_META")"
 assert_file_exists "$SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$SAMPLE_DIR/oracle.json"
 assert_file_exists "$SAMPLE_DIR/cache_diff.json"
 assert_file_exists "$SAMPLE_DIR/triage.json"
-assert_file_exists "$SAMPLE_DIR/bind9.before.cache.txt"
-assert_file_exists "$SAMPLE_DIR/bind9.after.cache.txt"
-assert_file_exists "$SAMPLE_DIR/smartdns.before.cache.txt"
-assert_file_exists "$SAMPLE_DIR/smartdns.after.cache.txt"
+assert_file_exists "$SAMPLE_DIR/bind9/bind9.before.cache.txt"
+assert_file_exists "$SAMPLE_DIR/bind9/bind9.after.cache.txt"
+assert_file_exists "$SAMPLE_DIR/smartdns/smartdns.before.cache.txt"
+assert_file_exists "$SAMPLE_DIR/smartdns/smartdns.after.cache.txt"
 assert_dir_exists "$SAMPLE_DIR/bind9"
 assert_dir_exists "$SAMPLE_DIR/smartdns"
 
@@ -189,7 +209,7 @@ sample_dir = pathlib.Path(sys.argv[1])
 meta = json.loads((sample_dir / "sample.meta.json").read_text(encoding="utf-8"))
 triage = json.loads((sample_dir / "triage.json").read_text(encoding="utf-8"))
 artifacts = meta.get("artifacts", {})
-if artifacts.get("smartdns_stderr") != "smartdns.stderr":
+if artifacts.get("smartdns_stderr") != "smartdns/smartdns.stderr":
     raise SystemExit(f"ASSERT FAIL: artifacts 未保留 smartdns_stderr: {artifacts!r}")
 if meta.get("status") != "completed":
     raise SystemExit(f"ASSERT FAIL: sample.meta.status={meta.get('status')!r}")

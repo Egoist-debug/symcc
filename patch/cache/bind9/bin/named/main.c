@@ -19,13 +19,13 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <uv.h>
 
 #ifdef HAVE_DNSTAP
 #include <protobuf-c/protobuf-c.h>
 #endif
 
-#include <isc/app.h>
 #include <isc/attributes.h>
 #include <isc/backtrace.h>
 #include <isc/commandline.h>
@@ -37,11 +37,9 @@
 #include <isc/netmgr.h>
 #include <isc/os.h>
 #include <isc/print.h>
-#include <isc/resource.h>
 #include <isc/result.h>
 #include <isc/stdio.h>
 #include <isc/string.h>
-#include <isc/task.h>
 #include <isc/timer.h>
 #include <isc/util.h>
 
@@ -700,7 +698,6 @@ printversion(bool verbose) {
 	printf("  DNSSEC root key:      %s\n", named_g_defaultbindkeys);
 	printf("  nsupdate session key: %s\n", named_g_defaultsessionkeyfile);
 	printf("  named PID file:       %s\n", named_g_defaultpidfile);
-	printf("  named lock file:      %s\n", named_g_defaultlockfile);
 #if defined(HAVE_GEOIP2)
 #define RTC(x) RUNTIME_CHECK((x) == ISC_R_SUCCESS)
 	RTC(cfg_parser_create(mctx, named_g_lctx, &parser));
@@ -993,9 +990,8 @@ parse_command_line(int argc, char *argv[]) {
 			parse_T_opt(isc_commandline_argument);
 			break;
 		case 'U':
-			named_g_udpdisp = parse_int(isc_commandline_argument,
-						    "number of UDP listeners "
-						    "per interface");
+			/* Obsolete.  No longer in use.  Ignore. */
+			named_main_earlywarning("option '-U' has been removed");
 			break;
 		case 'u':
 			named_g_username = isc_commandline_argument;
@@ -1010,13 +1006,8 @@ parse_command_line(int argc, char *argv[]) {
 			/* Obsolete. No longer in use. Ignore. */
 			break;
 		case 'X':
-			named_g_forcelock = true;
-			if (strcasecmp(isc_commandline_argument, "none") != 0) {
-				named_g_defaultlockfile =
-					isc_commandline_argument;
-			} else {
-				named_g_defaultlockfile = NULL;
-			}
+			/* Obsolete. No longer in use. Abort. */
+			named_main_earlyfatal("option '-X' has been removed");
 			break;
 		case 'F':
 			/* Reserved for FIPS mode */
@@ -1054,8 +1045,6 @@ parse_command_line(int argc, char *argv[]) {
 
 static isc_result_t
 create_managers(void) {
-	isc_result_t result;
-
 	INSIST(named_g_cpus_detected > 0);
 
 	if (named_g_cpus == 0) {
@@ -1066,23 +1055,9 @@ create_managers(void) {
 		ISC_LOG_INFO, "found %u CPU%s, using %u worker thread%s",
 		named_g_cpus_detected, named_g_cpus_detected == 1 ? "" : "s",
 		named_g_cpus, named_g_cpus == 1 ? "" : "s");
-	if (named_g_udpdisp == 0) {
-		named_g_udpdisp = named_g_cpus_detected;
-	}
-	if (named_g_udpdisp > named_g_cpus) {
-		named_g_udpdisp = named_g_cpus;
-	}
-	isc_log_write(named_g_lctx, NAMED_LOGCATEGORY_GENERAL,
-		      NAMED_LOGMODULE_SERVER, ISC_LOG_INFO,
-		      "using %u UDP listener%s per interface", named_g_udpdisp,
-		      named_g_udpdisp == 1 ? "" : "s");
 
-	result = isc_managers_create(named_g_mctx, named_g_cpus,
-				     0 /* quantum */, &named_g_netmgr,
-				     &named_g_taskmgr, &named_g_timermgr);
-	if (result != ISC_R_SUCCESS) {
-		return result;
-	}
+	isc_managers_create(&named_g_mctx, named_g_cpus, &named_g_loopmgr,
+			    &named_g_netmgr);
 
 	isc_nm_maxudp(named_g_netmgr, maxudp);
 
@@ -1091,14 +1066,18 @@ create_managers(void) {
 
 static void
 destroy_managers(void) {
-	isc_managers_destroy(&named_g_netmgr, &named_g_taskmgr,
-			     &named_g_timermgr);
+	isc_managers_destroy(&named_g_mctx, &named_g_loopmgr, &named_g_netmgr);
 }
 
 static void
 setup(void) {
 	isc_result_t result;
-	isc_resourcevalue_t old_openfiles;
+	struct rlimit rl;
+	uint64_t initstacksize = 0;
+	uint64_t initdatasize = 0;
+	uint64_t initcoresize = 0;
+	uint64_t initopenfiles = 0;
+	uint64_t old_openfiles = 0;
 	ns_server_t *sctx;
 #ifdef HAVE_LIBSCF
 	char *instance = NULL;
@@ -1164,16 +1143,6 @@ setup(void) {
 	 */
 	if (!named_g_foreground) {
 		named_os_daemonize();
-	}
-
-	/*
-	 * We call isc_app_start() here as some versions of FreeBSD's fork()
-	 * destroys all the signal handling it sets up.
-	 */
-	result = isc_app_start();
-	if (result != ISC_R_SUCCESS) {
-		named_main_earlyfatal("isc_app_start() failed: %s",
-				      isc_result_totext(result));
 	}
 
 	isc_log_write(named_g_lctx, NAMED_LOGCATEGORY_GENERAL,
@@ -1291,35 +1260,30 @@ setup(void) {
 	/*
 	 * Get the initial resource limits.
 	 */
-	RUNTIME_CHECK(isc_resource_getlimit(isc_resource_stacksize,
-					    &named_g_initstacksize) ==
-		      ISC_R_SUCCESS);
-	RUNTIME_CHECK(isc_resource_getlimit(isc_resource_datasize,
-					    &named_g_initdatasize) ==
-		      ISC_R_SUCCESS);
-	RUNTIME_CHECK(isc_resource_getlimit(isc_resource_coresize,
-					    &named_g_initcoresize) ==
-		      ISC_R_SUCCESS);
-	RUNTIME_CHECK(isc_resource_getlimit(isc_resource_openfiles,
-					    &named_g_initopenfiles) ==
-		      ISC_R_SUCCESS);
+	RUNTIME_CHECK(getrlimit(RLIMIT_STACK, &rl) == 0);
+	initstacksize = (uint64_t)rl.rlim_cur;
+	RUNTIME_CHECK(getrlimit(RLIMIT_DATA, &rl) == 0);
+	initdatasize = (uint64_t)rl.rlim_cur;
+	RUNTIME_CHECK(getrlimit(RLIMIT_CORE, &rl) == 0);
+	initcoresize = (uint64_t)rl.rlim_cur;
+	RUNTIME_CHECK(getrlimit(RLIMIT_NOFILE, &rl) == 0);
+	initopenfiles = (uint64_t)rl.rlim_cur;
 
 	/*
 	 * System resources cannot effectively be tuned on some systems.
 	 * Raise the limit in such cases for safety.
 	 */
-	old_openfiles = named_g_initopenfiles;
+	old_openfiles = initopenfiles;
 	named_os_adjustnofile();
-	RUNTIME_CHECK(isc_resource_getlimit(isc_resource_openfiles,
-					    &named_g_initopenfiles) ==
-		      ISC_R_SUCCESS);
-	if (old_openfiles != named_g_initopenfiles) {
+	RUNTIME_CHECK(getrlimit(RLIMIT_NOFILE, &rl) == 0);
+	initopenfiles = (uint64_t)rl.rlim_cur;
+	if (old_openfiles != initopenfiles) {
 		isc_log_write(named_g_lctx, NAMED_LOGCATEGORY_GENERAL,
 			      NAMED_LOGMODULE_MAIN, ISC_LOG_NOTICE,
 			      "adjusted limit on open files from "
 			      "%" PRIu64 " to "
 			      "%" PRIu64,
-			      old_openfiles, named_g_initopenfiles);
+			      old_openfiles, initopenfiles);
 	}
 
 	/*
@@ -1342,11 +1306,7 @@ setup(void) {
 	/*
 	 * Record the server's startup time.
 	 */
-	result = isc_time_now(&named_g_boottime);
-	if (result != ISC_R_SUCCESS) {
-		named_main_earlyfatal("isc_time_now() failed: %s",
-				      isc_result_totext(result));
-	}
+	named_g_boottime = isc_time_now();
 
 	result = create_managers();
 	if (result != ISC_R_SUCCESS) {
@@ -1652,20 +1612,7 @@ main(int argc, char *argv[]) {
 	 * Start things running and then wait for a shutdown request
 	 * or reload.
 	 */
-	do {
-		result = isc_app_run();
-
-		if (result == ISC_R_RELOAD) {
-			named_server_reloadwanted(named_g_server);
-		} else if (result != ISC_R_SUCCESS) {
-			UNEXPECTED_ERROR("isc_app_run(): %s",
-					 isc_result_totext(result));
-			/*
-			 * Force exit.
-			 */
-			result = ISC_R_SUCCESS;
-		}
-	} while (result != ISC_R_SUCCESS);
+	isc_loopmgr_run(named_g_loopmgr);
 
 #ifdef HAVE_LIBSCF
 	if (named_smf_want_disable == 1) {
@@ -1708,8 +1655,6 @@ main(int argc, char *argv[]) {
 	isc_mem_checkdestroyed(stderr);
 
 	named_main_setmemstats(NULL);
-
-	isc_app_finish();
 
 	named_os_closedevnull();
 

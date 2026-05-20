@@ -249,17 +249,17 @@ summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
 if stdout_payload.get("exit_code") != 0:
     raise SystemExit(f"ASSERT FAIL: campaign-close stdout exit_code={stdout_payload.get('exit_code')!r}")
-if summary.get("status") != "completed":
+if summary.get("status") != "success":
     raise SystemExit(f"ASSERT FAIL: campaign_close.status={summary.get('status')!r}")
-if summary.get("exit_reason") != "completed":
+if summary.get("exit_reason") != "success":
     raise SystemExit(f"ASSERT FAIL: campaign_close.exit_reason={summary.get('exit_reason')!r}")
 for phase in ("follow-diff-window", "triage-report", "campaign-report"):
     phase_payload = (summary.get("phases") or {}).get(phase) or {}
-    if phase_payload.get("status") != "completed":
+    if phase_payload.get("status") != "success":
         raise SystemExit(f"ASSERT FAIL: phase {phase} status={phase_payload.get('status')!r}")
 metric_denominators = summary.get("metric_denominators") or {}
-if metric_denominators.get("sample_count", 0) < 1:
-    raise SystemExit(f"ASSERT FAIL: sample_count={metric_denominators.get('sample_count')!r}")
+if metric_denominators.get("total_samples", 0) < 1:
+    raise SystemExit(f"ASSERT FAIL: total_samples={metric_denominators.get('total_samples')!r}")
 triage_report = ((summary.get("phase_context") or {}).get("triage_report")) or {}
 if not triage_report.get("root"):
     raise SystemExit("ASSERT FAIL: phase_context.triage_report.root 缺失")

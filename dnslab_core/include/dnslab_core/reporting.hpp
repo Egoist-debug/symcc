@@ -61,6 +61,14 @@ struct TriageReportArtifacts {
   size_t SemanticFrontierEntryCount = 0;
 };
 
+struct CaseStudyExportArtifacts {
+  std::filesystem::path Root;
+  std::filesystem::path ReportDir;
+  std::filesystem::path OutputDir;
+  std::filesystem::path IndexPath;
+  size_t SelectedCount = 0;
+};
+
 struct CampaignReportArtifacts {
   std::filesystem::path Root;
   std::filesystem::path ReportDir;
@@ -92,6 +100,10 @@ TriageReportArtifacts
 generateTriageReportArtifacts(const std::filesystem::path &Root,
                               const std::optional<std::filesystem::path>
                                   &HighValueManifestPath = std::nullopt);
+CaseStudyExportArtifacts
+exportCaseStudies(const std::filesystem::path &Root,
+                  const std::filesystem::path &CampaignReportDir,
+                  size_t TopN = 5);
 CampaignReportArtifacts
 generateCampaignReportArtifacts(const std::filesystem::path &Root,
                                 const std::optional<std::filesystem::path>
@@ -108,6 +120,7 @@ json::Value toJson(const ReportArtifact &Input);
 json::Value toJson(const EvidenceBundle &Input);
 json::Value toJson(const SemanticFrontierEntry &Input);
 json::Value toJson(const TriageReportArtifacts &Input);
+json::Value toJson(const CaseStudyExportArtifacts &Input);
 json::Value toJson(const CampaignReportArtifacts &Input);
 
 } // namespace dnslab

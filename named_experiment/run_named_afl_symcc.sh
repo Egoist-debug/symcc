@@ -677,11 +677,63 @@ copy_if_different() {
 apply_bind9_tree_compat_fixes() {
 	local tree="$1"
 	local qp_file="$tree/lib/dns/qp.c"
+	local baseline_root="$tree/.symcc_patch_baseline/files"
+	local full_restore_files=(
+		"lib/ns/client.c"
+	)
+	local legacy_print_include_files=(
+		"$tree/lib/dns/dispatch.c"
+		"$tree/lib/ns/client.c"
+		"$tree/bin/named/main.c"
+	)
+	local dispatchmgr_call_fixups=(
+		"$tree/lib/dns/client.c|dns_dispatchmgr_create\\(mctx,\\s*nm,\\s*(&client->dispatchmgr)\\)|dns_dispatchmgr_create(mctx, loopmgr, nm, \$1)"
+		"$tree/tests/dns/dispatch_test.c|dns_dispatchmgr_create\\(mctx,\\s*connect_nm,\\s*(&[^)]+)\\)|dns_dispatchmgr_create(mctx, loopmgr, connect_nm, \$1)"
+		"$tree/tests/libtest/dns.c|dns_dispatchmgr_create\\(mctx,\\s*netmgr,\\s*(&dispatchmgr)\\)|dns_dispatchmgr_create(mctx, loopmgr, netmgr, \$1)"
+		"$tree/tests/libtest/ns.c|dns_dispatchmgr_create\\(mctx,\\s*netmgr,\\s*(&dispatchmgr)\\)|dns_dispatchmgr_create(mctx, loopmgr, netmgr, \$1)"
+		"$tree/bin/nsupdate/nsupdate.c|dns_dispatchmgr_create\\(gmctx,\\s*netmgr,\\s*(&dispatchmgr)\\)|dns_dispatchmgr_create(gmctx, loopmgr, netmgr, \$1)"
+		"$tree/bin/tools/mdig.c|dns_dispatchmgr_create\\(mctx,\\s*netmgr,\\s*(&dispatchmgr)\\)|dns_dispatchmgr_create(mctx, loopmgr, netmgr, \$1)"
+		"$tree/bin/named/server.c|dns_dispatchmgr_create\\(named_g_mctx,\\s*named_g_netmgr,\\s*(&named_g_dispatchmgr)\\)|dns_dispatchmgr_create(named_g_mctx, named_g_loopmgr, named_g_netmgr, \$1)"
+		"$tree/bin/tests/system/pipelined/pipequeries.c|dns_dispatchmgr_create\\(mctx,\\s*netmgr,\\s*(&dispatchmgr)\\)|dns_dispatchmgr_create(mctx, loopmgr, netmgr, \$1)"
+		"$tree/bin/delv/delv.c|dns_dispatchmgr_create\\(mctx,\\s*netmgr,\\s*(&dispatchmgr)\\)|dns_dispatchmgr_create(mctx, loopmgr, netmgr, \$1)"
+	)
+	local legacy_print_file=""
+	local dispatchmgr_fixup=""
+	local dispatchmgr_fixup_file=""
+	local dispatchmgr_fixup_pattern=""
+	local dispatchmgr_fixup_replacement=""
+	local full_restore_rel=""
 
 	if [ -f "$qp_file" ] && grep -Fq 'chunk_get_raw(dns_qp_t *qp) {' "$qp_file"; then
 		perl -0pi -e 's/chunk_get_raw\(dns_qp_t \*qp\) \{/chunk_get_raw(dns_qp_t *qp, size_t bytes) {/g' "$qp_file"
 		perl -0pi -e 's/size_t size = chunk_size_raw\(\);\n\t\tvoid \*ptr = mmap/size_t size = chunk_size_raw();\n\t\tINSIST(bytes <= size);\n\t\tvoid *ptr = mmap/g' "$qp_file"
 		perl -0pi -e 's/return isc_mem_allocate\(qp->mctx, QP_CHUNK_BYTES\);/return isc_mem_allocate(qp->mctx, bytes);/g' "$qp_file"
+	fi
+
+	for full_restore_rel in "${full_restore_files[@]}"; do
+		if [ -f "$baseline_root/$full_restore_rel" ]; then
+			copy_if_different \
+				"$baseline_root/$full_restore_rel" \
+				"$tree/$full_restore_rel"
+		fi
+	done
+
+	for dispatchmgr_fixup in "${dispatchmgr_call_fixups[@]}"; do
+		dispatchmgr_fixup_file="${dispatchmgr_fixup%%|*}"
+		dispatchmgr_fixup="${dispatchmgr_fixup#*|}"
+		dispatchmgr_fixup_pattern="${dispatchmgr_fixup%%|*}"
+		dispatchmgr_fixup_replacement="${dispatchmgr_fixup#*|}"
+		if [ -f "$dispatchmgr_fixup_file" ] && grep -Fq 'dns_dispatchmgr_create(' "$dispatchmgr_fixup_file"; then
+			perl -0pi -e "s/${dispatchmgr_fixup_pattern}/${dispatchmgr_fixup_replacement}/gs" "$dispatchmgr_fixup_file"
+		fi
+	done
+
+	if [ ! -f "$tree/lib/isc/include/isc/print.h" ]; then
+		for legacy_print_file in "${legacy_print_include_files[@]}"; do
+			if [ -f "$legacy_print_file" ] && grep -Fq '#include <isc/print.h>' "$legacy_print_file"; then
+				perl -0pi -e 's/^#include <isc\/print\.h>\n//m' "$legacy_print_file"
+			fi
+		done
 	fi
 }
 
@@ -802,7 +854,7 @@ build_helper_and_gen_input() {
 		cd "$ROOT_DIR"
 		HOME="$ROOT_DIR/.xmake-home" \
 		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
-		xmake f --backend=qsym -m release >/dev/null
+		xmake f -c --backend=qsym -m release >/dev/null
 		HOME="$ROOT_DIR/.xmake-home" \
 		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
 		xmake b symcc_fuzzing_helper
@@ -1022,7 +1074,6 @@ generate_seeds() {
 			-v \
 			-f dns-stateful-transcript \
 			--seed-dir "$TRANSCRIPT_SEED_MIX_DIR" \
-			--max-responses-per-transcript "$TRANSCRIPT_MAX_RESPONSES" \
 			-i "$TRANSCRIPT_MAX_ITER" \
 			-o "$TRANSCRIPT_CORPUS_DIR" \
 			"$TRANSCRIPT_GEN_TARGET" \

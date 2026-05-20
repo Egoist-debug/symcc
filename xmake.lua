@@ -1,7 +1,36 @@
 add_rules("mode.debug", "mode.release")
 
-local DEFAULT_SYMCC_LLVM_PREFIX = os.getenv("SYMCC_LLVM_PREFIX") or "/usr/lib/llvm-18"
-local DEFAULT_SYMCC_LLVM_MAJOR = os.getenv("SYMCC_LLVM_MAJOR") or "18"
+local function nonempty(value)
+    return value ~= nil and value ~= ""
+end
+
+local function detect_default_symcc_llvm()
+    local env_prefix = os.getenv("SYMCC_LLVM_PREFIX")
+    local env_major = os.getenv("SYMCC_LLVM_MAJOR")
+
+    if nonempty(env_prefix) then
+        local inferred_major = env_prefix:match("llvm%-(%d+)$") or env_major or "18"
+        return env_prefix, inferred_major
+    end
+
+    if nonempty(env_major) then
+        local prefixed = path.join("/usr/lib", "llvm-" .. env_major)
+        if os.isfile(path.join(prefixed, "bin", "clang++")) then
+            return prefixed, env_major
+        end
+    end
+
+    for _, major in ipairs({"20", "19", "18", "17", "16", "15", "14"}) do
+        local prefix = path.join("/usr/lib", "llvm-" .. major)
+        if os.isfile(path.join(prefix, "bin", "clang++")) then
+            return prefix, major
+        end
+    end
+
+    return "/usr/lib/llvm-18", "18"
+end
+
+local DEFAULT_SYMCC_LLVM_PREFIX, DEFAULT_SYMCC_LLVM_MAJOR = detect_default_symcc_llvm()
 
 option("symcc_llvm_prefix")
     set_default(DEFAULT_SYMCC_LLVM_PREFIX)

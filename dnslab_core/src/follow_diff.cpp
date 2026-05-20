@@ -819,7 +819,8 @@ void writeFailureMeta(const FollowDiffConfig &Config,
                       const std::filesystem::path &SampleDir,
                       const SampleIdentity &Identity,
                       const std::vector<std::uint8_t> &SampleBytes,
-                      const std::string &Message, int ExitCode) {
+                      const std::string &Message, int ExitCode,
+                      double BudgetSec) {
   auto Meta = buildSampleMeta(Identity.SampleId);
   Meta.QueueEventId = Identity.QueueEventId;
   Meta.SourceQueueFile = QueueFile.string();
@@ -829,8 +830,8 @@ void writeFailureMeta(const FollowDiffConfig &Config,
   Meta.IsStateful = parseTranscript(SampleBytes).has_value();
   Meta.Status = "failed";
   Meta.State = AnalysisState::Unknown;
-  Meta.Aggregation = buildAggregationKey(Config, 1.0);
-  Meta.BaselineCompare = buildBaselineCompareKey(Config, 1.0);
+  Meta.Aggregation = buildAggregationKey(Config, BudgetSec);
+  Meta.BaselineCompare = buildBaselineCompareKey(Config, BudgetSec);
   FailureEvidence Failure;
   Failure.Kind = "replay_error";
   Failure.Reason = "subprocess_failed";
@@ -846,9 +847,12 @@ void writeFailureMeta(const FollowDiffConfig &Config,
 
 void runSyncReplay(const FollowDiffConfig &Config,
                    const std::filesystem::path &QueueFile,
-                   const std::filesystem::path &SampleDir) {
+                   const std::filesystem::path &SampleDir, double BudgetSec) {
   ProcessRequest Request;
   Request.WorkingDirectory = Config.RootDir;
+  Request.Environment = {
+      {"DNSLAB_SYNC_REPLAY_BUDGET_SEC", std::to_string(BudgetSec)},
+  };
   Request.Arguments = {
       Config.SelfExecutable.string(),
       "sync-replay",
@@ -889,7 +893,7 @@ enum class SampleProcessStatus {
 
 SampleProcessStatus processOneSample(const FollowDiffConfig &Config,
                                      const std::filesystem::path &QueueFile,
-                                     bool RetryFailed) {
+                                     bool RetryFailed, double BudgetSec) {
   const auto SampleBytes = readBinaryFile(QueueFile);
   const auto Identity = buildSampleIdentity(QueueFile.filename().string(),
                                             SampleBytes);
@@ -908,22 +912,23 @@ SampleProcessStatus processOneSample(const FollowDiffConfig &Config,
                              std::filesystem::copy_options::overwrite_existing);
 
   try {
-    runSyncReplay(Config, QueueFile, SampleDir);
+    runSyncReplay(Config, QueueFile, SampleDir, BudgetSec);
     return SampleProcessStatus::Completed;
   } catch (const ProcessFailure &Error) {
     writeFailureMeta(Config, QueueFile, SampleDir, Identity, SampleBytes,
-                     Error.what(), Error.ExitCode);
+                     Error.what(), Error.ExitCode, BudgetSec);
     return SampleProcessStatus::Failed;
   } catch (const std::exception &Error) {
     writeFailureMeta(Config, QueueFile, SampleDir, Identity, SampleBytes,
-                     Error.what(), 1);
+                     Error.what(), 1, BudgetSec);
     return SampleProcessStatus::Failed;
   }
 }
 
 BatchSummary processQueueEntries(const FollowDiffConfig &Config,
                                  bool RetryFailed,
-                                 const std::optional<std::string> &QueueTailId) {
+                                 const std::optional<std::string> &QueueTailId,
+                                 double BudgetSec) {
   BatchSummary Summary;
   auto QueueEntries = listQueueEntries(Config.SourceDir);
   if (QueueTailId.has_value()) {
@@ -940,7 +945,8 @@ BatchSummary processQueueEntries(const FollowDiffConfig &Config,
   }
 
   for (const auto &QueueFile : QueueEntries) {
-    const auto Status = processOneSample(Config, QueueFile, RetryFailed);
+    const auto Status =
+        processOneSample(Config, QueueFile, RetryFailed, BudgetSec);
     if (Status == SampleProcessStatus::Skipped) {
       ++Summary.Skipped;
       continue;
@@ -1087,7 +1093,7 @@ FollowDiffRunArtifacts runFollowDiffOnce() {
   State.LastScanTs = utcTimestampNow();
   State.RunningSampleId.reset();
 
-  const auto Summary = processQueueEntries(Config, false, std::nullopt);
+  const auto Summary = processQueueEntries(Config, false, std::nullopt, 1.0);
   State.LastQueueEventId = Summary.LastQueueEventId;
   State.CompletedCount = Summary.Completed;
   State.FailedCount = Summary.Failed;
@@ -1173,7 +1179,8 @@ runFollowDiffWindow(double BudgetSec, bool RetryFailed,
       return Output;
     }
 
-    const auto Summary = processQueueEntries(Config, RetryFailed, QueueTailId);
+    const auto Summary =
+        processQueueEntries(Config, RetryFailed, QueueTailId, BudgetSec);
     LastSummary = Summary;
     State.LastAttemptTs = utcTimestampNow();
     State.LastScanTs = utcTimestampNow();

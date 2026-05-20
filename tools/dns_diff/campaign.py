@@ -127,16 +127,19 @@ def _shell_quote_path(path: Path) -> str:
 def _build_regeneration_commands(root_path: Path, report_dir: Path) -> Dict[str, str]:
     root_arg = _shell_quote_path(root_path)
     report_dir_arg = _shell_quote_path(report_dir)
+    dnslabctl_bin_arg = _shell_quote_path(
+        (_resolve_root_dir() / "build/linux/x86_64/release/dnslabctl").resolve()
+    )
     return {
         "triage_rewrite": (
             f"python3 -m tools.dns_diff.cli triage --root {root_arg} --rewrite"
         ),
-        "triage_report": f"python3 -m tools.dns_diff.cli report --root {root_arg}",
+        "triage_report": f"{dnslabctl_bin_arg} report --root {root_arg}",
         "campaign_report": (
-            f"python3 -m tools.dns_diff.cli campaign-report --root {root_arg}"
+            f"{dnslabctl_bin_arg} campaign-report --root {root_arg}"
         ),
         "case_study_export": (
-            "python3 -m tools.dns_diff.cli case-study-export "
+            f"{dnslabctl_bin_arg} case-study-export "
             f"--root {root_arg} --campaign-report-dir {report_dir_arg}"
         ),
     }
