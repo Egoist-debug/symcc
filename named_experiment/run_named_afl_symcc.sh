@@ -454,18 +454,25 @@ import sys
 sample_path = Path(sys.argv[1])
 data = sample_path.read_bytes()
 
-if len(data) < 8:
-    raise SystemExit(f"{sample_path}: transcript seed 太短，无法解析两段式 header")
+if len(data) < 10:
+    raise SystemExit(f"{sample_path}: transcript seed 太短，无法解析现行 DST1 header")
 
 if data[:4] != b"DST1":
-    raise SystemExit(f"{sample_path}: transcript magic 非 DST1，拒绝作为两段式 v2 seed")
+    raise SystemExit(f"{sample_path}: transcript magic 非 DST1，拒绝作为现行 DST1 seed")
 
 response_count = data[4]
-version = data[5]
+reserved_or_version = data[5]
 query_len = struct.unpack_from("<H", data, 6)[0]
-offset = 8
-length_table_bytes = response_count * 2
+post_check_len = struct.unpack_from("<H", data, 8)[0]
+max_responses = 16
 
+if response_count > max_responses:
+    raise SystemExit(
+        f"{sample_path}: response_count={response_count} 超出上限 {max_responses}"
+    )
+
+offset = 10
+length_table_bytes = response_count * 2
 if len(data) < offset + length_table_bytes:
     raise SystemExit(f"{sample_path}: transcript seed 不完整，缺少 response length 表")
 
@@ -474,17 +481,23 @@ for _ in range(response_count):
     response_lengths.append(struct.unpack_from("<H", data, offset)[0])
     offset += 2
 
-if version != 2:
+expected_total = offset + query_len + sum(response_lengths) + post_check_len
+actual_total = len(data)
+if (
+    reserved_or_version == 0
+    and query_len > 0
+    and expected_total == actual_total
+):
+    raise SystemExit(0)
+
+if reserved_or_version == 0:
     raise SystemExit(
-        f"{sample_path}: transcript version={version}，仅支持 version=2 两段式 seed"
+        f"{sample_path}: transcript version=0，布局不符合现行 DST1 两段式格式"
     )
 
-expected_total = offset + query_len + sum(response_lengths)
-actual_total = len(data)
-if expected_total != actual_total:
-    raise SystemExit(
-        f"{sample_path}: transcript 长度不匹配，期望 {expected_total} 实际 {actual_total}（疑似旧三段式或损坏 seed）"
-    )
+raise SystemExit(
+    f"{sample_path}: transcript header[5]={reserved_or_version}，布局不符合现行 DST1 两段式格式"
+)
 PY
 }
 
@@ -497,7 +510,7 @@ validate_transcript_corpus_dir_or_die() {
 	for sample in "$dir_path"/*; do
 		[ -f "$sample" ] || continue
 		if ! validate_transcript_seed_v2_two_part "$sample"; then
-			die "$context_tag 检测到旧三段式/非 version=2 transcript seed: $sample。请删除旧语料后重新生成 transcript corpus（例如设置 REGEN_SEEDS=1 重新跑 gen-seeds/prepare）。"
+			die "$context_tag 检测到旧格式/损坏 transcript seed: $sample。请删除旧语料后重新生成 transcript corpus（例如设置 REGEN_SEEDS=1 重新跑 gen-seeds/prepare）。"
 		fi
 	done
 }
@@ -647,6 +660,7 @@ patch_variant_mappings() {
 			"bin/named/resolver_afl_symcc_mutator_server.c:bin/named/resolver_afl_symcc_mutator_server.c" \
 			"include/named/resolver_afl_symcc_orchestrator.h:bin/named/include/named/resolver_afl_symcc_orchestrator.h" \
 			"include/named/resolver_afl_symcc_mutator_server.h:bin/named/include/named/resolver_afl_symcc_mutator_server.h" \
+			"lib/isc/managers.c:lib/isc/managers.c" \
 			"lib/dns/dispatch.c:lib/dns/dispatch.c" \
 			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h" \
 			"lib/ns/client.c:lib/ns/client.c"
@@ -1115,35 +1129,12 @@ sample_is_stable() {
 
 sample_is_stateful_stable() {
 	local sample="$1"
-	local stderr_file
-	local ld_path
+	require_file "$DNSLABCTL_BIN"
 
-	stderr_file="$(mktemp "$LOG_DIR/filter.stateful.XXXXXX.stderr")"
-	ld_path="$(afl_ld_library_path)"
-
-	if env \
-		LD_LIBRARY_PATH="$ld_path" \
-		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
-		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
-		timeout -k 5 "$SEED_TIMEOUT_SEC" \
-		"$AFL_TREE/bin/named/.libs/named" \
-		-g \
-		-c "$NAMED_CONF" \
-		-A "resolver-afl-symcc:${MUTATOR_ADDR},input=$sample" \
-		>/dev/null 2>"$stderr_file"
-	then
-		if grep -q 'Transcript cases: 1' "$stderr_file" && \
-			grep -q 'Oracle parse_ok: 1' "$stderr_file" && \
-			grep -q 'Oracle resolver_fetch_started: 1' "$stderr_file" && \
-			grep -q 'Oracle response_accepted: 1' "$stderr_file" && \
-			grep -q 'Oracle second_query_hit: 1' "$stderr_file"
-		then
-			rm -f "$stderr_file"
-			return 0
-		fi
+	if "$DNSLABCTL_BIN" transcript-summary --input "$sample" >/dev/null 2>&1; then
+		return 0
 	fi
 
-	rm -f "$stderr_file"
 	return 1
 }
 

@@ -122,6 +122,25 @@ def decode_deadwood_name(encoded: str) -> str:
     return ".".join(labels)
 
 
+def decode_dns_wire_name(packet: bytes) -> str:
+    if len(packet) < 13:
+        return ""
+    labels = []
+    cursor = 12
+    while cursor < len(packet):
+        length = packet[cursor]
+        if length == 0:
+            break
+        cursor += 1
+        if cursor + length > len(packet):
+            return ""
+        labels.append(packet[cursor : cursor + length].decode("ascii", errors="replace"))
+        cursor += length
+    if not labels:
+        return ""
+    return ".".join(labels) + "."
+
+
 def maradns_cache_dump(raw_log: str) -> str:
     lines = ["MARADNS_CACHE_DUMP"]
     for raw_line in raw_log.splitlines():
@@ -176,8 +195,22 @@ def main():
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     upstream_sock.bind(("127.0.0.1", upstream_port))
     upstream_sock.settimeout(args.timeout_sec)
+    upstream_tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream_tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    upstream_tcp_sock.bind(("127.0.0.1", upstream_port))
+    upstream_tcp_sock.listen(4)
+    upstream_tcp_sock.settimeout(0.5)
     stop_flag = {"stop": False}
     upstream_queries = []
+
+    def build_reply(packet: bytes) -> bytes:
+        if not responses:
+            return packet
+        index = min(len(upstream_queries) - 1, len(responses) - 1)
+        reply = bytearray(responses[index])
+        if len(reply) >= 2 and len(packet) >= 2:
+            reply[0:2] = packet[0:2]
+        return bytes(reply)
 
     def upstream_loop():
         while not stop_flag["stop"]:
@@ -186,14 +219,40 @@ def main():
             except Exception:
                 continue
             upstream_queries.append(packet)
-            if responses:
-                index = min(len(upstream_queries) - 1, len(responses) - 1)
-                reply = bytearray(responses[index])
-                if len(reply) >= 2 and len(packet) >= 2:
-                    reply[0:2] = packet[0:2]
-                upstream_sock.sendto(reply, addr)
+            upstream_sock.sendto(build_reply(packet), addr)
 
     threading.Thread(target=upstream_loop, daemon=True).start()
+
+    def upstream_tcp_loop():
+        while not stop_flag["stop"]:
+            try:
+                conn, _ = upstream_tcp_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                conn.settimeout(args.timeout_sec)
+                try:
+                    header = conn.recv(2)
+                    if len(header) != 2:
+                        continue
+                    length = int.from_bytes(header, "big")
+                    packet = bytearray()
+                    while len(packet) < length:
+                        chunk = conn.recv(length - len(packet))
+                        if not chunk:
+                            break
+                        packet.extend(chunk)
+                    if len(packet) != length:
+                        continue
+                    upstream_queries.append(bytes(packet))
+                    reply = build_reply(bytes(packet))
+                    conn.sendall(len(reply).to_bytes(2, "big") + reply)
+                except socket.timeout:
+                    continue
+
+    threading.Thread(target=upstream_tcp_loop, daemon=True).start()
 
     uid = os.getuid()
     gid = os.getgid()
@@ -202,8 +261,8 @@ def main():
             'bind_address="127.0.0.1"\n'
             f'chroot_dir="{run_root}"\n'
             f"dns_port = {listen_port}\n"
+            "root_servers = {}\n"
             "upstream_servers = {}\n"
-            'upstream_servers["."]="127.0.0.1"\n'
             f"upstream_port = {upstream_port}\n"
             'recursive_acl = "127.0.0.1/16"\n'
             "num_retries = 1\n"
@@ -212,6 +271,12 @@ def main():
             "verbose_level = 1000\n"
             f"maradns_uid = {uid}\n"
             f"maradns_gid = {gid}\n"
+            + (
+                f'upstream_servers["{decode_dns_wire_name(client_query)}"] = "127.0.0.1"\n'
+                if client_query and decode_dns_wire_name(client_query) != "."
+                else ""
+            )
+            + 'root_servers["."] = "127.0.0.1"\n'
         ),
         encoding="utf-8",
     )
@@ -232,8 +297,17 @@ def main():
     stdout_text = ""
     try:
         if args.mode == "run":
-            cli.sendto(client_query, ("127.0.0.1", listen_port))
-            response = cli.recv(4096)
+            deadline = time.monotonic() + args.timeout_sec
+            response = b""
+            while time.monotonic() < deadline:
+                cli.sendto(client_query, ("127.0.0.1", listen_port))
+                remaining = max(0.05, deadline - time.monotonic())
+                cli.settimeout(min(0.25, remaining))
+                try:
+                    response = cli.recv(4096)
+                    break
+                except socket.timeout:
+                    continue
             resolver_fetch_started = len(upstream_queries) > 0
             response_accepted = bool(response)
             upstream_after_first = len(upstream_queries)
@@ -244,6 +318,8 @@ def main():
                     bool(post_response) and len(upstream_queries) == upstream_after_first
                 )
                 cache_entry_created = second_query_hit
+            if not response_accepted:
+                timeout_seen = True
         os.kill(proc.pid, signal.SIGUSR1)
         time.sleep(0.3)
     except socket.timeout:
@@ -256,6 +332,7 @@ def main():
         stdout_text, _ = proc.communicate(timeout=5)
         stop_flag["stop"] = True
         upstream_sock.close()
+        upstream_tcp_sock.close()
         cli.close()
 
     write_text(maradns_log_path, stdout_text)

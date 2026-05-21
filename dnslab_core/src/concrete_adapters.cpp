@@ -37,6 +37,142 @@ CommandResult copyPatchTree(const std::filesystem::path &PatchRoot,
   return {0, "", ""};
 }
 
+std::string readTextFile(const std::filesystem::path &InputPath) {
+  std::ifstream Input(InputPath);
+  if (!Input) {
+    throw std::runtime_error("无法读取文件: " + InputPath.string());
+  }
+  std::ostringstream Buffer;
+  Buffer << Input.rdbuf();
+  return Buffer.str();
+}
+
+void writeTextFile(const std::filesystem::path &OutputPath,
+                   const std::string &Text) {
+  std::ofstream Output(OutputPath);
+  if (!Output) {
+    throw std::runtime_error("无法写入文件: " + OutputPath.string());
+  }
+  Output << Text;
+}
+
+bool replaceOnce(std::string &Text, const std::string &Needle,
+                 const std::string &Replacement) {
+  const auto Position = Text.find(Needle);
+  if (Position == std::string::npos) {
+    return false;
+  }
+  Text.replace(Position, Needle.size(), Replacement);
+  return true;
+}
+
+void ensureUnboundFuzzmeMakefile(const std::filesystem::path &TargetRoot) {
+  const auto MakefileInPath = TargetRoot / "Makefile.in";
+  auto MakefileIn = readTextFile(MakefileInPath);
+  if (MakefileIn.find("unbound_afl_symcc_orchestrator") != std::string::npos) {
+    return;
+  }
+
+  const std::string FuzzmeBlock =
+      "FUZZME_SRC=smallapp/unbound-fuzzme.c "
+      "smallapp/unbound_afl_symcc_orchestrator.c "
+      "smallapp/unbound_afl_symcc_mutator_server.c\n"
+      "FUZZME_OBJ=unbound-fuzzme.lo unbound_afl_symcc_orchestrator.lo "
+      "unbound_afl_symcc_mutator_server.lo\n"
+      "FUZZME_OBJ_LINK=$(FUZZME_OBJ) cachedump.lo $(COMMON_OBJ_ALL_SYMBOLS) "
+      "$(SLDNS_OBJ) $(COMPAT_OBJ)\n";
+
+  if (!replaceOnce(MakefileIn,
+                   "DAEMON_OBJ_LINK=$(DAEMON_OBJ) $(COMMON_OBJ_ALL_SYMBOLS) $(SLDNS_OBJ) \\\n"
+                   "$(COMPAT_OBJ) @WIN_DAEMON_OBJ_LINK@\n",
+                   "DAEMON_OBJ_LINK=$(DAEMON_OBJ) $(COMMON_OBJ_ALL_SYMBOLS) "
+                   "$(SLDNS_OBJ) \\\n$(COMPAT_OBJ) @WIN_DAEMON_OBJ_LINK@\n" +
+                       FuzzmeBlock)) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 daemon 链接段");
+  }
+
+  if (!replaceOnce(MakefileIn,
+                   "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
+                   "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) $(LIBS)\n\n",
+                   "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
+                   "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) "
+                   "$(LIBS)\n\n"
+                   "unbound-fuzzme$(EXEEXT):\t$(FUZZME_OBJ_LINK) libunbound.la\n"
+                   "\t$(LINK) -o $@ $(FUZZME_OBJ_LINK) libunbound.la "
+                   "$(EXTRALINK) $(SSLLIB) $(LIBS)\n\n")) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 daemon 链接规则");
+  }
+
+  if (!replaceOnce(MakefileIn,
+                   "ALL_SRC=$(COMMON_SRC) $(UNITTEST_SRC) $(DAEMON_SRC) \\\n",
+                   "ALL_SRC=$(COMMON_SRC) $(UNITTEST_SRC) $(DAEMON_SRC) \\\n"
+                   "\t$(FUZZME_SRC) \\\n")) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 ALL_SRC 段");
+  }
+
+  if (!replaceOnce(MakefileIn,
+                   "ALL_OBJ=$(COMMON_OBJ) $(UNITTEST_OBJ) $(DAEMON_OBJ) \\\n",
+                   "ALL_OBJ=$(COMMON_OBJ) $(UNITTEST_OBJ) $(DAEMON_OBJ) \\\n"
+                   "\t$(FUZZME_OBJ) \\\n")) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 ALL_OBJ 段");
+  }
+
+  if (!replaceOnce(MakefileIn,
+                   "alltargets:\tunbound$(EXEEXT) unbound-checkconf$(EXEEXT) lib "
+                   "unbound-host$(EXEEXT) unbound-control$(EXEEXT) "
+                   "unbound-anchor$(EXEEXT) unbound-control-setup $(WINAPPS) "
+                   "$(PYUNBOUND_TARGET)\n",
+                   "alltargets:\tunbound$(EXEEXT) unbound-checkconf$(EXEEXT) lib "
+                   "unbound-host$(EXEEXT) unbound-control$(EXEEXT) "
+                   "unbound-anchor$(EXEEXT) unbound-control-setup "
+                   "unbound-fuzzme$(EXEEXT) $(WINAPPS) $(PYUNBOUND_TARGET)\n")) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 alltargets 段");
+  }
+
+  if (!replaceOnce(MakefileIn,
+                   "clean:\n\trm -f *.o *.d *.lo *~ tags\n\trm -f "
+                   "unbound$(EXEEXT) unbound-checkconf$(EXEEXT) "
+                   "unbound-host$(EXEEXT) unbound-control$(EXEEXT) "
+                   "unbound-anchor$(EXEEXT) unbound-control-setup libunbound.la "
+                   "unbound.h\n",
+                   "clean:\n\trm -f *.o *.d *.lo *~ tags\n\trm -f "
+                   "unbound$(EXEEXT) unbound-checkconf$(EXEEXT) "
+                   "unbound-fuzzme$(EXEEXT) unbound-host$(EXEEXT) "
+                   "unbound-control$(EXEEXT) unbound-anchor$(EXEEXT) "
+                   "unbound-control-setup libunbound.la unbound.h\n")) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 clean 段");
+  }
+
+  if (!replaceOnce(
+          MakefileIn,
+          "$(srcdir)/respip/respip.h $(srcdir)/dnstap/dtstream.h\n",
+          "$(srcdir)/respip/respip.h $(srcdir)/dnstap/dtstream.h\n"
+          "unbound-fuzzme.lo unbound-fuzzme.o: "
+          "$(srcdir)/smallapp/unbound-fuzzme.c config.h\n"
+          "unbound_afl_symcc_orchestrator.lo unbound_afl_symcc_orchestrator.o: "
+          "$(srcdir)/smallapp/unbound_afl_symcc_orchestrator.c config.h\n"
+          "unbound_afl_symcc_mutator_server.lo unbound_afl_symcc_mutator_server.o: "
+          "$(srcdir)/smallapp/unbound_afl_symcc_mutator_server.c config.h\n")) {
+    throw std::runtime_error("无法定位 unbound Makefile.in 的 worker_cb 依赖尾部");
+  }
+
+  writeTextFile(MakefileInPath, MakefileIn);
+}
+
+void ensureUnboundHarnessTree(const std::filesystem::path &WorkspaceRoot,
+                              const std::filesystem::path &TargetRoot) {
+  copyPatchTree(WorkspaceRoot / "patch" / "cache" / "unbound", TargetRoot);
+  ensureUnboundFuzzmeMakefile(TargetRoot);
+  const auto ConfigStatus = TargetRoot / "config.status";
+  if (std::filesystem::exists(ConfigStatus)) {
+    const auto Result =
+        runProcess({{"./config.status"}, TargetRoot, {}, std::nullopt});
+    if (Result.ExitCode != 0) {
+      throw std::runtime_error("unbound config.status 失败: " + Result.StderrText);
+    }
+  }
+}
+
 std::filesystem::path cloneIfMissing(const std::filesystem::path &WorkspaceRoot,
                                      const std::string &Resolver,
                                      const std::string &Tag,
@@ -629,6 +765,7 @@ UnboundResolverAdapter::build(const std::filesystem::path &SourceRoot,
                           std::filesystem::copy_options::recursive |
                               std::filesystem::copy_options::copy_symlinks);
   }
+  ensureUnboundHarnessTree(Config_.WorkspaceRoot, TargetRoot);
 
   if (!std::filesystem::exists(TargetRoot / "config.status") &&
       std::filesystem::exists(TargetRoot / "configure")) {
@@ -642,7 +779,21 @@ UnboundResolverAdapter::build(const std::filesystem::path &SourceRoot,
       return ConfigureResult;
     }
   }
-  return runProcess({{"make", "-j2"}, TargetRoot, {}, std::nullopt});
+  auto BuildResult =
+      runProcess({{"make", "-j2", "unbound-fuzzme"}, TargetRoot, {}, std::nullopt});
+  if (BuildResult.ExitCode != 0) {
+    return BuildResult;
+  }
+
+  const auto TopLevelBinary = TargetRoot / "unbound-fuzzme";
+  const auto CanonicalBinary = TargetRoot / ".libs" / "unbound-fuzzme";
+  if (!std::filesystem::exists(CanonicalBinary) &&
+      std::filesystem::exists(TopLevelBinary)) {
+    std::filesystem::create_directories(CanonicalBinary.parent_path());
+    std::filesystem::copy_file(TopLevelBinary, CanonicalBinary,
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  return BuildResult;
 }
 
 CommandResult

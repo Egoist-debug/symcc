@@ -702,15 +702,32 @@ def _dump_unbound_cache(sample: Optional[str], output_path: Optional[str]) -> in
     stderr_path = (work_dir / "unbound_dump_cache.stderr").resolve()
     timeout_sec = _parse_positive_int("SEED_TIMEOUT_SEC", 5)
 
-    if not target.is_file():
-        raise TargetRegistryError(
-            f"缺少 Unbound AFL 目标或不可执行: {target}",
-            exit_code=EXIT_DEPENDENCY,
-        )
-    if not os.access(target, os.X_OK):
-        raise TargetRegistryError(
-            f"Unbound AFL 目标不可执行: {target}", exit_code=EXIT_DEPENDENCY
-        )
+    if not target.is_file() or not os.access(target, os.X_OK):
+        build_args = [
+            "adapter-build",
+            "--resolver",
+            "unbound",
+            "--source-root",
+            str(_resolve_unbound_src_tree(root_dir)),
+            "--build-root",
+            str(unbound_afl_tree),
+        ]
+        completed = _run_dnslabctl_command(root_dir, build_args)
+        if completed.returncode != 0:
+            raise TargetRegistryError(
+                f"unbound adapter-build 失败: rc={completed.returncode}",
+                exit_code=EXIT_SUBPROCESS,
+            )
+        if not target.is_file():
+            raise TargetRegistryError(
+                f"缺少 Unbound AFL 目标或不可执行: {target}",
+                exit_code=EXIT_DEPENDENCY,
+            )
+        if not os.access(target, os.X_OK):
+            raise TargetRegistryError(
+                f"Unbound AFL 目标不可执行: {target}",
+                exit_code=EXIT_DEPENDENCY,
+            )
 
     sample_path: Optional[Path] = None
     base_name = "empty"

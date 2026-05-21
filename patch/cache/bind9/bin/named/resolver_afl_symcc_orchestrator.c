@@ -38,6 +38,7 @@
 #include <ns/interfacemgr.h>
 #include <ns/query.h>
 
+#include <isc/async.h>
 #include <named/globals.h>
 #include <named/resolver_afl_symcc_mutator_server.h>
 #include <named/resolver_afl_symcc_orchestrator.h>
@@ -69,6 +70,9 @@ typedef struct named_resolver_afl_symcc_request_context {
 	pthread_cond_t cond;
 	const uint8_t *request;
 	size_t request_len;
+	isc_sockaddr_t local;
+	isc_sockaddr_t peer;
+	long timeout_ms;
 	ns_client_t *client;
 	bool finished;
 	bool reply_sent;
@@ -794,11 +798,15 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 	ifp.mgr = named_g_server->interfacemgr;
 	clientmgr = ns_interfacemgr_getclientmgr(ifp.mgr);
 	client = isc_nmhandle_getdata(handle);
-	ns__client_setup(client, clientmgr, true);
-	result = ISC_R_SUCCESS;
-	isc_nmhandle_setdata(handle, client, ns__client_reset_cb,
-			     ns__client_put_cb);
-	client->handle = handle;
+	if (client == NULL) {
+		client = isc_mem_get(clientmgr->mctx, sizeof(*client));
+		ns__client_setup(client, clientmgr, true);
+		isc_nmhandle_setdata(handle, client, ns__client_reset_cb,
+				     ns__client_put_cb);
+		client->handle = handle;
+	} else {
+		ns__client_setup(client, NULL, false);
+	}
 
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->client = client;
@@ -819,6 +827,16 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 	region.length = (unsigned int)ctx->request_len;
 
 	ns_client_request(handle, ISC_R_SUCCESS, &region, &ifp);
+}
+
+static void
+resolver_afl_symcc_start_udpconnect(void *arg) {
+	named_resolver_afl_symcc_request_context_t *ctx =
+		(named_resolver_afl_symcc_request_context_t *)arg;
+
+	isc_nm_udpconnect(named_g_netmgr, &ctx->local, &ctx->peer,
+			  resolver_afl_symcc_request_connected, ctx,
+			  (unsigned int)ctx->timeout_ms);
 }
 
 static isc_result_t
@@ -849,6 +867,7 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 	pthread_cond_init(&ctx->cond, NULL);
 	ctx->request = request;
 	ctx->request_len = request_len;
+	ctx->timeout_ms = timeout_ms;
 	ctx->result = ISC_R_UNSET;
 
 	load_request_target(host, sizeof(host), &port);
@@ -876,9 +895,10 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 	}
 
 	set_request_context(ctx);
-	isc_nm_udpconnect(named_g_netmgr, &local, &peer,
-			  resolver_afl_symcc_request_connected, ctx,
-			  (unsigned int)timeout_ms);
+	ctx->local = local;
+	ctx->peer = peer;
+	isc_async_run(named_g_mainloop, resolver_afl_symcc_start_udpconnect,
+		      ctx);
 
 	clock_gettime(CLOCK_REALTIME, &deadline);
 	deadline.tv_sec += timeout_ms / 1000;
