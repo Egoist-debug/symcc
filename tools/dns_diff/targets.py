@@ -64,6 +64,33 @@ def _resolve_cache_dump_dir(work_dir: Path) -> Path:
     return (work_dir / "cache_dumps").resolve()
 
 
+def _first_existing_executable(candidates: Sequence[Path]) -> Optional[Path]:
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _resolve_smartdns_binary(build_root: Path) -> Path:
+    return _first_existing_executable(
+        (
+            build_root / "src" / "smartdns",
+            build_root / "smartdns-build" / "src" / "smartdns",
+            build_root / "smartdns",
+        )
+    ) or (build_root / "src" / "smartdns")
+
+
+def _resolve_maradns_binary(build_root: Path) -> Path:
+    return _first_existing_executable(
+        (
+            build_root / "deadwood-build" / "deadwood-github" / "src" / "Deadwood",
+            build_root / "deadwood-github" / "src" / "Deadwood",
+            build_root / "Deadwood",
+        )
+    ) or (build_root / "deadwood-github" / "src" / "Deadwood")
+
+
 def _resolve_unbound_src_tree(root_dir: Path) -> Path:
     return (
         Path(os.environ.get("SRC_TREE", str(root_dir / "unbound-1.24.2")))
@@ -500,7 +527,7 @@ def _dump_maradns_cache(sample: Optional[str], output_path: Optional[str]) -> in
     output_file.parent.mkdir(parents=True, exist_ok=True)
     runtime_root.mkdir(parents=True, exist_ok=True)
 
-    binary = build_root / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"
+    binary = _resolve_maradns_binary(build_root)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         build_args = [
             "adapter-build",
@@ -646,7 +673,7 @@ def _dump_smartdns_cache(sample: Optional[str], output_path: Optional[str]) -> i
     output_file.parent.mkdir(parents=True, exist_ok=True)
     runtime_root.mkdir(parents=True, exist_ok=True)
 
-    binary = build_root / "src" / "smartdns"
+    binary = _resolve_smartdns_binary(build_root)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         build_args = [
             "adapter-build",

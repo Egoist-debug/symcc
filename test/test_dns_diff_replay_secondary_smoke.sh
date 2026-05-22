@@ -194,8 +194,9 @@ PY
 
 printf 'PASS: dns diff replay secondary smoke test passed\n'
 
-SMARTDNS_BUILD="$WORKDIR/smartdns-build"
-SMARTDNS_BIN="$SMARTDNS_BUILD/smartdns-build/src/smartdns"
+SMARTDNS_BUILD_ROOT="$WORKDIR/smartdns-build"
+SMARTDNS_BUILD="$SMARTDNS_BUILD_ROOT/smartdns-build"
+SMARTDNS_BIN="$SMARTDNS_BUILD/src/smartdns"
 SMARTDNS_HARNESS="$WORKDIR/smartdns-harness.py"
 SMARTDNS_OUTPUT_DIR="$WORKDIR/replay-out-smartdns"
 
@@ -265,13 +266,14 @@ env \
 	ROOT_DIR="$ROOT_DIR" \
 	DNS_DIFF_SECONDARY_RESOLVER=smartdns \
 	BIND9_AFL_TREE="$BIND9_TREE" \
-	SMARTDNS_BUILD_TREE="$SMARTDNS_BUILD" \
+	SMARTDNS_BUILD_TREE="$SMARTDNS_BUILD_ROOT" \
 	SMARTDNS_HARNESS_SCRIPT="$SMARTDNS_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
 	python3 -m tools.dns_diff.cli replay-diff-cache "$SAMPLE_FILE" "$SMARTDNS_OUTPUT_DIR" >/dev/null
 
 assert_file_exists "$SMARTDNS_OUTPUT_DIR/bind9.stderr"
 assert_file_exists "$SMARTDNS_OUTPUT_DIR/smartdns.stderr"
+assert_file_exists "$SMARTDNS_OUTPUT_DIR/smartdns.native.log"
 assert_file_exists "$SMARTDNS_OUTPUT_DIR/smartdns.after.cache.txt"
 
 python3 - "$SMARTDNS_OUTPUT_DIR" <<'PY'

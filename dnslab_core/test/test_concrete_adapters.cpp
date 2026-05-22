@@ -255,14 +255,14 @@ int main() {
   const auto SmartdnsBuildResult = Smartdns.build(SmartdnsSource, SmartdnsBuild);
   assert(SmartdnsBuildResult.ExitCode == 0);
   assert(std::filesystem::exists(SmartdnsBuild / "smartdns-build" / "src" / "smartdns"));
-  ::setenv("DNSLAB_SMARTDNS_BUILD_ROOT",
-           (SmartdnsBuild / "smartdns-build").c_str(), 1);
+  ::setenv("DNSLAB_SMARTDNS_BUILD_ROOT", SmartdnsBuild.c_str(), 1);
 
   dnslab::RunSampleRequest SmartdnsRequest{
       Root, SmartdnsBuild, RunRoot, Sample, "sample-1", {}};
   const auto SmartdnsRun = Smartdns.runSample(SmartdnsRequest);
   assert(SmartdnsRun.ExitCode == 0);
   assert(std::filesystem::exists(RunRoot / "smartdns.after.cache.txt"));
+  assert(std::filesystem::exists(RunRoot / "smartdns.native.log"));
   const auto SmartdnsOracle = Smartdns.parseOracle(RunRoot / "smartdns.stderr");
   assert(SmartdnsOracle.ParseOk);
 
@@ -270,23 +270,25 @@ int main() {
   const auto SmartdnsDump = Smartdns.dumpCache(RunRoot, SmartdnsBefore);
   assert(SmartdnsDump.ExitCode == 0);
   assert(std::filesystem::exists(SmartdnsBefore));
+  assert(std::filesystem::exists(RunRoot / "smartdns.native.log"));
 
   const auto MaradnsBuildResult = Maradns.build(MaradnsSource, MaradnsBuild);
   assert(MaradnsBuildResult.ExitCode == 0);
   assert(std::filesystem::exists(MaradnsBuild / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"));
-  ::setenv("DNSLAB_MARADNS_BUILD_ROOT",
-           (MaradnsBuild / "deadwood-build").c_str(), 1);
+  ::setenv("DNSLAB_MARADNS_BUILD_ROOT", MaradnsBuild.c_str(), 1);
   dnslab::RunSampleRequest MaradnsRequest{
       Root, MaradnsBuild, RunRoot, Sample, "sample-1", {}};
   const auto MaradnsRun = Maradns.runSample(MaradnsRequest);
   assert(MaradnsRun.ExitCode == 0);
   assert(std::filesystem::exists(RunRoot / "maradns.after.cache.txt"));
+  assert(std::filesystem::exists(RunRoot / "maradns.native.log"));
   const auto MaradnsOracle = Maradns.parseOracle(RunRoot / "maradns.stderr");
   assert(MaradnsOracle.ParseOk);
   const auto MaradnsBefore = RunRoot / "maradns.before.cache.txt";
   const auto MaradnsDump = Maradns.dumpCache(RunRoot, MaradnsBefore);
   assert(MaradnsDump.ExitCode == 0);
   assert(std::filesystem::exists(MaradnsBefore));
+  assert(std::filesystem::exists(RunRoot / "maradns.native.log"));
 
   const auto KnotBefore = RunRoot / "knot-resolver.before.cache.txt";
   const auto KnotDump = Knot.dumpCache(RunRoot, KnotBefore);

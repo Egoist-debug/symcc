@@ -169,6 +169,20 @@ def _require_executable(path: Path, *, message: str, resolver: str) -> Path:
     return path
 
 
+def _first_existing_executable(candidates: Sequence[Path]) -> Optional[Path]:
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _secondary_native_log_path(
+    output_dir: Path, *, resolver: str, prefix: str
+) -> Path:
+    suffix = "native.stderr" if resolver == "dnsmasq" else "native.log"
+    return output_dir / f"{prefix}.{suffix}"
+
+
 def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
     root_dir = _resolve_root_dir()
     secondary_resolver = _resolve_secondary_resolver()
@@ -211,7 +225,13 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
                 str(root_dir / "experiments" / "subjects" / "smartdns" / "Release47.1-build"),
             )
         ).expanduser()
-        secondary_binary = secondary_build_tree / "smartdns-build" / "src" / "smartdns"
+        secondary_binary = _first_existing_executable(
+            (
+                secondary_build_tree / "src" / "smartdns",
+                secondary_build_tree / "smartdns-build" / "src" / "smartdns",
+                secondary_build_tree / "smartdns",
+            )
+        ) or (secondary_build_tree / "src" / "smartdns")
         secondary_harness = Path(
             os.environ.get(
                 "SMARTDNS_HARNESS_SCRIPT",
@@ -225,7 +245,17 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
                 str(root_dir / "experiments" / "subjects" / "maradns" / "deadwood-3.3.02-build"),
             )
         ).expanduser()
-        secondary_binary = secondary_build_tree / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"
+        secondary_binary = _first_existing_executable(
+            (
+                secondary_build_tree
+                / "deadwood-build"
+                / "deadwood-github"
+                / "src"
+                / "Deadwood",
+                secondary_build_tree / "deadwood-github" / "src" / "Deadwood",
+                secondary_build_tree / "Deadwood",
+            )
+        ) or (secondary_build_tree / "deadwood-github" / "src" / "Deadwood")
         secondary_harness = Path(
             os.environ.get(
                 "MARADNS_HARNESS_SCRIPT",
@@ -701,7 +731,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
             mode="dump",
             transcript=None,
             cache_dump_path=paths.secondary_before_cache,
-            native_log_path=paths.output_dir / f"{secondary_prefix}.native.stderr",
+            native_log_path=_secondary_native_log_path(
+                paths.output_dir,
+                resolver=secondary_resolver,
+                prefix=secondary_prefix,
+            ),
             stderr_path=paths.secondary_stderr,
         )
     _ensure_nonempty_file(
@@ -759,7 +793,11 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
             mode="run",
             transcript=paths.sample_bin,
             cache_dump_path=paths.secondary_after_cache,
-            native_log_path=paths.output_dir / f"{secondary_prefix}.native.stderr",
+            native_log_path=_secondary_native_log_path(
+                paths.output_dir,
+                resolver=secondary_resolver,
+                prefix=secondary_prefix,
+            ),
             stderr_path=paths.secondary_stderr,
         )
     _ensure_nonempty_file(

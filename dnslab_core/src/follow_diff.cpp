@@ -640,6 +640,8 @@ std::string buildResolverPair(const std::string &SecondaryResolver) {
   return "bind9_vs_" + SecondaryResolver;
 }
 
+std::string resolveVariantName();
+
 AggregationKey buildAggregationKey(const FollowDiffConfig &Config,
                                    double BudgetSec) {
   AggregationKey Output;
@@ -649,7 +651,7 @@ AggregationKey buildAggregationKey(const FollowDiffConfig &Config,
   Output.SourceQueueDir = Config.SourceDir.string();
   Output.BudgetSec = static_cast<int>(std::max(1.0, std::floor(BudgetSec)));
   Output.SeedTimeoutSec = 5;
-  Output.VariantName = "full_stack";
+  Output.VariantName = resolveVariantName();
   Output.AblationStatus = "enabled";
   Output.ContractVersion = kContractVersion;
   return Output;
@@ -694,6 +696,42 @@ json::Value::Object buildAblationStatusPayload() {
   return Output;
 }
 
+std::string resolveVariantName() {
+  const auto IsEnabled = [](const char *Name, bool DefaultValue) {
+    const char *Value = std::getenv(Name);
+    if (Value == nullptr) {
+      return DefaultValue;
+    }
+    return std::string(Value) == "1";
+  };
+
+  const bool Mutator = IsEnabled("ENABLE_DST1_MUTATOR", false);
+  const bool CacheDelta = IsEnabled("ENABLE_CACHE_DELTA", true);
+  const bool Triage = IsEnabled("ENABLE_TRIAGE", true);
+  const bool Symcc = IsEnabled("ENABLE_SYMCC", true);
+
+  if (Mutator && CacheDelta && Triage && Symcc) {
+    return "full_stack";
+  }
+  if (Mutator && CacheDelta && Triage && !Symcc) {
+    return "afl_only";
+  }
+  if (!Mutator && CacheDelta && Triage && Symcc) {
+    return "no_mutator";
+  }
+  if (Mutator && !CacheDelta && Triage && Symcc) {
+    return "no_cache_delta";
+  }
+
+  std::ostringstream Output;
+  Output << "custom-"
+         << "mutator-" << (Mutator ? "on" : "off") << "-"
+         << "cache-delta-" << (CacheDelta ? "on" : "off") << "-"
+         << "triage-" << (Triage ? "on" : "off") << "-"
+         << "symcc-" << (Symcc ? "on" : "off");
+  return Output.str();
+}
+
 json::Value::Object buildAggregationKeyPayload(const FollowDiffConfig &Config,
                                                double BudgetSec) {
   json::Value::Object Output;
@@ -703,7 +741,7 @@ json::Value::Object buildAggregationKeyPayload(const FollowDiffConfig &Config,
   Output["source_queue_dir"] = Config.SourceDir.string();
   Output["budget_sec"] = budgetJsonValue(BudgetSec);
   Output["seed_timeout_sec"] = static_cast<std::int64_t>(5);
-  Output["variant_name"] = "control";
+  Output["variant_name"] = resolveVariantName();
   Output["ablation_status"] = buildAblationStatusPayload();
   Output["contract_version"] = static_cast<std::int64_t>(kContractVersion);
   return Output;

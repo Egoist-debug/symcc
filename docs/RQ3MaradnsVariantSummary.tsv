@@ -1,0 +1,5 @@
+variant_name	run_count	variance_status	queue_limit	budget_sec	total_samples_mean	included_samples_mean	unknown_samples_mean	needs_review_count_mean	cluster_count_mean	oracle_audit_candidate_count_mean	semantic_diff_count_mean	semantic_counts_mean_json	ablation_status_json
+full_stack	5	ok	2	12	2.000000	2.000000	0.000000	2.000000	1.000000	2.000000	2.000000	{"oracle_diff": 2.0}	{"cache-delta": "on", "mutator": "on", "symcc": "on", "triage": "on"}
+afl_only	5	ok	2	12	2.000000	2.000000	0.000000	2.000000	1.000000	2.000000	2.000000	{"oracle_diff": 2.0}	{"cache-delta": "on", "mutator": "on", "symcc": "off", "triage": "on"}
+no_mutator	5	ok	2	12	2.000000	2.000000	0.000000	2.000000	1.000000	2.000000	2.000000	{"oracle_diff": 2.0}	{"cache-delta": "on", "mutator": "off", "symcc": "on", "triage": "on"}
+no_cache_delta	5	ok	2	12	2.000000	2.000000	0.000000	2.000000	1.000000	2.000000	2.000000	{"oracle_diff": 2.0}	{"cache-delta": "off", "mutator": "on", "symcc": "on", "triage": "on"}

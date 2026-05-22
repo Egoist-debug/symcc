@@ -109,8 +109,9 @@ PY
 BIND9_TREE="$WORKDIR/bind9-afl"
 BIND9_BIN="$BIND9_TREE/bin/named/.libs/named"
 BIND9_SRC="$WORKDIR/bind9-src"
-MARADNS_BUILD="$WORKDIR/maradns-build"
-MARADNS_BIN="$MARADNS_BUILD/deadwood-build/deadwood-github/src/Deadwood"
+MARADNS_BUILD_ROOT="$WORKDIR/maradns-build"
+MARADNS_BUILD="$MARADNS_BUILD_ROOT/deadwood-build"
+MARADNS_BIN="$MARADNS_BUILD/deadwood-github/src/Deadwood"
 MARADNS_SRC="$WORKDIR/maradns-src"
 MARADNS_HARNESS="$WORKDIR/maradns-harness.py"
 NAMED_CONF_TEMPLATE="$ROOT_ENV/named_experiment/runtime/named.conf"
@@ -159,7 +160,7 @@ env \
 	DNS_DIFF_REPLAY_BACKEND=dnslabctl \
 	BIND9_AFL_TREE="$BIND9_TREE" \
 	BIND9_SRC_TREE="$BIND9_SRC" \
-	MARADNS_BUILD_TREE="$MARADNS_BUILD" \
+	MARADNS_BUILD_TREE="$MARADNS_BUILD_ROOT" \
 	MARADNS_SRC_TREE="$MARADNS_SRC" \
 	MARADNS_HARNESS_SCRIPT="$MARADNS_HARNESS" \
 	python3 -m tools.dns_diff.cli follow-diff-once >/dev/null
@@ -175,6 +176,7 @@ assert_file_exists "$SAMPLE_DIR/bind9/bind9.before.cache.txt"
 assert_file_exists "$SAMPLE_DIR/bind9/bind9.after.cache.txt"
 assert_file_exists "$SAMPLE_DIR/maradns/maradns.before.cache.txt"
 assert_file_exists "$SAMPLE_DIR/maradns/maradns.after.cache.txt"
+assert_file_exists "$SAMPLE_DIR/maradns/maradns.native.log"
 assert_dir_exists "$SAMPLE_DIR/bind9"
 assert_dir_exists "$SAMPLE_DIR/maradns"
 

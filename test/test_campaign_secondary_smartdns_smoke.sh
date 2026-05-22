@@ -121,8 +121,9 @@ PY
 
 BIND9_TREE="$WORKDIR/bind9-afl"
 BIND9_BIN="$BIND9_TREE/bin/named/.libs/named"
-SMARTDNS_BUILD="$WORKDIR/smartdns-build"
-SMARTDNS_BIN="$SMARTDNS_BUILD/smartdns-build/src/smartdns"
+SMARTDNS_BUILD_ROOT="$WORKDIR/smartdns-build"
+SMARTDNS_BUILD="$SMARTDNS_BUILD_ROOT/smartdns-build"
+SMARTDNS_BIN="$SMARTDNS_BUILD/src/smartdns"
 SMARTDNS_HARNESS="$WORKDIR/smartdns-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
@@ -143,7 +144,7 @@ env \
 	DNS_DIFF_SECONDARY_RESOLVER=smartdns \
 	FOLLOW_DIFF_INTERVAL_SEC=0.1 \
 	BIND9_AFL_TREE="$BIND9_TREE" \
-	SMARTDNS_BUILD_TREE="$SMARTDNS_BUILD" \
+	SMARTDNS_BUILD_TREE="$SMARTDNS_BUILD_ROOT" \
 	SMARTDNS_HARNESS_SCRIPT="$SMARTDNS_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
 	python3 -m tools.dns_diff.cli follow-diff-window --budget-sec 5 >/dev/null
@@ -190,7 +191,7 @@ parse_ok = json.loads(row["parse_ok_by_resolver_json"])
 if parse_ok.get("smartdns") is not True:
     raise SystemExit(f"ASSERT FAIL: smartdns parse_ok 未映射到 audit 列: {parse_ok!r}")
 artifacts = bundle["raw_sample_root"]["claim_review_artifacts"]
-if "smartdns.stderr" not in artifacts:
+if "smartdns/smartdns.stderr" not in artifacts:
     raise SystemExit(f"ASSERT FAIL: evidence bundle 缺少 smartdns.stderr: {artifacts!r}")
 PY
 

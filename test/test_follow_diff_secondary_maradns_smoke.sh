@@ -99,8 +99,9 @@ PY
 
 BIND9_TREE="$WORKDIR/bind9-afl"
 BIND9_BIN="$BIND9_TREE/bin/named/.libs/named"
-MARADNS_BUILD="$WORKDIR/maradns-build"
-MARADNS_BIN="$MARADNS_BUILD/deadwood-build/deadwood-github/src/Deadwood"
+MARADNS_BUILD_ROOT="$WORKDIR/maradns-build"
+MARADNS_BUILD="$MARADNS_BUILD_ROOT/deadwood-build"
+MARADNS_BIN="$MARADNS_BUILD/deadwood-github/src/Deadwood"
 MARADNS_HARNESS="$WORKDIR/maradns-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
 RESPONSE_CORPUS_DIR="$WORKDIR/response_corpus"
@@ -141,7 +142,7 @@ env \
 	BIND9_WORK_DIR="$WORKDIR/bind9-work" \
 	DNS_DIFF_SECONDARY_RESOLVER=maradns \
 	BIND9_AFL_TREE="$BIND9_TREE" \
-	MARADNS_BUILD_TREE="$MARADNS_BUILD" \
+	MARADNS_BUILD_TREE="$MARADNS_BUILD_ROOT" \
 	MARADNS_HARNESS_SCRIPT="$MARADNS_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
 	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
@@ -154,6 +155,7 @@ assert_file_exists "$SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$SAMPLE_DIR/oracle.json"
 assert_file_exists "$SAMPLE_DIR/cache_diff.json"
 assert_file_exists "$SAMPLE_DIR/triage.json"
+assert_file_exists "$SAMPLE_DIR/maradns/maradns.native.log"
 
 python3 - "$SAMPLE_DIR" <<'PY'
 import json

@@ -99,8 +99,9 @@ PY
 
 BIND9_TREE="$WORKDIR/bind9-afl"
 BIND9_BIN="$BIND9_TREE/bin/named/.libs/named"
-MARADNS_BUILD="$WORKDIR/maradns-build"
-MARADNS_BIN="$MARADNS_BUILD/deadwood-build/deadwood-github/src/Deadwood"
+MARADNS_BUILD_ROOT="$WORKDIR/maradns-build"
+MARADNS_BUILD="$MARADNS_BUILD_ROOT/deadwood-build"
+MARADNS_BIN="$MARADNS_BUILD/deadwood-github/src/Deadwood"
 MARADNS_HARNESS="$WORKDIR/maradns-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
@@ -121,7 +122,7 @@ env \
 	DNS_DIFF_SECONDARY_RESOLVER=maradns \
 	FOLLOW_DIFF_INTERVAL_SEC=0.1 \
 	BIND9_AFL_TREE="$BIND9_TREE" \
-	MARADNS_BUILD_TREE="$MARADNS_BUILD" \
+	MARADNS_BUILD_TREE="$MARADNS_BUILD_ROOT" \
 	MARADNS_HARNESS_SCRIPT="$MARADNS_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
 	python3 -m tools.dns_diff.cli follow-diff-window --budget-sec 5 >/dev/null
@@ -168,7 +169,7 @@ parse_ok = json.loads(row["parse_ok_by_resolver_json"])
 if parse_ok.get("maradns") is not True:
     raise SystemExit(f"ASSERT FAIL: maradns parse_ok 未映射到 audit 列: {parse_ok!r}")
 artifacts = bundle["raw_sample_root"]["claim_review_artifacts"]
-if "maradns.stderr" not in artifacts:
+if "maradns/maradns.stderr" not in artifacts:
     raise SystemExit(f"ASSERT FAIL: evidence bundle 缺少 maradns.stderr: {artifacts!r}")
 PY
 

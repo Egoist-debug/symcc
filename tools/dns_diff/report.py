@@ -31,6 +31,10 @@ SEMANTIC_FRONTIER_MANIFEST_CONTRACT_NAME = "semantic_frontier_manifest"
 SEMANTIC_FRONTIER_TIER3_OUTCOMES = frozenset(
     {"oracle_and_cache_diff", "oracle_diff", "cache_diff_interesting"}
 )
+NON_SAMPLE_ARTIFACT_DIR_PREFIXES: Tuple[str, ...] = (
+    "campaign_reports",
+    "case_studies",
+)
 SEMANTIC_FRONTIER_OUTCOME_ORDER = {
     "oracle_and_cache_diff": 0,
     "oracle_diff": 1,
@@ -157,6 +161,8 @@ def _coerce_labels(value: Any) -> List[str]:
 def _is_sample_dir(path: Path) -> bool:
     candidate = Path(path)
     if not candidate.is_dir():
+        return False
+    if candidate.name.startswith(NON_SAMPLE_ARTIFACT_DIR_PREFIXES):
         return False
 
     return (candidate / "triage.json").is_file() or (

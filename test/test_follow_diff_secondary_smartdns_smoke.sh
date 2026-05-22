@@ -121,8 +121,9 @@ PY
 
 BIND9_TREE="$WORKDIR/bind9-afl"
 BIND9_BIN="$BIND9_TREE/bin/named/.libs/named"
-SMARTDNS_BUILD="$WORKDIR/smartdns-build"
-SMARTDNS_BIN="$SMARTDNS_BUILD/smartdns-build/src/smartdns"
+SMARTDNS_BUILD_ROOT="$WORKDIR/smartdns-build"
+SMARTDNS_BUILD="$SMARTDNS_BUILD_ROOT/smartdns-build"
+SMARTDNS_BIN="$SMARTDNS_BUILD/src/smartdns"
 SMARTDNS_HARNESS="$WORKDIR/smartdns-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
 RESPONSE_CORPUS_DIR="$WORKDIR/response_corpus"
@@ -163,7 +164,7 @@ env \
 	BIND9_WORK_DIR="$WORKDIR/bind9-work" \
 	DNS_DIFF_SECONDARY_RESOLVER=smartdns \
 	BIND9_AFL_TREE="$BIND9_TREE" \
-	SMARTDNS_BUILD_TREE="$SMARTDNS_BUILD" \
+	SMARTDNS_BUILD_TREE="$SMARTDNS_BUILD_ROOT" \
 	SMARTDNS_HARNESS_SCRIPT="$SMARTDNS_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
 	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
@@ -176,6 +177,7 @@ assert_file_exists "$SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$SAMPLE_DIR/oracle.json"
 assert_file_exists "$SAMPLE_DIR/cache_diff.json"
 assert_file_exists "$SAMPLE_DIR/triage.json"
+assert_file_exists "$SAMPLE_DIR/smartdns/smartdns.native.log"
 
 python3 - "$SAMPLE_DIR" <<'PY'
 import json
