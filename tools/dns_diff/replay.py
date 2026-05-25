@@ -8,6 +8,14 @@ from typing import Dict, List, Mapping, Optional, Sequence
 
 from .io import atomic_write_json
 from .oracle import parse_oracle_summary
+from .path_defaults import (
+    resolve_bind9_afl_tree,
+    resolve_dnsmasq_tag,
+    resolve_knot_resolver_tag,
+    resolve_maradns_tag,
+    resolve_smartdns_tag,
+    resolve_unbound_afl_tree,
+)
 from .schema import stamp_with_shared_meta
 
 EXIT_USAGE = 2
@@ -191,24 +199,27 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             "WORK_DIR", str(root_dir / "unbound_experiment" / "work_stateful")
         )
     ).expanduser()
-    bind9_afl_tree = Path(
-        os.environ.get("BIND9_AFL_TREE", str(root_dir / "bind-9.18.46-afl"))
-    ).expanduser()
+    bind9_afl_tree = resolve_bind9_afl_tree(root_dir)
     secondary_binary: Optional[Path] = None
     secondary_build_tree: Optional[Path] = None
     secondary_harness: Optional[Path] = None
     unbound_afl_tree: Optional[Path] = None
     if secondary_resolver == "unbound":
-        unbound_afl_tree = Path(
-            os.environ.get("AFL_TREE", str(root_dir / "unbound-1.24.2-afl"))
-        ).expanduser()
+        unbound_afl_tree = resolve_unbound_afl_tree(root_dir)
         secondary_binary = unbound_afl_tree / ".libs" / "unbound-fuzzme"
         secondary_build_tree = unbound_afl_tree.resolve()
     elif secondary_resolver == "dnsmasq":
+        default_tag = resolve_dnsmasq_tag(root_dir)
         secondary_build_tree = Path(
             os.environ.get(
                 "DNSMASQ_BUILD_TREE",
-                str(root_dir / "experiments" / "subjects" / "dnsmasq" / "v2.92-build"),
+                str(
+                    root_dir
+                    / "experiments"
+                    / "subjects"
+                    / "dnsmasq"
+                    / f"{default_tag}-build"
+                ),
             )
         ).expanduser()
         secondary_binary = secondary_build_tree / "dnsmasq"
@@ -219,10 +230,17 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             )
         ).expanduser()
     elif secondary_resolver == "smartdns":
+        default_tag = resolve_smartdns_tag(root_dir)
         secondary_build_tree = Path(
             os.environ.get(
                 "SMARTDNS_BUILD_TREE",
-                str(root_dir / "experiments" / "subjects" / "smartdns" / "Release47.1-build"),
+                str(
+                    root_dir
+                    / "experiments"
+                    / "subjects"
+                    / "smartdns"
+                    / f"{default_tag}-build"
+                ),
             )
         ).expanduser()
         secondary_binary = _first_existing_executable(
@@ -239,10 +257,17 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             )
         ).expanduser()
     elif secondary_resolver == "maradns":
+        default_tag = resolve_maradns_tag(root_dir)
         secondary_build_tree = Path(
             os.environ.get(
                 "MARADNS_BUILD_TREE",
-                str(root_dir / "experiments" / "subjects" / "maradns" / "deadwood-3.3.02-build"),
+                str(
+                    root_dir
+                    / "experiments"
+                    / "subjects"
+                    / "maradns"
+                    / f"{default_tag}-build"
+                ),
             )
         ).expanduser()
         secondary_binary = _first_existing_executable(
@@ -263,6 +288,7 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             )
         ).expanduser()
     elif secondary_resolver == "knot-resolver":
+        default_tag = resolve_knot_resolver_tag(root_dir)
         secondary_build_tree = Path(
             os.environ.get(
                 "KNOT_RESOLVER_BUILD_TREE",
@@ -271,7 +297,7 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
                     / "experiments"
                     / "subjects"
                     / "knot-resolver"
-                    / "v6.2.0-build"
+                    / f"{default_tag}-build"
                 ),
             )
         ).expanduser()

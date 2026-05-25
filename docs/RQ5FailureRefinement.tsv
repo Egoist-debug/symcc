@@ -1,3 +1,3 @@
 resolver	total_samples	completed_samples	bind9_parse_ok_samples	secondary_parse_ok_samples	semantic_outcome	diff_class	interpretation
-unbound	10	10	10	10	runtime_or_parse_failure	oracle_parse_incomplete	样本已完成 replay，当前只是 oracle 证据不完整
-smartdns	10	10	10	10	runtime_or_parse_failure	oracle_parse_incomplete	样本已完成 replay，当前只是 oracle 证据不完整
+unbound	20	20	20	20	runtime_or_parse_failure	oracle_parse_incomplete	样本已完成 replay，当前只是 oracle 证据不完整
+smartdns	20	20	20	20	runtime_or_parse_failure	oracle_parse_incomplete	样本已完成 replay，当前只是 oracle 证据不完整

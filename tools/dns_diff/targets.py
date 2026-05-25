@@ -4,6 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple, TypeVar
 
+from .path_defaults import (
+    resolve_dnsmasq_tag as _path_default_dnsmasq_tag,
+    resolve_knot_resolver_tag as _path_default_knot_resolver_tag,
+    resolve_maradns_tag as _path_default_maradns_tag,
+    resolve_smartdns_tag as _path_default_smartdns_tag,
+    resolve_unbound_afl_tree as _path_default_unbound_afl_tree,
+    resolve_unbound_source_root as _path_default_unbound_source_root,
+)
+
 
 EXIT_USAGE = 2
 EXIT_DEPENDENCY = 3
@@ -92,19 +101,11 @@ def _resolve_maradns_binary(build_root: Path) -> Path:
 
 
 def _resolve_unbound_src_tree(root_dir: Path) -> Path:
-    return (
-        Path(os.environ.get("SRC_TREE", str(root_dir / "unbound-1.24.2")))
-        .expanduser()
-        .resolve()
-    )
+    return _path_default_unbound_source_root(root_dir)
 
 
 def _resolve_unbound_afl_tree(root_dir: Path) -> Path:
-    return (
-        Path(os.environ.get("AFL_TREE", str(root_dir / "unbound-1.24.2-afl")))
-        .expanduser()
-        .resolve()
-    )
+    return _path_default_unbound_afl_tree(root_dir)
 
 
 def _resolve_dnslabctl_bin(root_dir: Path) -> Path:
@@ -121,91 +122,19 @@ def _resolve_dnslabctl_bin(root_dir: Path) -> Path:
 
 
 def _resolve_dnsmasq_tag(root_dir: Path) -> str:
-    raw = os.environ.get("DNSMASQ_TAG")
-    if raw and raw.strip():
-        return raw.strip()
-    dnslabctl = _resolve_dnslabctl_bin(root_dir)
-    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
-        try:
-            completed = subprocess.run(
-                [str(dnslabctl), "lock-resolved-tag", "--resolver", "dnsmasq"],
-                check=True,
-                cwd=root_dir,
-                capture_output=True,
-                text=True,
-            )
-            value = completed.stdout.strip()
-            if value:
-                return value
-        except subprocess.SubprocessError:
-            pass
-    return "v2.92"
+    return _path_default_dnsmasq_tag(root_dir)
 
 
 def _resolve_smartdns_tag(root_dir: Path) -> str:
-    raw = os.environ.get("SMARTDNS_TAG")
-    if raw and raw.strip():
-        return raw.strip()
-    dnslabctl = _resolve_dnslabctl_bin(root_dir)
-    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
-        try:
-            completed = subprocess.run(
-                [str(dnslabctl), "lock-resolved-tag", "--resolver", "smartdns"],
-                check=True,
-                cwd=root_dir,
-                capture_output=True,
-                text=True,
-            )
-            value = completed.stdout.strip()
-            if value:
-                return value
-        except subprocess.SubprocessError:
-            pass
-    return "Release47.1"
+    return _path_default_smartdns_tag(root_dir)
 
 
 def _resolve_maradns_tag(root_dir: Path) -> str:
-    raw = os.environ.get("MARADNS_TAG")
-    if raw and raw.strip():
-        return raw.strip()
-    dnslabctl = _resolve_dnslabctl_bin(root_dir)
-    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
-        try:
-            completed = subprocess.run(
-                [str(dnslabctl), "lock-resolved-tag", "--resolver", "maradns"],
-                check=True,
-                cwd=root_dir,
-                capture_output=True,
-                text=True,
-            )
-            value = completed.stdout.strip()
-            if value:
-                return value
-        except subprocess.SubprocessError:
-            pass
-    return "deadwood-3.3.02"
+    return _path_default_maradns_tag(root_dir)
 
 
 def _resolve_knot_resolver_tag(root_dir: Path) -> str:
-    raw = os.environ.get("KNOT_RESOLVER_TAG")
-    if raw and raw.strip():
-        return raw.strip()
-    dnslabctl = _resolve_dnslabctl_bin(root_dir)
-    if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK):
-        try:
-            completed = subprocess.run(
-                [str(dnslabctl), "lock-resolved-tag", "--resolver", "knot-resolver"],
-                check=True,
-                cwd=root_dir,
-                capture_output=True,
-                text=True,
-            )
-            value = completed.stdout.strip()
-            if value:
-                return value
-        except subprocess.SubprocessError:
-            pass
-    return "v6.2.0"
+    return _path_default_knot_resolver_tag(root_dir)
 
 
 def _resolve_dnsmasq_src_tree(root_dir: Path) -> Path:

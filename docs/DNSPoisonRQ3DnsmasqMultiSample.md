@@ -53,5 +53,5 @@
 ## 下一步
 
 1. 把 `queue_limit` 从 `2` 提高到 `4` 或 `8`
-2. 将 `maradns` 与 `knot-resolver` 也跑完同构消融
+2. 在当前 `dnsmasq / maradns / knot-resolver` 主表之上补“无 high-value gate”对照
 3. 将当前结果和 `RQ5` 主表一起写成论文正文里的“工程闭环 + 变体无显著差异”双重结论

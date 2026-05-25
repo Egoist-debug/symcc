@@ -33,7 +33,7 @@
 
 这轮结果强化了 RQ3 当前的保守结论：
 
-- 现在已经有两个 resolver (`dnsmasq`、`maradns`) 在相同批次口径下显示“四个变体结果一致”
+- 现在已经有三个 resolver (`dnsmasq`、`maradns`、`knot-resolver`) 在相同批次口径下显示“四个变体结果一致”
 - 当前样本池下，还看不出 `SYMCC / mutator / cache-delta` 的稳定增益
 - 继续扩大样本池的收益高于继续重复相同小样本配置
 

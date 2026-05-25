@@ -76,4 +76,65 @@ for resolver in $RESOLVERS; do
 	run_resolver "$resolver"
 done
 
+python3 - "$BASE_DIR" "$QUEUE_LIMIT" "$BUDGET_SEC" <<'PY'
+from pathlib import Path
+import csv, json
+import sys
+
+base = Path(sys.argv[1])
+queue_limit = str(sys.argv[2])
+budget_sec = str(sys.argv[3])
+rows = []
+for resolver_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name not in ("manual_case_studies",)):
+    agg_root = resolver_dir / "campaign_aggregates"
+    if not agg_root.is_dir():
+        continue
+    agg_dir = sorted(p for p in agg_root.iterdir() if p.is_dir())[-1]
+    agg_summary = json.loads((agg_dir / "summary.json").read_text(encoding="utf-8"))
+    report_dirs = sorted((resolver_dir / "aggregate_input").iterdir())
+    semantic_totals = {}
+    for report_link in report_dirs:
+        payload = json.loads((report_link.resolve() / "summary.json").read_text(encoding="utf-8"))
+        for key, value in payload.get("semantic_counts", {}).items():
+            semantic_totals[key] = semantic_totals.get(key, 0.0) + float(value)
+    semantic_means = {key: round(value / len(report_dirs), 6) for key, value in sorted(semantic_totals.items())} if report_dirs else {}
+    aggregates = agg_summary.get("aggregates", {})
+
+    def mean_of(name: str) -> str:
+        return f"{float(aggregates.get(name, {}).get('mean', 0.0)):.6f}"
+
+    def std_of(name: str) -> str:
+        return f"{float(aggregates.get(name, {}).get('stddev', 0.0)):.6f}"
+
+    rows.append({
+        "resolver": agg_summary.get("aggregation_key", {}).get("resolver_pair", "").replace("bind9_vs_", ""),
+        "resolver_pair": agg_summary.get("aggregation_key", {}).get("resolver_pair", ""),
+        "run_count": str(int(agg_summary.get("run_count", 0))),
+        "variance_status": agg_summary.get("variance_status", ""),
+        "queue_limit": queue_limit,
+        "budget_sec": budget_sec,
+        "total_samples_mean": mean_of("total_samples"),
+        "total_samples_stddev": std_of("total_samples"),
+        "unknown_samples_mean": mean_of("unknown_samples"),
+        "unknown_samples_stddev": std_of("unknown_samples"),
+        "needs_review_count_mean": mean_of("needs_review_count"),
+        "needs_review_count_stddev": std_of("needs_review_count"),
+        "cluster_count_mean": mean_of("cluster_count"),
+        "cluster_count_stddev": std_of("cluster_count"),
+        "oracle_audit_candidate_count_mean": mean_of("oracle_audit_candidate_count"),
+        "semantic_diff_count_mean": mean_of("semantic_diff_count"),
+        "semantic_counts_mean_json": json.dumps(semantic_means, ensure_ascii=False, sort_keys=True),
+        "aggregate_dir": str(agg_dir),
+    })
+
+summary_tsv = base / "resolver_summary.tsv"
+with summary_tsv.open("w", encoding="utf-8", newline="") as fh:
+    fieldnames = list(rows[0].keys())
+    writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+    writer.writeheader()
+    writer.writerows(rows)
+(base / "resolver_summary.json").write_text(json.dumps({"rows": rows}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(summary_tsv)
+PY
+
 printf 'PASS: real full-stack multi-resolver batch generated at %s\n' "$BASE_DIR"

@@ -13,6 +13,16 @@ from .cache_diff import build_cache_diff
 from .cache_parser import CacheParseError, parse_cache_dump
 from .io import atomic_write_json, load_state_file, save_state_file
 from .oracle import ORACLE_FIELDS
+from .path_defaults import (
+    resolve_bind9_afl_tree,
+    resolve_bind9_source_root,
+    resolve_dnsmasq_tag,
+    resolve_knot_resolver_tag,
+    resolve_maradns_tag,
+    resolve_smartdns_tag,
+    resolve_unbound_afl_tree,
+    resolve_unbound_source_root,
+)
 from .replay import ReplayError, replay_diff_cache
 from .schema import (
     CONTRACT_VERSION,
@@ -1148,21 +1158,14 @@ def _process_one_sample_with_state(
 
 
 def _resolve_bind9_build_root(root_dir: Path) -> Path:
-    return (
-        Path(os.environ.get("BIND9_AFL_TREE", str(root_dir / "bind-9.18.46-afl")))
-        .expanduser()
-        .resolve()
-    )
+    return resolve_bind9_afl_tree(root_dir)
 
 
 def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
     if resolver == "unbound":
-        return (
-            Path(os.environ.get("AFL_TREE", str(root_dir / "unbound-1.24.2-afl")))
-            .expanduser()
-            .resolve()
-        )
+        return resolve_unbound_afl_tree(root_dir)
     if resolver == "dnsmasq":
+        default_tag = resolve_dnsmasq_tag(root_dir)
         return (
             Path(
                 os.environ.get(
@@ -1172,7 +1175,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
                         / "experiments"
                         / "subjects"
                         / "dnsmasq"
-                        / "v2.92-build"
+                        / f"{default_tag}-build"
                     ),
                 )
             )
@@ -1180,6 +1183,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
             .resolve()
         )
     if resolver == "smartdns":
+        default_tag = resolve_smartdns_tag(root_dir)
         return (
             Path(
                 os.environ.get(
@@ -1189,7 +1193,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
                         / "experiments"
                         / "subjects"
                         / "smartdns"
-                        / "Release47.1-build"
+                        / f"{default_tag}-build"
                     ),
                 )
             )
@@ -1197,6 +1201,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
             .resolve()
         )
     if resolver == "maradns":
+        default_tag = resolve_maradns_tag(root_dir)
         return (
             Path(
                 os.environ.get(
@@ -1206,7 +1211,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
                         / "experiments"
                         / "subjects"
                         / "maradns"
-                        / "deadwood-3.3.02-build"
+                        / f"{default_tag}-build"
                     ),
                 )
             )
@@ -1214,6 +1219,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
             .resolve()
         )
     if resolver == "knot-resolver":
+        default_tag = resolve_knot_resolver_tag(root_dir)
         return (
             Path(
                 os.environ.get(
@@ -1223,7 +1229,7 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
                         / "experiments"
                         / "subjects"
                         / "knot-resolver"
-                        / "v6.2.0-build"
+                        / f"{default_tag}-build"
                     ),
                 )
             )
@@ -1234,14 +1240,14 @@ def _resolve_secondary_build_root(root_dir: Path, resolver: str) -> Path:
 
 
 def _resolve_bind9_source_root(root_dir: Path, build_root: Path) -> Path:
-    return (
-        Path(os.environ.get("BIND9_SRC_TREE", str(build_root)))
-        .expanduser()
-        .resolve()
-    )
+    env_path = os.environ.get("BIND9_SRC_TREE")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    return resolve_bind9_source_root(root_dir)
 
 
 def _resolve_secondary_source_root(resolver: str, build_root: Path) -> Path:
+    root_dir = Path(os.environ.get("ROOT_DIR", Path(__file__).resolve().parents[2])).resolve()
     env_map = {
         "unbound": ("UNBOUND_SRC_TREE", "SRC_TREE"),
         "dnsmasq": ("DNSMASQ_SRC_TREE",),
@@ -1253,6 +1259,40 @@ def _resolve_secondary_source_root(resolver: str, build_root: Path) -> Path:
         raw_value = os.environ.get(env_name)
         if raw_value:
             return Path(raw_value).expanduser().resolve()
+    if resolver == "unbound":
+        return resolve_unbound_source_root(root_dir)
+    if resolver == "dnsmasq":
+        return (
+            root_dir
+            / "experiments"
+            / "subjects"
+            / "dnsmasq"
+            / resolve_dnsmasq_tag(root_dir)
+        ).resolve()
+    if resolver == "smartdns":
+        return (
+            root_dir
+            / "experiments"
+            / "subjects"
+            / "smartdns"
+            / resolve_smartdns_tag(root_dir)
+        ).resolve()
+    if resolver == "maradns":
+        return (
+            root_dir
+            / "experiments"
+            / "subjects"
+            / "maradns"
+            / resolve_maradns_tag(root_dir)
+        ).resolve()
+    if resolver == "knot-resolver":
+        return (
+            root_dir
+            / "experiments"
+            / "subjects"
+            / "knot-resolver"
+            / resolve_knot_resolver_tag(root_dir)
+        ).resolve()
     return build_root
 
 

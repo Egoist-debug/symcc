@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-replay-unbound-real.XXXXXX")"
 export PYTHONDONTWRITEBYTECODE=1
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/real_experiment_paths.sh"
 
 cleanup() {
 	rm -rf "$WORKDIR"
@@ -50,9 +52,11 @@ PY
 env \
 	ROOT_DIR="$ROOT_DIR" \
 	WORK_DIR="$WORKDIR/work" \
-	BIND9_AFL_TREE="/home/ubuntu/symcc/bind-9.18.46-afl" \
-	AFL_TREE="/home/ubuntu/symcc/unbound-1.24.2-afl" \
-	RESPONSE_CORPUS_DIR="$ROOT_DIR/unbound_experiment/work_stateful/response_corpus" \
+	BIND9_AFL_TREE="$(bind9_afl_tree)" \
+	BIND9_SRC_TREE="$(resolver_src_root bind9)" \
+	AFL_TREE="$(unbound_afl_tree)" \
+	UNBOUND_SRC_TREE="$(resolver_src_root unbound)" \
+	RESPONSE_CORPUS_DIR="$(default_response_corpus_dir)" \
 	BIND9_NAMED_CONF_TEMPLATE="$ROOT_DIR/named_experiment/runtime/named.conf" \
 	python3 -m tools.dns_diff.cli replay-diff-cache "$SAMPLE_FILE" "$OUTPUT_DIR" >/dev/null
 
@@ -75,6 +79,8 @@ for field in (
     "bind9.parse_ok",
     "bind9.resolver_fetch_started",
     "bind9.response_accepted",
+    "bind9.second_query_hit",
+    "bind9.cache_entry_created",
     "unbound.parse_ok",
     "unbound.resolver_fetch_started",
     "unbound.response_accepted",
@@ -83,9 +89,6 @@ for field in (
 ):
     if oracle.get(field) is not True:
         raise SystemExit(f"ASSERT FAIL: {field}={oracle.get(field)!r} != True")
-
-if oracle.get("bind9.second_query_hit") is not False:
-    raise SystemExit("ASSERT FAIL: bind9.second_query_hit 应为 False")
 if "ORACLE_SUMMARY parse_ok=1" not in stderr_text:
     raise SystemExit("ASSERT FAIL: unbound.stderr 缺少 ORACLE_SUMMARY parse_ok=1")
 PY

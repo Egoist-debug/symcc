@@ -27,8 +27,8 @@ DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl"
 DST1_MUTATOR_LIBRARY="${DST1_MUTATOR_LIBRARY:-$ROOT_DIR/build/linux/x86_64/release/libafl_dst1_mutator.so}"
 AFL_FUZZ_BIN="${AFL_FUZZ_BIN:-/usr/local/bin/afl-fuzz}"
 AFL_CC_BIN="${AFL_CC_BIN:-/usr/local/bin/afl-clang-fast}"
-SYMCC_CC_BIN="${SYMCC_CC_BIN:-$ROOT_DIR/symcc_build_qsym/symcc}"
-SYMCC_CXX_BIN="${SYMCC_CXX_BIN:-$ROOT_DIR/symcc_build_qsym/sym++}"
+SYMCC_CC_BIN="${SYMCC_CC_BIN:-$ROOT_DIR/build/linux/x86_64/release/symcc}"
+SYMCC_CXX_BIN="${SYMCC_CXX_BIN:-$ROOT_DIR/build/linux/x86_64/release/sym++}"
 
 BIN_DIR="$WORK_DIR/bin"
 RUNTIME_STATE_DIR="$WORK_DIR/runtime"
@@ -64,11 +64,11 @@ HELPER_PID="$PID_DIR/helper.pid"
 
 MUTATOR_ADDR="${MUTATOR_ADDR:-127.0.0.1:55300}"
 TARGET_ADDR="${TARGET_ADDR:-127.0.0.1:55301}"
-REPLY_TIMEOUT_MS="${REPLY_TIMEOUT_MS:-50}"
+REPLY_TIMEOUT_MS="${REPLY_TIMEOUT_MS:-}"
 JOBS="${JOBS:-2}"
-AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-3000+}"
+AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-15}"
-ENABLE_SECONDARY="${ENABLE_SECONDARY:-1}"
+ENABLE_SECONDARY="${ENABLE_SECONDARY:-}"
 ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-}"
 DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-}"
 SYMCC_FRONTIER_RELOAD_SEC="${SYMCC_FRONTIER_RELOAD_SEC:-}"
@@ -77,17 +77,17 @@ SYMCC_SEMANTIC_FRONTIER_MANIFEST="${SYMCC_SEMANTIC_FRONTIER_MANIFEST:-}"
 REGEN_SEEDS="${REGEN_SEEDS:-0}"
 REFILTER_QUERIES="${REFILTER_QUERIES:-0}"
 RESET_OUTPUT="${RESET_OUTPUT:-1}"
-QUERY_MAX_ITER="${QUERY_MAX_ITER:-40}"
-RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-500}"
-RESPONSE_QUERY_SEEDS="${RESPONSE_QUERY_SEEDS:-8}"
-TRANSCRIPT_MAX_ITER="${TRANSCRIPT_MAX_ITER:-256}"
-TRANSCRIPT_RESPONSE_SEEDS="${TRANSCRIPT_RESPONSE_SEEDS:-24}"
+QUERY_MAX_ITER="${QUERY_MAX_ITER:-}"
+RESPONSE_MAX_ITER="${RESPONSE_MAX_ITER:-}"
+RESPONSE_QUERY_SEEDS="${RESPONSE_QUERY_SEEDS:-}"
+TRANSCRIPT_MAX_ITER="${TRANSCRIPT_MAX_ITER:-}"
+TRANSCRIPT_RESPONSE_SEEDS="${TRANSCRIPT_RESPONSE_SEEDS:-}"
 TRANSCRIPT_MAX_RESPONSES="${TRANSCRIPT_MAX_RESPONSES:-3}"
 RESPONSE_PRESERVE="${RESPONSE_PRESERVE:-20}"
 TRANSCRIPT_FORMAT_VERSION="${TRANSCRIPT_FORMAT_VERSION:-2}"
 RUN_DURATION_SEC="${RUN_DURATION_SEC:-180}"
 FUZZ_PROFILE="${FUZZ_PROFILE:-poison-stateful}"
-TRANSCRIPT_GEN_TARGET="${TRANSCRIPT_GEN_TARGET:-/bin/true}"
+TRANSCRIPT_GEN_TARGET="${TRANSCRIPT_GEN_TARGET:-}"
 HELPER_NAME="${HELPER_NAME:-symcc}"
 HELPER_RUN_ROOT="${HELPER_RUN_ROOT:-$WORK_DIR}"
 HELPER_RUN_NAME="${HELPER_RUN_NAME:-$(basename "$AFL_OUT_DIR")}"
@@ -147,7 +147,7 @@ usage() {
   SYMCC_FRONTIER_RETRY_LIMIT=1
   SYMCC_SEMANTIC_FRONTIER_MANIFEST=<dirname(SYMCC_HIGH_VALUE_MANIFEST)>/semantic_frontier_manifest.json
   RESPONSE_QUERY_SEEDS=8
-  TRANSCRIPT_MAX_ITER=256
+  TRANSCRIPT_MAX_ITER=4
   TRANSCRIPT_RESPONSE_SEEDS=24
   TRANSCRIPT_FORMAT_VERSION=2
   TRANSCRIPT_MAX_RESPONSES=3
@@ -565,6 +565,15 @@ load_profile() {
 		die "未知 FUZZ_PROFILE: $FUZZ_PROFILE"
 		;;
 	esac
+	: "${REPLY_TIMEOUT_MS:=50}"
+	: "${AFL_TIMEOUT_MS:=3000+}"
+	: "${ENABLE_SECONDARY:=1}"
+	: "${QUERY_MAX_ITER:=40}"
+	: "${RESPONSE_MAX_ITER:=4}"
+	: "${RESPONSE_QUERY_SEEDS:=8}"
+	: "${TRANSCRIPT_MAX_ITER:=4}"
+	: "${TRANSCRIPT_RESPONSE_SEEDS:=24}"
+	: "${TRANSCRIPT_GEN_TARGET:=/bin/true}"
 	apply_profile_semantic_defaults
 	if [ "$TRANSCRIPT_FORMAT_VERSION" != "2" ]; then
 		die "仅支持两段式 transcript 格式版本：TRANSCRIPT_FORMAT_VERSION 必须为 2（当前: $TRANSCRIPT_FORMAT_VERSION）"
@@ -656,6 +665,7 @@ patch_variant_mappings() {
 	cache)
 		printf '%s\n' \
 			"bin/named/main.c:bin/named/main.c" \
+			"bin/named/Makefile.am:bin/named/Makefile.am" \
 			"bin/named/resolver_afl_symcc_orchestrator.c:bin/named/resolver_afl_symcc_orchestrator.c" \
 			"bin/named/resolver_afl_symcc_mutator_server.c:bin/named/resolver_afl_symcc_mutator_server.c" \
 			"include/named/resolver_afl_symcc_orchestrator.h:bin/named/include/named/resolver_afl_symcc_orchestrator.h" \
@@ -875,6 +885,9 @@ build_helper_and_gen_input() {
 		HOME="$ROOT_DIR/.xmake-home" \
 		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
 		xmake b gen_input
+		HOME="$ROOT_DIR/.xmake-home" \
+		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
+		xmake b SymCC
 		if [ "$ENABLE_DST1_MUTATOR" = "1" ] && \
 		   [ "$DST1_MUTATOR_LIBRARY" = "$ROOT_DIR/build/linux/x86_64/release/libafl_dst1_mutator.so" ]; then
 			HOME="$ROOT_DIR/.xmake-home" \
@@ -884,6 +897,8 @@ build_helper_and_gen_input() {
 	)
 	require_file "$HELPER_BIN"
 	require_file "$GEN_INPUT_BIN"
+	require_file "$SYMCC_CC_BIN"
+	require_file "$SYMCC_CXX_BIN"
 	if [ "$ENABLE_DST1_MUTATOR" = "1" ]; then
 		require_file "$DST1_MUTATOR_LIBRARY"
 	fi
@@ -935,13 +950,30 @@ ensure_bind9_configure_ready() {
 	[ -x "$configure_path" ] || die "autoreconf 未生成可执行 configure: $configure_path"
 }
 
+bind9_named_makefile_needs_autoreconf() {
+	local tree="$1"
+	local named_makefile_am="$tree/bin/named/Makefile.am"
+	local named_makefile_in="$tree/bin/named/Makefile.in"
+
+	[ -f "$named_makefile_am" ] || return 1
+	grep -q 'resolver_afl_symcc_orchestrator.c' "$named_makefile_am" || return 1
+	grep -q 'resolver_afl_symcc_mutator_server.c' "$named_makefile_am" || return 1
+	grep -q 'resolver_afl_symcc_orchestrator.c' "$named_makefile_in" 2>/dev/null || return 0
+	grep -q 'resolver_afl_symcc_mutator_server.c' "$named_makefile_in" 2>/dev/null || return 0
+	return 1
+}
+
 build_afl_named() {
 	local reconfigure=0
 
 	require_file "$AFL_CC_BIN"
 	ensure_tree_exists "$AFL_TREE"
 	sync_patch_tree "$AFL_TREE" "$PATCH_VARIANT"
-	if [ ! -x "$AFL_TREE/configure" ]; then
+	if bind9_named_makefile_needs_autoreconf "$AFL_TREE"; then
+		log "检测到 named Makefile.in 未同步 patch，刷新 autotools 产物: $AFL_TREE"
+		ensure_bind9_configure_ready "$AFL_TREE"
+		reconfigure=1
+	elif [ ! -x "$AFL_TREE/configure" ]; then
 		ensure_bind9_configure_ready "$AFL_TREE"
 		reconfigure=1
 	fi
@@ -971,7 +1003,9 @@ build_afl_named() {
 	log "编译 AFL named"
 	(
 		cd "$AFL_TREE"
-		make -j"$JOBS"
+		make bind.keys.h
+		make -C lib -j"$JOBS"
+		make -C bin/named -j"$JOBS" named
 	)
 	require_file "$AFL_TREE/bin/named/.libs/named"
 }
@@ -983,7 +1017,11 @@ build_symcc_named() {
 	require_file "$SYMCC_CXX_BIN"
 	ensure_tree_exists "$SYMCC_TREE"
 	sync_patch_tree "$SYMCC_TREE" "$PATCH_VARIANT"
-	if [ ! -x "$SYMCC_TREE/configure" ]; then
+	if bind9_named_makefile_needs_autoreconf "$SYMCC_TREE"; then
+		log "检测到 named Makefile.in 未同步 patch，刷新 autotools 产物: $SYMCC_TREE"
+		ensure_bind9_configure_ready "$SYMCC_TREE"
+		reconfigure=1
+	elif [ ! -x "$SYMCC_TREE/configure" ]; then
 		ensure_bind9_configure_ready "$SYMCC_TREE"
 		reconfigure=1
 	fi
@@ -1017,9 +1055,13 @@ build_symcc_named() {
 	log "编译 SymCC named"
 	(
 		cd "$SYMCC_TREE"
+		make bind.keys.h
 		SYMCC_NO_SYMBOLIC_INPUT=1 \
 		SYMCC_OUTPUT_DIR="$SYMCC_OUTPUT_DIR/build" \
-		make -j"$JOBS"
+		make -C lib -j"$JOBS"
+		SYMCC_NO_SYMBOLIC_INPUT=1 \
+		SYMCC_OUTPUT_DIR="$SYMCC_OUTPUT_DIR/build" \
+		make -C bin/named -j"$JOBS" named
 	)
 	require_file "$SYMCC_TREE/bin/named/named"
 }
@@ -1765,6 +1807,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	require_file "$NAMED_CONF_TEMPLATE"
 	resolve_bind9_tree_layout_defaults
 	load_profile
+	export -n AFL_TREE 2>/dev/null || true
+	export -n AFL_CC_BIN 2>/dev/null || true
+	export -n AFL_FUZZ_BIN 2>/dev/null || true
+	export -n AFL_TIMEOUT_MS 2>/dev/null || true
 
 	main "$@"
 fi

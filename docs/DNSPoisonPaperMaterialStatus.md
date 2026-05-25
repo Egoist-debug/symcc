@@ -2,7 +2,7 @@
 
 ## 更新时间
 
-- `2026-05-22`
+- `2026-05-23`
 
 ## 本轮新增真实产物
 
@@ -79,7 +79,7 @@
 ### `repeat=5` 多样本 full_stack 主表
 
 - 批次目录：
-  - `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260522_073442`
+  - `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260523_095431`
 - repo 内正式表：
   - [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)
 - 结果说明：
@@ -91,20 +91,20 @@
 
 | resolver | run_count | variance_status | semantic_counts_mean_json |
 | --- | --- | --- | --- |
-| `unbound` | `5` | `ok` | `{"runtime_or_parse_failure": 2.0}` |
-| `dnsmasq` | `5` | `ok` | `{"oracle_diff": 2.0}` |
-| `smartdns` | `5` | `ok` | `{"runtime_or_parse_failure": 2.0}` |
-| `maradns` | `5` | `ok` | `{"oracle_diff": 2.0}` |
-| `knot-resolver` | `5` | `ok` | `{"no_diff": 2.0}` |
+| `unbound` | `5` | `ok` | `{"runtime_or_parse_failure": 4.0}` |
+| `dnsmasq` | `5` | `ok` | `{"oracle_diff": 4.0}` |
+| `smartdns` | `5` | `ok` | `{"runtime_or_parse_failure": 4.0}` |
+| `maradns` | `5` | `ok` | `{"oracle_diff": 4.0}` |
+| `knot-resolver` | `5` | `ok` | `{"no_diff": 4.0}` |
 
 这意味着：
 
-- `dnsmasq` 与 `maradns` 已经在小批量多样本设置下稳定落为 `oracle_diff`
-- `knot-resolver` 已经提供了稳定 `no_diff` 负对照
+- `dnsmasq` 与 `maradns` 已经在更大样本池下稳定落为 `oracle_diff`
+- `knot-resolver` 已经在更大样本池下继续提供稳定 `no_diff` 负对照
 - `unbound` 与 `smartdns` 当前仍主要体现为 `runtime_or_parse_failure`
-- `unbound / smartdns` 的代表性样本当前仍是 `sample.meta.status=completed` 且 `parse_ok=true`，因此这一标签更像保守的 `oracle_parse_incomplete`，还不是明确的运行崩溃
+- `unbound / smartdns` 在当前 `20` 个样本上仍是 `sample.meta.status=completed` 且 `parse_ok=true`，因此这一标签更像保守的 `oracle_parse_incomplete`
 
-因此，当前论文材料已经从“5 个 resolver 能跑”推进到“5 个 resolver 在多样本重复下出现可区分的三类结论”。
+因此，当前论文材料已经从“5 个 resolver 能跑”推进到“5 个 resolver 在 `queue_limit=4` 的多样本重复下稳定出现三类结论”。
 
 ## 当前不应直接写入论文终稿的说法
 
@@ -147,15 +147,16 @@
 当前仓库已经拥有一组可以直接服务论文草稿的材料：
 
 1. 一张新的 RQ1 多样本输入可接入性表
-2. 一张 `queue_limit=2`、`repeat=5` 的 RQ5 多样本 full_stack 主表
+2. 一张 `queue_limit=4`、`repeat=5` 的 RQ5 多样本 full_stack 主表
 3. 一组 `5 resolver` 全部 `pass` 的真实 smoke batch
-4. 一张明确显示 `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已开始分化的 RQ5 结果说明
-5. 一组 `4` 个端到端人工 case study
+4. 一组 `dnsmasq / maradns / knot-resolver` 的 RQ3 多 resolver 多样本消融表
+5. 一张明确显示 `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已开始分化的 RQ5 结果说明
+6. 一组 `4` 个端到端人工 case study
 
 当前仓库距离“整份论文实验完成”还差三步：
 
-1. 把 `queue_limit` 从 `2` 继续抬到 `4` 或 `8`
-2. 在当前多样本主表之上补 `afl_only / no_mutator / no_cache_delta`，完成 RQ3 对照
+1. 把 `queue_limit` 从 `4` 继续抬到 `8`，或在 `queue_limit=4` 下延长预算
+2. 在现有 `dnsmasq / maradns / knot-resolver` 三条路径基础上补“无 high-value gate”与更大样本池，继续验证 RQ3 增益
 3. 把 `runtime_or_parse_failure` 再细分成更可发表的真值类别
 
 ### dnsmasq 多样本 RQ3 消融结果
@@ -194,6 +195,21 @@
 - 四个变体同样都收敛到 `oracle_diff`
 - 当前“变体差异不显著”的 RQ3 结论已经不再局限于 `dnsmasq` 单一路径
 
+### knot-resolver 多样本 RQ3 消融结果
+
+- 批次目录：
+  - `experiments/results/real_rq3_multi_resolver_ablation/20260523_093620/knot`
+- repo 内正式表：
+  - [RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)
+- 结果说明：
+  - [DNSPoisonRQ3KnotMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3KnotMultiSample.md)
+
+这说明：
+
+- `knot-resolver` 现在也已经在 `full_stack / afl_only / no_mutator / no_cache_delta` 四个变体上全部完成 `repeat=5`
+- 四个变体都稳定收敛到 `no_diff`
+- 当前 RQ3 已经同时拥有 `oracle_diff` 正样例路径和 `no_diff` 负对照路径，三条 resolver 的保守结论一致指向“当前变体差异不显著”
+
 ### RQ5 failure refinement
 
 - 汇总表：
@@ -203,6 +219,6 @@
 
 当前可直接写入论文的保守结论：
 
-- `unbound` 与 `smartdns` 的代表性样本都已完成 replay
+- `unbound` 与 `smartdns` 的 `20/20` 个样本都已完成 replay
 - 当前 `runtime_or_parse_failure` 更接近 `oracle_parse_incomplete`
 - 这比“运行崩溃”更准确，也更适合论文里的失败标签分层
