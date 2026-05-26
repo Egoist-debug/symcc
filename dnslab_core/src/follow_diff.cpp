@@ -479,6 +479,10 @@ int resolvePositiveIntEnv(const char *Name, int Fallback) {
 }
 
 std::filesystem::path resolveSelfExecutable() {
+  if (const char *SelfExecutable = std::getenv("DNSLAB_SELF_EXECUTABLE");
+      SelfExecutable != nullptr && *SelfExecutable != '\0') {
+    return normalizePath(SelfExecutable);
+  }
   std::error_code Error;
   const auto SelfPath = std::filesystem::read_symlink("/proc/self/exe", Error);
   if (!Error && !SelfPath.empty()) {

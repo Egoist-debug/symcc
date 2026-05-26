@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-oracle-audit-report.XXXXXX")"
 FOLLOW_ROOT="$WORKDIR/follow"
 export PYTHONDONTWRITEBYTECODE=1
@@ -29,6 +30,18 @@ run_cli() {
 		ENABLE_TRIAGE=1 \
 		ENABLE_SYMCC=1 \
 		python3 -m tools.dns_diff.cli "$@"
+}
+
+run_dnslabctl_campaign_report_from_tmp() {
+	(
+		cd /tmp
+		env \
+			ENABLE_DST1_MUTATOR=0 \
+			ENABLE_CACHE_DELTA=1 \
+			ENABLE_TRIAGE=1 \
+			ENABLE_SYMCC=1 \
+			"$DNSLABCTL_BIN" campaign-report --root "$FOLLOW_ROOT" >/dev/null
+	)
 }
 
 get_latest_report_dir() {
@@ -222,11 +235,12 @@ for sample_id, artifacts in fixtures.items():
         write_json(sample_dir / filename, payload)
 PY
 
-run_cli campaign-report --root "$FOLLOW_ROOT" >/dev/null
+run_dnslabctl_campaign_report_from_tmp
 REPORT_DIR="$(get_latest_report_dir "$FOLLOW_ROOT/campaign_reports")"
 
 assert_file_exists "$REPORT_DIR/oracle_audit.tsv"
 assert_file_exists "$REPORT_DIR/oracle_reliability.json"
+assert_file_exists "$REPORT_DIR/evidence_bundle.json"
 
 python3 - "$REPORT_DIR/oracle_audit.tsv" "$FOLLOW_ROOT" <<'PY'
 import csv
@@ -312,6 +326,44 @@ for sample_id, row in rows_by_id.items():
             raise SystemExit(
                 f"ASSERT FAIL: {sample_id}.{key}={actual!s} != {expected!s}"
             )
+PY
+
+python3 - "$REPORT_DIR/evidence_bundle.json" "$FOLLOW_ROOT" "$DNSLABCTL_BIN" <<'PY'
+import json
+import pathlib
+import sys
+
+bundle = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+follow_root = pathlib.Path(sys.argv[2]).resolve()
+dnslabctl_bin = pathlib.Path(sys.argv[3]).resolve()
+
+commands = bundle.get("regeneration_commands")
+if not isinstance(commands, dict):
+    raise SystemExit("ASSERT FAIL: evidence_bundle.regeneration_commands 应为对象")
+
+for key in ("triage_report", "campaign_report", "case_study_export"):
+    value = commands.get(key)
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"ASSERT FAIL: regeneration_commands.{key} 应为非空字符串")
+    if not value.startswith(str(dnslabctl_bin) + " "):
+        raise SystemExit(
+            f"ASSERT FAIL: regeneration_commands.{key}={value!r} 未引用真实 dnslabctl 路径 {dnslabctl_bin!s}"
+        )
+    if str(follow_root) not in value:
+        raise SystemExit(
+            f"ASSERT FAIL: regeneration_commands.{key}={value!r} 未引用 root 路径 {follow_root!s}"
+        )
+
+campaign_summary = bundle.get("campaign_summary")
+oracle_audit = bundle.get("oracle_audit")
+for name, payload in (("campaign_summary", campaign_summary), ("oracle_audit", oracle_audit)):
+    if not isinstance(payload, dict):
+        raise SystemExit(f"ASSERT FAIL: {name} 应为对象")
+    if payload.get("regeneration_command") != commands["campaign_report"]:
+        raise SystemExit(
+            f"ASSERT FAIL: {name}.regeneration_command={payload.get('regeneration_command')!r} "
+            f"!= regeneration_commands.campaign_report={commands['campaign_report']!r}"
+        )
 PY
 
 python3 - "$REPORT_DIR/oracle_reliability.json" <<'PY'

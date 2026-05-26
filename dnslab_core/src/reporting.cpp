@@ -150,6 +150,20 @@ std::filesystem::path normalizePath(const std::filesystem::path &Input) {
   return Absolute.lexically_normal();
 }
 
+std::filesystem::path resolveSelfExecutablePath() {
+  if (const char *SelfExecutable = std::getenv("DNSLAB_SELF_EXECUTABLE");
+      SelfExecutable != nullptr && *SelfExecutable != '\0') {
+    return normalizePath(SelfExecutable);
+  }
+  std::error_code Error;
+  const auto SelfPath = std::filesystem::read_symlink("/proc/self/exe", Error);
+  if (!Error && !SelfPath.empty()) {
+    return normalizePath(SelfPath);
+  }
+  return normalizePath(std::filesystem::current_path() /
+                       "build/linux/x86_64/release/dnslabctl");
+}
+
 bool isAnalysisStateValue(const std::string &Value) {
   return Value == "included" || Value == "excluded" || Value == "unknown";
 }
@@ -2162,10 +2176,7 @@ std::map<std::string, std::string>
 buildRegenerationCommands(const std::filesystem::path &Root,
                           const std::filesystem::path &ReportDir,
                           const std::optional<std::filesystem::path> &ReportBase) {
-  const auto DnslabctlBin =
-      (std::filesystem::current_path() / "build/linux/x86_64/release/dnslabctl")
-          .lexically_normal()
-          .string();
+  const auto DnslabctlBin = resolveSelfExecutablePath().string();
   std::map<std::string, std::string> Commands;
   Commands["triage_rewrite"] =
       "python3 -m tools.dns_diff.cli triage --root " + Root.string() +

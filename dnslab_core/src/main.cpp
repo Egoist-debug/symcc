@@ -49,6 +49,61 @@ void writeJsonFile(const std::filesystem::path &OutputPath,
   Output << Payload.dump(2) << '\n';
 }
 
+std::filesystem::path normalizePath(const std::filesystem::path &InputPath) {
+  std::error_code Error;
+  const auto Absolute = std::filesystem::absolute(InputPath, Error);
+  if (Error) {
+    return InputPath.lexically_normal();
+  }
+  return Absolute.lexically_normal();
+}
+
+std::optional<std::filesystem::path>
+resolveSelfExecutableFromArgv0(const char *Argv0) {
+  if (Argv0 == nullptr || *Argv0 == '\0') {
+    return std::nullopt;
+  }
+  const std::filesystem::path Candidate(Argv0);
+  if (Candidate.is_absolute()) {
+    return normalizePath(Candidate);
+  }
+  if (Candidate.has_parent_path()) {
+    return normalizePath(std::filesystem::current_path() / Candidate);
+  }
+  if (const char *PathEnv = std::getenv("PATH")) {
+    std::stringstream Stream(PathEnv);
+    std::string Entry;
+    while (std::getline(Stream, Entry, ':')) {
+      if (Entry.empty()) {
+        continue;
+      }
+      const auto Resolved = std::filesystem::path(Entry) / Candidate;
+      if (std::filesystem::exists(Resolved)) {
+        return normalizePath(Resolved);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::filesystem::path resolveSelfExecutablePath(const char *Argv0 = nullptr) {
+  if (const char *SelfExecutable = std::getenv("DNSLAB_SELF_EXECUTABLE");
+      SelfExecutable != nullptr && *SelfExecutable != '\0') {
+    return normalizePath(SelfExecutable);
+  }
+  std::error_code Error;
+  const auto SelfPath = std::filesystem::read_symlink("/proc/self/exe", Error);
+  if (!Error && !SelfPath.empty()) {
+    return normalizePath(SelfPath);
+  }
+  if (const auto Argv0Path = resolveSelfExecutableFromArgv0(Argv0);
+      Argv0Path.has_value()) {
+    return *Argv0Path;
+  }
+  return normalizePath(std::filesystem::current_path() /
+                       "build/linux/x86_64/release/dnslabctl");
+}
+
 std::string requireOption(const std::vector<std::string> &Args,
                           const std::string &Name) {
   for (size_t Index = 0; Index + 1 < Args.size(); ++Index) {
@@ -327,6 +382,12 @@ int main(int argc, char **argv) {
     const std::string Command = argv[1];
     const std::vector<std::string> Args(argv + 2, argv + argc);
     const auto WorkspaceRoot = std::filesystem::current_path();
+    const auto SelfExecutablePath = resolveSelfExecutablePath(argv[0]);
+    const auto SelfExecutableCommand = SelfExecutablePath.string();
+    if (::setenv("DNSLAB_SELF_EXECUTABLE", SelfExecutableCommand.c_str(), 1) !=
+        0) {
+      throw std::runtime_error("无法设置 DNSLAB_SELF_EXECUTABLE 环境变量");
+    }
     std::optional<dnslab::ResolverLockFile> DefaultResolverLock;
     bool DefaultResolverLockLoaded = false;
 
@@ -1458,7 +1519,7 @@ int main(int argc, char **argv) {
             }
           }
           ReplayCommand +=
-              "./build/linux/x86_64/release/dnslabctl sync-replay --sample " +
+              SelfExecutableCommand + " sync-replay --sample " +
               Result.Meta.SourceQueueFile.value_or("_") + " --run-root " +
               Result.ArtifactDir.string() + " --bind9-build-root " +
               Bind9BuildRoot.string() + " --bind9-source-root " +
@@ -1745,27 +1806,29 @@ int main(int argc, char **argv) {
       Summary["comparability"] = dnslab::toJson(Comparability);
       writeJsonFile(RunRoot / "summary.json", dnslab::json::Value(Summary));
 
+      const auto BatchSyncReplayCommand =
+          SelfExecutableCommand + " batch-sync-replay";
       std::vector<dnslab::ReportArtifact> Artifacts = {
           {"summary", (RunRoot / "summary.json").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"ablation_matrix", (RunRoot / "ablation_matrix.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"cluster_counts", (RunRoot / "cluster_counts.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"repro_rate", (RunRoot / "repro_rate.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"oracle_audit", (RunRoot / "oracle_audit.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"oracle_reliability", (RunRoot / "oracle_reliability.json").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"failure_taxonomy", (RunRoot / "failure_taxonomy.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"exclusion_summary", (RunRoot / "exclusion_summary.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"cluster", (RunRoot / "cluster.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
           {"case_studies_index", (RunRoot / "case_studies/index.tsv").string(),
-           "./build/linux/x86_64/release/dnslabctl batch-sync-replay"},
+           BatchSyncReplayCommand},
       };
       const auto Bundle = dnslab::buildEvidenceBundle(
           std::optional<std::string>("manual-batch"), std::nullopt,
