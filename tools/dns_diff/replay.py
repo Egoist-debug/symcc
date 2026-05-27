@@ -10,10 +10,14 @@ from .io import atomic_write_json
 from .oracle import parse_oracle_summary
 from .path_defaults import (
     resolve_bind9_afl_tree,
-    resolve_dnsmasq_tag,
-    resolve_knot_resolver_tag,
-    resolve_maradns_tag,
-    resolve_smartdns_tag,
+    resolve_dnsmasq_binary,
+    resolve_dnsmasq_build_tree,
+    resolve_knot_resolver_binary,
+    resolve_knot_resolver_build_tree,
+    resolve_maradns_binary,
+    resolve_maradns_build_tree,
+    resolve_smartdns_binary,
+    resolve_smartdns_build_tree,
     resolve_unbound_afl_tree,
 )
 from .schema import stamp_with_shared_meta
@@ -177,13 +181,6 @@ def _require_executable(path: Path, *, message: str, resolver: str) -> Path:
     return path
 
 
-def _first_existing_executable(candidates: Sequence[Path]) -> Optional[Path]:
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
 def _secondary_native_log_path(
     output_dir: Path, *, resolver: str, prefix: str
 ) -> Path:
@@ -209,20 +206,8 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
         secondary_binary = unbound_afl_tree / ".libs" / "unbound-fuzzme"
         secondary_build_tree = unbound_afl_tree.resolve()
     elif secondary_resolver == "dnsmasq":
-        default_tag = resolve_dnsmasq_tag(root_dir)
-        secondary_build_tree = Path(
-            os.environ.get(
-                "DNSMASQ_BUILD_TREE",
-                str(
-                    root_dir
-                    / "experiments"
-                    / "subjects"
-                    / "dnsmasq"
-                    / f"{default_tag}-build"
-                ),
-            )
-        ).expanduser()
-        secondary_binary = secondary_build_tree / "dnsmasq"
+        secondary_build_tree = resolve_dnsmasq_build_tree(root_dir)
+        secondary_binary = resolve_dnsmasq_binary(secondary_build_tree)
         secondary_harness = Path(
             os.environ.get(
                 "DNSMASQ_HARNESS_SCRIPT",
@@ -230,26 +215,8 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             )
         ).expanduser()
     elif secondary_resolver == "smartdns":
-        default_tag = resolve_smartdns_tag(root_dir)
-        secondary_build_tree = Path(
-            os.environ.get(
-                "SMARTDNS_BUILD_TREE",
-                str(
-                    root_dir
-                    / "experiments"
-                    / "subjects"
-                    / "smartdns"
-                    / f"{default_tag}-build"
-                ),
-            )
-        ).expanduser()
-        secondary_binary = _first_existing_executable(
-            (
-                secondary_build_tree / "src" / "smartdns",
-                secondary_build_tree / "smartdns-build" / "src" / "smartdns",
-                secondary_build_tree / "smartdns",
-            )
-        ) or (secondary_build_tree / "src" / "smartdns")
+        secondary_build_tree = resolve_smartdns_build_tree(root_dir)
+        secondary_binary = resolve_smartdns_binary(secondary_build_tree)
         secondary_harness = Path(
             os.environ.get(
                 "SMARTDNS_HARNESS_SCRIPT",
@@ -257,30 +224,8 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             )
         ).expanduser()
     elif secondary_resolver == "maradns":
-        default_tag = resolve_maradns_tag(root_dir)
-        secondary_build_tree = Path(
-            os.environ.get(
-                "MARADNS_BUILD_TREE",
-                str(
-                    root_dir
-                    / "experiments"
-                    / "subjects"
-                    / "maradns"
-                    / f"{default_tag}-build"
-                ),
-            )
-        ).expanduser()
-        secondary_binary = _first_existing_executable(
-            (
-                secondary_build_tree
-                / "deadwood-build"
-                / "deadwood-github"
-                / "src"
-                / "Deadwood",
-                secondary_build_tree / "deadwood-github" / "src" / "Deadwood",
-                secondary_build_tree / "Deadwood",
-            )
-        ) or (secondary_build_tree / "deadwood-github" / "src" / "Deadwood")
+        secondary_build_tree = resolve_maradns_build_tree(root_dir)
+        secondary_binary = resolve_maradns_binary(secondary_build_tree)
         secondary_harness = Path(
             os.environ.get(
                 "MARADNS_HARNESS_SCRIPT",
@@ -288,20 +233,8 @@ def _collect_paths(sample: str, output_dir: Optional[str]) -> ReplayPaths:
             )
         ).expanduser()
     elif secondary_resolver == "knot-resolver":
-        default_tag = resolve_knot_resolver_tag(root_dir)
-        secondary_build_tree = Path(
-            os.environ.get(
-                "KNOT_RESOLVER_BUILD_TREE",
-                str(
-                    root_dir
-                    / "experiments"
-                    / "subjects"
-                    / "knot-resolver"
-                    / f"{default_tag}-build"
-                ),
-            )
-        ).expanduser()
-        secondary_binary = secondary_build_tree / "knot-build" / "daemon" / "kresd"
+        secondary_build_tree = resolve_knot_resolver_build_tree(root_dir)
+        secondary_binary = resolve_knot_resolver_binary(secondary_build_tree)
         secondary_harness = Path(
             os.environ.get(
                 "KNOT_RESOLVER_HARNESS_SCRIPT",

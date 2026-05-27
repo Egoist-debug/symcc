@@ -890,6 +890,10 @@ void writeFailureMeta(const FollowDiffConfig &Config,
 void runSyncReplay(const FollowDiffConfig &Config,
                    const std::filesystem::path &QueueFile,
                    const std::filesystem::path &SampleDir, double BudgetSec) {
+  std::string RequestedResolvers = "bind9";
+  if (Config.SecondaryResolver != "bind9") {
+    RequestedResolvers += "," + Config.SecondaryResolver;
+  }
   ProcessRequest Request;
   Request.WorkingDirectory = Config.RootDir;
   Request.Environment = {
@@ -912,6 +916,8 @@ void runSyncReplay(const FollowDiffConfig &Config,
       Config.SecondaryBuildRoot.string(),
       "--secondary-source-root",
       Config.SecondarySourceRoot.string(),
+      "--resolvers",
+      RequestedResolvers,
       "--unbound-build-root",
       Config.SecondaryBuildRoot.string(),
   };

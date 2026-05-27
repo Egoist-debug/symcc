@@ -6,9 +6,12 @@ WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-case-study.XXXXXX")"
 FOLLOW_ROOT="$WORKDIR/follow_diff"
 EMPTY_ROOT="$WORKDIR/follow_diff_empty"
 BAD_ROOT="$WORKDIR/follow_diff_bad"
+TRANSCRIPT_ROOT="$WORKDIR/follow_diff_transcript"
 CAMPAIGN_REPORT_DIR="$WORKDIR/campaign_report"
 EMPTY_REPORT_DIR="$WORKDIR/campaign_report_empty"
 BAD_REPORT_DIR="$WORKDIR/campaign_report_bad"
+TRANSCRIPT_REPORT_DIR="$WORKDIR/campaign_report_transcript"
+TRANSCRIPT_CPP_REPORT_DIR="$WORKDIR/campaign_report_transcript_cpp"
 export PYTHONDONTWRITEBYTECODE=1
 
 cleanup() {
@@ -45,6 +48,14 @@ assert_file_contains() {
 
 run_cli() {
 	env \
+		PYTHONDONTWRITEBYTECODE=1 \
+		PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+		python3 -m tools.dns_diff.cli "$@"
+}
+
+run_cli_python() {
+	env \
+		DNS_DIFF_CLI_BACKEND=python \
 		PYTHONDONTWRITEBYTECODE=1 \
 		PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 		python3 -m tools.dns_diff.cli "$@"
@@ -661,6 +672,99 @@ write_json(
 PY
 }
 
+write_transcript_fixture_root() {
+	python3 - "$TRANSCRIPT_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+transcript_root = pathlib.Path(sys.argv[1])
+transcript_root.mkdir(parents=True, exist_ok=True)
+sample_dir = transcript_root / "sample-transcript"
+sample_dir.mkdir(parents=True, exist_ok=True)
+
+
+def write_json(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+write_json(
+    sample_dir / "sample.meta.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-transcript",
+        "status": "completed",
+        "sample_sha1": "sha1-sample-transcript",
+        "sample_size": 11,
+        "sample_path": "/fixtures/sample-transcript.bin",
+    },
+)
+write_json(
+    sample_dir / "oracle.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-transcript",
+        "bind9.stderr_parse_status": "ok",
+        "unbound.stderr_parse_status": "ok",
+        "bind9.parse_ok": True,
+        "unbound.parse_ok": False,
+        "bind9.resolver_fetch_started": True,
+        "unbound.resolver_fetch_started": True,
+        "bind9.response_accepted": True,
+        "unbound.response_accepted": True,
+        "bind9.second_query_hit": False,
+        "unbound.second_query_hit": False,
+        "bind9.cache_entry_created": False,
+        "unbound.cache_entry_created": False,
+        "bind9.timeout": False,
+        "unbound.timeout": False,
+    },
+)
+write_json(
+    sample_dir / "cache_diff.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-transcript",
+        "cache_delta_triggered": False,
+        "bind9": {"has_cache_diff": False, "interesting_delta_count": 0, "delta_items": []},
+        "unbound": {"has_cache_diff": False, "interesting_delta_count": 0, "delta_items": []},
+    },
+)
+write_json(
+    sample_dir / "triage.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-transcript",
+        "status": "completed_oracle_diff",
+        "diff_class": "oracle_diff",
+        "analysis_state": "included",
+        "exclude_reason": None,
+        "semantic_outcome": "oracle_diff",
+        "failure_taxonomy_version": 1,
+        "failure_bucket_primary": "semantic_diff",
+        "failure_bucket_detail": "oracle_diff",
+        "oracle_audit_candidate": True,
+        "case_study_candidate": True,
+        "manual_truth_status": "not_started",
+        "filter_labels": ["oracle_diff"],
+        "cluster_key": "completed_oracle_diff|oracle_diff|oracle_diff|fp:iterative->iterative",
+        "cache_delta_triggered": False,
+        "interesting_delta_count": 0,
+        "needs_manual_review": True,
+        "notes": ["transcript fallback"],
+    },
+)
+(sample_dir / "transcript").write_bytes(b"hello-world")
+(sample_dir / "bind9.stderr").write_text("bind9 stderr\n", encoding="utf-8")
+(sample_dir / "unbound.stderr").write_text("unbound stderr\n", encoding="utf-8")
+PY
+}
+
 assert_case_study_contract() {
 	python3 - "$FOLLOW_ROOT" "$CAMPAIGN_REPORT_DIR" <<'PY'
 import csv
@@ -869,9 +973,46 @@ if json_files:
 PY
 }
 
+assert_transcript_export_contract() {
+	python3 - "$TRANSCRIPT_ROOT" "$TRANSCRIPT_REPORT_DIR" <<'PY'
+import csv
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+report_dir = pathlib.Path(sys.argv[2]).resolve()
+sample_dir = root / "sample-transcript"
+case_dir = report_dir / "case_studies"
+index_path = case_dir / "index.tsv"
+
+with index_path.open(encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle, delimiter="\t"))
+
+if len(rows) != 1 or rows[0]["sample_id"] != "sample-transcript":
+    raise SystemExit(f"ASSERT FAIL: transcript fallback case-study index 异常: {rows!r}")
+
+payload = json.loads((case_dir / "sample-transcript.json").read_text(encoding="utf-8"))
+sample_bin_path = pathlib.Path(payload["raw_evidence"]["paths"]["sample_bin_path"]).resolve()
+expected_sample_path = (sample_dir / "transcript").resolve()
+if sample_bin_path != expected_sample_path:
+    raise SystemExit(
+        f"ASSERT FAIL: transcript fallback sample_bin_path={sample_bin_path!s} != {expected_sample_path!s}"
+    )
+if payload["raw_evidence"]["sample_bin"].get("exists") is not True:
+    raise SystemExit("ASSERT FAIL: transcript fallback sample_bin.exists 应为 true")
+if payload["raw_evidence"]["sample_bin"].get("size") != 11:
+    raise SystemExit("ASSERT FAIL: transcript fallback sample_bin.size 应为 11")
+claim_scope = payload.get("claim_scope") or []
+if not any("transcript" in item for item in claim_scope):
+    raise SystemExit("ASSERT FAIL: transcript fallback claim_scope 应提到 transcript")
+PY
+}
+
 write_main_fixture_root
 write_empty_fixture_root
 write_bad_fixture_root
+write_transcript_fixture_root
 
 run_cli case-study-export --root "$FOLLOW_ROOT" --campaign-report-dir "$CAMPAIGN_REPORT_DIR" --top-n 5 >/dev/null
 assert_file_exists "$CAMPAIGN_REPORT_DIR/case_studies/index.tsv"
@@ -883,6 +1024,16 @@ assert_case_study_contract
 run_cli case-study-export --root "$EMPTY_ROOT" --campaign-report-dir "$EMPTY_REPORT_DIR" >/dev/null
 assert_file_exists "$EMPTY_REPORT_DIR/case_studies/index.tsv"
 assert_empty_export_contract
+
+run_cli_python case-study-export --root "$TRANSCRIPT_ROOT" --campaign-report-dir "$TRANSCRIPT_REPORT_DIR" >/dev/null
+assert_file_exists "$TRANSCRIPT_REPORT_DIR/case_studies/index.tsv"
+assert_file_exists "$TRANSCRIPT_REPORT_DIR/case_studies/sample-transcript.json"
+assert_transcript_export_contract
+
+run_cli case-study-export --root "$TRANSCRIPT_ROOT" --campaign-report-dir "$TRANSCRIPT_CPP_REPORT_DIR" >/dev/null
+assert_file_exists "$TRANSCRIPT_CPP_REPORT_DIR/case_studies/index.tsv"
+assert_file_exists "$TRANSCRIPT_CPP_REPORT_DIR/case_studies/sample-transcript.json"
+TRANSCRIPT_REPORT_DIR="$TRANSCRIPT_CPP_REPORT_DIR" assert_transcript_export_contract
 
 assert_case_study_fail_closed \
 	"$BAD_ROOT" \

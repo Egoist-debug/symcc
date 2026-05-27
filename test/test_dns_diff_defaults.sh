@@ -88,6 +88,141 @@ EXPECTED_UNBOUND_AFL_TREE="$ROOT_DIR/experiments/subjects/unbound/${UNBOUND_TAG}
 
 mkdir -p "$ISOLATED_ROOT"
 
+PATH_HELPER_ROOT="$WORKDIR/path-helper-root"
+mkdir -p "$PATH_HELPER_ROOT"
+
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PYTHONPATH_VALUE" python3 - "$PATH_HELPER_ROOT" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+from tools.dns_diff.path_defaults import (
+    resolve_cache_dump_dir,
+    resolve_dnsmasq_build_tree,
+    resolve_dnslabctl_bin,
+    resolve_knot_resolver_build_tree,
+    resolve_maradns_binary,
+    resolve_maradns_build_tree,
+    resolve_response_corpus_dir,
+    resolve_smartdns_binary,
+    resolve_smartdns_build_tree,
+)
+
+root = Path(sys.argv[1]).resolve()
+smart_tag = "smartdns-test-tag"
+maradns_tag = "maradns-test-tag"
+dnsmasq_tag = "dnsmasq-test-tag"
+knot_tag = "knot-test-tag"
+
+expected_smartdns_build = (
+    root / "experiments" / "subjects" / "smartdns" / f"{smart_tag}-build"
+).resolve()
+expected_maradns_build = (
+    root / "experiments" / "subjects" / "maradns" / f"{maradns_tag}-build"
+).resolve()
+expected_dnsmasq_build = (
+    root / "experiments" / "subjects" / "dnsmasq" / f"{dnsmasq_tag}-build"
+).resolve()
+expected_knot_build = (
+    root / "experiments" / "subjects" / "knot-resolver" / f"{knot_tag}-build"
+).resolve()
+
+checks = {
+    "resolve_smartdns_build_tree(tag_override)": resolve_smartdns_build_tree(
+        root, environ={"SMARTDNS_TAG": smart_tag}
+    )
+    == expected_smartdns_build,
+    "resolve_maradns_build_tree(tag_override)": resolve_maradns_build_tree(
+        root, environ={"MARADNS_TAG": maradns_tag}
+    )
+    == expected_maradns_build,
+    "resolve_dnsmasq_build_tree(tag_override)": resolve_dnsmasq_build_tree(
+        root, environ={"DNSMASQ_TAG": dnsmasq_tag}
+    )
+    == expected_dnsmasq_build,
+    "resolve_knot_resolver_build_tree(tag_override)": resolve_knot_resolver_build_tree(
+        root, environ={"KNOT_RESOLVER_TAG": knot_tag}
+    )
+    == expected_knot_build,
+}
+
+smartdns_override = (root / "override-smartdns-build").resolve()
+maradns_override = (root / "override-maradns-build").resolve()
+dnslabctl_override = (root / "override-bin" / "dnslabctl").resolve()
+checks["resolve_smartdns_build_tree(env_override)"] = resolve_smartdns_build_tree(
+    root,
+    environ={"SMARTDNS_BUILD_TREE": str(smartdns_override)},
+) == smartdns_override
+checks["resolve_maradns_build_tree(env_override)"] = resolve_maradns_build_tree(
+    root,
+    environ={"MARADNS_BUILD_TREE": str(maradns_override)},
+) == maradns_override
+checks["resolve_dnslabctl_bin(default)"] = resolve_dnslabctl_bin(root) == (
+    root / "build" / "linux" / "x86_64" / "release" / "dnslabctl"
+).resolve()
+checks["resolve_dnslabctl_bin(env_override)"] = resolve_dnslabctl_bin(
+    root,
+    environ={"DNSLABCTL_BIN": str(dnslabctl_override)},
+) == dnslabctl_override
+
+expected_work = (root / "unbound_experiment" / "work_stateful").resolve()
+expected_response_corpus = (expected_work / "response_corpus").resolve()
+expected_cache_dump_dir = (expected_work / "cache_dumps").resolve()
+response_override = (root / "override-response-corpus").resolve()
+checks["resolve_response_corpus_dir(default)"] = resolve_response_corpus_dir(
+    expected_work,
+    environ={},
+) == expected_response_corpus
+checks["resolve_response_corpus_dir(env_override)"] = resolve_response_corpus_dir(
+    expected_work,
+    environ={"RESPONSE_CORPUS_DIR": str(response_override)},
+) == response_override
+checks["resolve_cache_dump_dir(default)"] = resolve_cache_dump_dir(expected_work) == expected_cache_dump_dir
+
+failed = [name for name, ok in checks.items() if not ok]
+if failed:
+    raise SystemExit(f"ASSERT FAIL: path_defaults build tree helper 校验失败 {failed}")
+
+smartdns_candidate = expected_smartdns_build / "smartdns-build" / "src" / "smartdns"
+smartdns_candidate.parent.mkdir(parents=True, exist_ok=True)
+smartdns_candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+smartdns_candidate.chmod(
+    smartdns_candidate.stat().st_mode
+    | stat.S_IXUSR
+    | stat.S_IXGRP
+    | stat.S_IXOTH
+)
+if resolve_smartdns_binary(expected_smartdns_build) != smartdns_candidate.resolve():
+    raise SystemExit(
+        "ASSERT FAIL: resolve_smartdns_binary 未命中兼容 smartdns-build/src/smartdns"
+    )
+
+maradns_candidate = expected_maradns_build / "deadwood-github" / "src" / "Deadwood"
+maradns_candidate.parent.mkdir(parents=True, exist_ok=True)
+maradns_candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+maradns_candidate.chmod(
+    maradns_candidate.stat().st_mode
+    | stat.S_IXUSR
+    | stat.S_IXGRP
+    | stat.S_IXOTH
+)
+if resolve_maradns_binary(expected_maradns_build) != maradns_candidate.resolve():
+    raise SystemExit(
+        "ASSERT FAIL: resolve_maradns_binary 未命中兼容 deadwood-github/src/Deadwood"
+    )
+
+smartdns_fallback_root = (root / "smartdns-fallback").resolve()
+maradns_fallback_root = (root / "maradns-fallback").resolve()
+if resolve_smartdns_binary(smartdns_fallback_root) != (
+    smartdns_fallback_root / "src" / "smartdns"
+):
+    raise SystemExit("ASSERT FAIL: resolve_smartdns_binary fallback 路径不符合预期")
+if resolve_maradns_binary(maradns_fallback_root) != (
+    maradns_fallback_root / "deadwood-github" / "src" / "Deadwood"
+):
+    raise SystemExit("ASSERT FAIL: resolve_maradns_binary fallback 路径不符合预期")
+PY
+
 env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PYTHONPATH_VALUE" python3 - "$ISOLATED_ROOT" <<'PY'
 import sys
 from pathlib import Path
@@ -189,6 +324,7 @@ env \
 	PYTHONDONTWRITEBYTECODE=1 \
 	PYTHONPATH="$PYTHONPATH_VALUE" \
 	ROOT_DIR="$ISOLATED_ROOT" \
+	DNS_DIFF_CLI_BACKEND=python \
 	python3 -m tools.dns_diff.cli follow-diff-once >/dev/null
 assert_dir_exists "$ISOLATED_ROOT/unbound_experiment/work_stateful/follow_diff"
 assert_file_exists "$ISOLATED_ROOT/unbound_experiment/work_stateful/follow_diff.state.json"
@@ -200,6 +336,7 @@ env \
 	PYTHONPATH="$PYTHONPATH_VALUE" \
 	ROOT_DIR="$ISOLATED_ROOT" \
 	WORK_DIR="$WORK_OVERRIDE" \
+	DNS_DIFF_CLI_BACKEND=python \
 	python3 -m tools.dns_diff.cli follow-diff-once >/dev/null
 assert_dir_exists "$WORK_OVERRIDE/follow_diff"
 assert_file_exists "$WORK_OVERRIDE/follow_diff.state.json"
@@ -245,6 +382,7 @@ env \
 	WORK_DIR="$SOURCE_WORK" \
 	BIND9_WORK_DIR="$DEFAULT_SOURCE_WORK" \
 	FOLLOW_DIFF_SOURCE_DIR="$OVERRIDE_QUEUE" \
+	DNS_DIFF_CLI_BACKEND=python \
 	python3 -m tools.dns_diff.cli follow-diff-once >/dev/null
 
 env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PYTHONPATH_VALUE" python3 - "$SOURCE_WORK/follow_diff" "$DEFAULT_QUEUE/id:000001,orig:default" "$OVERRIDE_QUEUE/id:000002,orig:override" <<'PY'
@@ -321,6 +459,7 @@ env \
 	ROOT_DIR="$ISOLATED_ROOT" \
 	WORK_DIR="$REPORT_WORK" \
 	SYMCC_HIGH_VALUE_MANIFEST="$DEFAULT_MANIFEST_OVERRIDE" \
+	DNS_DIFF_CLI_BACKEND=python \
 	python3 -m tools.dns_diff.cli triage-report >/dev/null
 assert_file_empty "$DEFAULT_MANIFEST_OVERRIDE"
 assert_path_absent "$REPORT_WORK/high_value_samples.txt"
@@ -331,6 +470,7 @@ env \
 	ROOT_DIR="$ISOLATED_ROOT" \
 	WORK_DIR="$REPORT_WORK" \
 	SYMCC_HIGH_VALUE_MANIFEST="$CUSTOM_MANIFEST_OVERRIDE" \
+	DNS_DIFF_CLI_BACKEND=python \
 	python3 -m tools.dns_diff.cli report --root "$CUSTOM_REPORT_ROOT" >/dev/null
 assert_file_empty "$CUSTOM_MANIFEST_OVERRIDE"
 assert_path_absent "$CUSTOM_REPORT_ROOT/high_value_samples.txt"

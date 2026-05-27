@@ -5,10 +5,23 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple, TypeVar
 
 from .path_defaults import (
+    resolve_cache_dump_dir as _path_resolve_cache_dump_dir,
+    resolve_dnslabctl_bin as _path_resolve_dnslabctl_bin,
+    resolve_dnsmasq_binary as _path_default_dnsmasq_binary,
+    resolve_dnsmasq_build_tree as _path_default_dnsmasq_build_tree,
     resolve_dnsmasq_tag as _path_default_dnsmasq_tag,
+    resolve_knot_resolver_binary as _path_default_knot_resolver_binary,
+    resolve_knot_resolver_build_tree as _path_default_knot_resolver_build_tree,
     resolve_knot_resolver_tag as _path_default_knot_resolver_tag,
+    resolve_maradns_binary as _path_default_maradns_binary,
+    resolve_maradns_build_tree as _path_default_maradns_build_tree,
     resolve_maradns_tag as _path_default_maradns_tag,
+    resolve_response_corpus_dir as _path_resolve_response_corpus_dir,
+    resolve_root_dir as _path_resolve_root_dir,
+    resolve_smartdns_binary as _path_default_smartdns_binary,
+    resolve_smartdns_build_tree as _path_default_smartdns_build_tree,
     resolve_smartdns_tag as _path_default_smartdns_tag,
+    resolve_follow_diff_work_dir as _path_resolve_work_dir,
     resolve_unbound_afl_tree as _path_default_unbound_afl_tree,
     resolve_unbound_source_root as _path_default_unbound_source_root,
 )
@@ -43,61 +56,35 @@ RegistrySpec = TypeVar("RegistrySpec", ResolverSpec, TargetSpec)
 
 
 def _resolve_root_dir() -> Path:
-    env_root = os.environ.get("ROOT_DIR")
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    return Path(__file__).resolve().parents[2]
+    return _path_resolve_root_dir()
 
 
 def _resolve_work_dir(root_dir: Path) -> Path:
-    return (
-        Path(
-            os.environ.get(
-                "WORK_DIR", str(root_dir / "unbound_experiment" / "work_stateful")
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+    return _path_resolve_work_dir(root_dir=root_dir)
 
 
 def _resolve_response_corpus_dir(work_dir: Path) -> Path:
-    return (
-        Path(os.environ.get("RESPONSE_CORPUS_DIR", str(work_dir / "response_corpus")))
-        .expanduser()
-        .resolve()
-    )
+    return _path_resolve_response_corpus_dir(work_dir)
 
 
 def _resolve_cache_dump_dir(work_dir: Path) -> Path:
-    return (work_dir / "cache_dumps").resolve()
-
-
-def _first_existing_executable(candidates: Sequence[Path]) -> Optional[Path]:
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+    return _path_resolve_cache_dump_dir(work_dir)
 
 
 def _resolve_smartdns_binary(build_root: Path) -> Path:
-    return _first_existing_executable(
-        (
-            build_root / "src" / "smartdns",
-            build_root / "smartdns-build" / "src" / "smartdns",
-            build_root / "smartdns",
-        )
-    ) or (build_root / "src" / "smartdns")
+    return _path_default_smartdns_binary(build_root)
 
 
 def _resolve_maradns_binary(build_root: Path) -> Path:
-    return _first_existing_executable(
-        (
-            build_root / "deadwood-build" / "deadwood-github" / "src" / "Deadwood",
-            build_root / "deadwood-github" / "src" / "Deadwood",
-            build_root / "Deadwood",
-        )
-    ) or (build_root / "deadwood-github" / "src" / "Deadwood")
+    return _path_default_maradns_binary(build_root)
+
+
+def _resolve_dnsmasq_binary(build_root: Path) -> Path:
+    return _path_default_dnsmasq_binary(build_root)
+
+
+def _resolve_knot_resolver_binary(build_root: Path) -> Path:
+    return _path_default_knot_resolver_binary(build_root)
 
 
 def _resolve_unbound_src_tree(root_dir: Path) -> Path:
@@ -109,16 +96,7 @@ def _resolve_unbound_afl_tree(root_dir: Path) -> Path:
 
 
 def _resolve_dnslabctl_bin(root_dir: Path) -> Path:
-    return (
-        Path(
-            os.environ.get(
-                "DNSLABCTL_BIN",
-                str(root_dir / "build" / "linux" / "x86_64" / "release" / "dnslabctl"),
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+    return _path_resolve_dnslabctl_bin(root_dir)
 
 
 def _resolve_dnsmasq_tag(root_dir: Path) -> str:
@@ -152,17 +130,7 @@ def _resolve_dnsmasq_src_tree(root_dir: Path) -> Path:
 
 
 def _resolve_dnsmasq_build_tree(root_dir: Path) -> Path:
-    default_tag = _resolve_dnsmasq_tag(root_dir)
-    return (
-        Path(
-            os.environ.get(
-                "DNSMASQ_BUILD_TREE",
-                str(root_dir / "experiments" / "subjects" / "dnsmasq" / f"{default_tag}-build"),
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+    return _path_default_dnsmasq_build_tree(root_dir)
 
 
 def _resolve_smartdns_src_tree(root_dir: Path) -> Path:
@@ -180,17 +148,7 @@ def _resolve_smartdns_src_tree(root_dir: Path) -> Path:
 
 
 def _resolve_smartdns_build_tree(root_dir: Path) -> Path:
-    default_tag = _resolve_smartdns_tag(root_dir)
-    return (
-        Path(
-            os.environ.get(
-                "SMARTDNS_BUILD_TREE",
-                str(root_dir / "experiments" / "subjects" / "smartdns" / f"{default_tag}-build"),
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+    return _path_default_smartdns_build_tree(root_dir)
 
 
 def _resolve_maradns_src_tree(root_dir: Path) -> Path:
@@ -208,17 +166,7 @@ def _resolve_maradns_src_tree(root_dir: Path) -> Path:
 
 
 def _resolve_maradns_build_tree(root_dir: Path) -> Path:
-    default_tag = _resolve_maradns_tag(root_dir)
-    return (
-        Path(
-            os.environ.get(
-                "MARADNS_BUILD_TREE",
-                str(root_dir / "experiments" / "subjects" / "maradns" / f"{default_tag}-build"),
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+    return _path_default_maradns_build_tree(root_dir)
 
 
 def _resolve_knot_resolver_src_tree(root_dir: Path) -> Path:
@@ -242,23 +190,7 @@ def _resolve_knot_resolver_src_tree(root_dir: Path) -> Path:
 
 
 def _resolve_knot_resolver_build_tree(root_dir: Path) -> Path:
-    default_tag = _resolve_knot_resolver_tag(root_dir)
-    return (
-        Path(
-            os.environ.get(
-                "KNOT_RESOLVER_BUILD_TREE",
-                str(
-                    root_dir
-                    / "experiments"
-                    / "subjects"
-                    / "knot-resolver"
-                    / f"{default_tag}-build"
-                ),
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+    return _path_default_knot_resolver_build_tree(root_dir)
 
 
 def _parse_positive_int(env_key: str, default: int) -> int:
@@ -529,7 +461,7 @@ def _dump_knot_resolver_cache(sample: Optional[str], output_path: Optional[str])
     output_file.parent.mkdir(parents=True, exist_ok=True)
     runtime_root.mkdir(parents=True, exist_ok=True)
 
-    binary = build_root / "knot-build" / "daemon" / "kresd"
+    binary = _resolve_knot_resolver_binary(build_root)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         build_args = [
             "adapter-build",
@@ -792,7 +724,7 @@ def _dump_dnsmasq_cache(sample: Optional[str], output_path: Optional[str]) -> in
     output_file.parent.mkdir(parents=True, exist_ok=True)
     runtime_root.mkdir(parents=True, exist_ok=True)
 
-    binary = build_root / "dnsmasq"
+    binary = _resolve_dnsmasq_binary(build_root)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         build_args = [
             "adapter-build",

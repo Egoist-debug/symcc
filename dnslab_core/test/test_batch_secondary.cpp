@@ -155,7 +155,8 @@ int main() {
       quote(SampleDir) + " --run-root " + quote(RunRoot) +
       " --bind9-build-root " + quote(BindBuildRoot) +
       " --secondary-resolver knot-resolver --secondary-build-root " +
-      quote(KnotBuildRoot) + " > " + quote(StdoutPath);
+      quote(KnotBuildRoot) + " --resolvers bind9,knot-resolver > " +
+      quote(StdoutPath);
   const int RawCode = std::system(Command.c_str());
   require(RawCode == 0, "batch-sync-replay 命令执行失败");
 

@@ -11,6 +11,12 @@ LEGACY_DNSMASQ_TAG = "v2.92"
 LEGACY_SMARTDNS_TAG = "Release47.1"
 LEGACY_MARADNS_TAG = "deadwood-3.3.02"
 LEGACY_KNOT_RESOLVER_TAG = "v6.2.0"
+DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = Path("unbound_experiment") / "work_stateful"
+DEFAULT_BIND9_WORK_DIR_RELATIVE = Path("named_experiment") / "work"
+DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = (
+    Path("afl_out") / "master" / "queue"
+)
+FOLLOW_DIFF_OUTPUT_DIR_NAME = "follow_diff"
 
 
 def _env(environ: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
@@ -26,10 +32,12 @@ def _expand_env_path(
     return Path(raw_value).expanduser().resolve()
 
 
-def _resolve_dnslabctl_bin(root_dir: Path) -> Path:
+def resolve_dnslabctl_bin(
+    root_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
     return (
         Path(
-            os.environ.get(
+            _env(environ).get(
                 "DNSLABCTL_BIN",
                 str(root_dir / "build" / "linux" / "x86_64" / "release" / "dnslabctl"),
             )
@@ -41,6 +49,88 @@ def _resolve_dnslabctl_bin(root_dir: Path) -> Path:
 
 def _resolve_lock_file(root_dir: Path) -> Path:
     return (root_dir / "experiments" / "resolvers.lock.json").resolve()
+
+
+def resolve_root_dir(*, environ: Optional[Mapping[str, str]] = None) -> Path:
+    env_path = _expand_env_path("ROOT_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    return Path(__file__).resolve().parents[2]
+
+
+def default_follow_diff_work_dir(root_dir: Path) -> Path:
+    return (Path(root_dir).expanduser().resolve() / DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE).resolve()
+
+
+def resolve_follow_diff_work_dir(
+    *,
+    root_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env_path = _expand_env_path("WORK_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    effective_root = resolve_root_dir(environ=environ) if root_dir is None else Path(root_dir)
+    return default_follow_diff_work_dir(effective_root)
+
+
+def default_bind9_work_dir(root_dir: Path) -> Path:
+    return (Path(root_dir).expanduser().resolve() / DEFAULT_BIND9_WORK_DIR_RELATIVE).resolve()
+
+
+def resolve_bind9_work_dir(
+    *,
+    root_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env_path = _expand_env_path("BIND9_WORK_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    env_path = _expand_env_path("WORK_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    effective_root = resolve_root_dir(environ=environ) if root_dir is None else Path(root_dir)
+    return default_bind9_work_dir(effective_root)
+
+
+def default_follow_diff_source_dir(bind9_work_dir: Path) -> Path:
+    return (
+        Path(bind9_work_dir).expanduser().resolve()
+        / DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE
+    ).resolve()
+
+
+def resolve_follow_diff_source_dir(
+    *,
+    root_dir: Optional[Path] = None,
+    bind9_work_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env_path = _expand_env_path("FOLLOW_DIFF_SOURCE_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    if bind9_work_dir is not None:
+        return default_follow_diff_source_dir(bind9_work_dir)
+    return default_follow_diff_source_dir(
+        resolve_bind9_work_dir(root_dir=root_dir, environ=environ)
+    )
+
+
+def default_follow_diff_output_root(work_dir: Path) -> Path:
+    return (Path(work_dir).expanduser().resolve() / FOLLOW_DIFF_OUTPUT_DIR_NAME).resolve()
+
+
+def resolve_response_corpus_dir(
+    work_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
+    env_path = _expand_env_path("RESPONSE_CORPUS_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    return (Path(work_dir).expanduser().resolve() / "response_corpus").resolve()
+
+
+def resolve_cache_dump_dir(work_dir: Path) -> Path:
+    return (Path(work_dir).expanduser().resolve() / "cache_dumps").resolve()
 
 
 def _first_existing(candidates: Sequence[Path]) -> Optional[Path]:
@@ -70,7 +160,7 @@ def resolve_locked_tag(
         if raw_value:
             return raw_value
 
-    dnslabctl = _resolve_dnslabctl_bin(root_dir)
+    dnslabctl = resolve_dnslabctl_bin(root_dir, environ=environ)
     lock_file = _resolve_lock_file(root_dir)
     if dnslabctl.is_file() and os.access(dnslabctl, os.X_OK) and lock_file.is_file():
         try:
@@ -270,3 +360,106 @@ def resolve_unbound_afl_tree(
         root_dir / "unbound-1.24.2-afl",
     )
     return _preferred_existing_or_default(candidates)
+
+
+def resolve_dnsmasq_build_tree(
+    root_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
+    env_path = _expand_env_path("DNSMASQ_BUILD_TREE", environ=environ)
+    if env_path is not None:
+        return env_path
+    dnsmasq_tag = resolve_dnsmasq_tag(root_dir, environ=environ)
+    return (
+        root_dir / "experiments" / "subjects" / "dnsmasq" / f"{dnsmasq_tag}-build"
+    ).resolve()
+
+
+def resolve_smartdns_build_tree(
+    root_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
+    env_path = _expand_env_path("SMARTDNS_BUILD_TREE", environ=environ)
+    if env_path is not None:
+        return env_path
+    smartdns_tag = resolve_smartdns_tag(root_dir, environ=environ)
+    return (
+        root_dir
+        / "experiments"
+        / "subjects"
+        / "smartdns"
+        / f"{smartdns_tag}-build"
+    ).resolve()
+
+
+def resolve_maradns_build_tree(
+    root_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
+    env_path = _expand_env_path("MARADNS_BUILD_TREE", environ=environ)
+    if env_path is not None:
+        return env_path
+    maradns_tag = resolve_maradns_tag(root_dir, environ=environ)
+    return (
+        root_dir
+        / "experiments"
+        / "subjects"
+        / "maradns"
+        / f"{maradns_tag}-build"
+    ).resolve()
+
+
+def resolve_knot_resolver_build_tree(
+    root_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
+    env_path = _expand_env_path("KNOT_RESOLVER_BUILD_TREE", environ=environ)
+    if env_path is not None:
+        return env_path
+    knot_resolver_tag = resolve_knot_resolver_tag(root_dir, environ=environ)
+    return (
+        root_dir
+        / "experiments"
+        / "subjects"
+        / "knot-resolver"
+        / f"{knot_resolver_tag}-build"
+    ).resolve()
+
+
+def _first_existing_executable(candidates: Sequence[Path]) -> Optional[Path]:
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    return None
+
+
+def resolve_dnsmasq_binary(build_root: Path) -> Path:
+    return (Path(build_root).expanduser().resolve() / "dnsmasq").resolve()
+
+
+def resolve_smartdns_binary(build_root: Path) -> Path:
+    normalized_build_root = Path(build_root).expanduser().resolve()
+    return _first_existing_executable(
+        (
+            normalized_build_root / "src" / "smartdns",
+            normalized_build_root / "smartdns-build" / "src" / "smartdns",
+            normalized_build_root / "smartdns",
+        )
+    ) or (normalized_build_root / "src" / "smartdns")
+
+
+def resolve_maradns_binary(build_root: Path) -> Path:
+    normalized_build_root = Path(build_root).expanduser().resolve()
+    return _first_existing_executable(
+        (
+            normalized_build_root
+            / "deadwood-build"
+            / "deadwood-github"
+            / "src"
+            / "Deadwood",
+            normalized_build_root / "deadwood-github" / "src" / "Deadwood",
+            normalized_build_root / "Deadwood",
+        )
+    ) or (normalized_build_root / "deadwood-github" / "src" / "Deadwood")
+
+
+def resolve_knot_resolver_binary(build_root: Path) -> Path:
+    return (
+        Path(build_root).expanduser().resolve() / "knot-build" / "daemon" / "kresd"
+    ).resolve()

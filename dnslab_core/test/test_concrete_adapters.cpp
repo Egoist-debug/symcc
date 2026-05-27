@@ -50,12 +50,20 @@ int main() {
   const auto DnsmasqBuild = Root / "dnsmasq-build";
   const auto DnsmasqBinary = DnsmasqBuild / "dnsmasq";
   const auto DnsmasqHarness = Root / "dnsmasq-harness.py";
+  const auto DnsmasqPatchTree = Root / "dnsmasq-patch-tree";
   const auto SmartdnsSource = Root / "smartdns-source";
   const auto SmartdnsBuild = Root / "smartdns-build";
   const auto SmartdnsHarness = Root / "smartdns-harness.py";
   const auto MaradnsSource = Root / "maradns-source";
   const auto MaradnsBuild = Root / "maradns-build";
   const auto MaradnsHarness = Root / "maradns-harness.py";
+  const auto KnotBuildSource = Root / "knot-build-source";
+  const auto KnotBuildGeneratedRootKeysSource =
+      Root / "knot-build-generated-rootkeys-source";
+  const auto KnotBuildRoot = Root / "knot-build-root";
+  const auto KnotBuildGeneratedRootKeysRoot =
+      Root / "knot-build-generated-rootkeys-root";
+  const auto FakeBin = Root / "fake-bin";
   const auto KnotBinary = Root / "knot-build" / "daemon" / "kresd";
   const auto KnotHarness = Root / "knot-harness.py";
   const auto Sample = Root / "sample.bin";
@@ -82,6 +90,7 @@ int main() {
       "printf 'unbound-cache\\n' > \"$UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH\"\n");
 
   std::filesystem::create_directories(DnsmasqSource);
+  std::filesystem::create_directories(DnsmasqPatchTree / "nested");
   {
     std::ofstream Makefile(DnsmasqSource / "Makefile");
     Makefile << "BUILDDIR ?= .\n"
@@ -90,6 +99,8 @@ int main() {
                 "\tprintf '#!/bin/sh\\nexit 0\\n' > $(BUILDDIR)/dnsmasq\n"
                 "\tchmod +x $(BUILDDIR)/dnsmasq\n";
   }
+  std::ofstream(DnsmasqPatchTree / "nested" / "patched.txt")
+      << "dnsmasq patch tree\n";
   {
     std::ofstream Harness(DnsmasqHarness);
     Harness << "#!/usr/bin/env python3\n"
@@ -195,6 +206,51 @@ int main() {
           std::filesystem::perms::owner_write |
           std::filesystem::perms::group_exec | std::filesystem::perms::group_read,
       std::filesystem::perm_options::add);
+  std::filesystem::create_directories(
+      KnotBuildSource / "daemon" / "lua" / "kres_modules");
+  std::filesystem::create_directories(KnotBuildSource / "etc");
+  std::ofstream(KnotBuildSource / "meson.build") << "project('kresd', 'c')\n";
+  std::ofstream(KnotBuildSource / "daemon" / "lua" / "sandbox.lua")
+      << "-- sandbox\n";
+  std::ofstream(KnotBuildSource / "daemon" / "lua" / "kres_modules" /
+                "ta_update.lua")
+      << "-- ta_update\n";
+  std::ofstream(KnotBuildSource / "etc" / "root.keys") << "rootkeys\n";
+  std::filesystem::create_directories(
+      KnotBuildGeneratedRootKeysSource / "daemon" / "lua" / "kres_modules");
+  std::ofstream(KnotBuildGeneratedRootKeysSource / "meson.build")
+      << "project('kresd', 'c')\n";
+  std::ofstream(KnotBuildGeneratedRootKeysSource / "daemon" / "lua" /
+                "sandbox.lua")
+      << "-- sandbox\n";
+  std::ofstream(KnotBuildGeneratedRootKeysSource / "daemon" / "lua" /
+                "kres_modules" / "ta_update.lua")
+      << "-- ta_update\n";
+  writeExecutable(
+      FakeBin / "meson",
+      "#!/usr/bin/env python3\n"
+      "import pathlib, sys\n"
+      "args = sys.argv[1:]\n"
+      "if args[:1] == ['setup']:\n"
+      "    target = pathlib.Path(args[1])\n"
+      "    target.mkdir(parents=True, exist_ok=True)\n"
+      "    (target / 'build.ninja').write_text('# ninja\\n', encoding='utf-8')\n"
+      "    sys.exit(0)\n"
+      "if args[:2] == ['install', '-C']:\n"
+      "    pathlib.Path(args[2]).mkdir(parents=True, exist_ok=True)\n"
+      "    sys.exit(0)\n"
+      "sys.exit(1)\n");
+  writeExecutable(
+      FakeBin / "ninja",
+      "#!/usr/bin/env python3\n"
+      "import os, pathlib, stat, sys\n"
+      "target = pathlib.Path(os.getcwd()) / 'daemon' / 'kresd'\n"
+      "target.parent.mkdir(parents=True, exist_ok=True)\n"
+      "target.write_text('#!/bin/sh\\nexit 0\\n', encoding='utf-8')\n"
+      "target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)\n"
+      "(pathlib.Path(os.getcwd()) / 'etc').mkdir(parents=True, exist_ok=True)\n"
+      "(pathlib.Path(os.getcwd()) / 'etc' / 'root.keys').write_text('generated-rootkeys\\n', encoding='utf-8')\n"
+      "sys.exit(0)\n");
 
   dnslab::Bind9ResolverAdapter Bind9(dnslab::Bind9AdapterConfig{
       Root, Root / "unused.sh", NamedTemplate, ResponseCorpus,
@@ -210,6 +266,8 @@ int main() {
       Root, 2, MaradnsHarness, MaradnsSource, std::nullopt});
   dnslab::KnotResolverAdapter Knot(dnslab::KnotResolverAdapterConfig{
       Root, KnotHarness, std::nullopt, KnotBinary});
+  dnslab::KnotResolverAdapter KnotBuildAdapter(dnslab::KnotResolverAdapterConfig{
+      Root, KnotHarness, std::nullopt, std::nullopt});
 
   const auto Bind9Before = RunRoot / "bind9.before.cache.txt";
   const auto Bind9Dump = Bind9.dumpCache(RunRoot, Bind9Before);
@@ -238,6 +296,9 @@ int main() {
   const auto DnsmasqBuildResult = Dnsmasq.build(DnsmasqSource, DnsmasqBuild);
   assert(DnsmasqBuildResult.ExitCode == 0);
   assert(std::filesystem::exists(DnsmasqBinary));
+  const auto DnsmasqPatchResult = Dnsmasq.applyPatch(DnsmasqSource, DnsmasqPatchTree);
+  assert(DnsmasqPatchResult.ExitCode == 0);
+  assert(std::filesystem::exists(DnsmasqSource / "nested" / "patched.txt"));
 
   dnslab::RunSampleRequest DnsmasqRequest{
       Root, DnsmasqBuild, RunRoot, Sample, "sample-1", {}};
@@ -255,6 +316,13 @@ int main() {
   const auto SmartdnsBuildResult = Smartdns.build(SmartdnsSource, SmartdnsBuild);
   assert(SmartdnsBuildResult.ExitCode == 0);
   assert(std::filesystem::exists(SmartdnsBuild / "smartdns-build" / "src" / "smartdns"));
+  const auto SmartdnsPartialBuild = Root / "smartdns-build-partial";
+  std::filesystem::create_directories(SmartdnsPartialBuild / "smartdns-build");
+  const auto SmartdnsPartialBuildResult =
+      Smartdns.build(SmartdnsSource, SmartdnsPartialBuild);
+  assert(SmartdnsPartialBuildResult.ExitCode == 0);
+  assert(std::filesystem::exists(
+      SmartdnsPartialBuild / "smartdns-build" / "src" / "smartdns"));
   ::setenv("DNSLAB_SMARTDNS_BUILD_ROOT", SmartdnsBuild.c_str(), 1);
 
   dnslab::RunSampleRequest SmartdnsRequest{
@@ -275,6 +343,14 @@ int main() {
   const auto MaradnsBuildResult = Maradns.build(MaradnsSource, MaradnsBuild);
   assert(MaradnsBuildResult.ExitCode == 0);
   assert(std::filesystem::exists(MaradnsBuild / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"));
+  const auto MaradnsPartialBuild = Root / "maradns-build-partial";
+  std::filesystem::create_directories(MaradnsPartialBuild / "deadwood-build");
+  const auto MaradnsPartialBuildResult =
+      Maradns.build(MaradnsSource, MaradnsPartialBuild);
+  assert(MaradnsPartialBuildResult.ExitCode == 0);
+  assert(std::filesystem::exists(
+      MaradnsPartialBuild / "deadwood-build" / "deadwood-github" / "src" /
+      "Deadwood"));
   ::setenv("DNSLAB_MARADNS_BUILD_ROOT", MaradnsBuild.c_str(), 1);
   dnslab::RunSampleRequest MaradnsRequest{
       Root, MaradnsBuild, RunRoot, Sample, "sample-1", {}};
@@ -302,6 +378,36 @@ int main() {
   const auto KnotOracle = Knot.parseOracle(RunRoot / "knot-resolver.stderr");
   assert(KnotOracle.ParseOk);
 
+  const std::string OriginalPath =
+      std::getenv("PATH") ? std::getenv("PATH") : "";
+  ::setenv("PATH",
+           (FakeBin.string() + (OriginalPath.empty() ? "" : ":" + OriginalPath))
+               .c_str(),
+           1);
+  const auto KnotBuildResult =
+      KnotBuildAdapter.build(KnotBuildSource, KnotBuildRoot);
+  assert(KnotBuildResult.ExitCode == 0);
+  assert(std::filesystem::exists(
+      KnotBuildRoot / "knot-runtime" / "lib" / "knot-resolver" / "sandbox.lua"));
+  assert(std::filesystem::exists(
+      KnotBuildRoot / "knot-runtime" / "lib" / "knot-resolver" /
+      "kres_modules" / "ta_update.lua"));
+  assert(std::filesystem::exists(
+      KnotBuildRoot / "knot-runtime" / "etc" / "knot-resolver" /
+      "root.keys"));
+  const auto KnotGeneratedRootKeysBuildResult =
+      KnotBuildAdapter.build(KnotBuildGeneratedRootKeysSource,
+                             KnotBuildGeneratedRootKeysRoot);
+  if (OriginalPath.empty()) {
+    ::unsetenv("PATH");
+  } else {
+    ::setenv("PATH", OriginalPath.c_str(), 1);
+  }
+  assert(KnotGeneratedRootKeysBuildResult.ExitCode == 0);
+  assert(std::filesystem::exists(
+      KnotBuildGeneratedRootKeysRoot / "knot-runtime" / "etc" /
+      "knot-resolver" / "root.keys"));
+
   const auto Registry = dnslab::makeDefaultResolverRegistry(Root);
   const auto Names = Registry.names();
   assert(Names.size() == 6U);
@@ -311,6 +417,19 @@ int main() {
   assert(std::find(Names.begin(), Names.end(), "dnsmasq") != Names.end());
   assert(std::find(Names.begin(), Names.end(), "smartdns") != Names.end());
   assert(std::find(Names.begin(), Names.end(), "knot-resolver") != Names.end());
+
+  const auto OriginalCwd = std::filesystem::current_path();
+  std::filesystem::current_path(Root);
+  ::setenv("DNSMASQ_HARNESS_SCRIPT", "dnsmasq-harness.py", 1);
+  const auto RelativeRegistry = dnslab::makeDefaultResolverRegistry(Root);
+  std::filesystem::current_path(OriginalCwd);
+  const auto &RelativeDnsmasq = RelativeRegistry.require("dnsmasq");
+  dnslab::RunSampleRequest RelativeDnsmasqRequest{
+      Root, DnsmasqBuild, RunRoot / "dnsmasq-relative", Sample, "sample-1", {}};
+  const auto RelativeDnsmasqRun = RelativeDnsmasq.runSample(RelativeDnsmasqRequest);
+  assert(RelativeDnsmasqRun.ExitCode == 0);
+  assert(std::filesystem::exists(RunRoot / "dnsmasq-relative" / "dnsmasq.stderr"));
+  ::unsetenv("DNSMASQ_HARNESS_SCRIPT");
 
   std::filesystem::remove_all(Root);
   return 0;

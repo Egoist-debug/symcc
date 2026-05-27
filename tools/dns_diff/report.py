@@ -8,10 +8,13 @@ from typing import Any, Dict, Iterable, List, Mapping, NoReturn, Optional, Tuple
 from .follow_diff import (
     FOLLOW_DIFF_STATE_FILE_NAME,
     FOLLOW_DIFF_WINDOW_SUMMARY_FILE_NAME,
-    default_follow_diff_output_root,
-    resolve_follow_diff_work_dir,
 )
 from .io import atomic_write_json, load_json_with_fallback
+from .path_defaults import (
+    default_follow_diff_output_root,
+    resolve_follow_diff_work_dir,
+    resolve_root_dir as _path_resolve_root_dir,
+)
 from .schema import (
     ANALYSIS_STATES,
     CONTRACT_VERSION,
@@ -49,10 +52,7 @@ class ReportError(RuntimeError):
 
 
 def _resolve_root_dir() -> Path:
-    env_root = os.environ.get("ROOT_DIR")
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    return Path(__file__).resolve().parents[2]
+    return _path_resolve_root_dir()
 
 
 def _resolve_work_dir(
@@ -294,13 +294,17 @@ def _load_auxiliary_payload(path: Path, *, label: str) -> Dict[str, Any]:
     return dict(load_result.data)
 
 
-def _resolve_sample_artifact_path(sample_dir: Path) -> Optional[Path]:
+def resolve_sample_input_artifact_path(sample_dir: Path) -> Optional[Path]:
     sample_path = sample_dir / "sample.bin"
     if not sample_path.is_file():
         sample_path = sample_dir / "transcript"
     if sample_path.is_file():
         return sample_path
     return None
+
+
+def _resolve_sample_artifact_path(sample_dir: Path) -> Optional[Path]:
+    return resolve_sample_input_artifact_path(sample_dir)
 
 
 def _resolve_semantic_frontier_sample_path(
@@ -891,5 +895,6 @@ __all__ = [
     "derive_semantic_diff_count",
     "generate_report",
     "resolve_high_value_manifest_path",
+    "resolve_sample_input_artifact_path",
     "resolve_semantic_frontier_manifest_path",
 ]

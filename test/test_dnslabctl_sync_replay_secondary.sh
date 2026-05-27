@@ -184,22 +184,37 @@ wire += query + response + post
 path.write_bytes(wire)
 PY
 
-env \
-	AFL_TREE="$UNBOUND_BUILD" \
-	DNSMASQ_HARNESS_SCRIPT="$DNSMASQ_HARNESS" \
-	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
-	UNBOUND_SRC_TREE="$WORKDIR/unbound-source" \
-	"$DNSLABCTL_BIN" sync-replay \
-		--sample "$SAMPLE_FILE" \
-		--run-root "$RUN_ROOT" \
-		--bind9-build-root "$BIND9_TREE" \
-		--secondary-resolver dnsmasq \
-		--secondary-build-root "$DNSMASQ_BUILD" \
-		--bind9-source-root "$WORKDIR/bind9-source" \
-		--secondary-source-root "$WORKDIR/dnsmasq-source" \
-		--unbound-build-root "$DNSMASQ_BUILD" \
-		--resolvers bind9,unbound,dnsmasq \
-		>"$WORKDIR/sync-replay.json"
+(
+	cd "$ROOT_DIR"
+	env \
+		AFL_TREE="$UNBOUND_BUILD" \
+		DNSMASQ_HARNESS_SCRIPT="$DNSMASQ_HARNESS" \
+		RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
+		UNBOUND_SRC_TREE="$WORKDIR/unbound-source" \
+		"$DNSLABCTL_BIN" sync-replay \
+			--sample "$(python3 - "$ROOT_DIR" "$SAMPLE_FILE" <<'PY'
+import os
+import pathlib
+import sys
+print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
+PY
+)" \
+			--run-root "$(python3 - "$ROOT_DIR" "$RUN_ROOT" <<'PY'
+import os
+import pathlib
+import sys
+print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
+PY
+)" \
+			--bind9-build-root "$BIND9_TREE" \
+			--secondary-resolver dnsmasq \
+			--secondary-build-root "$DNSMASQ_BUILD" \
+			--bind9-source-root "$WORKDIR/bind9-source" \
+			--secondary-source-root "$WORKDIR/dnsmasq-source" \
+			--unbound-build-root "$DNSMASQ_BUILD" \
+			--resolvers bind9,unbound,dnsmasq \
+			>"$WORKDIR/sync-replay.json"
+)
 
 assert_file_exists "$WORKDIR/sync-replay.json"
 assert_file_exists "$RUN_ROOT/sample.meta.json"
@@ -209,7 +224,7 @@ assert_file_exists "$RUN_ROOT/unbound/unbound.stderr"
 assert_file_exists "$RUN_ROOT/dnsmasq/dnsmasq.stderr"
 assert_file_exists "$RUN_ROOT/dnsmasq/dnsmasq.after.cache.txt"
 
-python3 - "$WORKDIR/sync-replay.json" "$RUN_ROOT/sample.meta.json" "$RUN_ROOT/oracle.json" <<'PY'
+python3 - "$WORKDIR/sync-replay.json" "$RUN_ROOT/sample.meta.json" "$RUN_ROOT/oracle.json" "$RUN_ROOT" <<'PY'
 import json
 import pathlib
 import sys
@@ -217,10 +232,18 @@ import sys
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 sample_meta = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 oracle_doc = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+run_root = pathlib.Path(sys.argv[4]).resolve()
 if payload.get("secondary_resolver") != "dnsmasq":
     raise SystemExit(f"ASSERT FAIL: secondary_resolver={payload.get('secondary_resolver')!r} != 'dnsmasq'")
 if "dnsmasq" not in payload:
     raise SystemExit("ASSERT FAIL: sync-replay 输出缺少 dnsmasq 键")
+artifact_dir_raw = payload.get("artifact_dir", "")
+artifact_dir_path = pathlib.Path(artifact_dir_raw)
+if not artifact_dir_path.is_absolute():
+    raise SystemExit(f"ASSERT FAIL: artifact_dir 应为绝对路径: {artifact_dir_raw!r}")
+artifact_dir = artifact_dir_path.resolve()
+if artifact_dir != run_root:
+    raise SystemExit(f"ASSERT FAIL: artifact_dir={artifact_dir!s} != {run_root!s}")
 resolvers = payload.get("resolvers")
 if not isinstance(resolvers, dict):
     raise SystemExit(f"ASSERT FAIL: resolvers={resolvers!r} 应为对象")

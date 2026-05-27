@@ -1198,6 +1198,122 @@ json::Value::Object buildSampleBinEvidence(const std::filesystem::path &Path) {
   return Output;
 }
 
+struct CaseStudyArtifacts {
+  std::filesystem::path SampleDir;
+  json::Value::Object SampleMetaPayload;
+  json::Value::Object OraclePayload;
+  json::Value::Object CacheDiffPayload;
+  ResolverEvidenceContext ResolverContext;
+  std::filesystem::path SampleMetaPath;
+  std::filesystem::path OraclePath;
+  std::filesystem::path CacheDiffPath;
+  std::filesystem::path TriagePath;
+  std::filesystem::path SampleBinPath;
+  std::filesystem::path Bind9StderrPath;
+  std::filesystem::path SecondaryStderrPath;
+};
+
+CaseStudyArtifacts loadCaseStudyArtifacts(
+    const CaseStudyCandidateRecord &Candidate) {
+  CaseStudyArtifacts Output;
+  Output.SampleDir = Candidate.SampleDir;
+  Output.SampleMetaPath = normalizePath(Output.SampleDir / "sample.meta.json");
+  Output.OraclePath = normalizePath(Output.SampleDir / "oracle.json");
+  Output.CacheDiffPath = normalizePath(Output.SampleDir / "cache_diff.json");
+  Output.TriagePath = normalizePath(Output.SampleDir / "triage.json");
+  Output.SampleMetaPayload = loadSampleMetaPayload(Output.SampleDir);
+  Output.OraclePayload =
+      loadRequiredObject(Output.SampleDir, "oracle.json", "oracle.json");
+  Output.CacheDiffPayload =
+      loadRequiredObject(Output.SampleDir, "cache_diff.json", "cache_diff.json");
+  Output.ResolverContext =
+      buildResolverEvidenceContext(&Output.SampleMetaPayload,
+                                  Output.OraclePayload);
+  if (const auto SampleArtifactPath = resolveSampleArtifactPath(Output.SampleDir)) {
+    Output.SampleBinPath = *SampleArtifactPath;
+  } else {
+    Output.SampleBinPath = normalizePath(Output.SampleDir / "sample.bin");
+  }
+  Output.Bind9StderrPath = normalizePath(
+      Output.SampleDir / Output.ResolverContext.PrimaryStderrName);
+  Output.SecondaryStderrPath = normalizePath(
+      Output.SampleDir / Output.ResolverContext.SecondaryStderrName);
+  return Output;
+}
+
+json::Value::Object buildCaseStudyPathsPayload(
+    const CaseStudyArtifacts &Artifacts) {
+  json::Value::Object Output;
+  Output["sample_meta_path"] = Artifacts.SampleMetaPath.string();
+  Output["oracle_path"] = Artifacts.OraclePath.string();
+  Output["cache_diff_path"] = Artifacts.CacheDiffPath.string();
+  Output["triage_path"] = Artifacts.TriagePath.string();
+  Output["sample_bin_path"] = Artifacts.SampleBinPath.string();
+  Output["bind9_stderr_path"] = Artifacts.Bind9StderrPath.string();
+  Output[Artifacts.ResolverContext.Secondary + "_stderr_path"] =
+      Artifacts.SecondaryStderrPath.string();
+  return Output;
+}
+
+json::Value::Object buildCaseStudyManualTruthScaffold() {
+  json::Value::Object Output;
+  Output["status"] = "not_started";
+  Output["reviewer_primary"] = "";
+  Output["reviewer_secondary"] = "";
+  Output["adjudicator"] = "";
+  Output["judgment"] = "";
+  Output["notes"] = "";
+  Output["decided_at"] = "";
+  return Output;
+}
+
+json::Value::Array buildCaseStudyClaimScope(
+    const CaseStudyArtifacts &Artifacts) {
+  json::Value::Array Output;
+  Output.emplace_back(
+      "选样仅消费 triage.json 中已冻结的 analysis_state 与 semantic_outcome，不重算 publication 语义。");
+  Output.emplace_back(
+      "原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、" +
+      Artifacts.SampleBinPath.filename().string() + "、bind9.stderr、" +
+      Artifacts.ResolverContext.Secondary + ".stderr。");
+  return Output;
+}
+
+json::Value::Array buildCaseStudyLimitations() {
+  json::Value::Array Output;
+  Output.emplace_back(
+      "manual_truth 仅为 not_started scaffold，当前尚无人工双评或 adjudication 结论。");
+  Output.emplace_back(
+      "stderr 仅收录尾部预览；如需完整上下文，必须回看 raw_evidence.paths 指向的原始文件。");
+  Output.emplace_back(
+      "automated_summary 仅基于现有 triage/oracle/cache_diff 工件自动整理，不能替代人工判断。");
+  return Output;
+}
+
+json::Value::Object buildCaseStudyRawEvidence(
+    const CaseStudyArtifacts &Artifacts,
+    const json::Value::Object &TriagePayload) {
+  json::Value::Object ResolverContextValue;
+  ResolverContextValue["primary"] = Artifacts.ResolverContext.Primary;
+  ResolverContextValue["secondary"] = Artifacts.ResolverContext.Secondary;
+
+  json::Value::Object Stderr;
+  Stderr["bind9"] = buildStderrPreview(Artifacts.Bind9StderrPath);
+  Stderr[Artifacts.ResolverContext.Secondary] =
+      buildStderrPreview(Artifacts.SecondaryStderrPath);
+
+  json::Value::Object Output;
+  Output["resolver_context"] = ResolverContextValue;
+  Output["paths"] = buildCaseStudyPathsPayload(Artifacts);
+  Output["sample_meta"] = Artifacts.SampleMetaPayload;
+  Output["oracle"] = Artifacts.OraclePayload;
+  Output["cache_diff"] = Artifacts.CacheDiffPayload;
+  Output["triage"] = TriagePayload;
+  Output["sample_bin"] = buildSampleBinEvidence(Artifacts.SampleBinPath);
+  Output["stderr"] = Stderr;
+  return Output;
+}
+
 std::vector<CaseStudyCandidateRecord>
 collectCaseStudyCandidates(const std::filesystem::path &Root) {
   std::vector<CaseStudyCandidateRecord> Output;
@@ -1289,85 +1405,20 @@ buildCaseStudyAutomatedSummary(const std::string &SemanticOutcome,
 
 json::Value::Object buildCaseStudyPayload(
     const CaseStudyCandidateRecord &Candidate) {
-  const auto SampleDir = Candidate.SampleDir;
-  const auto SampleMetaPath = normalizePath(SampleDir / "sample.meta.json");
-  const auto OraclePath = normalizePath(SampleDir / "oracle.json");
-  const auto CacheDiffPath = normalizePath(SampleDir / "cache_diff.json");
-  const auto TriagePath = normalizePath(SampleDir / "triage.json");
-  const auto SampleBinPath = normalizePath(SampleDir / "sample.bin");
-  const auto SampleMetaPayload = loadSampleMetaPayload(SampleDir);
-  const auto OraclePayload =
-      loadRequiredObject(SampleDir, "oracle.json", "oracle.json");
-  const auto CacheDiffPayload =
-      loadRequiredObject(SampleDir, "cache_diff.json", "cache_diff.json");
-  const auto ResolverContext =
-      buildResolverEvidenceContext(&SampleMetaPayload, OraclePayload);
-  const auto Bind9StderrPath =
-      normalizePath(SampleDir / ResolverContext.PrimaryStderrName);
-  const auto SecondaryStderrPath =
-      normalizePath(SampleDir / ResolverContext.SecondaryStderrName);
-
-  json::Value::Object Paths;
-  Paths["sample_meta_path"] = SampleMetaPath.string();
-  Paths["oracle_path"] = OraclePath.string();
-  Paths["cache_diff_path"] = CacheDiffPath.string();
-  Paths["triage_path"] = TriagePath.string();
-  Paths["sample_bin_path"] = SampleBinPath.string();
-  Paths["bind9_stderr_path"] = Bind9StderrPath.string();
-  Paths[ResolverContext.Secondary + "_stderr_path"] =
-      SecondaryStderrPath.string();
-
-  json::Value::Object ResolverContextValue;
-  ResolverContextValue["primary"] = ResolverContext.Primary;
-  ResolverContextValue["secondary"] = ResolverContext.Secondary;
-
-  json::Value::Object RawEvidence;
-  RawEvidence["resolver_context"] = ResolverContextValue;
-  RawEvidence["paths"] = Paths;
-  RawEvidence["sample_meta"] = SampleMetaPayload;
-  RawEvidence["oracle"] = OraclePayload;
-  RawEvidence["cache_diff"] = CacheDiffPayload;
-  RawEvidence["triage"] = Candidate.TriagePayload;
-  RawEvidence["sample_bin"] = buildSampleBinEvidence(SampleBinPath);
-  json::Value::Object Stderr;
-  Stderr["bind9"] = buildStderrPreview(Bind9StderrPath);
-  Stderr[ResolverContext.Secondary] = buildStderrPreview(SecondaryStderrPath);
-  RawEvidence["stderr"] = Stderr;
-
-  json::Value::Object ManualTruth;
-  ManualTruth["status"] = "not_started";
-  ManualTruth["reviewer_primary"] = "";
-  ManualTruth["reviewer_secondary"] = "";
-  ManualTruth["adjudicator"] = "";
-  ManualTruth["judgment"] = "";
-  ManualTruth["notes"] = "";
-  ManualTruth["decided_at"] = "";
-
-  json::Value::Array ClaimScope;
-  ClaimScope.emplace_back(
-      "选样仅消费 triage.json 中已冻结的 analysis_state 与 semantic_outcome，不重算 publication 语义。");
-  ClaimScope.emplace_back(
-      "原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、sample.bin、bind9.stderr、" +
-      ResolverContext.Secondary + ".stderr。");
-
-  json::Value::Array Limitations;
-  Limitations.emplace_back(
-      "manual_truth 仅为 not_started scaffold，当前尚无人工双评或 adjudication 结论。");
-  Limitations.emplace_back(
-      "stderr 仅收录尾部预览；如需完整上下文，必须回看 raw_evidence.paths 指向的原始文件。");
-  Limitations.emplace_back(
-      "automated_summary 仅基于现有 triage/oracle/cache_diff 工件自动整理，不能替代人工判断。");
+  const auto Artifacts = loadCaseStudyArtifacts(Candidate);
 
   json::Value::Object Output;
   Output["sample_id"] = Candidate.SampleId;
   Output["selection_reason"] = Candidate.SelectionReason;
-  Output["raw_evidence"] = RawEvidence;
+  Output["raw_evidence"] =
+      buildCaseStudyRawEvidence(Artifacts, Candidate.TriagePayload);
   Output["automated_summary"] = buildCaseStudyAutomatedSummary(
-      Candidate.SemanticOutcome, ResolverContext, Candidate.TriagePayload,
-      OraclePayload, CacheDiffPayload);
-  Output["manual_truth"] = ManualTruth;
-  Output["claim_scope"] = ClaimScope;
-  Output["limitations"] = Limitations;
+      Candidate.SemanticOutcome, Artifacts.ResolverContext,
+      Candidate.TriagePayload, Artifacts.OraclePayload,
+      Artifacts.CacheDiffPayload);
+  Output["manual_truth"] = buildCaseStudyManualTruthScaffold();
+  Output["claim_scope"] = buildCaseStudyClaimScope(Artifacts);
+  Output["limitations"] = buildCaseStudyLimitations();
   return Output;
 }
 
@@ -1689,12 +1740,44 @@ deriveSeedProvenance(const std::vector<json::Value::Object> &SampleMetaPayloads,
   return std::nullopt;
 }
 
-std::vector<std::string>
-collectClaimReviewArtifacts(const std::vector<json::Value::Object> &SampleMetaPayloads) {
-  std::vector<std::string> Ordered = {
-      "sample.meta.json", "oracle.json", "cache_diff.json", "triage.json",
-      "sample.bin"};
-  std::set<std::string> Seen(Ordered.begin(), Ordered.end());
+void appendClaimReviewArtifactName(std::vector<std::string> &Ordered,
+                                   std::set<std::string> &Seen,
+                                   const std::string &ArtifactName) {
+  if (ArtifactName.empty() || !Seen.insert(ArtifactName).second) {
+    return;
+  }
+  Ordered.push_back(ArtifactName);
+}
+
+std::vector<std::string> collectClaimReviewArtifacts(
+    const std::vector<std::filesystem::path> &SampleDirs,
+    const std::vector<json::Value::Object> &SampleMetaPayloads) {
+  std::vector<std::string> Ordered;
+  std::set<std::string> Seen;
+  for (const auto &ArtifactName : std::vector<std::string>{
+           "sample.meta.json", "oracle.json", "cache_diff.json", "triage.json",
+           "sample.bin"}) {
+    appendClaimReviewArtifactName(Ordered, Seen, ArtifactName);
+  }
+  for (const auto &SampleDir : SampleDirs) {
+    const auto SampleArtifactPath = resolveSampleArtifactPath(SampleDir);
+    if (!SampleArtifactPath.has_value()) {
+      // Keep the default sample.bin entry when no concrete input artifact exists.
+    } else {
+      appendClaimReviewArtifactName(Ordered, Seen,
+                                    SampleArtifactPath->filename().string());
+    }
+    for (const auto &Entry : std::filesystem::directory_iterator(SampleDir)) {
+      if (!Entry.is_regular_file()) {
+        continue;
+      }
+      const auto FileName = Entry.path().filename().string();
+      if (!hasSuffix(FileName, ".stderr")) {
+        continue;
+      }
+      appendClaimReviewArtifactName(Ordered, Seen, FileName);
+    }
+  }
   for (const auto &Payload : SampleMetaPayloads) {
     const auto *Artifacts = findObjectValue(Payload, "artifacts");
     const auto *ArtifactsObject =
@@ -1708,10 +1791,7 @@ collectClaimReviewArtifacts(const std::vector<json::Value::Object> &SampleMetaPa
       if (Text == nullptr || Text->empty()) {
         continue;
       }
-      if (!Seen.insert(*Text).second) {
-        continue;
-      }
-      Ordered.push_back(*Text);
+      appendClaimReviewArtifactName(Ordered, Seen, *Text);
     }
   }
   return Ordered;
@@ -2246,135 +2326,135 @@ buildRegenerationCommands(const std::filesystem::path &Root,
   return Commands;
 }
 
-json::Value buildPublicationEvidenceBundle(
-    const std::filesystem::path &Root,
-    const std::filesystem::path &ReportDir,
-    const json::Value::Object &Summary,
-    const CampaignReportSnapshot &Snapshot,
-    const std::optional<std::filesystem::path> &ReportBase) {
-  const auto Commands = buildRegenerationCommands(Root, ReportDir, ReportBase);
-  const auto buildArtifactReference =
-      [&](const std::filesystem::path &Path, const std::string &RegenerationCommand,
-          bool Optional = false,
-          const std::optional<std::vector<std::string>> &FieldPaths =
-              std::nullopt,
-          const std::optional<std::vector<std::string>> &ColumnPaths =
-              std::nullopt) {
-        json::Value::Object Payload;
-        Payload["path"] = normalizePath(Path).string();
-        Payload["exists"] = std::filesystem::is_regular_file(Path);
-        Payload["optional"] = Optional;
-        Payload["regeneration_command"] = RegenerationCommand;
-        if (FieldPaths.has_value()) {
-          json::Value::Array Items;
-          for (const auto &Field : *FieldPaths) {
-            Items.emplace_back(Field);
-          }
-          Payload["field_paths"] = Items;
-        }
-        if (ColumnPaths.has_value()) {
-          json::Value::Array Items;
-          for (const auto &Field : *ColumnPaths) {
-            Items.emplace_back(Field);
-          }
-          Payload["column_paths"] = Items;
-        }
-        return Payload;
-      };
+struct EvidenceBundleArtifactSpec {
+  std::string Key;
+  std::filesystem::path Path;
+  std::string RegenerationCommand;
+  bool Optional = false;
+  std::vector<std::string> FieldPaths;
+  std::vector<std::string> ColumnPaths;
+};
 
+json::Value::Object buildEvidenceBundleArtifactReference(
+    const std::filesystem::path &Path, const std::string &RegenerationCommand,
+    bool Optional = false, const std::vector<std::string> &FieldPaths = {},
+    const std::vector<std::string> &ColumnPaths = {}) {
   json::Value::Object Payload;
-  Payload["contract_name"] = kPublicationEvidenceBundleContractName;
-  Payload["contract_version"] = static_cast<std::int64_t>(kContractVersion);
-  Payload["campaign_summary"] = buildArtifactReference(
-      ReportDir / "summary.json", Commands.at("campaign_report"), false,
-      std::vector<std::string>{"campaign_id",
-                               "total_samples",
-                               "needs_review_count",
-                               "cluster_count",
-                               "semantic_diff_count",
-                               "metric_denominators.analysis_state.included",
-                               "metric_denominators.analysis_state.excluded",
-                               "metric_denominators.analysis_state.unknown",
-                               "repro_rate",
-                               "seed_provenance"});
-  Payload["oracle_audit"] = buildArtifactReference(
-      ReportDir / "oracle_audit.tsv", Commands.at("campaign_report"), false,
-      std::nullopt, kAuditColumns);
-  Payload["oracle_reliability"] = buildArtifactReference(
-      ReportDir / "oracle_reliability.json", Commands.at("campaign_report"),
-      false,
-      std::vector<std::string>{"signals.response_accepted_any",
-                               "signals.second_query_hit_any",
-                               "signals.cache_entry_created_any",
-                               "signals.oracle_diff_any",
-                               "signal_combos.oracle_diff_plus_cache_diff"});
-  Payload["failure_taxonomy"] = buildArtifactReference(
-      ReportDir / "failure_taxonomy.tsv", Commands.at("campaign_report"), false,
-      std::nullopt,
-      std::vector<std::string>{"failure_bucket_primary",
-                               "failure_bucket_detail", "count"});
-  Payload["exclusion_summary"] = buildArtifactReference(
-      ReportDir / "exclusion_summary.tsv", Commands.at("campaign_report"), false,
-      std::nullopt,
-      std::vector<std::string>{"failure_bucket_primary", "analysis_state",
-                               "count"});
-  Payload["case_study_index"] = buildArtifactReference(
-      ReportDir / "case_studies/index.tsv", Commands.at("case_study_export"), true,
-      std::nullopt,
-      std::vector<std::string>{"sample_id", "semantic_outcome",
-                               "selection_reason", "case_study_path"});
+  Payload["path"] = normalizePath(Path).string();
+  Payload["exists"] = std::filesystem::is_regular_file(Path);
+  Payload["optional"] = Optional;
+  Payload["regeneration_command"] = RegenerationCommand;
+  if (!FieldPaths.empty()) {
+    Payload["field_paths"] = buildStringArray(FieldPaths);
+  }
+  if (!ColumnPaths.empty()) {
+    Payload["column_paths"] = buildStringArray(ColumnPaths);
+  }
+  return Payload;
+}
 
+void appendPublicationEvidenceBundleArtifacts(
+    json::Value::Object &Payload, const std::filesystem::path &ReportDir,
+    const std::map<std::string, std::string> &Commands) {
+  const auto &CampaignReportCommand = Commands.at("campaign_report");
+  const auto &CaseStudyExportCommand = Commands.at("case_study_export");
+  const std::vector<EvidenceBundleArtifactSpec> Specs = {
+      {"campaign_summary",
+       ReportDir / "summary.json",
+       CampaignReportCommand,
+       false,
+       {"campaign_id",
+        "total_samples",
+        "needs_review_count",
+        "cluster_count",
+        "semantic_diff_count",
+        "metric_denominators.analysis_state.included",
+        "metric_denominators.analysis_state.excluded",
+        "metric_denominators.analysis_state.unknown",
+        "repro_rate",
+        "seed_provenance"},
+       {}},
+      {"oracle_audit",
+       ReportDir / "oracle_audit.tsv",
+       CampaignReportCommand,
+       false,
+       {},
+       kAuditColumns},
+      {"oracle_reliability",
+       ReportDir / "oracle_reliability.json",
+       CampaignReportCommand,
+       false,
+       {"signals.response_accepted_any",
+        "signals.second_query_hit_any",
+        "signals.cache_entry_created_any",
+        "signals.oracle_diff_any",
+        "signal_combos.oracle_diff_plus_cache_diff"},
+       {}},
+      {"failure_taxonomy",
+       ReportDir / "failure_taxonomy.tsv",
+       CampaignReportCommand,
+       false,
+       {},
+       {"failure_bucket_primary", "failure_bucket_detail", "count"}},
+      {"exclusion_summary",
+       ReportDir / "exclusion_summary.tsv",
+       CampaignReportCommand,
+       false,
+       {},
+       {"failure_bucket_primary", "analysis_state", "count"}},
+      {"case_study_index",
+       ReportDir / "case_studies/index.tsv",
+       CaseStudyExportCommand,
+       true,
+       {},
+       {"sample_id", "semantic_outcome", "selection_reason",
+        "case_study_path"}}};
+
+  for (const auto &Spec : Specs) {
+    Payload[Spec.Key] = buildEvidenceBundleArtifactReference(
+        Spec.Path, Spec.RegenerationCommand, Spec.Optional, Spec.FieldPaths,
+        Spec.ColumnPaths);
+  }
+}
+
+json::Value::Object buildEvidenceBundleRawSampleRootPayload(
+    const std::filesystem::path &Root, const CampaignReportSnapshot &Snapshot) {
   json::Value::Object RawSampleRoot;
   RawSampleRoot["path"] = normalizePath(Root).string();
   RawSampleRoot["exists"] = std::filesystem::is_directory(Root);
   RawSampleRoot["sample_dir_pattern"] = "<raw_sample_root>/<sample_id>/";
-  json::Value::Array ClaimReviewArtifacts;
-  for (const auto &Artifact : collectClaimReviewArtifacts(Snapshot.SampleMetaPayloads)) {
-    ClaimReviewArtifacts.emplace_back(Artifact);
-  }
-  RawSampleRoot["claim_review_artifacts"] = ClaimReviewArtifacts;
-  Payload["raw_sample_root"] = RawSampleRoot;
+  RawSampleRoot["claim_review_artifacts"] = buildStringArray(
+      collectClaimReviewArtifacts(Snapshot.SampleDirs, Snapshot.SampleMetaPayloads));
+  return RawSampleRoot;
+}
 
-  if (Snapshot.SeedProvenance.has_value()) {
-    Payload["seed_provenance"] = *Snapshot.SeedProvenance;
-  } else {
-    Payload["seed_provenance"] = json::Value();
-  }
+json::Value::Object buildEvidenceBundleClaim(
+    const std::string &Claim, const json::Value &Value,
+    const std::filesystem::path &SourceFilePath, const std::string &FieldPath,
+    const std::string &RegenerationCommand, const std::string &Guardrail) {
+  json::Value::Object Item;
+  Item["claim"] = Claim;
+  Item["value"] = Value;
+  Item["artifact"] = "campaign_summary";
+  Item["source_file_path"] = normalizePath(SourceFilePath).string();
+  Item["field_path"] = FieldPath;
+  Item["regeneration_command"] = RegenerationCommand;
+  Item["guardrail"] = Guardrail;
+  return Item;
+}
 
-  json::Value::Object CommandsValue;
-  for (const auto &[Key, Value] : Commands) {
-    CommandsValue[Key] = Value;
-  }
-  Payload["regeneration_commands"] = CommandsValue;
-
-  json::Value::Array Claims;
-  const auto buildClaim =
-      [&](const std::string &Claim, const json::Value &Value,
-          const std::string &FieldPath, const std::string &Guardrail) {
-        json::Value::Object Item;
-        Item["claim"] = Claim;
-        Item["value"] = Value;
-        Item["artifact"] = "campaign_summary";
-        Item["source_file_path"] = normalizePath(ReportDir / "summary.json").string();
-        Item["field_path"] = FieldPath;
-        Item["regeneration_command"] = Commands.at("campaign_report");
-        Item["guardrail"] = Guardrail;
-        return Item;
-      };
-  auto SemanticDiffClaim = buildClaim(
-      "semantic_diff_count",
-      *findObjectValue(Summary, "semantic_diff_count"),
-      "semantic_diff_count",
-      "included、excluded、unknown 只是 publication-facing 状态，不等于人工确认真值。");
-  json::Value::Array SupportingSources;
+json::Value::Object buildEvidenceBundleSupportingSource(
+    const std::string &Artifact, const std::filesystem::path &SourceFilePath,
+    const std::string &FieldPath) {
   json::Value::Object Support;
-  Support["artifact"] = "failure_taxonomy";
-  Support["source_file_path"] =
-      normalizePath(ReportDir / "failure_taxonomy.tsv").string();
-  Support["field_path"] = "rows[failure_bucket_primary=semantic_diff].count(sum)";
-  SupportingSources.emplace_back(Support);
-  SemanticDiffClaim["supporting_sources"] = SupportingSources;
-  Claims.emplace_back(SemanticDiffClaim);
+  Support["artifact"] = Artifact;
+  Support["source_file_path"] = normalizePath(SourceFilePath).string();
+  Support["field_path"] = FieldPath;
+  return Support;
+}
+
+json::Value summaryAnalysisStateValue(const json::Value::Object &Summary,
+                                      const std::string &Key) {
   const auto *MetricDenominatorsValue =
       findObjectValue(Summary, "metric_denominators");
   const auto *MetricDenominators =
@@ -2388,34 +2468,82 @@ json::Value buildPublicationEvidenceBundle(
       AnalysisStateValue
           ? std::get_if<json::Value::Object>(&AnalysisStateValue->storage())
           : nullptr;
-  const auto analysisStateValue = [&](const std::string &Key) -> json::Value {
-    if (AnalysisState == nullptr) {
-      return json::Value(static_cast<std::int64_t>(0));
-    }
-    const auto *Value = findObjectValue(*AnalysisState, Key);
-    return Value ? *Value : json::Value(static_cast<std::int64_t>(0));
-  };
+  if (AnalysisState == nullptr) {
+    return json::Value(static_cast<std::int64_t>(0));
+  }
+  const auto *Value = findObjectValue(*AnalysisState, Key);
+  return Value ? *Value : json::Value(static_cast<std::int64_t>(0));
+}
+
+json::Value::Array buildPublicationEvidenceBundleClaims(
+    const json::Value::Object &Summary, const std::filesystem::path &ReportDir,
+    const std::string &CampaignReportCommand) {
+  const auto SummaryPath = ReportDir / "summary.json";
+  const auto FailureTaxonomyPath = ReportDir / "failure_taxonomy.tsv";
+  const auto AnalysisStateGuardrail =
+      std::string("included、excluded、unknown 只是 publication-facing 状态，不等于人工确认真值。");
   const auto ProxyGuardrail =
       std::string("该统计只能说明候选样本的复现或聚类情况，不能把 proxy signal 直接写成漏洞已证实。");
-  Claims.emplace_back(buildClaim(
-      "included_samples", analysisStateValue("included"),
-      "metric_denominators.analysis_state.included",
-      "included、excluded、unknown 只是 publication-facing 状态，不等于人工确认真值。"));
-  Claims.emplace_back(buildClaim(
-      "excluded_samples", analysisStateValue("excluded"),
-      "metric_denominators.analysis_state.excluded",
-      "included、excluded、unknown 只是 publication-facing 状态，不等于人工确认真值。"));
-  Claims.emplace_back(buildClaim(
-      "unknown_samples", analysisStateValue("unknown"),
-      "metric_denominators.analysis_state.unknown",
-      "included、excluded、unknown 只是 publication-facing 状态，不等于人工确认真值。"));
-  Claims.emplace_back(buildClaim(
-      "repro_rate", *findObjectValue(Summary, "repro_rate"), "repro_rate",
-      ProxyGuardrail));
-  Claims.emplace_back(buildClaim(
-      "cluster_count", *findObjectValue(Summary, "cluster_count"), "cluster_count",
-      ProxyGuardrail));
-  Payload["claims"] = Claims;
+
+  auto SemanticDiffClaim = buildEvidenceBundleClaim(
+      "semantic_diff_count",
+      *findObjectValue(Summary, "semantic_diff_count"), SummaryPath,
+      "semantic_diff_count", CampaignReportCommand, AnalysisStateGuardrail);
+  SemanticDiffClaim["supporting_sources"] = json::Value::Array{
+      buildEvidenceBundleSupportingSource(
+          "failure_taxonomy", FailureTaxonomyPath,
+          "rows[failure_bucket_primary=semantic_diff].count(sum)")};
+
+  json::Value::Array Claims;
+  Claims.emplace_back(SemanticDiffClaim);
+  Claims.emplace_back(buildEvidenceBundleClaim(
+      "included_samples", summaryAnalysisStateValue(Summary, "included"),
+      SummaryPath, "metric_denominators.analysis_state.included",
+      CampaignReportCommand, AnalysisStateGuardrail));
+  Claims.emplace_back(buildEvidenceBundleClaim(
+      "excluded_samples", summaryAnalysisStateValue(Summary, "excluded"),
+      SummaryPath, "metric_denominators.analysis_state.excluded",
+      CampaignReportCommand, AnalysisStateGuardrail));
+  Claims.emplace_back(buildEvidenceBundleClaim(
+      "unknown_samples", summaryAnalysisStateValue(Summary, "unknown"),
+      SummaryPath, "metric_denominators.analysis_state.unknown",
+      CampaignReportCommand, AnalysisStateGuardrail));
+  Claims.emplace_back(buildEvidenceBundleClaim(
+      "repro_rate", *findObjectValue(Summary, "repro_rate"), SummaryPath,
+      "repro_rate", CampaignReportCommand, ProxyGuardrail));
+  Claims.emplace_back(buildEvidenceBundleClaim(
+      "cluster_count", *findObjectValue(Summary, "cluster_count"), SummaryPath,
+      "cluster_count", CampaignReportCommand, ProxyGuardrail));
+  return Claims;
+}
+
+json::Value buildPublicationEvidenceBundle(
+    const std::filesystem::path &Root,
+    const std::filesystem::path &ReportDir,
+    const json::Value::Object &Summary,
+    const CampaignReportSnapshot &Snapshot,
+    const std::optional<std::filesystem::path> &ReportBase) {
+  const auto Commands = buildRegenerationCommands(Root, ReportDir, ReportBase);
+  json::Value::Object Payload;
+  Payload["contract_name"] = kPublicationEvidenceBundleContractName;
+  Payload["contract_version"] = static_cast<std::int64_t>(kContractVersion);
+  appendPublicationEvidenceBundleArtifacts(Payload, ReportDir, Commands);
+  Payload["raw_sample_root"] =
+      buildEvidenceBundleRawSampleRootPayload(Root, Snapshot);
+
+  if (Snapshot.SeedProvenance.has_value()) {
+    Payload["seed_provenance"] = *Snapshot.SeedProvenance;
+  } else {
+    Payload["seed_provenance"] = json::Value();
+  }
+
+  json::Value::Object CommandsValue;
+  for (const auto &[Key, Value] : Commands) {
+    CommandsValue[Key] = Value;
+  }
+  Payload["regeneration_commands"] = CommandsValue;
+  Payload["claims"] = buildPublicationEvidenceBundleClaims(
+      Summary, ReportDir, Commands.at("campaign_report"));
   return json::Value(Payload);
 }
 
@@ -2494,45 +2622,73 @@ EvidenceBundle buildEvidenceBundle(
   return Output;
 }
 
+struct TriageReportOutputPaths {
+  std::filesystem::path ClusterSummaryPath;
+  std::filesystem::path StatusSummaryPath;
+  std::filesystem::path HighValueManifestPath;
+  std::filesystem::path SemanticFrontierManifestPath;
+  std::filesystem::path TriageReportMarkdownPath;
+};
+
+TriageReportOutputPaths buildTriageReportOutputPaths(
+    const std::filesystem::path &ResolvedRoot,
+    const std::optional<std::filesystem::path> &HighValueManifestPath) {
+  TriageReportOutputPaths Output;
+  const auto ManifestPath = normalizePath(
+      HighValueManifestPath.value_or(ResolvedRoot / "high_value_samples.txt"));
+  Output.ClusterSummaryPath = ResolvedRoot / "cluster_summary.tsv";
+  Output.StatusSummaryPath = ResolvedRoot / "status_summary.tsv";
+  Output.HighValueManifestPath = ManifestPath;
+  Output.SemanticFrontierManifestPath =
+      normalizePath(ManifestPath.parent_path() /
+                    kSemanticFrontierManifestFileName);
+  Output.TriageReportMarkdownPath = ResolvedRoot / "triage_report.md";
+  return Output;
+}
+
+void writeTriageReportOutputs(const TriageReportSnapshot &Snapshot,
+                              const std::filesystem::path &ResolvedRoot,
+                              const TriageReportOutputPaths &Paths) {
+  writeTextFile(Paths.ClusterSummaryPath, buildClusterSummaryContent(Snapshot));
+  writeTextFile(Paths.StatusSummaryPath, buildStatusSummaryContent(Snapshot));
+  try {
+    writeTextFile(Paths.HighValueManifestPath,
+                  buildHighValueManifestContent(Snapshot.SemanticFrontierEntries));
+  } catch (const std::exception &Error) {
+    throw std::runtime_error("写入 high_value_samples.txt 失败: " +
+                             std::string(Error.what()));
+  }
+  writeJsonFile(Paths.SemanticFrontierManifestPath,
+                buildSemanticFrontierManifest(ResolvedRoot,
+                                              Snapshot.SemanticFrontierEntries));
+  writeTextFile(Paths.TriageReportMarkdownPath, buildTriageReportMarkdown(Snapshot));
+}
+
+TriageReportArtifacts buildTriageReportArtifactsResult(
+    const std::filesystem::path &ResolvedRoot,
+    const TriageReportOutputPaths &Paths, const TriageReportSnapshot &Snapshot) {
+  TriageReportArtifacts Output;
+  Output.Root = ResolvedRoot;
+  Output.ClusterSummaryPath = Paths.ClusterSummaryPath;
+  Output.StatusSummaryPath = Paths.StatusSummaryPath;
+  Output.HighValueManifestPath = Paths.HighValueManifestPath;
+  Output.SemanticFrontierManifestPath = Paths.SemanticFrontierManifestPath;
+  Output.TriageReportMarkdownPath = Paths.TriageReportMarkdownPath;
+  Output.SampleCount = Snapshot.TotalSamples;
+  Output.SemanticFrontierEntryCount = Snapshot.SemanticFrontierEntries.size();
+  return Output;
+}
+
 TriageReportArtifacts
 generateTriageReportArtifacts(const std::filesystem::path &Root,
                               const std::optional<std::filesystem::path>
                                   &HighValueManifestPath) {
   const auto Snapshot = collectTriageReportSnapshot(Root);
   const auto ResolvedRoot = normalizePath(Root);
-  const auto ManifestPath = normalizePath(
-      HighValueManifestPath.value_or(ResolvedRoot / "high_value_samples.txt"));
-  const auto SemanticManifestPath =
-      normalizePath(ManifestPath.parent_path() /
-                    kSemanticFrontierManifestFileName);
-  const auto ClusterSummaryPath = ResolvedRoot / "cluster_summary.tsv";
-  const auto StatusSummaryPath = ResolvedRoot / "status_summary.tsv";
-  const auto TriageReportMarkdownPath = ResolvedRoot / "triage_report.md";
-
-  writeTextFile(ClusterSummaryPath, buildClusterSummaryContent(Snapshot));
-  writeTextFile(StatusSummaryPath, buildStatusSummaryContent(Snapshot));
-  try {
-    writeTextFile(ManifestPath,
-                  buildHighValueManifestContent(Snapshot.SemanticFrontierEntries));
-  } catch (const std::exception &Error) {
-    throw std::runtime_error("写入 high_value_samples.txt 失败: " +
-                             std::string(Error.what()));
-  }
-  writeJsonFile(SemanticManifestPath,
-                buildSemanticFrontierManifest(ResolvedRoot,
-                                              Snapshot.SemanticFrontierEntries));
-  writeTextFile(TriageReportMarkdownPath, buildTriageReportMarkdown(Snapshot));
-
-  TriageReportArtifacts Output;
-  Output.Root = ResolvedRoot;
-  Output.ClusterSummaryPath = ClusterSummaryPath;
-  Output.StatusSummaryPath = StatusSummaryPath;
-  Output.HighValueManifestPath = ManifestPath;
-  Output.SemanticFrontierManifestPath = SemanticManifestPath;
-  Output.TriageReportMarkdownPath = TriageReportMarkdownPath;
-  Output.SampleCount = Snapshot.TotalSamples;
-  Output.SemanticFrontierEntryCount = Snapshot.SemanticFrontierEntries.size();
-  return Output;
+  const auto Paths =
+      buildTriageReportOutputPaths(ResolvedRoot, HighValueManifestPath);
+  writeTriageReportOutputs(Snapshot, ResolvedRoot, Paths);
+  return buildTriageReportArtifactsResult(ResolvedRoot, Paths, Snapshot);
 }
 
 CaseStudyExportArtifacts
@@ -2573,6 +2729,384 @@ exportCaseStudies(const std::filesystem::path &Root,
   return Output;
 }
 
+struct CampaignSummaryMetrics {
+  std::int64_t ManifestSize = 0;
+  std::int64_t ReproducedCount = 0;
+  double ReproRate = 0.0;
+  std::int64_t DiffDetectedCount = 0;
+  json::Value::Object MetricDenominators;
+  json::Value::Object SemanticCounts;
+  json::Value::Array ExecutedResolvers;
+  json::Value::Object ExecutedResolverCounts;
+  json::Value::Object SkippedResolverCounts;
+  json::Value::Object ResolverPairDiffCounts;
+  json::Value::Object AblationStatus;
+};
+
+struct CampaignManifestStats {
+  std::int64_t ManifestSize = 0;
+  std::int64_t ReproducedCount = 0;
+  double ReproRate = 0.0;
+};
+
+std::set<std::filesystem::path>
+collectCampaignManifestPathsFromFile(const std::filesystem::path &ManifestPath) {
+  std::set<std::filesystem::path> Output;
+  if (!std::filesystem::is_regular_file(ManifestPath)) {
+    return Output;
+  }
+
+  std::istringstream ManifestStream(readTextFile(ManifestPath));
+  std::string Line;
+  while (std::getline(ManifestStream, Line)) {
+    if (Line.empty()) {
+      continue;
+    }
+    const auto Path = normalizePath(Line);
+    if (!std::filesystem::is_regular_file(Path)) {
+      continue;
+    }
+    Output.insert(Path);
+  }
+  return Output;
+}
+
+std::set<std::filesystem::path> collectCampaignManifestPathsFromSnapshot(
+    const CampaignReportSnapshot &Snapshot) {
+  std::set<std::filesystem::path> Output;
+  for (const auto &Entry : Snapshot.SemanticFrontierEntries) {
+    if (Entry.PriorityTier <= 0) {
+      continue;
+    }
+    const auto Path = normalizePath(Entry.SamplePath);
+    if (!std::filesystem::is_regular_file(Path)) {
+      continue;
+    }
+    Output.insert(Path);
+  }
+  return Output;
+}
+
+CampaignManifestStats buildCampaignManifestStats(
+    const CampaignReportSnapshot &Snapshot,
+    const std::set<std::filesystem::path> &ManifestPaths) {
+  CampaignManifestStats Output;
+  Output.ManifestSize = static_cast<std::int64_t>(ManifestPaths.size());
+
+  std::set<std::filesystem::path> ManifestSampleDirs;
+  for (const auto &Path : ManifestPaths) {
+    ManifestSampleDirs.insert(normalizePath(Path).parent_path());
+  }
+  for (const auto &SampleDir : Snapshot.SampleDirs) {
+    if (ManifestSampleDirs.count(normalizePath(SampleDir)) != 0U) {
+      ++Output.ReproducedCount;
+    }
+  }
+  if (Output.ManifestSize > 0) {
+    Output.ReproRate = static_cast<double>(Output.ReproducedCount) /
+                       static_cast<double>(Output.ManifestSize);
+  }
+  return Output;
+}
+
+CampaignManifestStats buildCampaignManifestStats(
+    const CampaignReportSnapshot &Snapshot,
+    const std::optional<std::filesystem::path> &ManifestPath) {
+  return buildCampaignManifestStats(
+      Snapshot, ManifestPath.has_value()
+                    ? collectCampaignManifestPathsFromFile(*ManifestPath)
+                    : collectCampaignManifestPathsFromSnapshot(Snapshot));
+}
+
+std::string buildCampaignAblationMatrixContent(
+    const json::Value::Object &AblationStatus);
+std::string
+buildCampaignClusterCountsContent(const CampaignReportSnapshot &Snapshot);
+std::string
+buildCampaignFailureTaxonomyContent(const CampaignReportSnapshot &Snapshot);
+std::string
+buildCampaignExclusionSummaryContent(const CampaignReportSnapshot &Snapshot);
+std::string buildCampaignReproRateContent(
+    const CampaignSummaryMetrics &SummaryMetrics);
+std::string buildCampaignOracleAuditContent(
+    const std::vector<CampaignAuditRecord> &AuditRecords);
+
+struct CampaignReportOutputPaths {
+  std::filesystem::path ReportDir;
+  std::filesystem::path SummaryPath;
+  std::filesystem::path AblationMatrixPath;
+  std::filesystem::path ClusterCountsPath;
+  std::filesystem::path FailureTaxonomyPath;
+  std::filesystem::path ExclusionSummaryPath;
+  std::filesystem::path ReproRatePath;
+  std::filesystem::path OracleAuditPath;
+  std::filesystem::path OracleReliabilityPath;
+  std::filesystem::path EvidenceBundlePath;
+};
+
+CampaignReportOutputPaths buildCampaignReportOutputPaths(
+    const std::filesystem::path &ReportDir) {
+  CampaignReportOutputPaths Output;
+  Output.ReportDir = ReportDir;
+  Output.SummaryPath = ReportDir / "summary.json";
+  Output.AblationMatrixPath = ReportDir / "ablation_matrix.tsv";
+  Output.ClusterCountsPath = ReportDir / "cluster_counts.tsv";
+  Output.FailureTaxonomyPath = ReportDir / "failure_taxonomy.tsv";
+  Output.ExclusionSummaryPath = ReportDir / "exclusion_summary.tsv";
+  Output.ReproRatePath = ReportDir / "repro_rate.tsv";
+  Output.OracleAuditPath = ReportDir / "oracle_audit.tsv";
+  Output.OracleReliabilityPath = ReportDir / "oracle_reliability.json";
+  Output.EvidenceBundlePath = ReportDir / "evidence_bundle.json";
+  return Output;
+}
+
+void writeCampaignReportOutputs(
+    const CampaignReportOutputPaths &Paths,
+    const CampaignSummaryMetrics &SummaryMetrics,
+    const CampaignReportSnapshot &Snapshot,
+    const json::Value::Object &Summary,
+    const std::filesystem::path &ResolvedRoot,
+    const std::filesystem::path &ReportBasePath) {
+  writeJsonFile(Paths.SummaryPath, Summary);
+  writeTextFile(Paths.AblationMatrixPath,
+                buildCampaignAblationMatrixContent(
+                    SummaryMetrics.AblationStatus));
+  writeTextFile(Paths.ClusterCountsPath, buildCampaignClusterCountsContent(Snapshot));
+  writeTextFile(Paths.FailureTaxonomyPath,
+                buildCampaignFailureTaxonomyContent(Snapshot));
+  writeTextFile(Paths.ExclusionSummaryPath,
+                buildCampaignExclusionSummaryContent(Snapshot));
+  writeTextFile(Paths.ReproRatePath, buildCampaignReproRateContent(SummaryMetrics));
+  writeTextFile(Paths.OracleAuditPath,
+                buildCampaignOracleAuditContent(Snapshot.AuditRecords));
+  writeJsonFile(Paths.OracleReliabilityPath,
+                buildOracleReliability(Snapshot.AuditRecords));
+  writeJsonFile(Paths.EvidenceBundlePath,
+                buildPublicationEvidenceBundle(ResolvedRoot, Paths.ReportDir,
+                                               Summary, Snapshot,
+                                               ReportBasePath));
+}
+
+CampaignReportArtifacts buildCampaignReportArtifactsResult(
+    const std::filesystem::path &ResolvedRoot,
+    const CampaignReportOutputPaths &Paths,
+    const CampaignReportSnapshot &Snapshot) {
+  CampaignReportArtifacts Output;
+  Output.Root = ResolvedRoot;
+  Output.ReportDir = Paths.ReportDir;
+  Output.SummaryPath = Paths.SummaryPath;
+  Output.AblationMatrixPath = Paths.AblationMatrixPath;
+  Output.ClusterCountsPath = Paths.ClusterCountsPath;
+  Output.FailureTaxonomyPath = Paths.FailureTaxonomyPath;
+  Output.ExclusionSummaryPath = Paths.ExclusionSummaryPath;
+  Output.ReproRatePath = Paths.ReproRatePath;
+  Output.OracleAuditPath = Paths.OracleAuditPath;
+  Output.OracleReliabilityPath = Paths.OracleReliabilityPath;
+  Output.EvidenceBundlePath = Paths.EvidenceBundlePath;
+  Output.SampleCount = Snapshot.TotalSamples;
+  Output.ClusterCount = Snapshot.ClusterCounter.size();
+  Output.OracleAuditCandidateCount = Snapshot.OracleAuditCandidateCount;
+  Output.SemanticDiffCount = Snapshot.SemanticDiffCount;
+  return Output;
+}
+
+json::Value::Object buildCampaignAblationStatus() {
+  json::Value::Object Output;
+  Output["mutator"] =
+      (std::getenv("ENABLE_DST1_MUTATOR") &&
+       std::string(std::getenv("ENABLE_DST1_MUTATOR")) == "1")
+          ? "on"
+          : "off";
+  Output["cache-delta"] =
+      (!std::getenv("ENABLE_CACHE_DELTA") ||
+       std::string(std::getenv("ENABLE_CACHE_DELTA")) == "1")
+          ? "on"
+          : "off";
+  Output["triage"] =
+      (!std::getenv("ENABLE_TRIAGE") ||
+       std::string(std::getenv("ENABLE_TRIAGE")) == "1")
+          ? "on"
+          : "off";
+  Output["symcc"] =
+      (!std::getenv("ENABLE_SYMCC") ||
+       std::string(std::getenv("ENABLE_SYMCC")) == "1")
+          ? "on"
+          : "off";
+  return Output;
+}
+
+CampaignSummaryMetrics buildCampaignSummaryMetrics(
+    const CampaignReportSnapshot &Snapshot, std::int64_t ManifestSize,
+    std::int64_t ReproducedCount, double ReproRate) {
+  CampaignSummaryMetrics Output;
+  Output.ManifestSize = ManifestSize;
+  Output.ReproducedCount = ReproducedCount;
+  Output.ReproRate = ReproRate;
+  Output.MetricDenominators = buildMetricDenominators(
+      Snapshot.TotalSamples, Snapshot.AnalysisStateCounter,
+      *Snapshot.Comparability);
+  Output.AblationStatus = buildCampaignAblationStatus();
+
+  std::map<std::string, std::int64_t> ExecutedResolverCounts;
+  std::map<std::string, std::int64_t> SkippedResolverCounts;
+  std::map<std::string, std::int64_t> ResolverPairDiffCounts;
+  for (const auto &[Outcome, Count] : Snapshot.SemanticCounts) {
+    Output.SemanticCounts[Outcome] = static_cast<std::int64_t>(Count);
+  }
+  for (const auto &Record : Snapshot.AuditRecords) {
+    if (Record.DiffDetected) {
+      ++Output.DiffDetectedCount;
+    }
+    for (const auto &ResolverName : Record.ExecutedResolvers) {
+      ++ExecutedResolverCounts[ResolverName];
+    }
+    for (const auto &[ResolverName, Reason] : Record.SkippedResolvers) {
+      (void)Reason;
+      ++SkippedResolverCounts[ResolverName];
+    }
+    for (const auto &DifferenceValue : Record.ResolverDiffs) {
+      const auto Difference = coerceObjectOrEmpty(&DifferenceValue);
+      const auto Left =
+          coerceText(findObjectValue(Difference, "left_resolver"), "");
+      const auto Right =
+          coerceText(findObjectValue(Difference, "right_resolver"), "");
+      if (!Left.empty() && !Right.empty()) {
+        ++ResolverPairDiffCounts[Left + "_vs_" + Right];
+      }
+    }
+  }
+  for (const auto &[ResolverName, Count] : ExecutedResolverCounts) {
+    Output.ExecutedResolvers.emplace_back(ResolverName);
+    Output.ExecutedResolverCounts[ResolverName] = Count;
+  }
+  for (const auto &[ResolverName, Count] : SkippedResolverCounts) {
+    Output.SkippedResolverCounts[ResolverName] = Count;
+  }
+  for (const auto &[ResolverPair, Count] : ResolverPairDiffCounts) {
+    Output.ResolverPairDiffCounts[ResolverPair] = Count;
+  }
+  return Output;
+}
+
+json::Value::Object
+buildCampaignSummaryObject(const CampaignReportSnapshot &Snapshot,
+                           const CampaignSummaryMetrics &Metrics,
+                           const std::string &CampaignId) {
+  json::Value::Object Summary;
+  Summary["campaign_id"] = CampaignId;
+  Summary["total_samples"] = static_cast<std::int64_t>(Snapshot.TotalSamples);
+  Summary["needs_review_count"] =
+      static_cast<std::int64_t>(Snapshot.NeedsReviewCount);
+  Summary["cluster_count"] =
+      static_cast<std::int64_t>(Snapshot.ClusterCounter.size());
+  Summary["contract_version"] = static_cast<std::int64_t>(kContractVersion);
+  Summary["metric_denominators"] = Metrics.MetricDenominators;
+  Summary["semantic_counts"] = Metrics.SemanticCounts;
+  Summary["semantic_diff_count"] =
+      static_cast<std::int64_t>(Snapshot.SemanticDiffCount);
+  Summary["oracle_audit_candidate_count"] =
+      static_cast<std::int64_t>(Snapshot.OracleAuditCandidateCount);
+  Summary["diff_detected_sample_count"] = Metrics.DiffDetectedCount;
+  Summary["executed_resolvers"] = Metrics.ExecutedResolvers;
+  Summary["executed_resolver_sample_counts"] = Metrics.ExecutedResolverCounts;
+  Summary["skipped_resolver_sample_counts"] = Metrics.SkippedResolverCounts;
+  Summary["resolver_pair_diff_counts"] = Metrics.ResolverPairDiffCounts;
+  Summary["comparability"] = *Snapshot.Comparability;
+  json::setOptional(Summary, "run_id", Snapshot.RunId);
+  Summary["ablation_status"] = Metrics.AblationStatus;
+  if (Snapshot.SeedProvenance.has_value()) {
+    Summary["seed_provenance"] = *Snapshot.SeedProvenance;
+  } else {
+    Summary["seed_provenance"] = json::Value();
+  }
+  Summary["manifest_size"] = Metrics.ManifestSize;
+  Summary["reproduced_count"] = Metrics.ReproducedCount;
+  Summary["repro_rate"] = Metrics.ReproRate;
+  return Summary;
+}
+
+std::string buildCampaignAblationMatrixContent(
+    const json::Value::Object &AblationStatus) {
+  return "module\tstatus\n"
+         "cache-delta\t" +
+         coerceText(findObjectValue(AblationStatus, "cache-delta"), "off") +
+         "\nmutator\t" +
+         coerceText(findObjectValue(AblationStatus, "mutator"), "off") +
+         "\nsymcc\t" +
+         coerceText(findObjectValue(AblationStatus, "symcc"), "off") +
+         "\ntriage\t" +
+         coerceText(findObjectValue(AblationStatus, "triage"), "off") +
+         "\n";
+}
+
+std::string
+buildCampaignClusterCountsContent(const CampaignReportSnapshot &Snapshot) {
+  std::ostringstream Stream;
+  Stream << "cluster_key\tcount\n";
+  if (Snapshot.ClusterCounter.empty()) {
+    Stream << "_\t0\n";
+    return Stream.str();
+  }
+  for (const auto &[ClusterKey, Count] : Snapshot.ClusterCounter) {
+    Stream << ClusterKey << '\t' << Count << '\n';
+  }
+  return Stream.str();
+}
+
+std::string
+buildCampaignFailureTaxonomyContent(const CampaignReportSnapshot &Snapshot) {
+  std::ostringstream Stream;
+  Stream << "failure_bucket_primary\tfailure_bucket_detail\tcount\n";
+  for (const auto &[Key, Count] : Snapshot.FailureTaxonomyCounter) {
+    Stream << Key.first << '\t' << Key.second << '\t' << Count << '\n';
+  }
+  Stream << "__total__\t-\t" << Snapshot.TotalSamples << '\n';
+  return Stream.str();
+}
+
+std::string
+buildCampaignExclusionSummaryContent(const CampaignReportSnapshot &Snapshot) {
+  std::ostringstream Stream;
+  Stream << "failure_bucket_primary\tanalysis_state\tcount\n";
+  for (const auto &Primary : kFailureBucketPrimaryOrder) {
+    const auto Count = Snapshot.FailureBucketPrimaryCounter.count(Primary)
+                           ? Snapshot.FailureBucketPrimaryCounter.at(Primary)
+                           : 0U;
+    Stream << Primary << '\t' << kExclusionStateByPrimary.at(Primary) << '\t'
+           << Count << '\n';
+  }
+  Stream << "__total__\t-\t" << Snapshot.TotalSamples << '\n';
+  return Stream.str();
+}
+
+std::string buildCampaignReproRateContent(
+    const CampaignSummaryMetrics &SummaryMetrics) {
+  std::ostringstream Stream;
+  Stream << "metric\tvalue\n";
+  Stream << "manifest_size\t" << SummaryMetrics.ManifestSize << '\n';
+  Stream << "reproduced_count\t" << SummaryMetrics.ReproducedCount << '\n';
+  Stream.setf(std::ios::fixed, std::ios::floatfield);
+  Stream.precision(4);
+  Stream << "repro_rate\t" << SummaryMetrics.ReproRate << '\n';
+  return Stream.str();
+}
+
+std::string buildCampaignOracleAuditContent(
+    const std::vector<CampaignAuditRecord> &AuditRecords) {
+  std::ostringstream Stream;
+  for (size_t Index = 0; Index < kAuditColumns.size(); ++Index) {
+    if (Index != 0) {
+      Stream << '\t';
+    }
+    Stream << kAuditColumns[Index];
+  }
+  Stream << '\n';
+  for (const auto &Record : AuditRecords) {
+    Stream << auditRow(Record) << '\n';
+  }
+  return Stream.str();
+}
+
 CampaignReportArtifacts
 generateCampaignReportArtifacts(const std::filesystem::path &Root,
                                 const std::optional<std::filesystem::path>
@@ -2595,257 +3129,18 @@ generateCampaignReportArtifacts(const std::filesystem::path &Root,
       ReportBase.value_or(ResolvedRoot / "campaign_reports"));
   const auto ReportDir = ReportBasePath / compactTimestampNow();
   std::filesystem::create_directories(ReportDir);
+  const auto Paths = buildCampaignReportOutputPaths(ReportDir);
 
-  const auto HighValueManifestPath = TriageArtifacts.HighValueManifestPath;
-  std::set<std::filesystem::path> ManifestPaths;
-  std::set<std::filesystem::path> ManifestSampleDirs;
-  if (std::filesystem::is_regular_file(HighValueManifestPath)) {
-    std::istringstream ManifestStream(readTextFile(HighValueManifestPath));
-    std::string Line;
-    while (std::getline(ManifestStream, Line)) {
-      if (Line.empty()) {
-        continue;
-      }
-      const auto Path = normalizePath(Line);
-      if (!std::filesystem::is_regular_file(Path)) {
-        continue;
-      }
-      ManifestPaths.insert(Path);
-      ManifestSampleDirs.insert(Path.parent_path());
-    }
-  }
-
-  size_t ReproducedCount = 0;
-  for (const auto &SampleDir : Snapshot.SampleDirs) {
-    if (ManifestSampleDirs.count(normalizePath(SampleDir)) != 0U) {
-      ++ReproducedCount;
-    }
-  }
-  const size_t ManifestSize = ManifestPaths.size();
-  const double ReproRate =
-      ManifestSize == 0U
-          ? 0.0
-          : static_cast<double>(ReproducedCount) /
-                static_cast<double>(ManifestSize);
-
-  json::Value::Object MetricDenominators = buildMetricDenominators(
-      Snapshot.TotalSamples, Snapshot.AnalysisStateCounter,
-      *Snapshot.Comparability);
-
-  json::Value::Object AblationStatus;
-  AblationStatus["mutator"] =
-      (std::getenv("ENABLE_DST1_MUTATOR") &&
-       std::string(std::getenv("ENABLE_DST1_MUTATOR")) == "1")
-          ? "on"
-          : "off";
-  AblationStatus["cache-delta"] =
-      (!std::getenv("ENABLE_CACHE_DELTA") ||
-       std::string(std::getenv("ENABLE_CACHE_DELTA")) == "1")
-          ? "on"
-          : "off";
-  AblationStatus["triage"] =
-      (!std::getenv("ENABLE_TRIAGE") ||
-       std::string(std::getenv("ENABLE_TRIAGE")) == "1")
-          ? "on"
-          : "off";
-  AblationStatus["symcc"] =
-      (!std::getenv("ENABLE_SYMCC") ||
-       std::string(std::getenv("ENABLE_SYMCC")) == "1")
-          ? "on"
-          : "off";
-
-  json::Value::Object Summary;
-  std::map<std::string, std::int64_t> ExecutedResolverCounts;
-  std::map<std::string, std::int64_t> SkippedResolverCounts;
-  std::map<std::string, std::int64_t> ResolverPairDiffCounts;
-  size_t DiffDetectedCount = 0;
-  for (const auto &Record : Snapshot.AuditRecords) {
-    if (Record.DiffDetected) {
-      ++DiffDetectedCount;
-    }
-    for (const auto &ResolverName : Record.ExecutedResolvers) {
-      ++ExecutedResolverCounts[ResolverName];
-    }
-    for (const auto &[ResolverName, Reason] : Record.SkippedResolvers) {
-      (void)Reason;
-      ++SkippedResolverCounts[ResolverName];
-    }
-    for (const auto &DifferenceValue : Record.ResolverDiffs) {
-      const auto Difference = coerceObjectOrEmpty(&DifferenceValue);
-      const auto Left =
-          coerceText(findObjectValue(Difference, "left_resolver"), "");
-      const auto Right =
-          coerceText(findObjectValue(Difference, "right_resolver"), "");
-      if (!Left.empty() && !Right.empty()) {
-        ++ResolverPairDiffCounts[Left + "_vs_" + Right];
-      }
-    }
-  }
-  Summary["campaign_id"] = ReportDir.filename().string();
-  Summary["total_samples"] =
-      static_cast<std::int64_t>(Snapshot.TotalSamples);
-  Summary["needs_review_count"] =
-      static_cast<std::int64_t>(Snapshot.NeedsReviewCount);
-  Summary["cluster_count"] =
-      static_cast<std::int64_t>(Snapshot.ClusterCounter.size());
-  Summary["contract_version"] = static_cast<std::int64_t>(kContractVersion);
-  Summary["metric_denominators"] = MetricDenominators;
-  json::Value::Object SemanticCounts;
-  for (const auto &[Outcome, Count] : Snapshot.SemanticCounts) {
-    SemanticCounts[Outcome] = static_cast<std::int64_t>(Count);
-  }
-  Summary["semantic_counts"] = SemanticCounts;
-  Summary["semantic_diff_count"] =
-      static_cast<std::int64_t>(Snapshot.SemanticDiffCount);
-  Summary["oracle_audit_candidate_count"] =
-      static_cast<std::int64_t>(Snapshot.OracleAuditCandidateCount);
-  Summary["diff_detected_sample_count"] =
-      static_cast<std::int64_t>(DiffDetectedCount);
-  json::Value::Array ExecutedResolvers;
-  for (const auto &[ResolverName, Count] : ExecutedResolverCounts) {
-    (void)Count;
-    ExecutedResolvers.emplace_back(ResolverName);
-  }
-  Summary["executed_resolvers"] = ExecutedResolvers;
-  json::Value::Object ExecutedResolverCountsPayload;
-  for (const auto &[ResolverName, Count] : ExecutedResolverCounts) {
-    ExecutedResolverCountsPayload[ResolverName] = Count;
-  }
-  Summary["executed_resolver_sample_counts"] =
-      ExecutedResolverCountsPayload;
-  json::Value::Object SkippedResolverCountsPayload;
-  for (const auto &[ResolverName, Count] : SkippedResolverCounts) {
-    SkippedResolverCountsPayload[ResolverName] = Count;
-  }
-  Summary["skipped_resolver_sample_counts"] =
-      SkippedResolverCountsPayload;
-  json::Value::Object ResolverPairDiffCountsPayload;
-  for (const auto &[ResolverPair, Count] : ResolverPairDiffCounts) {
-    ResolverPairDiffCountsPayload[ResolverPair] = Count;
-  }
-  Summary["resolver_pair_diff_counts"] = ResolverPairDiffCountsPayload;
-  Summary["comparability"] = *Snapshot.Comparability;
-  json::setOptional(Summary, "run_id", Snapshot.RunId);
-  Summary["ablation_status"] = AblationStatus;
-  if (Snapshot.SeedProvenance.has_value()) {
-    Summary["seed_provenance"] = *Snapshot.SeedProvenance;
-  } else {
-    Summary["seed_provenance"] = json::Value();
-  }
-  Summary["manifest_size"] = static_cast<std::int64_t>(ManifestSize);
-  Summary["reproduced_count"] = static_cast<std::int64_t>(ReproducedCount);
-  Summary["repro_rate"] = ReproRate;
-
-  const auto SummaryPath = ReportDir / "summary.json";
-  const auto AblationMatrixPath = ReportDir / "ablation_matrix.tsv";
-  const auto ClusterCountsPath = ReportDir / "cluster_counts.tsv";
-  const auto FailureTaxonomyPath = ReportDir / "failure_taxonomy.tsv";
-  const auto ExclusionSummaryPath = ReportDir / "exclusion_summary.tsv";
-  const auto ReproRatePath = ReportDir / "repro_rate.tsv";
-  const auto OracleAuditPath = ReportDir / "oracle_audit.tsv";
-  const auto OracleReliabilityPath = ReportDir / "oracle_reliability.json";
-  const auto EvidenceBundlePath = ReportDir / "evidence_bundle.json";
-
-  writeJsonFile(SummaryPath, Summary);
-  writeTextFile(AblationMatrixPath,
-                "module\tstatus\n"
-                "cache-delta\t" +
-                    coerceText(findObjectValue(AblationStatus, "cache-delta"),
-                               "off") +
-                    "\nmutator\t" +
-                    coerceText(findObjectValue(AblationStatus, "mutator"), "off") +
-                    "\nsymcc\t" +
-                    coerceText(findObjectValue(AblationStatus, "symcc"), "off") +
-                    "\ntriage\t" +
-                    coerceText(findObjectValue(AblationStatus, "triage"), "off") +
-                    "\n");
-
-  {
-    std::ostringstream Stream;
-    Stream << "cluster_key\tcount\n";
-    if (Snapshot.ClusterCounter.empty()) {
-      Stream << "_\t0\n";
-    } else {
-      for (const auto &[ClusterKey, Count] : Snapshot.ClusterCounter) {
-        Stream << ClusterKey << '\t' << Count << '\n';
-      }
-    }
-    writeTextFile(ClusterCountsPath, Stream.str());
-  }
-
-  {
-    std::ostringstream Stream;
-    Stream << "failure_bucket_primary\tfailure_bucket_detail\tcount\n";
-    for (const auto &[Key, Count] : Snapshot.FailureTaxonomyCounter) {
-      Stream << Key.first << '\t' << Key.second << '\t' << Count << '\n';
-    }
-    Stream << "__total__\t-\t" << Snapshot.TotalSamples << '\n';
-    writeTextFile(FailureTaxonomyPath, Stream.str());
-  }
-
-  {
-    std::ostringstream Stream;
-    Stream << "failure_bucket_primary\tanalysis_state\tcount\n";
-    for (const auto &Primary : kFailureBucketPrimaryOrder) {
-      const auto Count = Snapshot.FailureBucketPrimaryCounter.count(Primary)
-                             ? Snapshot.FailureBucketPrimaryCounter.at(Primary)
-                             : 0U;
-      Stream << Primary << '\t' << kExclusionStateByPrimary.at(Primary) << '\t'
-             << Count << '\n';
-    }
-    Stream << "__total__\t-\t" << Snapshot.TotalSamples << '\n';
-    writeTextFile(ExclusionSummaryPath, Stream.str());
-  }
-
-  {
-    std::ostringstream Stream;
-    Stream << "metric\tvalue\n";
-    Stream << "manifest_size\t" << ManifestSize << '\n';
-    Stream << "reproduced_count\t" << ReproducedCount << '\n';
-    Stream.setf(std::ios::fixed, std::ios::floatfield);
-    Stream.precision(4);
-    Stream << "repro_rate\t" << ReproRate << '\n';
-    writeTextFile(ReproRatePath, Stream.str());
-  }
-
-  {
-    std::ostringstream Stream;
-    for (size_t Index = 0; Index < kAuditColumns.size(); ++Index) {
-      if (Index != 0) {
-        Stream << '\t';
-      }
-      Stream << kAuditColumns[Index];
-    }
-    Stream << '\n';
-    for (const auto &Record : Snapshot.AuditRecords) {
-      Stream << auditRow(Record) << '\n';
-    }
-    writeTextFile(OracleAuditPath, Stream.str());
-  }
-
-  writeJsonFile(OracleReliabilityPath,
-                buildOracleReliability(Snapshot.AuditRecords));
-  writeJsonFile(EvidenceBundlePath,
-                buildPublicationEvidenceBundle(ResolvedRoot, ReportDir, Summary,
-                                               Snapshot, ReportBasePath));
-
-  CampaignReportArtifacts Output;
-  Output.Root = ResolvedRoot;
-  Output.ReportDir = ReportDir;
-  Output.SummaryPath = SummaryPath;
-  Output.AblationMatrixPath = AblationMatrixPath;
-  Output.ClusterCountsPath = ClusterCountsPath;
-  Output.FailureTaxonomyPath = FailureTaxonomyPath;
-  Output.ExclusionSummaryPath = ExclusionSummaryPath;
-  Output.ReproRatePath = ReproRatePath;
-  Output.OracleAuditPath = OracleAuditPath;
-  Output.OracleReliabilityPath = OracleReliabilityPath;
-  Output.EvidenceBundlePath = EvidenceBundlePath;
-  Output.SampleCount = Snapshot.TotalSamples;
-  Output.ClusterCount = Snapshot.ClusterCounter.size();
-  Output.OracleAuditCandidateCount = Snapshot.OracleAuditCandidateCount;
-  Output.SemanticDiffCount = Snapshot.SemanticDiffCount;
-  return Output;
+  const auto ManifestStats =
+      buildCampaignManifestStats(Snapshot, TriageArtifacts.HighValueManifestPath);
+  const auto SummaryMetrics = buildCampaignSummaryMetrics(
+      Snapshot, ManifestStats.ManifestSize, ManifestStats.ReproducedCount,
+      ManifestStats.ReproRate);
+  auto Summary = buildCampaignSummaryObject(
+      Snapshot, SummaryMetrics, ReportDir.filename().string());
+  writeCampaignReportOutputs(Paths, SummaryMetrics, Snapshot, Summary,
+                             ResolvedRoot, ReportBasePath);
+  return buildCampaignReportArtifactsResult(ResolvedRoot, Paths, Snapshot);
 }
 
 json::Value::Object
@@ -2854,119 +3149,17 @@ buildCampaignSummaryPayload(const std::filesystem::path &Root,
                                 &AssociatedWorkDir) {
   const auto Snapshot =
       collectCampaignReportSnapshot(normalizePath(Root), AssociatedWorkDir);
-  json::Value::Object AblationStatus;
-  AblationStatus["mutator"] =
-      (std::getenv("ENABLE_DST1_MUTATOR") &&
-       std::string(std::getenv("ENABLE_DST1_MUTATOR")) == "1")
-          ? "on"
-          : "off";
-  AblationStatus["cache-delta"] =
-      (!std::getenv("ENABLE_CACHE_DELTA") ||
-       std::string(std::getenv("ENABLE_CACHE_DELTA")) == "1")
-          ? "on"
-          : "off";
-  AblationStatus["triage"] =
-      (!std::getenv("ENABLE_TRIAGE") ||
-       std::string(std::getenv("ENABLE_TRIAGE")) == "1")
-          ? "on"
-          : "off";
-  AblationStatus["symcc"] =
-      (!std::getenv("ENABLE_SYMCC") ||
-       std::string(std::getenv("ENABLE_SYMCC")) == "1")
-          ? "on"
-          : "off";
-
-  const auto ManifestSize = static_cast<std::int64_t>(
-      std::count_if(Snapshot.SemanticFrontierEntries.begin(),
-                    Snapshot.SemanticFrontierEntries.end(),
-                    [](const SemanticFrontierEntry &Entry) {
-                      return Entry.PriorityTier > 0;
-                    }));
-
-  std::map<std::string, std::int64_t> ExecutedResolverCounts;
-  std::map<std::string, std::int64_t> SkippedResolverCounts;
-  std::map<std::string, std::int64_t> ResolverPairDiffCounts;
-  size_t DiffDetectedCount = 0;
-  for (const auto &Record : Snapshot.AuditRecords) {
-    if (Record.DiffDetected) {
-      ++DiffDetectedCount;
-    }
-    for (const auto &ResolverName : Record.ExecutedResolvers) {
-      ++ExecutedResolverCounts[ResolverName];
-    }
-    for (const auto &[ResolverName, Reason] : Record.SkippedResolvers) {
-      (void)Reason;
-      ++SkippedResolverCounts[ResolverName];
-    }
-    for (const auto &DifferenceValue : Record.ResolverDiffs) {
-      const auto Difference = coerceObjectOrEmpty(&DifferenceValue);
-      const auto Left =
-          coerceText(findObjectValue(Difference, "left_resolver"), "");
-      const auto Right =
-          coerceText(findObjectValue(Difference, "right_resolver"), "");
-      if (!Left.empty() && !Right.empty()) {
-        ++ResolverPairDiffCounts[Left + "_vs_" + Right];
-      }
-    }
-  }
-
-  json::Value::Object Summary;
-  Summary["campaign_id"] = compactTimestampNow();
-  Summary["total_samples"] = static_cast<std::int64_t>(Snapshot.TotalSamples);
-  Summary["needs_review_count"] =
-      static_cast<std::int64_t>(Snapshot.NeedsReviewCount);
-  Summary["cluster_count"] =
-      static_cast<std::int64_t>(Snapshot.ClusterCounter.size());
-  Summary["contract_version"] = static_cast<std::int64_t>(kContractVersion);
-  Summary["metric_denominators"] = buildMetricDenominators(
-      Snapshot.TotalSamples, Snapshot.AnalysisStateCounter,
-      *Snapshot.Comparability);
-  json::Value::Object SemanticCounts;
-  for (const auto &[Outcome, Count] : Snapshot.SemanticCounts) {
-    SemanticCounts[Outcome] = static_cast<std::int64_t>(Count);
-  }
-  Summary["semantic_counts"] = SemanticCounts;
-  Summary["semantic_diff_count"] =
-      static_cast<std::int64_t>(Snapshot.SemanticDiffCount);
-  Summary["oracle_audit_candidate_count"] =
-      static_cast<std::int64_t>(Snapshot.OracleAuditCandidateCount);
-  Summary["diff_detected_sample_count"] =
-      static_cast<std::int64_t>(DiffDetectedCount);
-  json::Value::Array ExecutedResolvers;
-  for (const auto &[ResolverName, Count] : ExecutedResolverCounts) {
-    (void)Count;
-    ExecutedResolvers.emplace_back(ResolverName);
-  }
-  Summary["executed_resolvers"] = ExecutedResolvers;
-  json::Value::Object ExecutedResolverCountsPayload;
-  for (const auto &[ResolverName, Count] : ExecutedResolverCounts) {
-    ExecutedResolverCountsPayload[ResolverName] = Count;
-  }
-  Summary["executed_resolver_sample_counts"] =
-      ExecutedResolverCountsPayload;
-  json::Value::Object SkippedResolverCountsPayload;
-  for (const auto &[ResolverName, Count] : SkippedResolverCounts) {
-    SkippedResolverCountsPayload[ResolverName] = Count;
-  }
-  Summary["skipped_resolver_sample_counts"] =
-      SkippedResolverCountsPayload;
-  json::Value::Object ResolverPairDiffCountsPayload;
-  for (const auto &[ResolverPair, Count] : ResolverPairDiffCounts) {
-    ResolverPairDiffCountsPayload[ResolverPair] = Count;
-  }
-  Summary["resolver_pair_diff_counts"] = ResolverPairDiffCountsPayload;
-  Summary["comparability"] = *Snapshot.Comparability;
-  json::setOptional(Summary, "run_id", Snapshot.RunId);
-  Summary["ablation_status"] = AblationStatus;
-  if (Snapshot.SeedProvenance.has_value()) {
-    Summary["seed_provenance"] = *Snapshot.SeedProvenance;
-  } else {
-    Summary["seed_provenance"] = json::Value();
-  }
-  Summary["manifest_size"] = ManifestSize;
-  Summary["reproduced_count"] = ManifestSize;
-  Summary["repro_rate"] = ManifestSize == 0 ? json::Value(0.0) : json::Value(1.0);
-  return Summary;
+  const auto ManifestPath =
+      AssociatedWorkDir.has_value()
+          ? std::optional<std::filesystem::path>(*AssociatedWorkDir /
+                                                 "high_value_samples.txt")
+          : std::nullopt;
+  const auto ManifestStats = buildCampaignManifestStats(Snapshot, ManifestPath);
+  const auto SummaryMetrics = buildCampaignSummaryMetrics(
+      Snapshot, ManifestStats.ManifestSize, ManifestStats.ReproducedCount,
+      ManifestStats.ReproRate);
+  return buildCampaignSummaryObject(Snapshot, SummaryMetrics,
+                                    compactTimestampNow());
 }
 
 json::Value toJson(const ClusterSummary &Input) {

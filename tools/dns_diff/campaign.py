@@ -13,8 +13,12 @@ from .audit import (
     write_oracle_audit_tsv,
     write_oracle_reliability_json,
 )
+from .path_defaults import (
+    resolve_dnslabctl_bin,
+    resolve_follow_diff_work_dir,
+    resolve_root_dir,
+)
 from .report import (
-    _resolve_root_dir,
     collect_report_snapshot,
     derive_semantic_diff_count,
     resolve_high_value_manifest_path,
@@ -127,9 +131,7 @@ def _shell_quote_path(path: Path) -> str:
 def _build_regeneration_commands(root_path: Path, report_dir: Path) -> Dict[str, str]:
     root_arg = _shell_quote_path(root_path)
     report_dir_arg = _shell_quote_path(report_dir)
-    dnslabctl_bin_arg = _shell_quote_path(
-        (_resolve_root_dir() / "build/linux/x86_64/release/dnslabctl").resolve()
-    )
+    dnslabctl_bin_arg = _shell_quote_path(resolve_dnslabctl_bin(resolve_root_dir()))
     return {
         "triage_rewrite": (
             f"python3 -m tools.dns_diff.cli triage --root {root_arg} --rewrite"
@@ -403,12 +405,7 @@ def generate_campaign_report(root: Path, is_custom_root: bool = False) -> int:
     if is_custom_root:
         report_base = root_path / "campaign_reports"
     else:
-        work_dir = Path(
-            os.environ.get(
-                "WORK_DIR",
-                str(_resolve_root_dir() / "unbound_experiment" / "work_stateful"),
-            )
-        ).resolve()
+        work_dir = resolve_follow_diff_work_dir(root_dir=resolve_root_dir())
         report_base = work_dir / "campaign_reports"
     timestamp = _get_timestamp()
     report_dir = report_base / timestamp

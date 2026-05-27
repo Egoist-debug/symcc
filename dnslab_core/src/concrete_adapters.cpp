@@ -11,6 +11,15 @@ namespace dnslab {
 
 namespace {
 
+std::filesystem::path normalizePath(const std::filesystem::path &InputPath) {
+  std::error_code Error;
+  const auto Absolute = std::filesystem::absolute(InputPath, Error);
+  if (Error) {
+    return InputPath.lexically_normal();
+  }
+  return Absolute.lexically_normal();
+}
+
 std::filesystem::path requireExisting(const std::filesystem::path &InputPath,
                                       const std::string &Message) {
   if (!std::filesystem::exists(InputPath)) {
@@ -20,21 +29,109 @@ std::filesystem::path requireExisting(const std::filesystem::path &InputPath,
 }
 
 CommandResult copyPatchTree(const std::filesystem::path &PatchRoot,
-                            const std::filesystem::path &SourceRoot) {
-  if (!std::filesystem::is_directory(PatchRoot)) {
-    throw std::runtime_error("patch 目录不存在: " + PatchRoot.string());
+                            const std::filesystem::path &SourceRoot);
+std::filesystem::path cloneIfMissing(const std::filesystem::path &WorkspaceRoot,
+                                     const std::string &Resolver,
+                                     const std::string &Tag,
+                                     const std::string &RepoUrl);
+
+std::filesystem::path prepareGitResolverSource(
+    const std::filesystem::path &WorkspaceRoot, const std::string &Resolver,
+    const std::string &Tag,
+    const std::optional<std::filesystem::path> &SourceFallbackPath,
+    const std::filesystem::path &LegacyPath, const std::string &RepoUrl) {
+  const auto SubjectRoot = defaultSubjectRoot(WorkspaceRoot, Resolver, Tag);
+  if (std::filesystem::exists(SubjectRoot)) {
+    return SubjectRoot;
   }
-  for (const auto &Entry : std::filesystem::recursive_directory_iterator(PatchRoot)) {
+  if (SourceFallbackPath.has_value() &&
+      std::filesystem::exists(*SourceFallbackPath)) {
+    return *SourceFallbackPath;
+  }
+  if (std::filesystem::exists(LegacyPath)) {
+    return LegacyPath;
+  }
+  return cloneIfMissing(WorkspaceRoot, Resolver, Tag, RepoUrl);
+}
+
+CommandResult applyPatchFileOrTree(const std::filesystem::path &SourceRoot,
+                                   const std::filesystem::path &PatchFile) {
+  if (std::filesystem::is_directory(PatchFile)) {
+    return copyPatchTree(PatchFile, SourceRoot);
+  }
+  return runProcess({{"git", "-C", SourceRoot.string(), "apply",
+                      PatchFile.string()},
+                     std::nullopt,
+                     {},
+                     std::nullopt});
+}
+
+void copyRegularFilesWithRelativeLayout(
+    const std::filesystem::path &SourceRoot,
+    const std::filesystem::path &TargetRoot) {
+  for (const auto &Entry :
+       std::filesystem::recursive_directory_iterator(SourceRoot)) {
     if (!Entry.is_regular_file()) {
       continue;
     }
-    const auto Relative = std::filesystem::relative(Entry.path(), PatchRoot);
-    const auto Target = SourceRoot / Relative;
+    const auto Relative = std::filesystem::relative(Entry.path(), SourceRoot);
+    const auto Target = TargetRoot / Relative;
     std::filesystem::create_directories(Target.parent_path());
     std::filesystem::copy_file(Entry.path(), Target,
                                std::filesystem::copy_options::overwrite_existing);
   }
+}
+
+CommandResult copyPatchTree(const std::filesystem::path &PatchRoot,
+                            const std::filesystem::path &SourceRoot) {
+  if (!std::filesystem::is_directory(PatchRoot)) {
+    throw std::runtime_error("patch 目录不存在: " + PatchRoot.string());
+  }
+  copyRegularFilesWithRelativeLayout(PatchRoot, SourceRoot);
   return {0, "", ""};
+}
+
+void copyRegularFilesRecursively(const std::filesystem::path &SourceRoot,
+                                 const std::filesystem::path &TargetRoot) {
+  if (!std::filesystem::is_directory(SourceRoot)) {
+    return;
+  }
+  copyRegularFilesWithRelativeLayout(SourceRoot, TargetRoot);
+}
+
+void copyFirstExistingFile(
+    const std::vector<std::filesystem::path> &Candidates,
+    const std::filesystem::path &TargetPath) {
+  for (const auto &Candidate : Candidates) {
+    if (!std::filesystem::is_regular_file(Candidate)) {
+      continue;
+    }
+    std::filesystem::create_directories(TargetPath.parent_path());
+    std::filesystem::copy_file(
+        Candidate, TargetPath,
+        std::filesystem::copy_options::overwrite_existing);
+    return;
+  }
+}
+
+void prepareKnotRuntimeAssets(const std::filesystem::path &SourceRoot,
+                              const std::filesystem::path &TargetRoot,
+                              const std::filesystem::path &RuntimePrefix) {
+  const auto RuntimeLuaDir = RuntimePrefix / "lib" / "knot-resolver";
+  const auto RuntimeEtcDir = RuntimePrefix / "etc" / "knot-resolver";
+  std::filesystem::create_directories(RuntimeLuaDir);
+  std::filesystem::create_directories(RuntimeEtcDir);
+  copyRegularFilesRecursively(SourceRoot / "daemon" / "lua", RuntimeLuaDir);
+  copyRegularFilesRecursively(TargetRoot / "daemon" / "lua", RuntimeLuaDir);
+  copyFirstExistingFile({SourceRoot / "etc" / "root.keys",
+                         TargetRoot / "etc" / "root.keys"},
+                        RuntimeEtcDir / "root.keys");
+  requireExisting(RuntimeLuaDir / "sandbox.lua",
+                  "缺少 knot-resolver Lua runtime");
+  requireExisting(RuntimeLuaDir / "kres_modules" / "ta_update.lua",
+                  "缺少 knot-resolver 内置模块");
+  requireExisting(RuntimeEtcDir / "root.keys",
+                  "缺少 knot-resolver trust anchor");
 }
 
 std::string readTextFile(const std::filesystem::path &InputPath) {
@@ -306,6 +403,119 @@ std::filesystem::path firstExisting(
   return {};
 }
 
+std::optional<std::filesystem::path> envRootPath(const char *EnvName) {
+  if (EnvName == nullptr || *EnvName == '\0') {
+    return std::nullopt;
+  }
+  if (const char *EnvValue = std::getenv(EnvName);
+      EnvValue != nullptr && *EnvValue != '\0') {
+    return normalizePath(EnvValue);
+  }
+  return std::nullopt;
+}
+
+std::filesystem::path resolveEnvPathOrDefault(
+    const char *EnvName, const std::filesystem::path &DefaultPath) {
+  if (const auto EnvPath = envRootPath(EnvName)) {
+    return *EnvPath;
+  }
+  return DefaultPath;
+}
+
+void appendRelativeCandidates(
+    std::vector<std::filesystem::path> &Candidates,
+    const std::filesystem::path &Root,
+    std::initializer_list<std::filesystem::path> RelativePaths) {
+  if (Root.empty()) {
+    return;
+  }
+  for (const auto &RelativePath : RelativePaths) {
+    Candidates.push_back(Root / RelativePath);
+  }
+}
+
+OracleArtifact makeOracleArtifact(const OracleSnapshot &Snapshot);
+
+CommandResult runResolverHarness(const std::string &ResolverName,
+                                 const std::vector<std::string> &HarnessArgs,
+                                 const std::filesystem::path &RunRoot) {
+  std::filesystem::create_directories(RunRoot);
+  CommandResult Result =
+      runProcess({HarnessArgs, std::nullopt, {}, std::nullopt});
+  std::ofstream(RunRoot / (ResolverName + ".stderr")) << Result.StdoutText;
+  return Result;
+}
+
+CommandResult runScriptedResolverMode(
+    const std::string &ResolverName, const std::filesystem::path &BinaryPath,
+    const std::string &MissingBinaryMessage,
+    const std::filesystem::path &HarnessPath,
+    const std::string &MissingHarnessMessage, const std::string &BinaryArgName,
+    const std::string &Mode, const std::filesystem::path &CacheDumpPath,
+    const std::string &NativeOutputArgName,
+    const std::filesystem::path &NativeOutputPath,
+    const std::filesystem::path &RunRoot,
+    const std::optional<std::filesystem::path> &TranscriptPath = std::nullopt) {
+  const auto Binary = requireExisting(BinaryPath, MissingBinaryMessage);
+  const auto Harness = requireExisting(HarnessPath, MissingHarnessMessage);
+  std::vector<std::string> HarnessArgs = {"python3", Harness.string(),
+                                          BinaryArgName, Binary.string(),
+                                          "--mode", Mode};
+  if (TranscriptPath.has_value()) {
+    HarnessArgs.push_back("--transcript");
+    HarnessArgs.push_back(TranscriptPath->string());
+  }
+  HarnessArgs.push_back("--cache-dump-path");
+  HarnessArgs.push_back(CacheDumpPath.string());
+  HarnessArgs.push_back(NativeOutputArgName);
+  HarnessArgs.push_back(NativeOutputPath.string());
+  return runResolverHarness(ResolverName, HarnessArgs, RunRoot);
+}
+
+std::filesystem::path prepareMirroredBuildTree(
+    const std::filesystem::path &SourceRoot,
+    const std::filesystem::path &BuildRoot,
+    const std::filesystem::path &ExistingLayoutProbe,
+    const std::filesystem::path &MirroredSubdir) {
+  if (std::filesystem::exists(BuildRoot / ExistingLayoutProbe)) {
+    return BuildRoot;
+  }
+  const auto TargetRoot = BuildRoot / MirroredSubdir;
+  if (std::filesystem::exists(TargetRoot / ExistingLayoutProbe)) {
+    return TargetRoot;
+  }
+  if (std::filesystem::exists(TargetRoot)) {
+    std::filesystem::remove_all(TargetRoot);
+  }
+  std::filesystem::create_directories(TargetRoot.parent_path());
+  std::filesystem::copy(SourceRoot, TargetRoot,
+                        std::filesystem::copy_options::recursive |
+                            std::filesystem::copy_options::copy_symlinks);
+  return TargetRoot;
+}
+
+OracleArtifact parseResolverOracleFile(const std::filesystem::path &OraclePath,
+                                       const std::string &ResolverName) {
+  std::ifstream Input(OraclePath);
+  std::ostringstream Buffer;
+  Buffer << Input.rdbuf();
+  return makeOracleArtifact(parseOracleSummary(Buffer.str(), ResolverName));
+}
+
+std::vector<std::filesystem::path>
+collectResolverLogPair(const std::filesystem::path &RunRoot,
+                       const std::string &ResolverName,
+                       const std::filesystem::path &NativeLogPath) {
+  std::vector<std::filesystem::path> Output;
+  for (const auto &Candidate :
+       {RunRoot / (ResolverName + ".stderr"), NativeLogPath}) {
+    if (std::filesystem::exists(Candidate)) {
+      Output.push_back(Candidate);
+    }
+  }
+  return Output;
+}
+
 std::string collectDotLibs(const std::filesystem::path &TreeRoot) {
   std::set<std::string> LibDirs;
   if (!std::filesystem::is_directory(TreeRoot)) {
@@ -373,19 +583,22 @@ std::filesystem::path dnsmasqBinaryPath(const DnsmasqAdapterConfig &Config,
   if (Config.BinaryPathOverride.has_value()) {
     return *Config.BinaryPathOverride;
   }
-  const char *EnvBuildRoot = std::getenv("DNSLAB_DNSMASQ_BUILD_ROOT");
-  return firstExisting({BuildRoot / "dnsmasq",
-                        BuildRoot / "dnsmasq-afl" / "dnsmasq",
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "dnsmasq"
-                            : std::filesystem::path(),
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "dnsmasq-afl" /
-                                  "dnsmasq"
-                            : std::filesystem::path(),
-                        Config.WorkspaceRoot / "experiments" / "subjects" /
-                            "dnsmasq" / "v2.92-afl" / "dnsmasq",
-                        Config.WorkspaceRoot / "dnsmasq-2.92-afl" / "dnsmasq"});
+  std::vector<std::filesystem::path> Candidates;
+  appendRelativeCandidates(Candidates, BuildRoot,
+                           {"dnsmasq", "dnsmasq-afl/dnsmasq"});
+  if (const auto EnvBuildRoot = envRootPath("DNSLAB_DNSMASQ_BUILD_ROOT");
+      EnvBuildRoot.has_value()) {
+    appendRelativeCandidates(Candidates, *EnvBuildRoot,
+                             {"dnsmasq", "dnsmasq-afl/dnsmasq"});
+  }
+  appendRelativeCandidates(
+      Candidates,
+      Config.WorkspaceRoot / "experiments" / "subjects" / "dnsmasq" /
+          "v2.92-afl",
+      {"dnsmasq"});
+  appendRelativeCandidates(Candidates, Config.WorkspaceRoot / "dnsmasq-2.92-afl",
+                           {"dnsmasq"});
+  return firstExisting(Candidates);
 }
 
 std::filesystem::path smartdnsBinaryPath(const SmartdnsAdapterConfig &Config,
@@ -393,18 +606,22 @@ std::filesystem::path smartdnsBinaryPath(const SmartdnsAdapterConfig &Config,
   if (Config.BinaryPathOverride.has_value()) {
     return *Config.BinaryPathOverride;
   }
-  const char *EnvBuildRoot = std::getenv("DNSLAB_SMARTDNS_BUILD_ROOT");
-  return firstExisting({BuildRoot / "src" / "smartdns",
-                        BuildRoot / "smartdns-build" / "src" / "smartdns",
-                        BuildRoot / "smartdns",
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "src" / "smartdns"
-                            : std::filesystem::path(),
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "smartdns-build" / "src" / "smartdns"
-                            : std::filesystem::path(),
-                        Config.WorkspaceRoot / "experiments" / "subjects" /
-                            "smartdns" / "Release47.1-build" / "src" / "smartdns"});
+  std::vector<std::filesystem::path> Candidates;
+  appendRelativeCandidates(
+      Candidates, BuildRoot,
+      {"src/smartdns", "smartdns-build/src/smartdns", "smartdns"});
+  if (const auto EnvBuildRoot = envRootPath("DNSLAB_SMARTDNS_BUILD_ROOT");
+      EnvBuildRoot.has_value()) {
+    appendRelativeCandidates(
+        Candidates, *EnvBuildRoot,
+        {"src/smartdns", "smartdns-build/src/smartdns", "smartdns"});
+  }
+  appendRelativeCandidates(
+      Candidates,
+      Config.WorkspaceRoot / "experiments" / "subjects" / "smartdns" /
+          "Release47.1-build",
+      {"src/smartdns"});
+  return firstExisting(Candidates);
 }
 
 std::filesystem::path maradnsBinaryPath(const MaradnsAdapterConfig &Config,
@@ -412,18 +629,24 @@ std::filesystem::path maradnsBinaryPath(const MaradnsAdapterConfig &Config,
   if (Config.BinaryPathOverride.has_value()) {
     return *Config.BinaryPathOverride;
   }
-  const char *EnvBuildRoot = std::getenv("DNSLAB_MARADNS_BUILD_ROOT");
-  return firstExisting({BuildRoot / "deadwood-build" / "deadwood-github" / "src" / "Deadwood",
-                        BuildRoot / "deadwood-github" / "src" / "Deadwood",
-                        BuildRoot / "Deadwood",
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "deadwood-build" / "deadwood-github" / "src" / "Deadwood"
-                            : std::filesystem::path(),
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "deadwood-github" / "src" / "Deadwood"
-                            : std::filesystem::path(),
-                        Config.WorkspaceRoot / "experiments" / "subjects" / "maradns" /
-                            "deadwood-3.3.02-build" / "deadwood-github" / "src" / "Deadwood"});
+  std::vector<std::filesystem::path> Candidates;
+  appendRelativeCandidates(
+      Candidates, BuildRoot,
+      {"deadwood-build/deadwood-github/src/Deadwood",
+       "deadwood-github/src/Deadwood", "Deadwood"});
+  if (const auto EnvBuildRoot = envRootPath("DNSLAB_MARADNS_BUILD_ROOT");
+      EnvBuildRoot.has_value()) {
+    appendRelativeCandidates(
+        Candidates, *EnvBuildRoot,
+        {"deadwood-build/deadwood-github/src/Deadwood",
+         "deadwood-github/src/Deadwood", "Deadwood"});
+  }
+  appendRelativeCandidates(
+      Candidates,
+      Config.WorkspaceRoot / "experiments" / "subjects" / "maradns" /
+          "deadwood-3.3.02-build",
+      {"deadwood-github/src/Deadwood"});
+  return firstExisting(Candidates);
 }
 
 std::filesystem::path knotResolverBinaryPath(
@@ -432,20 +655,20 @@ std::filesystem::path knotResolverBinaryPath(
   if (Config.BinaryPathOverride.has_value()) {
     return *Config.BinaryPathOverride;
   }
-  const char *EnvBuildRoot = std::getenv("DNSLAB_KNOT_RESOLVER_BUILD_ROOT");
-  return firstExisting({BuildRoot / "knot-build" / "daemon" / "kresd",
-                        BuildRoot / "daemon" / "kresd",
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "knot-build" /
-                                  "daemon" / "kresd"
-                            : std::filesystem::path(),
-                        EnvBuildRoot != nullptr
-                            ? std::filesystem::path(EnvBuildRoot) / "daemon" /
-                                  "kresd"
-                            : std::filesystem::path(),
-                        Config.WorkspaceRoot / "experiments" / "subjects" /
-                            "knot-resolver" / "v6.2.0-build" / "knot-build" /
-                            "daemon" / "kresd"});
+  std::vector<std::filesystem::path> Candidates;
+  appendRelativeCandidates(Candidates, BuildRoot,
+                           {"knot-build/daemon/kresd", "daemon/kresd"});
+  if (const auto EnvBuildRoot = envRootPath("DNSLAB_KNOT_RESOLVER_BUILD_ROOT");
+      EnvBuildRoot.has_value()) {
+    appendRelativeCandidates(Candidates, *EnvBuildRoot,
+                             {"knot-build/daemon/kresd", "daemon/kresd"});
+  }
+  appendRelativeCandidates(
+      Candidates,
+      Config.WorkspaceRoot / "experiments" / "subjects" / "knot-resolver" /
+          "v6.2.0-build",
+      {"knot-build/daemon/kresd"});
+  return firstExisting(Candidates);
 }
 
 OracleArtifact makeOracleArtifact(const OracleSnapshot &Snapshot) {
@@ -884,33 +1107,16 @@ std::string DnsmasqResolverAdapter::name() const { return "dnsmasq"; }
 std::filesystem::path
 DnsmasqResolverAdapter::prepareSource(const std::filesystem::path &WorkspaceRoot,
                                       const std::string &Tag) const {
-  const auto SubjectRoot = defaultSubjectRoot(WorkspaceRoot, "dnsmasq", Tag);
-  if (std::filesystem::exists(SubjectRoot)) {
-    return SubjectRoot;
-  }
-  if (Config_.SourceFallbackPath.has_value() &&
-      std::filesystem::exists(*Config_.SourceFallbackPath)) {
-    return *Config_.SourceFallbackPath;
-  }
-  const auto Legacy = WorkspaceRoot / "dnsmasq-2.92";
-  if (std::filesystem::exists(Legacy)) {
-    return Legacy;
-  }
-  return cloneIfMissing(WorkspaceRoot, "dnsmasq", Tag,
-                        "https://github.com/imp/dnsmasq.git");
+  return prepareGitResolverSource(WorkspaceRoot, "dnsmasq", Tag,
+                                  Config_.SourceFallbackPath,
+                                  WorkspaceRoot / "dnsmasq-2.92",
+                                  "https://github.com/imp/dnsmasq.git");
 }
 
 CommandResult
 DnsmasqResolverAdapter::applyPatch(const std::filesystem::path &SourceRoot,
                                    const std::filesystem::path &PatchFile) const {
-  if (std::filesystem::is_directory(PatchFile)) {
-    return copyPatchTree(PatchFile, SourceRoot);
-  }
-  return runProcess({{"git", "-C", SourceRoot.string(), "apply",
-                      PatchFile.string()},
-                     std::nullopt,
-                     {},
-                     std::nullopt});
+  return applyPatchFileOrTree(SourceRoot, PatchFile);
 }
 
 CommandResult
@@ -934,60 +1140,25 @@ DnsmasqResolverAdapter::build(const std::filesystem::path &SourceRoot,
 
 CommandResult
 DnsmasqResolverAdapter::runSample(const RunSampleRequest &Request) const {
-  const auto Binary = requireExisting(dnsmasqBinaryPath(Config_, Request.BuildRoot),
-                                      "缺少 dnsmasq 可执行文件");
-  const auto Harness =
-      requireExisting(Config_.HarnessScriptPath, "缺少 dnsmasq replay harness");
-  std::filesystem::create_directories(Request.RunRoot);
   const auto CacheDumpPath = Request.RunRoot / "dnsmasq.after.cache.txt";
   const auto NativeStderrPath = Request.RunRoot / "dnsmasq.native.stderr";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--dnsmasq-bin",
-       Binary.string(),
-       "--mode",
-       "run",
-       "--transcript",
-       Request.TranscriptPath.string(),
-       "--cache-dump-path",
-       CacheDumpPath.string(),
-       "--dnsmasq-stderr-path",
-       NativeStderrPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(Request.RunRoot / "dnsmasq.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "dnsmasq", dnsmasqBinaryPath(Config_, Request.BuildRoot),
+      "缺少 dnsmasq 可执行文件", Config_.HarnessScriptPath,
+      "缺少 dnsmasq replay harness", "--dnsmasq-bin", "run", CacheDumpPath,
+      "--dnsmasq-stderr-path", NativeStderrPath, Request.RunRoot,
+      Request.TranscriptPath);
 }
 
 CommandResult
 DnsmasqResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                   const std::filesystem::path &OutputFile) const {
-  const auto Binary = requireExisting(dnsmasqBinaryPath(Config_, RunRoot),
-                                      "缺少 dnsmasq 可执行文件");
-  const auto Harness =
-      requireExisting(Config_.HarnessScriptPath, "缺少 dnsmasq replay harness");
-  std::filesystem::create_directories(RunRoot);
   const auto NativeStderrPath = RunRoot / "dnsmasq.native.stderr";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--dnsmasq-bin",
-       Binary.string(),
-       "--mode",
-       "dump",
-       "--cache-dump-path",
-       OutputFile.string(),
-       "--dnsmasq-stderr-path",
-       NativeStderrPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(RunRoot / "dnsmasq.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "dnsmasq", dnsmasqBinaryPath(Config_, RunRoot), "缺少 dnsmasq 可执行文件",
+      Config_.HarnessScriptPath, "缺少 dnsmasq replay harness",
+      "--dnsmasq-bin", "dump", OutputFile, "--dnsmasq-stderr-path",
+      NativeStderrPath, RunRoot);
 }
 
 CommandResult
@@ -998,22 +1169,13 @@ DnsmasqResolverAdapter::flushCache(const std::filesystem::path &RunRoot) const {
 
 OracleArtifact
 DnsmasqResolverAdapter::parseOracle(const std::filesystem::path &OraclePath) const {
-  std::ifstream Input(OraclePath);
-  std::ostringstream Buffer;
-  Buffer << Input.rdbuf();
-  return makeOracleArtifact(parseOracleSummary(Buffer.str(), "dnsmasq"));
+  return parseResolverOracleFile(OraclePath, "dnsmasq");
 }
 
 std::vector<std::filesystem::path>
 DnsmasqResolverAdapter::collectLogs(const std::filesystem::path &RunRoot) const {
-  std::vector<std::filesystem::path> Output;
-  for (const auto &Candidate :
-       {RunRoot / "dnsmasq.stderr", RunRoot / "dnsmasq.native.stderr"}) {
-    if (std::filesystem::exists(Candidate)) {
-      Output.push_back(Candidate);
-    }
-  }
-  return Output;
+  return collectResolverLogPair(RunRoot, "dnsmasq",
+                                RunRoot / "dnsmasq.native.stderr");
 }
 
 SmartdnsResolverAdapter::SmartdnsResolverAdapter(SmartdnsAdapterConfig Config)
@@ -1024,46 +1186,23 @@ std::string SmartdnsResolverAdapter::name() const { return "smartdns"; }
 std::filesystem::path
 SmartdnsResolverAdapter::prepareSource(const std::filesystem::path &WorkspaceRoot,
                                        const std::string &Tag) const {
-  const auto SubjectRoot = defaultSubjectRoot(WorkspaceRoot, "smartdns", Tag);
-  if (std::filesystem::exists(SubjectRoot)) {
-    return SubjectRoot;
-  }
-  if (Config_.SourceFallbackPath.has_value() &&
-      std::filesystem::exists(*Config_.SourceFallbackPath)) {
-    return *Config_.SourceFallbackPath;
-  }
-  const auto Legacy = WorkspaceRoot / "smartdns-Release47.1";
-  if (std::filesystem::exists(Legacy)) {
-    return Legacy;
-  }
-  return cloneIfMissing(WorkspaceRoot, "smartdns", Tag,
-                        "https://github.com/pymumu/smartdns.git");
+  return prepareGitResolverSource(WorkspaceRoot, "smartdns", Tag,
+                                  Config_.SourceFallbackPath,
+                                  WorkspaceRoot / "smartdns-Release47.1",
+                                  "https://github.com/pymumu/smartdns.git");
 }
 
 CommandResult
 SmartdnsResolverAdapter::applyPatch(const std::filesystem::path &SourceRoot,
                                     const std::filesystem::path &PatchFile) const {
-  if (std::filesystem::is_directory(PatchFile)) {
-    return copyPatchTree(PatchFile, SourceRoot);
-  }
-  return runProcess({{"git", "-C", SourceRoot.string(), "apply",
-                      PatchFile.string()},
-                     std::nullopt,
-                     {},
-                     std::nullopt});
+  return applyPatchFileOrTree(SourceRoot, PatchFile);
 }
 
 CommandResult
 SmartdnsResolverAdapter::build(const std::filesystem::path &SourceRoot,
                                const std::filesystem::path &BuildRoot) const {
-  const auto TargetRoot =
-      std::filesystem::exists(BuildRoot / "src") ? BuildRoot : (BuildRoot / "smartdns-build");
-  if (!std::filesystem::exists(TargetRoot)) {
-    std::filesystem::create_directories(TargetRoot.parent_path());
-    std::filesystem::copy(SourceRoot, TargetRoot,
-                          std::filesystem::copy_options::recursive |
-                              std::filesystem::copy_options::copy_symlinks);
-  }
+  const auto TargetRoot = prepareMirroredBuildTree(
+      SourceRoot, BuildRoot, "src", "smartdns-build");
   const CommandResult Result = runProcess({
       {"make", "-j" + std::to_string(Config_.BuildJobs), "-C",
        (TargetRoot / "src").string(), "all"},
@@ -1081,60 +1220,25 @@ SmartdnsResolverAdapter::build(const std::filesystem::path &SourceRoot,
 
 CommandResult
 SmartdnsResolverAdapter::runSample(const RunSampleRequest &Request) const {
-  const auto Binary = requireExisting(smartdnsBinaryPath(Config_, Request.BuildRoot),
-                                      "缺少 smartdns 可执行文件");
-  const auto Harness =
-      requireExisting(Config_.HarnessScriptPath, "缺少 smartdns replay harness");
-  std::filesystem::create_directories(Request.RunRoot);
   const auto CacheDumpPath = Request.RunRoot / "smartdns.after.cache.txt";
   const auto NativeLogPath = Request.RunRoot / "smartdns.native.log";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--smartdns-bin",
-       Binary.string(),
-       "--mode",
-       "run",
-       "--transcript",
-       Request.TranscriptPath.string(),
-       "--cache-dump-path",
-       CacheDumpPath.string(),
-       "--smartdns-log-path",
-       NativeLogPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(Request.RunRoot / "smartdns.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "smartdns", smartdnsBinaryPath(Config_, Request.BuildRoot),
+      "缺少 smartdns 可执行文件", Config_.HarnessScriptPath,
+      "缺少 smartdns replay harness", "--smartdns-bin", "run", CacheDumpPath,
+      "--smartdns-log-path", NativeLogPath, Request.RunRoot,
+      Request.TranscriptPath);
 }
 
 CommandResult
 SmartdnsResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                    const std::filesystem::path &OutputFile) const {
-  const auto Binary = requireExisting(smartdnsBinaryPath(Config_, RunRoot),
-                                      "缺少 smartdns 可执行文件");
-  const auto Harness =
-      requireExisting(Config_.HarnessScriptPath, "缺少 smartdns replay harness");
-  std::filesystem::create_directories(RunRoot);
   const auto NativeLogPath = RunRoot / "smartdns.native.log";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--smartdns-bin",
-       Binary.string(),
-       "--mode",
-       "dump",
-       "--cache-dump-path",
-       OutputFile.string(),
-       "--smartdns-log-path",
-       NativeLogPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(RunRoot / "smartdns.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "smartdns", smartdnsBinaryPath(Config_, RunRoot), "缺少 smartdns 可执行文件",
+      Config_.HarnessScriptPath, "缺少 smartdns replay harness",
+      "--smartdns-bin", "dump", OutputFile, "--smartdns-log-path",
+      NativeLogPath, RunRoot);
 }
 
 CommandResult
@@ -1145,22 +1249,13 @@ SmartdnsResolverAdapter::flushCache(const std::filesystem::path &RunRoot) const 
 
 OracleArtifact
 SmartdnsResolverAdapter::parseOracle(const std::filesystem::path &OraclePath) const {
-  std::ifstream Input(OraclePath);
-  std::ostringstream Buffer;
-  Buffer << Input.rdbuf();
-  return makeOracleArtifact(parseOracleSummary(Buffer.str(), "smartdns"));
+  return parseResolverOracleFile(OraclePath, "smartdns");
 }
 
 std::vector<std::filesystem::path>
 SmartdnsResolverAdapter::collectLogs(const std::filesystem::path &RunRoot) const {
-  std::vector<std::filesystem::path> Output;
-  for (const auto &Candidate :
-       {RunRoot / "smartdns.stderr", RunRoot / "smartdns.native.log"}) {
-    if (std::filesystem::exists(Candidate)) {
-      Output.push_back(Candidate);
-    }
-  }
-  return Output;
+  return collectResolverLogPair(RunRoot, "smartdns",
+                                RunRoot / "smartdns.native.log");
 }
 
 MaradnsResolverAdapter::MaradnsResolverAdapter(MaradnsAdapterConfig Config)
@@ -1171,48 +1266,23 @@ std::string MaradnsResolverAdapter::name() const { return "maradns"; }
 std::filesystem::path
 MaradnsResolverAdapter::prepareSource(const std::filesystem::path &WorkspaceRoot,
                                       const std::string &Tag) const {
-  const auto SubjectRoot = defaultSubjectRoot(WorkspaceRoot, "maradns", Tag);
-  if (std::filesystem::exists(SubjectRoot)) {
-    return SubjectRoot;
-  }
-  if (Config_.SourceFallbackPath.has_value() &&
-      std::filesystem::exists(*Config_.SourceFallbackPath)) {
-    return *Config_.SourceFallbackPath;
-  }
-  const auto Legacy = WorkspaceRoot / "maradns-deadwood-3.3.02";
-  if (std::filesystem::exists(Legacy)) {
-    return Legacy;
-  }
-  return cloneIfMissing(WorkspaceRoot, "maradns", Tag,
-                        "https://github.com/samboy/MaraDNS.git");
+  return prepareGitResolverSource(WorkspaceRoot, "maradns", Tag,
+                                  Config_.SourceFallbackPath,
+                                  WorkspaceRoot / "maradns-deadwood-3.3.02",
+                                  "https://github.com/samboy/MaraDNS.git");
 }
 
 CommandResult
 MaradnsResolverAdapter::applyPatch(const std::filesystem::path &SourceRoot,
                                    const std::filesystem::path &PatchFile) const {
-  if (std::filesystem::is_directory(PatchFile)) {
-    return copyPatchTree(PatchFile, SourceRoot);
-  }
-  return runProcess({{"git", "-C", SourceRoot.string(), "apply",
-                      PatchFile.string()},
-                     std::nullopt,
-                     {},
-                     std::nullopt});
+  return applyPatchFileOrTree(SourceRoot, PatchFile);
 }
 
 CommandResult
 MaradnsResolverAdapter::build(const std::filesystem::path &SourceRoot,
                               const std::filesystem::path &BuildRoot) const {
-  const auto TargetRoot =
-      std::filesystem::exists(BuildRoot / "deadwood-github")
-          ? BuildRoot
-          : (BuildRoot / "deadwood-build");
-  if (!std::filesystem::exists(TargetRoot)) {
-    std::filesystem::create_directories(TargetRoot.parent_path());
-    std::filesystem::copy(SourceRoot, TargetRoot,
-                          std::filesystem::copy_options::recursive |
-                              std::filesystem::copy_options::copy_symlinks);
-  }
+  const auto TargetRoot = prepareMirroredBuildTree(
+      SourceRoot, BuildRoot, "deadwood-github", "deadwood-build");
   const auto SrcDir = TargetRoot / "deadwood-github" / "src";
   const CommandResult VersionResult = runProcess({
       {"make", "version.h"},
@@ -1239,60 +1309,25 @@ MaradnsResolverAdapter::build(const std::filesystem::path &SourceRoot,
 
 CommandResult
 MaradnsResolverAdapter::runSample(const RunSampleRequest &Request) const {
-  const auto Binary = requireExisting(maradnsBinaryPath(Config_, Request.BuildRoot),
-                                      "缺少 maradns/deadwood 可执行文件");
-  const auto Harness =
-      requireExisting(Config_.HarnessScriptPath, "缺少 maradns replay harness");
-  std::filesystem::create_directories(Request.RunRoot);
   const auto CacheDumpPath = Request.RunRoot / "maradns.after.cache.txt";
   const auto NativeLogPath = Request.RunRoot / "maradns.native.log";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--deadwood-bin",
-       Binary.string(),
-       "--mode",
-       "run",
-       "--transcript",
-       Request.TranscriptPath.string(),
-       "--cache-dump-path",
-       CacheDumpPath.string(),
-       "--maradns-log-path",
-       NativeLogPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(Request.RunRoot / "maradns.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "maradns", maradnsBinaryPath(Config_, Request.BuildRoot),
+      "缺少 maradns/deadwood 可执行文件", Config_.HarnessScriptPath,
+      "缺少 maradns replay harness", "--deadwood-bin", "run", CacheDumpPath,
+      "--maradns-log-path", NativeLogPath, Request.RunRoot,
+      Request.TranscriptPath);
 }
 
 CommandResult
 MaradnsResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                   const std::filesystem::path &OutputFile) const {
-  const auto Binary = requireExisting(maradnsBinaryPath(Config_, RunRoot),
-                                      "缺少 maradns/deadwood 可执行文件");
-  const auto Harness =
-      requireExisting(Config_.HarnessScriptPath, "缺少 maradns replay harness");
-  std::filesystem::create_directories(RunRoot);
   const auto NativeLogPath = RunRoot / "maradns.native.log";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--deadwood-bin",
-       Binary.string(),
-       "--mode",
-       "dump",
-       "--cache-dump-path",
-       OutputFile.string(),
-       "--maradns-log-path",
-       NativeLogPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(RunRoot / "maradns.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "maradns", maradnsBinaryPath(Config_, RunRoot),
+      "缺少 maradns/deadwood 可执行文件", Config_.HarnessScriptPath,
+      "缺少 maradns replay harness", "--deadwood-bin", "dump", OutputFile,
+      "--maradns-log-path", NativeLogPath, RunRoot);
 }
 
 CommandResult
@@ -1303,22 +1338,13 @@ MaradnsResolverAdapter::flushCache(const std::filesystem::path &RunRoot) const {
 
 OracleArtifact
 MaradnsResolverAdapter::parseOracle(const std::filesystem::path &OraclePath) const {
-  std::ifstream Input(OraclePath);
-  std::ostringstream Buffer;
-  Buffer << Input.rdbuf();
-  return makeOracleArtifact(parseOracleSummary(Buffer.str(), "maradns"));
+  return parseResolverOracleFile(OraclePath, "maradns");
 }
 
 std::vector<std::filesystem::path>
 MaradnsResolverAdapter::collectLogs(const std::filesystem::path &RunRoot) const {
-  std::vector<std::filesystem::path> Output;
-  for (const auto &Candidate :
-       {RunRoot / "maradns.stderr", RunRoot / "maradns.native.log"}) {
-    if (std::filesystem::exists(Candidate)) {
-      Output.push_back(Candidate);
-    }
-  }
-  return Output;
+  return collectResolverLogPair(RunRoot, "maradns",
+                                RunRoot / "maradns.native.log");
 }
 
 KnotResolverAdapter::KnotResolverAdapter(KnotResolverAdapterConfig Config)
@@ -1329,34 +1355,16 @@ std::string KnotResolverAdapter::name() const { return "knot-resolver"; }
 std::filesystem::path
 KnotResolverAdapter::prepareSource(const std::filesystem::path &WorkspaceRoot,
                                    const std::string &Tag) const {
-  const auto SubjectRoot =
-      defaultSubjectRoot(WorkspaceRoot, "knot-resolver", Tag);
-  if (std::filesystem::exists(SubjectRoot)) {
-    return SubjectRoot;
-  }
-  if (Config_.SourceFallbackPath.has_value() &&
-      std::filesystem::exists(*Config_.SourceFallbackPath)) {
-    return *Config_.SourceFallbackPath;
-  }
-  const auto Legacy = WorkspaceRoot / ("knot-resolver-" + Tag);
-  if (std::filesystem::exists(Legacy)) {
-    return Legacy;
-  }
-  return cloneIfMissing(WorkspaceRoot, "knot-resolver", Tag,
-                        "https://github.com/CZ-NIC/knot-resolver.git");
+  return prepareGitResolverSource(WorkspaceRoot, "knot-resolver", Tag,
+                                  Config_.SourceFallbackPath,
+                                  WorkspaceRoot / ("knot-resolver-" + Tag),
+                                  "https://github.com/CZ-NIC/knot-resolver.git");
 }
 
 CommandResult
 KnotResolverAdapter::applyPatch(const std::filesystem::path &SourceRoot,
                                 const std::filesystem::path &PatchFile) const {
-  if (std::filesystem::is_directory(PatchFile)) {
-    return copyPatchTree(PatchFile, SourceRoot);
-  }
-  return runProcess({{"git", "-C", SourceRoot.string(), "apply",
-                      PatchFile.string()},
-                     std::nullopt,
-                     {},
-                     std::nullopt});
+  return applyPatchFileOrTree(SourceRoot, PatchFile);
 }
 
 CommandResult
@@ -1417,37 +1425,7 @@ KnotResolverAdapter::build(const std::filesystem::path &SourceRoot,
   if (InstallResult.ExitCode != 0) {
     return InstallResult;
   }
-  const auto RuntimeLuaDir = RuntimePrefix / "lib" / "knot-resolver";
-  const auto RuntimeEtcDir = RuntimePrefix / "etc" / "knot-resolver";
-  std::filesystem::create_directories(RuntimeLuaDir);
-  std::filesystem::create_directories(RuntimeEtcDir);
-  const auto copyLuaDir = [&](const std::filesystem::path &LuaDir) {
-    if (!std::filesystem::is_directory(LuaDir)) {
-      return;
-    }
-    for (const auto &Entry : std::filesystem::directory_iterator(LuaDir)) {
-      if (!Entry.is_regular_file()) {
-        continue;
-      }
-      std::filesystem::copy_file(
-          Entry.path(), RuntimeLuaDir / Entry.path().filename(),
-          std::filesystem::copy_options::overwrite_existing);
-    }
-  };
-  copyLuaDir(SourceRoot / "daemon" / "lua");
-  copyLuaDir(TargetRoot / "daemon" / "lua");
-  const auto RootKeysSource = SourceRoot / "etc" / "root.keys";
-  if (std::filesystem::is_regular_file(RootKeysSource)) {
-    std::filesystem::copy_file(
-        RootKeysSource, RuntimeEtcDir / "root.keys",
-        std::filesystem::copy_options::overwrite_existing);
-  }
-  requireExisting(RuntimeLuaDir / "sandbox.lua",
-                  "缺少 knot-resolver Lua runtime");
-  requireExisting(RuntimeLuaDir / "kres_modules" / "ta_update.lua",
-                  "缺少 knot-resolver 内置模块");
-  requireExisting(RuntimeEtcDir / "root.keys",
-                  "缺少 knot-resolver trust anchor");
+  prepareKnotRuntimeAssets(SourceRoot, TargetRoot, RuntimePrefix);
   requireExisting(knotResolverBinaryPath(Config_, BuildRoot),
                   "缺少 knot-resolver 可执行文件");
   return BuildResult;
@@ -1455,61 +1433,25 @@ KnotResolverAdapter::build(const std::filesystem::path &SourceRoot,
 
 CommandResult
 KnotResolverAdapter::runSample(const RunSampleRequest &Request) const {
-  const auto Binary =
-      requireExisting(knotResolverBinaryPath(Config_, Request.BuildRoot),
-                      "缺少 knot-resolver 可执行文件");
-  const auto Harness = requireExisting(Config_.HarnessScriptPath,
-                                       "缺少 knot-resolver replay harness");
-  std::filesystem::create_directories(Request.RunRoot);
   const auto CacheDumpPath = Request.RunRoot / "knot-resolver.after.cache.txt";
   const auto NativeLogPath = Request.RunRoot / "knot-resolver.native.log";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--kresd-bin",
-       Binary.string(),
-       "--mode",
-       "run",
-       "--transcript",
-       Request.TranscriptPath.string(),
-       "--cache-dump-path",
-       CacheDumpPath.string(),
-       "--kresd-log-path",
-       NativeLogPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(Request.RunRoot / "knot-resolver.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "knot-resolver", knotResolverBinaryPath(Config_, Request.BuildRoot),
+      "缺少 knot-resolver 可执行文件", Config_.HarnessScriptPath,
+      "缺少 knot-resolver replay harness", "--kresd-bin", "run",
+      CacheDumpPath, "--kresd-log-path", NativeLogPath, Request.RunRoot,
+      Request.TranscriptPath);
 }
 
 CommandResult
 KnotResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                const std::filesystem::path &OutputFile) const {
-  const auto Binary = requireExisting(knotResolverBinaryPath(Config_, RunRoot),
-                                      "缺少 knot-resolver 可执行文件");
-  const auto Harness = requireExisting(Config_.HarnessScriptPath,
-                                       "缺少 knot-resolver replay harness");
-  std::filesystem::create_directories(RunRoot);
   const auto NativeLogPath = RunRoot / "knot-resolver.native.log";
-  const CommandResult Result = runProcess({
-      {"python3",
-       Harness.string(),
-       "--kresd-bin",
-       Binary.string(),
-       "--mode",
-       "dump",
-       "--cache-dump-path",
-       OutputFile.string(),
-       "--kresd-log-path",
-       NativeLogPath.string()},
-      std::nullopt,
-      {},
-      std::nullopt,
-  });
-  std::ofstream(RunRoot / "knot-resolver.stderr") << Result.StdoutText;
-  return Result;
+  return runScriptedResolverMode(
+      "knot-resolver", knotResolverBinaryPath(Config_, RunRoot),
+      "缺少 knot-resolver 可执行文件", Config_.HarnessScriptPath,
+      "缺少 knot-resolver replay harness", "--kresd-bin", "dump", OutputFile,
+      "--kresd-log-path", NativeLogPath, RunRoot);
 }
 
 CommandResult
@@ -1520,22 +1462,13 @@ KnotResolverAdapter::flushCache(const std::filesystem::path &RunRoot) const {
 
 OracleArtifact
 KnotResolverAdapter::parseOracle(const std::filesystem::path &OraclePath) const {
-  std::ifstream Input(OraclePath);
-  std::ostringstream Buffer;
-  Buffer << Input.rdbuf();
-  return makeOracleArtifact(parseOracleSummary(Buffer.str(), "knot-resolver"));
+  return parseResolverOracleFile(OraclePath, "knot-resolver");
 }
 
 std::vector<std::filesystem::path>
 KnotResolverAdapter::collectLogs(const std::filesystem::path &RunRoot) const {
-  std::vector<std::filesystem::path> Output;
-  for (const auto &Candidate :
-       {RunRoot / "knot-resolver.stderr", RunRoot / "knot-resolver.native.log"}) {
-    if (std::filesystem::exists(Candidate)) {
-      Output.push_back(Candidate);
-    }
-  }
-  return Output;
+  return collectResolverLogPair(RunRoot, "knot-resolver",
+                                RunRoot / "knot-resolver.native.log");
 }
 
 ResolverRegistry
@@ -1545,18 +1478,12 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   Bind9Config.WorkspaceRoot = WorkspaceRoot;
   Bind9Config.ScriptPath =
       WorkspaceRoot / "named_experiment" / "run_named_afl_symcc.sh";
-  if (const char *NamedConfEnv = std::getenv("BIND9_NAMED_CONF_TEMPLATE")) {
-    Bind9Config.NamedConfTemplate = std::filesystem::path(NamedConfEnv);
-  } else {
-    Bind9Config.NamedConfTemplate =
-        WorkspaceRoot / "named_experiment" / "runtime" / "named.conf";
-  }
-  if (const char *ResponseCorpusEnv = std::getenv("RESPONSE_CORPUS_DIR")) {
-    Bind9Config.ResponseCorpusDir = std::filesystem::path(ResponseCorpusEnv);
-  } else {
-    Bind9Config.ResponseCorpusDir =
-        WorkspaceRoot / "named_experiment" / "work" / "response_corpus";
-  }
+  Bind9Config.NamedConfTemplate = resolveEnvPathOrDefault(
+      "BIND9_NAMED_CONF_TEMPLATE",
+      WorkspaceRoot / "named_experiment" / "runtime" / "named.conf");
+  Bind9Config.ResponseCorpusDir = resolveEnvPathOrDefault(
+      "RESPONSE_CORPUS_DIR",
+      WorkspaceRoot / "named_experiment" / "work" / "response_corpus");
   Bind9Config.SourceFallbackPath = std::nullopt;
   Bind9Config.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1564,13 +1491,10 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
 
   UnboundAdapterConfig UnboundConfig;
   UnboundConfig.WorkspaceRoot = WorkspaceRoot;
-  if (const char *ResponseCorpusEnv = std::getenv("RESPONSE_CORPUS_DIR")) {
-    UnboundConfig.ResponseCorpusDir = std::filesystem::path(ResponseCorpusEnv);
-  } else {
-    UnboundConfig.ResponseCorpusDir =
-        WorkspaceRoot / "unbound_experiment" / "work_stateful" /
-        "response_corpus";
-  }
+  UnboundConfig.ResponseCorpusDir = resolveEnvPathOrDefault(
+      "RESPONSE_CORPUS_DIR",
+      WorkspaceRoot / "unbound_experiment" / "work_stateful" /
+          "response_corpus");
   UnboundConfig.SourceFallbackPath = std::nullopt;
   UnboundConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1579,12 +1503,9 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   DnsmasqAdapterConfig DnsmasqConfig;
   DnsmasqConfig.WorkspaceRoot = WorkspaceRoot;
   DnsmasqConfig.BuildJobs = 2;
-  if (const char *HarnessEnv = std::getenv("DNSMASQ_HARNESS_SCRIPT")) {
-    DnsmasqConfig.HarnessScriptPath = std::filesystem::path(HarnessEnv);
-  } else {
-    DnsmasqConfig.HarnessScriptPath =
-        WorkspaceRoot / "tools" / "dnsmasq_replay_harness.py";
-  }
+  DnsmasqConfig.HarnessScriptPath = resolveEnvPathOrDefault(
+      "DNSMASQ_HARNESS_SCRIPT",
+      WorkspaceRoot / "tools" / "dnsmasq_replay_harness.py");
   DnsmasqConfig.SourceFallbackPath = std::nullopt;
   DnsmasqConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1593,12 +1514,9 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   SmartdnsAdapterConfig SmartdnsConfig;
   SmartdnsConfig.WorkspaceRoot = WorkspaceRoot;
   SmartdnsConfig.BuildJobs = 2;
-  if (const char *HarnessEnv = std::getenv("SMARTDNS_HARNESS_SCRIPT")) {
-    SmartdnsConfig.HarnessScriptPath = std::filesystem::path(HarnessEnv);
-  } else {
-    SmartdnsConfig.HarnessScriptPath =
-        WorkspaceRoot / "tools" / "smartdns_replay_harness.py";
-  }
+  SmartdnsConfig.HarnessScriptPath = resolveEnvPathOrDefault(
+      "SMARTDNS_HARNESS_SCRIPT",
+      WorkspaceRoot / "tools" / "smartdns_replay_harness.py");
   SmartdnsConfig.SourceFallbackPath = std::nullopt;
   SmartdnsConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1607,12 +1525,9 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   MaradnsAdapterConfig MaradnsConfig;
   MaradnsConfig.WorkspaceRoot = WorkspaceRoot;
   MaradnsConfig.BuildJobs = 2;
-  if (const char *HarnessEnv = std::getenv("MARADNS_HARNESS_SCRIPT")) {
-    MaradnsConfig.HarnessScriptPath = std::filesystem::path(HarnessEnv);
-  } else {
-    MaradnsConfig.HarnessScriptPath =
-        WorkspaceRoot / "tools" / "maradns_replay_harness.py";
-  }
+  MaradnsConfig.HarnessScriptPath = resolveEnvPathOrDefault(
+      "MARADNS_HARNESS_SCRIPT",
+      WorkspaceRoot / "tools" / "maradns_replay_harness.py");
   MaradnsConfig.SourceFallbackPath = std::nullopt;
   MaradnsConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1620,12 +1535,9 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
 
   KnotResolverAdapterConfig KnotConfig;
   KnotConfig.WorkspaceRoot = WorkspaceRoot;
-  if (const char *HarnessEnv = std::getenv("KNOT_RESOLVER_HARNESS_SCRIPT")) {
-    KnotConfig.HarnessScriptPath = std::filesystem::path(HarnessEnv);
-  } else {
-    KnotConfig.HarnessScriptPath =
-        WorkspaceRoot / "tools" / "knot_resolver_replay_harness.py";
-  }
+  KnotConfig.HarnessScriptPath = resolveEnvPathOrDefault(
+      "KNOT_RESOLVER_HARNESS_SCRIPT",
+      WorkspaceRoot / "tools" / "knot_resolver_replay_harness.py");
   KnotConfig.SourceFallbackPath = std::nullopt;
   KnotConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(

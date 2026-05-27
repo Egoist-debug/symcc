@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DNSLABCTL_BIN="$ROOT_DIR/build/linux/x86_64/release/dnslabctl"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-evidence-bundle.XXXXXX")"
 FOLLOW_ROOT="$WORKDIR/follow_diff"
 export PYTHONDONTWRITEBYTECODE=1
@@ -10,6 +11,14 @@ cleanup() {
 	rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
+
+assert_file_exists() {
+	local path="$1"
+	if [ ! -f "$path" ]; then
+		printf 'ASSERT FAIL: 缺少文件 %s\n' "$path" >&2
+		exit 1
+	fi
+}
 
 run_cli() {
 	env \
@@ -218,7 +227,10 @@ for sample_id, files in fixtures.items():
     write_json(sample_dir / "sample.meta.json", sample_meta(sample_id))
     for filename, payload in files.items():
         write_json(sample_dir / filename, payload)
-    (sample_dir / "sample.bin").write_bytes(b"\x00\x01\x02\x03")
+    if sample_id == "sample-002":
+        (sample_dir / "transcript").write_bytes(b"\x05\x06\x07\x08")
+    else:
+        (sample_dir / "sample.bin").write_bytes(b"\x00\x01\x02\x03")
     (sample_dir / "bind9.stderr").write_text("bind9 stderr\n", encoding="utf-8")
     (sample_dir / "unbound.stderr").write_text("unbound stderr\n", encoding="utf-8")
 
@@ -292,6 +304,16 @@ if pathlib.Path(raw_sample_root["path"]).resolve() != follow_root:
     raise SystemExit("ASSERT FAIL: raw_sample_root.path 不符合 follow_root")
 if raw_sample_root.get("exists") is not True:
     raise SystemExit("ASSERT FAIL: raw_sample_root.exists 应为 true")
+claim_review_artifacts = raw_sample_root.get("claim_review_artifacts")
+if not isinstance(claim_review_artifacts, list) or "transcript" not in claim_review_artifacts:
+    raise SystemExit(
+        f"ASSERT FAIL: raw_sample_root.claim_review_artifacts 应包含 transcript: {claim_review_artifacts!r}"
+    )
+for required_artifact in ("bind9.stderr", "unbound.stderr"):
+    if required_artifact not in claim_review_artifacts:
+        raise SystemExit(
+            f"ASSERT FAIL: raw_sample_root.claim_review_artifacts 应包含 {required_artifact}: {claim_review_artifacts!r}"
+        )
 
 commands = bundle["regeneration_commands"]
 for key in ("triage_rewrite", "triage_report", "campaign_report", "case_study_export"):
@@ -383,6 +405,58 @@ if support.get("field_path") != "rows[failure_bucket_primary=semantic_diff].coun
 PY
 }
 
+assert_manual_evidence_bundle_command() {
+	local report_dir="$1"
+	local output_path="$2"
+	python3 - "$report_dir" "$output_path" <<'PY'
+import json
+import pathlib
+import sys
+
+report_dir = pathlib.Path(sys.argv[1]).resolve()
+output_path = pathlib.Path(sys.argv[2]).resolve()
+bundle = json.loads(output_path.read_text(encoding="utf-8"))
+
+if bundle.get("run_id") != "manual-bundle-001":
+    raise SystemExit(
+        f"ASSERT FAIL: run_id={bundle.get('run_id')!r} != 'manual-bundle-001'"
+    )
+
+artifacts = bundle.get("artifacts")
+if not isinstance(artifacts, list) or len(artifacts) != 5:
+    raise SystemExit(
+        f"ASSERT FAIL: artifacts={artifacts!r} 应为长度 5 的数组"
+    )
+
+artifacts_by_kind = {item.get("kind"): item for item in artifacts}
+expected_paths = {
+    "summary": report_dir / "summary.json",
+    "oracle_audit": report_dir / "oracle_audit.tsv",
+    "failure_taxonomy": report_dir / "failure_taxonomy.tsv",
+    "cluster": report_dir / "cluster_counts.tsv",
+    "case_studies_index": report_dir / "case_studies" / "index.tsv",
+}
+if set(artifacts_by_kind) != set(expected_paths):
+    raise SystemExit(
+        f"ASSERT FAIL: artifact kinds={sorted(artifacts_by_kind)!r} != {sorted(expected_paths)!r}"
+    )
+
+for kind, expected_path in expected_paths.items():
+    actual_path = pathlib.Path(artifacts_by_kind[kind]["path"]).resolve()
+    if actual_path != expected_path.resolve():
+        raise SystemExit(
+            f"ASSERT FAIL: {kind}.path={actual_path!s} != {expected_path!s}"
+        )
+
+if artifacts_by_kind["summary"].get("regenerate_command") != "regen-summary":
+    raise SystemExit("ASSERT FAIL: summary.regenerate_command 不符合预期")
+if artifacts_by_kind["oracle_audit"].get("regenerate_command") != "regen-audit":
+    raise SystemExit("ASSERT FAIL: oracle_audit.regenerate_command 不符合预期")
+if artifacts_by_kind["case_studies_index"].get("regenerate_command") is not None:
+    raise SystemExit("ASSERT FAIL: case_studies_index.regenerate_command 应为 null")
+PY
+}
+
 write_fixtures
 run_cli campaign-report --root "$FOLLOW_ROOT" >/dev/null
 REPORT_DIR="$(get_latest_report_dir "$FOLLOW_ROOT/campaign_reports")"
@@ -393,5 +467,23 @@ if [ ! -f "$REPORT_DIR/evidence_bundle.json" ]; then
 fi
 
 assert_evidence_bundle_contract "$REPORT_DIR"
+
+MANUAL_BUNDLE_PATH="$WORKDIR/manual-evidence-bundle.json"
+(
+	cd "$REPORT_DIR"
+	"$DNSLABCTL_BIN" evidence-bundle \
+		--output "$MANUAL_BUNDLE_PATH" \
+		--summary "summary.json" \
+		--summary-cmd "regen-summary" \
+		--oracle-audit "oracle_audit.tsv" \
+		--oracle-audit-cmd "regen-audit" \
+		--failure-taxonomy "failure_taxonomy.tsv" \
+		--cluster "cluster_counts.tsv" \
+		--case-index "case_studies/index.tsv" \
+		--run-id "manual-bundle-001" >/dev/null
+)
+
+assert_file_exists "$MANUAL_BUNDLE_PATH"
+assert_manual_evidence_bundle_command "$REPORT_DIR" "$MANUAL_BUNDLE_PATH"
 
 printf 'PASS: publication evidence bundle regression test passed\n'

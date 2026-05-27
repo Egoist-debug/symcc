@@ -50,8 +50,15 @@ cat >"$WORKDIR/experiments/resolvers.lock.json" <<'EOF'
 EOF
 
 (
-	cd "$WORKDIR"
+	cd "$ROOT_DIR"
 	"$DNSLABCTL_BIN" prepare-subject \
+		--workspace-root "$(python3 - "$ROOT_DIR" "$WORKDIR" <<'PY'
+import os
+import pathlib
+import sys
+print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
+PY
+)" \
 		--resolver bind9 \
 		>"$WORKDIR/prepare-subject.json"
 )

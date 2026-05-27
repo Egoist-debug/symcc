@@ -18,8 +18,8 @@ from .io import (
     json_artifact_error_reason,
     load_required_json_object,
 )
+from .path_defaults import resolve_dnslabctl_bin, resolve_root_dir
 from .report import (
-    _resolve_root_dir,
     ReportError,
     collect_report_snapshot,
     default_follow_diff_root,
@@ -45,13 +45,6 @@ class CampaignCloseError(RuntimeError):
         self.exit_code = exit_code
 
 
-def _resolve_dnslabctl_bin() -> Path:
-    explicit = os.environ.get("DNSLABCTL_BIN", "").strip()
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    return (_resolve_root_dir() / "build/linux/x86_64/release/dnslabctl").resolve()
-
-
 def _resolve_campaign_close_backend() -> str:
     raw = os.environ.get("DNS_DIFF_CAMPAIGN_CLOSE_BACKEND", "").strip().lower()
     if not raw:
@@ -66,13 +59,14 @@ def _resolve_campaign_close_backend() -> str:
 
 
 def _run_dnslabctl_campaign_close(*, budget_sec: float) -> int:
-    dnslabctl_bin = _resolve_dnslabctl_bin()
+    root_dir = resolve_root_dir()
+    dnslabctl_bin = resolve_dnslabctl_bin(root_dir)
     if not dnslabctl_bin.is_file():
         raise CampaignCloseError(f"缺少 dnslabctl 可执行文件: {dnslabctl_bin}")
 
     completed = subprocess.run(
         [str(dnslabctl_bin), "campaign-close", "--budget-sec", str(budget_sec)],
-        cwd=_resolve_root_dir(),
+        cwd=root_dir,
         capture_output=True,
         text=True,
         env=dict(os.environ),

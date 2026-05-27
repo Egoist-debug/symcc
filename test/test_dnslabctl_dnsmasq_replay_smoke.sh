@@ -38,29 +38,59 @@ wire += query + response + post
 path.write_bytes(wire)
 PY
 
-"$DNSLABCTL_BIN" adapter-build \
-	--resolver dnsmasq \
-	--build-root "$ROOT_DIR/experiments/subjects/dnsmasq/v2.92-build" \
-	>"$WORKDIR/adapter-build.json"
+(
+	cd "$ROOT_DIR"
+	"$DNSLABCTL_BIN" adapter-build \
+		--resolver dnsmasq \
+		--build-root "experiments/subjects/dnsmasq/v2.92-build" \
+		>"$WORKDIR/adapter-build.json"
+)
 
-"$DNSLABCTL_BIN" adapter-replay \
-	--resolver dnsmasq \
-	--sample "$WORKDIR/sample.bin" \
-	--build-root "$ROOT_DIR/experiments/subjects/dnsmasq/v2.92-build" \
-	--run-root "$WORKDIR/run" \
-	>"$WORKDIR/adapter-replay.json"
+(
+	cd "$ROOT_DIR"
+	"$DNSLABCTL_BIN" adapter-replay \
+		--resolver dnsmasq \
+		--sample "$(python3 - "$ROOT_DIR" "$WORKDIR/sample.bin" <<'PY'
+import os
+import pathlib
+import sys
+print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
+PY
+)" \
+		--build-root "experiments/subjects/dnsmasq/v2.92-build" \
+		--run-root "$(python3 - "$ROOT_DIR" "$WORKDIR/run" <<'PY'
+import os
+import pathlib
+import sys
+print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
+PY
+)" \
+		>"$WORKDIR/adapter-replay.json"
+)
 
 assert_file_exists "$WORKDIR/run/dnsmasq.stderr"
 assert_file_exists "$WORKDIR/run/dnsmasq.native.stderr"
 assert_file_exists "$WORKDIR/run/dnsmasq.after.cache.txt"
 
-python3 - "$WORKDIR/adapter-replay.json" "$WORKDIR/run/dnsmasq.after.cache.txt" <<'PY'
+python3 - "$WORKDIR/adapter-build.json" "$WORKDIR/adapter-replay.json" "$WORKDIR/run/dnsmasq.after.cache.txt" "$ROOT_DIR/experiments/subjects/dnsmasq/v2.92-build" "$WORKDIR/run" "$WORKDIR/sample.bin" <<'PY'
 import json
 import pathlib
 import sys
 
-payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-cache_dump = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+build_payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+payload = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+cache_dump = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+build_root = pathlib.Path(sys.argv[4]).resolve()
+run_root = pathlib.Path(sys.argv[5]).resolve()
+sample_path = pathlib.Path(sys.argv[6]).resolve()
+
+if pathlib.Path(build_payload.get("build_root", "")).resolve() != build_root:
+    raise SystemExit(
+        f"ASSERT FAIL: build_root={build_payload.get('build_root')!r} != {str(build_root)!r}"
+    )
+source_root = build_payload.get("source_root")
+if not isinstance(source_root, str) or not pathlib.Path(source_root).is_absolute():
+    raise SystemExit(f"ASSERT FAIL: source_root 应为绝对路径: {source_root!r}")
 
 if payload.get("resolver") != "dnsmasq":
     raise SystemExit(f"ASSERT FAIL: resolver={payload.get('resolver')!r} != 'dnsmasq'")
@@ -68,6 +98,22 @@ if payload.get("dump_cache_exit_code") != 0:
     raise SystemExit(f"ASSERT FAIL: dump_cache_exit_code={payload.get('dump_cache_exit_code')!r} != 0")
 if payload.get("run_sample_exit_code") != 0:
     raise SystemExit(f"ASSERT FAIL: run_sample_exit_code={payload.get('run_sample_exit_code')!r} != 0")
+for key, expected_path in {
+    "before_cache": run_root / "dnsmasq.before.cache.txt",
+    "after_cache": run_root / "dnsmasq.after.cache.txt",
+    "stderr": run_root / "dnsmasq.stderr",
+}.items():
+    actual = pathlib.Path(payload.get(key, "")).resolve()
+    if actual != expected_path.resolve():
+        raise SystemExit(
+            f"ASSERT FAIL: {key}={str(actual)!r} != {str(expected_path)!r}"
+        )
+logs = payload.get("logs")
+if not isinstance(logs, list) or not logs:
+    raise SystemExit(f"ASSERT FAIL: logs 应为非空数组: {logs!r}")
+for item in logs:
+    if not pathlib.Path(item).is_absolute():
+        raise SystemExit(f"ASSERT FAIL: log path 应为绝对路径: {item!r}")
 oracle = payload.get("oracle")
 if not isinstance(oracle, dict):
     raise SystemExit("ASSERT FAIL: oracle 应为对象")

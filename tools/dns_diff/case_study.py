@@ -10,7 +10,11 @@ from .io import (
     load_required_json_object,
 )
 from .oracle import ORACLE_FIELDS
-from .report import ReportError, collect_sample_dirs
+from .report import (
+    ReportError,
+    collect_sample_dirs,
+    resolve_sample_input_artifact_path,
+)
 
 EXIT_USAGE = 2
 MAX_CASE_STUDIES = 5
@@ -319,7 +323,9 @@ def _build_raw_evidence(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     oracle_path = _resolve_sample_artifact(sample_dir, "oracle.json")
     cache_diff_path = _resolve_sample_artifact(sample_dir, "cache_diff.json")
     triage_path = _resolve_sample_artifact(sample_dir, "triage.json")
-    sample_bin_path = _resolve_sample_artifact(sample_dir, "sample.bin")
+    sample_bin_path = resolve_sample_input_artifact_path(sample_dir)
+    if sample_bin_path is None:
+        sample_bin_path = _resolve_sample_artifact(sample_dir, "sample.bin")
     sample_meta_payload = _load_json_artifact(sample_meta_path, label="sample.meta.json")
     oracle_payload = _load_json_artifact(oracle_path, label="oracle.json")
     resolver_context = _resolver_context(sample_meta_payload, oracle_payload)
@@ -362,6 +368,7 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     oracle_payload = raw_evidence["oracle"]
     cache_diff_payload = raw_evidence["cache_diff"]
     resolver_context = _resolver_context(raw_evidence["sample_meta"], oracle_payload)
+    sample_input_name = Path(raw_evidence["paths"]["sample_bin_path"]).name
 
     automated_summary = _build_automated_summary(
         semantic_outcome=candidate.semantic_outcome,
@@ -387,7 +394,7 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
         },
         "claim_scope": [
             "选样仅消费 triage.json 中已冻结的 analysis_state 与 semantic_outcome，不重算 publication 语义。",
-            f"原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、sample.bin、bind9.stderr、{resolver_context.secondary}.stderr。",
+            f"原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、{sample_input_name}、bind9.stderr、{resolver_context.secondary}.stderr。",
         ],
         "limitations": [
             "manual_truth 仅为 not_started scaffold，当前尚无人工双评或 adjudication 结论。",

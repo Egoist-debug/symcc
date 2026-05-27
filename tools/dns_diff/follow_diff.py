@@ -21,11 +21,23 @@ from .io import (
 )
 from .oracle import ORACLE_FIELDS
 from .path_defaults import (
+    DEFAULT_BIND9_WORK_DIR_RELATIVE as _PATH_DEFAULT_BIND9_WORK_DIR_RELATIVE,
+    DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE as _PATH_DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE,
+    DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE as _PATH_DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE,
+    FOLLOW_DIFF_OUTPUT_DIR_NAME as _PATH_FOLLOW_DIFF_OUTPUT_DIR_NAME,
+    default_bind9_work_dir as _path_default_bind9_work_dir,
+    default_follow_diff_output_root as _path_default_follow_diff_output_root,
+    default_follow_diff_source_dir as _path_default_follow_diff_source_dir,
+    default_follow_diff_work_dir as _path_default_follow_diff_work_dir,
     resolve_bind9_afl_tree,
     resolve_bind9_source_root,
+    resolve_bind9_work_dir as _path_resolve_bind9_work_dir,
     resolve_dnsmasq_tag,
+    resolve_follow_diff_source_dir as _path_resolve_follow_diff_source_dir,
+    resolve_follow_diff_work_dir as _path_resolve_follow_diff_work_dir,
     resolve_knot_resolver_tag,
     resolve_maradns_tag,
+    resolve_root_dir as _path_resolve_root_dir,
     resolve_smartdns_tag,
     resolve_unbound_afl_tree,
     resolve_unbound_source_root,
@@ -52,10 +64,10 @@ DEFAULT_FOLLOW_DIFF_INTERVAL_SEC = 60.0
 DEFAULT_FOLLOW_DIFF_WINDOW_IDLE_ROUNDS = 2
 FOLLOW_DIFF_STATE_FILE_NAME = "follow_diff.state.json"
 FOLLOW_DIFF_WINDOW_SUMMARY_FILE_NAME = "follow_diff.window.summary.json"
-DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = Path("unbound_experiment") / "work_stateful"
-DEFAULT_BIND9_WORK_DIR_RELATIVE = Path("named_experiment") / "work"
-DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = Path("afl_out") / "master" / "queue"
-FOLLOW_DIFF_OUTPUT_DIR_NAME = "follow_diff"
+DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE = _PATH_DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE
+DEFAULT_BIND9_WORK_DIR_RELATIVE = _PATH_DEFAULT_BIND9_WORK_DIR_RELATIVE
+DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE = _PATH_DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE
+FOLLOW_DIFF_OUTPUT_DIR_NAME = _PATH_FOLLOW_DIFF_OUTPUT_DIR_NAME
 PRODUCER_SEED_PROVENANCE_FILE_NAME = "producer_seed_provenance.json"
 FOLLOW_DIFF_PRODUCER_PROFILE = "poison-stateful"
 FOLLOW_DIFF_INPUT_MODEL = "DST1 transcript"
@@ -309,17 +321,12 @@ def _write_follow_diff_window_summary(
 
 
 def _resolve_root_dir() -> Path:
-    env_root = os.environ.get("ROOT_DIR")
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    return Path(__file__).resolve().parents[2]
+    return _path_resolve_root_dir()
 
 
 def default_follow_diff_work_dir(root_dir: Optional[Path] = None) -> Path:
-    base_root = _resolve_root_dir() if root_dir is None else Path(root_dir)
-    return (
-        base_root.expanduser().resolve() / DEFAULT_FOLLOW_DIFF_WORK_DIR_RELATIVE
-    ).resolve()
+    effective_root = _resolve_root_dir() if root_dir is None else Path(root_dir)
+    return _path_default_follow_diff_work_dir(effective_root)
 
 
 def resolve_follow_diff_work_dir(
@@ -327,18 +334,15 @@ def resolve_follow_diff_work_dir(
     root_dir: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Path:
-    env = os.environ if environ is None else environ
-    env_work_dir = env.get("WORK_DIR")
-    if env_work_dir:
-        return Path(env_work_dir).expanduser().resolve()
-    return default_follow_diff_work_dir(root_dir)
+    return _path_resolve_follow_diff_work_dir(
+        root_dir=root_dir,
+        environ=environ,
+    )
 
 
 def default_bind9_work_dir(root_dir: Optional[Path] = None) -> Path:
-    base_root = _resolve_root_dir() if root_dir is None else Path(root_dir)
-    return (
-        base_root.expanduser().resolve() / DEFAULT_BIND9_WORK_DIR_RELATIVE
-    ).resolve()
+    effective_root = _resolve_root_dir() if root_dir is None else Path(root_dir)
+    return _path_default_bind9_work_dir(effective_root)
 
 
 def resolve_bind9_work_dir(
@@ -346,23 +350,14 @@ def resolve_bind9_work_dir(
     root_dir: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Path:
-    env = os.environ if environ is None else environ
-    env_bind9_work_dir = env.get("BIND9_WORK_DIR")
-    if env_bind9_work_dir:
-        return Path(env_bind9_work_dir).expanduser().resolve()
-
-    env_work_dir = env.get("WORK_DIR")
-    if env_work_dir:
-        return Path(env_work_dir).expanduser().resolve()
-
-    return default_bind9_work_dir(root_dir)
+    return _path_resolve_bind9_work_dir(
+        root_dir=root_dir,
+        environ=environ,
+    )
 
 
 def default_follow_diff_source_dir(bind9_work_dir: Path) -> Path:
-    return (
-        Path(bind9_work_dir).expanduser().resolve()
-        / DEFAULT_FOLLOW_DIFF_SOURCE_DIR_RELATIVE
-    ).resolve()
+    return _path_default_follow_diff_source_dir(bind9_work_dir)
 
 
 def resolve_follow_diff_source_dir(
@@ -371,24 +366,15 @@ def resolve_follow_diff_source_dir(
     bind9_work_dir: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Path:
-    env = os.environ if environ is None else environ
-    env_source_dir = env.get("FOLLOW_DIFF_SOURCE_DIR")
-    if env_source_dir:
-        return Path(env_source_dir).expanduser().resolve()
-
-    resolved_bind9_work_dir = resolve_bind9_work_dir(
+    return _path_resolve_follow_diff_source_dir(
         root_dir=root_dir,
-        environ=env,
+        bind9_work_dir=bind9_work_dir,
+        environ=environ,
     )
-    if bind9_work_dir is not None:
-        resolved_bind9_work_dir = Path(bind9_work_dir).expanduser().resolve()
-    return default_follow_diff_source_dir(resolved_bind9_work_dir)
 
 
 def default_follow_diff_output_root(work_dir: Path) -> Path:
-    return (
-        Path(work_dir).expanduser().resolve() / FOLLOW_DIFF_OUTPUT_DIR_NAME
-    ).resolve()
+    return _path_default_follow_diff_output_root(work_dir)
 
 
 def _collect_config() -> FollowDiffConfig:
