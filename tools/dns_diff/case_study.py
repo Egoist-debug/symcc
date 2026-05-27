@@ -3,7 +3,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
-from .io import atomic_write_json, load_json_with_fallback
+from .io import (
+    JsonArtifactError,
+    atomic_write_json,
+    json_artifact_error_reason,
+    load_required_json_object,
+)
 from .oracle import ORACLE_FIELDS
 from .report import ReportError, collect_sample_dirs
 
@@ -75,13 +80,15 @@ def _coerce_int(value: Any, fallback: int = 0) -> int:
 
 
 def _load_json_artifact(path: Path, *, label: str) -> Dict[str, Any]:
-    load_result = load_json_with_fallback(path)
-    if load_result.downgraded and path.exists():
-        detail = load_result.error or load_result.status
-        sys.stderr.write(
-            f"dns-diff: case-study-export 读取 {label} 降级，已回退默认值 {path}: {detail}\n"
-        )
-    return dict(load_result.data)
+    try:
+        return dict(load_required_json_object(path))
+    except JsonArtifactError as exc:
+        detail = f" detail={exc.detail}" if exc.detail else ""
+        raise CaseStudyError(
+            "样本 semantic truth-source 无效: "
+            f"sample_dir={path.parent.resolve()} file={label} path={path.resolve()} "
+            f"reason={json_artifact_error_reason(exc.status)}{detail}"
+        ) from exc
 
 
 def _resolve_sample_artifact(sample_dir: Path, relative_name: str) -> Path:

@@ -459,6 +459,56 @@ std::string readTextFile(const std::filesystem::path &InputPath) {
                      std::istreambuf_iterator<char>());
 }
 
+std::optional<std::string> validateUtf8(const std::string &Input) {
+  size_t Position = 0;
+  while (Position < Input.size()) {
+    const auto Lead = static_cast<unsigned char>(Input[Position]);
+    if (Lead <= 0x7F) {
+      ++Position;
+      continue;
+    }
+
+    size_t ExpectedContinuation = 0;
+    std::uint32_t CodePoint = 0;
+    if (Lead >= 0xC2 && Lead <= 0xDF) {
+      ExpectedContinuation = 1;
+      CodePoint = Lead & 0x1FU;
+    } else if (Lead >= 0xE0 && Lead <= 0xEF) {
+      ExpectedContinuation = 2;
+      CodePoint = Lead & 0x0FU;
+    } else if (Lead >= 0xF0 && Lead <= 0xF4) {
+      ExpectedContinuation = 3;
+      CodePoint = Lead & 0x07U;
+    } else {
+      return "byte=" + std::to_string(Position);
+    }
+
+    if (Position + ExpectedContinuation >= Input.size()) {
+      return "byte=" + std::to_string(Position);
+    }
+
+    for (size_t Offset = 1; Offset <= ExpectedContinuation; ++Offset) {
+      const auto Continuation =
+          static_cast<unsigned char>(Input[Position + Offset]);
+      if ((Continuation & 0xC0U) != 0x80U) {
+        return "byte=" + std::to_string(Position + Offset);
+      }
+      CodePoint = (CodePoint << 6U) | (Continuation & 0x3FU);
+    }
+
+    if ((ExpectedContinuation == 1 && CodePoint < 0x80U) ||
+        (ExpectedContinuation == 2 && CodePoint < 0x800U) ||
+        (ExpectedContinuation == 3 && CodePoint < 0x10000U) ||
+        (CodePoint >= 0xD800U && CodePoint <= 0xDFFFU) ||
+        CodePoint > 0x10FFFFU) {
+      return "byte=" + std::to_string(Position);
+    }
+
+    Position += ExpectedContinuation + 1U;
+  }
+  return std::nullopt;
+}
+
 void writeTextFile(const std::filesystem::path &OutputPath,
                    const std::string &Content) {
   std::filesystem::create_directories(OutputPath.parent_path());
@@ -602,12 +652,27 @@ std::optional<json::Value::Object>
 loadOptionalObject(const std::filesystem::path &ArtifactPath,
                    const std::filesystem::path &SampleDir,
                    const std::string &Label) {
-  if (!std::filesystem::is_regular_file(ArtifactPath)) {
+  if (!std::filesystem::exists(ArtifactPath)) {
     return std::nullopt;
+  }
+  if (!std::filesystem::is_regular_file(ArtifactPath)) {
+    throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "文件读取失败",
+                                "不是常规文件");
+  }
+  std::string Text;
+  try {
+    Text = readTextFile(ArtifactPath);
+  } catch (const std::exception &Error) {
+    throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "文件读取失败",
+                                Error.what());
+  }
+  if (const auto Utf8Error = validateUtf8(Text)) {
+    throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "UTF-8 解码失败",
+                                *Utf8Error);
   }
   json::Value Payload;
   try {
-    Payload = JsonParser(readTextFile(ArtifactPath)).parse();
+    Payload = JsonParser(Text).parse();
   } catch (const std::exception &Error) {
     throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "JSON 损坏",
                                 Error.what());
@@ -638,13 +703,29 @@ json::Value::Object loadRequiredObject(const std::filesystem::path &SampleDir,
                                        const std::string &FileName,
                                        const std::string &Label) {
   const auto ArtifactPath = SampleDir / FileName;
-  if (!std::filesystem::is_regular_file(ArtifactPath)) {
+  if (!std::filesystem::exists(ArtifactPath)) {
     throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "文件缺失");
+  }
+  if (!std::filesystem::is_regular_file(ArtifactPath)) {
+    throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "文件读取失败",
+                                "不是常规文件");
+  }
+
+  std::string Text;
+  try {
+    Text = readTextFile(ArtifactPath);
+  } catch (const std::exception &Error) {
+    throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "文件读取失败",
+                                Error.what());
+  }
+  if (const auto Utf8Error = validateUtf8(Text)) {
+    throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "UTF-8 解码失败",
+                                *Utf8Error);
   }
 
   json::Value Payload;
   try {
-    Payload = JsonParser(readTextFile(ArtifactPath)).parse();
+    Payload = JsonParser(Text).parse();
   } catch (const std::exception &Error) {
     throw buildTruthSourceError(SampleDir, ArtifactPath, Label, "JSON 损坏",
                                 Error.what());
@@ -706,28 +787,6 @@ json::Value::Object loadTriagePayload(const std::filesystem::path &SampleDir) {
   if (!findObjectValue(Payload, "filter_labels")) {
     Payload["filter_labels"] = json::Value::Array{};
   }
-  return Payload;
-}
-
-json::Value::Object
-buildTriageFallbackPayload(const std::filesystem::path &SampleDir,
-                           const json::Value::Object &SampleMetaPayload) {
-  json::Value::Object Payload;
-  Payload["sample_id"] =
-      coerceText(findObjectValue(SampleMetaPayload, "sample_id"),
-                 SampleDir.filename().string());
-  Payload["status"] =
-      coerceText(findObjectValue(SampleMetaPayload, "status"), "unknown");
-  Payload["cluster_key"] = "_";
-  Payload["diff_class"] = "unknown";
-  Payload["analysis_state"] =
-      coerceAnalysisState(findObjectValue(SampleMetaPayload, "analysis_state"));
-  Payload["semantic_outcome"] =
-      coerceText(findObjectValue(SampleMetaPayload, "semantic_outcome"),
-                 "unknown");
-  Payload["oracle_audit_candidate"] = false;
-  Payload["needs_manual_review"] = false;
-  Payload["filter_labels"] = json::Value::Array{};
   return Payload;
 }
 
@@ -829,11 +888,7 @@ collectTriageReportSnapshot(const std::filesystem::path &Root) {
   std::vector<SemanticFrontierEntry> PreparedEntries;
   for (const auto &SampleDir : collectSampleDirs(Snapshot.Root)) {
     const auto SampleMetaPayload = loadSampleMetaPayload(SampleDir);
-    const auto TriagePath = SampleDir / "triage.json";
-    const auto TriagePayload =
-        std::filesystem::is_regular_file(TriagePath)
-            ? loadTriagePayload(SampleDir)
-            : buildTriageFallbackPayload(SampleDir, SampleMetaPayload);
+    const auto TriagePayload = loadTriagePayload(SampleDir);
 
     const auto SampleId =
         coerceText(findObjectValue(TriagePayload, "sample_id"),
@@ -2113,10 +2168,7 @@ CampaignReportSnapshot collectCampaignReportSnapshot(
   for (const auto &SampleDir : Snapshot.SampleDirs) {
     const auto SampleMetaPayload = loadSampleMetaPayload(SampleDir);
     Snapshot.SampleMetaPayloads.push_back(SampleMetaPayload);
-    const auto TriagePayload =
-        std::filesystem::is_regular_file(SampleDir / "triage.json")
-            ? loadTriagePayload(SampleDir)
-            : buildTriageFallbackPayload(SampleDir, SampleMetaPayload);
+    const auto TriagePayload = loadTriagePayload(SampleDir);
 
     const auto FailureBucketPrimary = coerceFailureBucketPrimary(
         findObjectValue(TriagePayload, "failure_bucket_primary"));

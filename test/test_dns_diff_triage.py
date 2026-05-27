@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.dns_diff.triage import build_triage, rewrite_triage_payload
+from tools.dns_diff.triage import TriageError, build_triage, rewrite_triage_payload, rewrite_triage_root
 
 
 class DnsDiffTriageTest(unittest.TestCase):
@@ -83,6 +83,9 @@ class DnsDiffTriageTest(unittest.TestCase):
                     "bind9.forwarding_path": "iterative",
                     "unbound.forwarding_path": None,
                 },
+                sample_meta={
+                    "sample_id": "id:000001__deadbeef",
+                },
                 existing_triage={
                     "sample_id": "id:000001__deadbeef",
                     "status": "completed_no_diff",
@@ -92,6 +95,59 @@ class DnsDiffTriageTest(unittest.TestCase):
             self.assertIn("partial_fingerprint", payload["filter_labels"])
             self.assertIn("forwarding_path_seen", payload["filter_labels"])
             self.assertEqual("completed_no_diff", payload["status"])
+
+    def test_rewrite_triage_root_raises_when_triage_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "follow_diff"
+            sample_dir = root / "sample-missing-triage"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            (sample_dir / "sample.meta.json").write_text(
+                '{"sample_id":"sample-missing-triage"}\n',
+                encoding="utf-8",
+            )
+            (sample_dir / "oracle.json").write_text(
+                '{"bind9.stderr_parse_status":"ok","unbound.stderr_parse_status":"ok"}\n',
+                encoding="utf-8",
+            )
+            (sample_dir / "cache_diff.json").write_text(
+                '{"cache_delta_triggered":false,"bind9":{"has_cache_diff":false,"interesting_delta_count":0},"unbound":{"has_cache_diff":false,"interesting_delta_count":0}}\n',
+                encoding="utf-8",
+            )
+            (sample_dir / "state_fingerprint.json").write_text(
+                '{"bind9.forwarding_path":"iterative","unbound.forwarding_path":"iterative"}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(TriageError) as ctx:
+                rewrite_triage_root(root)
+            self.assertIn("triage.json", str(ctx.exception))
+
+    def test_rewrite_triage_root_raises_when_oracle_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "follow_diff"
+            sample_dir = root / "sample-corrupt-oracle"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            (sample_dir / "sample.meta.json").write_text(
+                '{"sample_id":"sample-corrupt-oracle"}\n',
+                encoding="utf-8",
+            )
+            (sample_dir / "oracle.json").write_text("{broken", encoding="utf-8")
+            (sample_dir / "cache_diff.json").write_text(
+                '{"cache_delta_triggered":false,"bind9":{"has_cache_diff":false,"interesting_delta_count":0},"unbound":{"has_cache_diff":false,"interesting_delta_count":0}}\n',
+                encoding="utf-8",
+            )
+            (sample_dir / "state_fingerprint.json").write_text(
+                '{"bind9.forwarding_path":"iterative","unbound.forwarding_path":"iterative"}\n',
+                encoding="utf-8",
+            )
+            (sample_dir / "triage.json").write_text(
+                '{"sample_id":"sample-corrupt-oracle","status":"completed_no_diff","diff_class":"no_diff"}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(TriageError) as ctx:
+                rewrite_triage_root(root)
+            self.assertIn("oracle.json", str(ctx.exception))
 
 
 if __name__ == "__main__":

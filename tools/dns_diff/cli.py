@@ -91,28 +91,34 @@ def _run_dnslabctl(command: Sequence[str]) -> int:
     if not dnslabctl_bin.is_file():
         raise RuntimeError(f"缺少 dnslabctl 可执行文件: {dnslabctl_bin}")
 
+    def _decode_output(raw: bytes) -> str:
+        if not raw:
+            return ""
+        return raw.decode("utf-8", errors="replace")
+
     completed = subprocess.run(
         [str(dnslabctl_bin), *command],
         cwd=_repo_root(),
         capture_output=True,
-        text=True,
         env=dict(os.environ),
         check=False,
     )
+    stdout_text = _decode_output(completed.stdout)
+    stderr_text = _decode_output(completed.stderr)
     if completed.returncode == 0:
-        if completed.stdout:
-            sys.stdout.write(completed.stdout)
-        if completed.stderr:
-            sys.stderr.write(completed.stderr)
+        if stdout_text:
+            sys.stdout.write(stdout_text)
+        if stderr_text:
+            sys.stderr.write(stderr_text)
         return 0
 
-    message = completed.stderr.strip() or completed.stdout.strip() or (
+    message = stderr_text.strip() or stdout_text.strip() or (
         f"dnslabctl 返回 {completed.returncode}"
     )
     raise DnslabctlForwardError(
         message,
         exit_code=int(completed.returncode),
-        stdout_text=completed.stdout,
+        stdout_text=stdout_text,
     )
 
 

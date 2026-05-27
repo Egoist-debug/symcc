@@ -3,7 +3,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .io import atomic_write_json, load_json_with_fallback
+from .io import (
+    JsonArtifactError,
+    atomic_write_json,
+    json_artifact_error_reason,
+    load_required_json_object,
+)
 from .oracle import ORACLE_FIELDS
 from .schema import STATE_FINGERPRINT_REQUIRED_FIELDS, stamp_with_shared_meta
 from .taxonomy import infer_replay_failure_reason, normalize_failure_taxonomy
@@ -352,13 +357,14 @@ def _rewrite_filter_labels(
 
 
 def _load_json_artifact(path: Path) -> Dict[str, Any]:
-    load_result = load_json_with_fallback(path)
-    if load_result.downgraded and path.exists():
-        detail = load_result.error or load_result.status
-        sys.stderr.write(
-            f"dns-diff: triage rewrite 读取降级，已回退默认值 {path}: {detail}\n"
-        )
-    return dict(load_result.data)
+    try:
+        return dict(load_required_json_object(path))
+    except JsonArtifactError as exc:
+        detail = f" detail={exc.detail}" if exc.detail else ""
+        raise TriageError(
+            "triage truth-source 无效: "
+            f"file={path.name} path={path.resolve()} reason={json_artifact_error_reason(exc.status)}{detail}"
+        ) from exc
 
 
 def _resolve_sample_id(sample_dir: Path, *payloads: Mapping[str, Any]) -> str:

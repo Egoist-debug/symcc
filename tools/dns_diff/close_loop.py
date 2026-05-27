@@ -12,7 +12,12 @@ from .follow_diff import (
     resolve_follow_diff_source_dir,
     resolve_follow_diff_work_dir,
 )
-from .io import atomic_write_json, load_json_with_fallback
+from .io import (
+    JsonArtifactError,
+    atomic_write_json,
+    json_artifact_error_reason,
+    load_required_json_object,
+)
 from .report import (
     _resolve_root_dir,
     ReportError,
@@ -189,22 +194,55 @@ def _collect_semantic_frontier_lifecycle(
         follow_root,
         work_dir=work_dir,
     )
-    load_result = load_json_with_fallback(semantic_manifest_path)
-    payload = load_result.data
+    if not semantic_manifest_path.exists():
+        return {
+            "text_manifest_path": str(text_manifest_path),
+            "text_manifest_exists": text_manifest_path.is_file(),
+            "sidecar_path": str(semantic_manifest_path),
+            "sidecar_exists": False,
+            "sidecar_status": "missing",
+            "generated_at": None,
+            "entry_count": 0,
+            "error": None,
+        }
+
+    try:
+        payload = dict(load_required_json_object(semantic_manifest_path))
+    except JsonArtifactError as exc:
+        detail = f" detail={exc.detail}" if exc.detail else ""
+        raise CampaignCloseError(
+            "semantic frontier sidecar 无效: "
+            f"path={semantic_manifest_path.resolve()} "
+            f"reason={json_artifact_error_reason(exc.status)}{detail}",
+            exit_code=EXIT_PHASE_FAILED,
+        ) from exc
+
     entries = payload.get("entries")
     generated_at = payload.get("generated_at")
+    if not isinstance(entries, list):
+        raise CampaignCloseError(
+            "semantic frontier sidecar 无效: "
+            f"path={semantic_manifest_path.resolve()} "
+            "reason=字段校验失败 detail=entries 必须是数组",
+            exit_code=EXIT_PHASE_FAILED,
+        )
+    if not isinstance(generated_at, str) or not generated_at:
+        raise CampaignCloseError(
+            "semantic frontier sidecar 无效: "
+            f"path={semantic_manifest_path.resolve()} "
+            "reason=字段校验失败 detail=generated_at 必须是非空字符串",
+            exit_code=EXIT_PHASE_FAILED,
+        )
 
     return {
         "text_manifest_path": str(text_manifest_path),
         "text_manifest_exists": text_manifest_path.is_file(),
         "sidecar_path": str(semantic_manifest_path),
-        "sidecar_exists": semantic_manifest_path.is_file(),
-        "sidecar_status": load_result.status,
-        "generated_at": generated_at
-        if isinstance(generated_at, str) and generated_at
-        else None,
-        "entry_count": len(entries) if isinstance(entries, list) else 0,
-        "error": load_result.error,
+        "sidecar_exists": True,
+        "sidecar_status": "ok",
+        "generated_at": generated_at,
+        "entry_count": len(entries),
+        "error": None,
     }
 
 

@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.dns_diff.io import atomic_write_json, load_json_with_fallback
+from tools.dns_diff.io import (
+    JsonArtifactError,
+    atomic_write_json,
+    load_json_with_fallback,
+    load_required_json_object,
+)
 
 
 class DnsDiffIoTest(unittest.TestCase):
@@ -39,6 +44,43 @@ class DnsDiffIoTest(unittest.TestCase):
             text = output_path.read_text(encoding="utf-8")
             self.assertTrue(text.endswith("\n"))
             self.assertEqual(payload, json.loads(text))
+
+    def test_load_required_json_object_raises_for_missing_and_corrupt_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            missing_path = tmp_path / "missing.json"
+            with self.assertRaises(JsonArtifactError) as missing_ctx:
+                load_required_json_object(missing_path)
+            self.assertEqual("missing", missing_ctx.exception.status)
+
+            corrupt_path = tmp_path / "corrupt.json"
+            corrupt_path.write_text("{broken", encoding="utf-8")
+            with self.assertRaises(JsonArtifactError) as corrupt_ctx:
+                load_required_json_object(corrupt_path)
+            self.assertEqual("corrupt_fallback", corrupt_ctx.exception.status)
+
+            mismatch_path = tmp_path / "mismatch.json"
+            mismatch_path.write_text("[]", encoding="utf-8")
+            with self.assertRaises(JsonArtifactError) as mismatch_ctx:
+                load_required_json_object(mismatch_path)
+            self.assertEqual("type_mismatch_fallback", mismatch_ctx.exception.status)
+
+    def test_load_required_json_object_raises_for_utf8_and_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            invalid_utf8_path = tmp_path / "invalid-utf8.json"
+            invalid_utf8_path.write_bytes(b"\xff\xfe{broken}")
+            with self.assertRaises(JsonArtifactError) as utf8_ctx:
+                load_required_json_object(invalid_utf8_path)
+            self.assertEqual("utf8_decode_error", utf8_ctx.exception.status)
+
+            directory_path = tmp_path / "directory.json"
+            directory_path.mkdir()
+            with self.assertRaises(JsonArtifactError) as read_ctx:
+                load_required_json_object(directory_path)
+            self.assertEqual("read_error", read_ctx.exception.status)
 
 
 if __name__ == "__main__":

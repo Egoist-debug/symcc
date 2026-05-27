@@ -9,6 +9,27 @@ JsonObject = Dict[str, Any]
 PathLike = Union[str, os.PathLike[str], Path]
 
 
+class JsonArtifactError(RuntimeError):
+    def __init__(self, *, path: Path, status: str, detail: Optional[str] = None) -> None:
+        self.path = path
+        self.status = status
+        self.detail = detail
+        message = f"path={self.path} status={self.status}"
+        if self.detail:
+            message += f" detail={self.detail}"
+        super().__init__(message)
+
+
+def json_artifact_error_reason(status: str) -> str:
+    return {
+        "missing": "文件缺失",
+        "corrupt_fallback": "JSON 损坏",
+        "type_mismatch_fallback": "JSON 顶层类型无效（期望 object）",
+        "utf8_decode_error": "UTF-8 解码失败",
+        "read_error": "文件读取失败",
+    }.get(status, status)
+
+
 @dataclass(frozen=True)
 class JsonLoadResult:
     status: str
@@ -87,6 +108,44 @@ def load_json_with_fallback(
 
 def load_state_file(path: PathLike) -> JsonLoadResult:
     return load_json_with_fallback(path, fallback_factory=dict)
+
+
+def load_required_json_object(path: PathLike) -> JsonObject:
+    src = _to_path(path)
+    if not src.exists():
+        raise JsonArtifactError(path=src, status="missing")
+
+    try:
+        text = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise JsonArtifactError(
+            path=src,
+            status="utf8_decode_error",
+            detail=str(exc),
+        ) from exc
+    except OSError as exc:
+        raise JsonArtifactError(
+            path=src,
+            status="read_error",
+            detail=str(exc),
+        ) from exc
+
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise JsonArtifactError(
+            path=src,
+            status="corrupt_fallback",
+            detail=f"{exc.msg} (line {exc.lineno}, col {exc.colno})",
+        ) from exc
+
+    if not isinstance(loaded, dict):
+        raise JsonArtifactError(
+            path=src,
+            status="type_mismatch_fallback",
+            detail=f"expect object, got {type(loaded).__name__}",
+        )
+    return loaded
 
 
 def save_state_file(path: PathLike, state: Mapping[str, Any]) -> Path:

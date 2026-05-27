@@ -5,8 +5,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-case-study.XXXXXX")"
 FOLLOW_ROOT="$WORKDIR/follow_diff"
 EMPTY_ROOT="$WORKDIR/follow_diff_empty"
+BAD_ROOT="$WORKDIR/follow_diff_bad"
 CAMPAIGN_REPORT_DIR="$WORKDIR/campaign_report"
 EMPTY_REPORT_DIR="$WORKDIR/campaign_report_empty"
+BAD_REPORT_DIR="$WORKDIR/campaign_report_bad"
 export PYTHONDONTWRITEBYTECODE=1
 
 cleanup() {
@@ -30,11 +32,40 @@ assert_file_not_exists() {
 	fi
 }
 
+assert_file_contains() {
+	local path="$1"
+	local expected="$2"
+	if ! grep -Fq -- "$expected" "$path"; then
+		printf 'ASSERT FAIL: 期望 %s 包含: %s\n' "$path" "$expected" >&2
+		printf '实际内容:\n' >&2
+		cat "$path" >&2
+		exit 1
+	fi
+}
+
 run_cli() {
 	env \
 		PYTHONDONTWRITEBYTECODE=1 \
 		PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 		python3 -m tools.dns_diff.cli "$@"
+}
+
+assert_case_study_fail_closed() {
+	local root="$1"
+	local report_dir="$2"
+	local stderr_path="$3"
+	shift 3
+
+	if run_cli case-study-export --root "$root" --campaign-report-dir "$report_dir" >/dev/null 2>"$stderr_path"; then
+		printf 'ASSERT FAIL: case-study-export 对坏 truth-source 输入不应成功: %s\n' "$root" >&2
+		exit 1
+	fi
+
+	assert_file_contains "$stderr_path" 'dns-diff: case-study-export 失败: 样本 semantic truth-source 无效:'
+	for expected in "$@"; do
+		assert_file_contains "$stderr_path" "$expected"
+	done
+	assert_file_not_exists "$report_dir/case_studies/index.tsv"
 }
 
 write_main_fixture_root() {
@@ -564,6 +595,72 @@ for sample_id, files in samples.items():
 PY
 }
 
+write_bad_fixture_root() {
+	python3 - "$BAD_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+sample_dir = root / "sample-bad-oracle"
+sample_dir.mkdir(parents=True, exist_ok=True)
+
+def write_json(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+write_json(
+    sample_dir / "sample.meta.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-bad-oracle",
+        "status": "completed",
+    },
+)
+write_json(
+    sample_dir / "triage.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-bad-oracle",
+        "status": "completed_oracle_diff",
+        "diff_class": "oracle_diff",
+        "analysis_state": "included",
+        "exclude_reason": None,
+        "semantic_outcome": "oracle_diff",
+        "failure_taxonomy_version": 1,
+        "failure_bucket_primary": "semantic_diff",
+        "failure_bucket_detail": "oracle_diff",
+        "oracle_audit_candidate": True,
+        "case_study_candidate": True,
+        "manual_truth_status": "not_started",
+        "filter_labels": ["oracle_diff"],
+        "cluster_key": "completed_oracle_diff|oracle_diff|oracle_diff|fp:iterative->iterative",
+        "cache_delta_triggered": False,
+        "interesting_delta_count": 0,
+        "needs_manual_review": True,
+        "notes": ["bad oracle fixture"],
+    },
+)
+(sample_dir / "oracle.json").write_text("{broken", encoding="utf-8")
+write_json(
+    sample_dir / "cache_diff.json",
+    {
+        "schema_version": 1,
+        "generated_at": "2026-03-24T00:00:00Z",
+        "sample_id": "sample-bad-oracle",
+        "cache_delta_triggered": False,
+        "bind9": {"has_cache_diff": False, "interesting_delta_count": 0, "delta_items": []},
+        "unbound": {"has_cache_diff": False, "interesting_delta_count": 0, "delta_items": []},
+    },
+)
+(sample_dir / "sample.bin").write_bytes(bytes((1, 2, 3, 4)))
+(sample_dir / "bind9.stderr").write_text("bind9 stderr\n", encoding="utf-8")
+(sample_dir / "unbound.stderr").write_text("unbound stderr\n", encoding="utf-8")
+PY
+}
+
 assert_case_study_contract() {
 	python3 - "$FOLLOW_ROOT" "$CAMPAIGN_REPORT_DIR" <<'PY'
 import csv
@@ -774,6 +871,7 @@ PY
 
 write_main_fixture_root
 write_empty_fixture_root
+write_bad_fixture_root
 
 run_cli case-study-export --root "$FOLLOW_ROOT" --campaign-report-dir "$CAMPAIGN_REPORT_DIR" --top-n 5 >/dev/null
 assert_file_exists "$CAMPAIGN_REPORT_DIR/case_studies/index.tsv"
@@ -785,5 +883,12 @@ assert_case_study_contract
 run_cli case-study-export --root "$EMPTY_ROOT" --campaign-report-dir "$EMPTY_REPORT_DIR" >/dev/null
 assert_file_exists "$EMPTY_REPORT_DIR/case_studies/index.tsv"
 assert_empty_export_contract
+
+assert_case_study_fail_closed \
+	"$BAD_ROOT" \
+	"$BAD_REPORT_DIR" \
+	"$WORKDIR/case-study-bad.stderr" \
+	'file=oracle.json' \
+	'reason=JSON 损坏'
 
 printf 'PASS: case study export contract test passed\n'

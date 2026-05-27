@@ -263,32 +263,6 @@ def _load_triage_payload(sample_dir: Path) -> Dict[str, Any]:
     return payload
 
 
-def _build_triage_fallback_payload(
-    sample_dir: Path,
-    *,
-    sample_meta_payload: Mapping[str, Any],
-) -> Dict[str, Any]:
-    payload = {
-        "sample_id": _coerce_text(
-            sample_meta_payload.get("sample_id"), sample_dir.name
-        ),
-        "status": _coerce_text(sample_meta_payload.get("status"), "unknown"),
-        "cluster_key": "_",
-        "diff_class": "unknown",
-        "analysis_state": _coerce_analysis_state(
-            sample_meta_payload.get("analysis_state")
-        ),
-        "semantic_outcome": _coerce_text(
-            sample_meta_payload.get("semantic_outcome"),
-            "unknown",
-        ),
-        "filter_labels": [],
-        "oracle_audit_candidate": False,
-        "needs_manual_review": False,
-    }
-    return payload
-
-
 def _load_sample_meta_payload(sample_dir: Path) -> Dict[str, Any]:
     payload = _load_required_truth_source_payload(
         sample_dir,
@@ -769,15 +743,7 @@ def collect_report_snapshot(
     for sample_dir in sample_dirs:
         sample_meta_payload = _load_sample_meta_payload(sample_dir)
         sample_meta_payloads.append(sample_meta_payload)
-
-        triage_path = sample_dir / "triage.json"
-        if triage_path.is_file():
-            payload = _load_triage_payload(sample_dir)
-        else:
-            payload = _build_triage_fallback_payload(
-                sample_dir,
-                sample_meta_payload=sample_meta_payload,
-            )
+        payload = _load_triage_payload(sample_dir)
 
         sample_id = _coerce_text(payload.get("sample_id"), sample_dir.name)
         status = _coerce_text(payload.get("status"), "unknown")

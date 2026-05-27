@@ -11,7 +11,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from .cache_diff import build_cache_diff
 from .cache_parser import CacheParseError, parse_cache_dump
-from .io import atomic_write_json, load_state_file, save_state_file
+from .io import (
+    JsonArtifactError,
+    atomic_write_json,
+    json_artifact_error_reason,
+    load_required_json_object,
+    load_state_file,
+    save_state_file,
+)
 from .oracle import ORACLE_FIELDS
 from .path_defaults import (
     resolve_bind9_afl_tree,
@@ -120,6 +127,21 @@ class FollowDiffError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int = EXIT_USAGE) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+def _raise_follow_diff_state_error(
+    state_path: Path,
+    *,
+    reason: str,
+    detail: Optional[str] = None,
+) -> "NoReturn":
+    message = (
+        "follow-diff 状态文件无效: "
+        f"path={state_path.resolve()} reason={reason}"
+    )
+    if detail:
+        message += f" detail={detail}"
+    raise FollowDiffError(message)
 
 
 def _secondary_resolver_name() -> str:
@@ -590,32 +612,6 @@ def _follow_diff_state_path(config: FollowDiffConfig) -> Path:
     return config.work_dir / FOLLOW_DIFF_STATE_FILE_NAME
 
 
-def _coerce_optional_text(value: Any) -> Optional[str]:
-    if isinstance(value, str) and value:
-        return value
-    return None
-
-
-def _coerce_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return ""
-
-
-def _coerce_non_negative_int(value: Any) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int) and value >= 0:
-        return value
-    return 0
-
-
-def _coerce_optional_mapping(value: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(value, Mapping):
-        return dict(value)
-    return None
-
-
 def _parse_positive_int_env(
     env_name: str,
     default: int,
@@ -735,31 +731,38 @@ def _new_bounded_run_id() -> str:
 
 
 def _load_follow_diff_state(state_path: Path) -> FollowDiffState:
-    load_result = load_state_file(state_path)
-    if load_result.downgraded and state_path.exists():
-        detail = load_result.error or load_result.status
-        sys.stderr.write(
-            f"dns-diff: follow-diff 状态文件读取降级，已回退默认值 {state_path}: {detail}\n"
+    try:
+        state_data = dict(load_required_json_object(state_path))
+    except JsonArtifactError as exc:
+        if exc.status == "missing":
+            return FollowDiffState(schema_version=FOLLOW_DIFF_STATE_SCHEMA_VERSION)
+        _raise_follow_diff_state_error(
+            state_path,
+            reason=json_artifact_error_reason(exc.status),
+            detail=exc.detail,
         )
 
-    state_data = load_result.data
+    errors = validate_follow_diff_state_fields(state_data)
+    if errors:
+        _raise_follow_diff_state_error(
+            state_path,
+            reason="字段校验失败",
+            detail="; ".join(errors),
+        )
+
     return FollowDiffState(
-        schema_version=FOLLOW_DIFF_STATE_SCHEMA_VERSION,
-        last_scan_ts=_coerce_text(state_data.get("last_scan_ts")),
-        last_queue_event_id=_coerce_optional_text(
-            state_data.get("last_queue_event_id")
-        ),
-        running_sample_id=_coerce_optional_text(state_data.get("running_sample_id")),
-        completed_count=_coerce_non_negative_int(state_data.get("completed_count")),
-        failed_count=_coerce_non_negative_int(state_data.get("failed_count")),
-        run_id=_coerce_optional_text(state_data.get("run_id")),
-        last_exit_reason=_coerce_optional_text(state_data.get("last_exit_reason")),
-        retry_count=_coerce_non_negative_int(state_data.get("retry_count")),
-        last_attempt_ts=_coerce_optional_text(state_data.get("last_attempt_ts")),
-        aggregation_key=_coerce_optional_mapping(state_data.get("aggregation_key")),
-        baseline_compare_key=_coerce_optional_mapping(
-            state_data.get("baseline_compare_key")
-        ),
+        schema_version=int(state_data["schema_version"]),
+        last_scan_ts=str(state_data["last_scan_ts"]),
+        last_queue_event_id=state_data.get("last_queue_event_id"),
+        running_sample_id=state_data.get("running_sample_id"),
+        completed_count=int(state_data["completed_count"]),
+        failed_count=int(state_data["failed_count"]),
+        run_id=state_data.get("run_id"),
+        last_exit_reason=state_data.get("last_exit_reason"),
+        retry_count=int(state_data.get("retry_count", 0)),
+        last_attempt_ts=state_data.get("last_attempt_ts"),
+        aggregation_key=dict(state_data["aggregation_key"]),
+        baseline_compare_key=dict(state_data["baseline_compare_key"]),
     )
 
 
