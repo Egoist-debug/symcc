@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import shutil
 import signal
 import socket
 import subprocess
@@ -164,7 +165,7 @@ def main():
     config_path.write_text(
         (
             "modules = { 'policy' }\n"
-            "cache.open(100 * MB)\n"
+            "cache.open(20 * MB)\n"
             "trust_anchors.remove('.')\n"
             "mode('permissive')\n"
             f"policy.add(policy.all(policy.STUB('127.0.0.1@{upstream_port}')))\n"
@@ -249,6 +250,16 @@ def main():
     entries = [(qname, qtype)] if cache_entry_created else []
     write_cache_dump(cache_dump_path, entries)
     write_text(kresd_log_path, raw_log)
+
+    for pattern in ("data.mdb", "lock.mdb", "top"):
+        for stale in run_root.rglob(pattern):
+            try:
+                stale.unlink()
+            except (FileNotFoundError, IsADirectoryError):
+                pass
+    for ruledb_dir in run_root.rglob("ruledb"):
+        if ruledb_dir.is_dir():
+            shutil.rmtree(ruledb_dir, ignore_errors=True)
 
     print(
         "ORACLE_SUMMARY "

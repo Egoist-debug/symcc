@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/cleanup_run_root.sh"
 STAMP="$(date -u +%Y%m%d_%H%M%S)"
 BASE_DIR="$ROOT_DIR/experiments/results/real_rq3_multi_resolver_ablation/$STAMP"
 TRANSCRIPT_SOURCE_DIR="${TRANSCRIPT_SOURCE_DIR:-$ROOT_DIR/named_experiment/work/stable_transcript_corpus}"
@@ -117,6 +119,7 @@ run_resolver() {
 				ln -sfn "$report_dir" "$agg_root/run-$(printf '%02d' "$repeat")"
 			fi
 			printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$env_resolver" "$variant" "$repeat" "$run_status" "$run_root" "${report_dir:--}" >>"$STATUS_TSV"
+			cleanup_run_root_artifacts "$run_root"
 		done
 		if find "$agg_root" -maxdepth 1 -mindepth 1 | grep -q .; then
 			python3 -m tools.dns_diff.cli campaign-aggregate --reports-root "$agg_root" --output-dir "$BASE_DIR/$resolver/$variant" >/dev/null
@@ -189,3 +192,5 @@ print(summary_tsv)
 PY
 
 printf 'PASS: real RQ3 multi-resolver ablation generated at %s\n' "$BASE_DIR"
+
+cleanup_experiment_base "$BASE_DIR"

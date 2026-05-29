@@ -50,23 +50,23 @@
 
 当前批次：
 
-- `experiments/results/real_rq3_multi_resolver_ablation/20260522_083406/dnsmasq`
-- `queue_limit = 2`
+- `experiments/results/real_rq3_multi_resolver_ablation/20260529_094512/dnsmasq`
+- `queue_limit = 8`
 - `repeat = 5`
-- `budget_sec = 12`
+- `budget_sec = 120`
 
 当前结果：
 
 | variant_name | run_count | variance_status | total_samples_mean | included_samples_mean | oracle_audit_candidate_count_mean | semantic_diff_count_mean | semantic_counts_mean_json |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `full_stack` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
-| `afl_only` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
-| `no_mutator` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
-| `no_cache_delta` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
+| `full_stack` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
+| `afl_only` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
+| `no_mutator` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
+| `no_cache_delta` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
 
 当前可直接写入正文的表述：
 
-> 在 `dnsmasq` 上，`full_stack / afl_only / no_mutator / no_cache_delta` 四个变体均完成了 `repeat=5` 的稳定重复，并且在当前 `queue_limit=2` 的样本池上都收敛到相同的 `oracle_diff` 语义结果。当前样本池下，关闭 `SYMCC`、关闭 `DST1 mutator` 或关闭 `cache-delta` 尚未改变 `dnsmasq` 的主导语义分布。
+> 在 `dnsmasq` 上，`full_stack / afl_only / no_mutator / no_cache_delta` 四个变体均完成了 `repeat=5` 的稳定重复，并且在 `queue_limit=8`、`budget_sec=120` 的样本池上都收敛到相同的 `oracle_diff` 语义结果，`semantic_diff_count_mean=8.0` 说明每个 run 的 8 个样本全部命中 oracle 差异。当前样本池下，关闭 `SYMCC`、关闭 `DST1 mutator` 或关闭 `cache-delta` 尚未改变 `dnsmasq` 的主导语义分布。
 
 当前边界：
 
@@ -82,23 +82,23 @@
 
 当前批次：
 
-- `experiments/results/real_rq3_multi_resolver_ablation/20260522_084931/maradns`
-- `queue_limit = 2`
+- `experiments/results/real_rq3_multi_resolver_ablation/20260529_094512/maradns`
+- `queue_limit = 8`
 - `repeat = 5`
-- `budget_sec = 12`
+- `budget_sec = 120`
 
 当前结果：
 
 | variant_name | run_count | variance_status | total_samples_mean | included_samples_mean | oracle_audit_candidate_count_mean | semantic_diff_count_mean | semantic_counts_mean_json |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `full_stack` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
-| `afl_only` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
-| `no_mutator` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
-| `no_cache_delta` | `5` | `ok` | `2.000000` | `2.000000` | `2.000000` | `2.000000` | `{"oracle_diff": 2.0}` |
+| `full_stack` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
+| `afl_only` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
+| `no_mutator` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
+| `no_cache_delta` | `5` | `ok` | `8.000000` | `8.000000` | `8.000000` | `8.000000` | `{"oracle_diff": 8.0}` |
 
 当前可直接写入正文的表述：
 
-> `maradns` 上的四个变体也都完成了 `repeat=5`，并且和 `dnsmasq` 一样在当前样本池下全部收敛到 `oracle_diff`。这说明当前 RQ3 的保守结论已经跨越两个不同 resolver：在小样本稳定 transcript 批次下，四个 hybrid 变体尚未拉开可观测差距。
+> `maradns` 上的四个变体也都完成了 `repeat=5`，并且和 `dnsmasq` 一样在当前 `queue_limit=8` 样本池上全部收敛到 `oracle_diff`，所有 8 个样本均命中 oracle 差异。这说明当前 RQ3 的保守结论已经跨越两个不同 resolver：在 4 倍于先前批次的稳定 transcript 样本池下，四个 hybrid 变体仍未拉开可观测差距。
 
 ## RQ3 knot-resolver 多样本消融
 
@@ -108,23 +108,23 @@
 
 当前批次：
 
-- `experiments/results/real_rq3_multi_resolver_ablation/20260523_093620/knot`
-- `queue_limit = 2`
+- `experiments/results/real_rq3_multi_resolver_ablation/20260529_094512/knot`
+- `queue_limit = 8`
 - `repeat = 5`
-- `budget_sec = 12`
+- `budget_sec = 120`
 
 当前结果：
 
 | variant_name | run_count | variance_status | total_samples_mean | included_samples_mean | oracle_audit_candidate_count_mean | semantic_diff_count_mean | semantic_counts_mean_json |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `full_stack` | `5` | `ok` | `2.000000` | `2.000000` | `0.000000` | `0.000000` | `{"no_diff": 2.0}` |
-| `afl_only` | `5` | `ok` | `2.000000` | `2.000000` | `0.000000` | `0.000000` | `{"no_diff": 2.0}` |
-| `no_mutator` | `5` | `ok` | `2.000000` | `2.000000` | `0.000000` | `0.000000` | `{"no_diff": 2.0}` |
-| `no_cache_delta` | `5` | `ok` | `2.000000` | `2.000000` | `0.000000` | `0.000000` | `{"no_diff": 2.0}` |
+| `full_stack` | `5` | `ok` | `8.000000` | `8.000000` | `0.000000` | `0.000000` | `{"no_diff": 8.0}` |
+| `afl_only` | `5` | `ok` | `8.000000` | `8.000000` | `0.000000` | `0.000000` | `{"no_diff": 8.0}` |
+| `no_mutator` | `5` | `ok` | `8.000000` | `8.000000` | `0.000000` | `0.000000` | `{"no_diff": 8.0}` |
+| `no_cache_delta` | `5` | `ok` | `8.000000` | `8.000000` | `0.000000` | `0.000000` | `{"no_diff": 8.0}` |
 
 当前可直接写入正文的表述：
 
-> `knot-resolver` 上的四个变体也都完成了 `repeat=5`，并且在当前样本池下全部收敛到 `no_diff`。这让 RQ3 当前同时拥有两条稳定 `oracle_diff` 路径和一条稳定 `no_diff` 路径，说明四个 hybrid 变体在这轮小样本真实批次里仍未拉开主导语义差异。
+> `knot-resolver` 上的四个变体也都完成了 `repeat=5`，并且在 `queue_limit=8` 样本池下全部收敛到 `no_diff`。这让 RQ3 当前同时拥有两条稳定 `oracle_diff` 路径（dnsmasq、maradns）和一条稳定 `no_diff` 路径（knot-resolver），说明四个 hybrid 变体在 4 倍样本池的真实批次里仍未拉开主导语义差异。
 
 ## RQ5 多 resolver 多样本主表
 
@@ -134,24 +134,24 @@
 
 当前批次：
 
-- `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260523_095431`
-- `queue_limit = 4`
+- `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260529_093012`
+- `queue_limit = 8`
 - `repeat = 5`
-- `budget_sec = 12`
+- `budget_sec = 120`
 
 当前结果：
 
 | resolver | resolver_pair | run_count | variance_status | total_samples_mean | unknown_samples_mean | oracle_audit_candidate_count_mean | semantic_diff_count_mean | semantic_counts_mean_json |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `unbound` | `bind9_vs_unbound` | `5` | `ok` | `4.0` | `4.0` | `0.0` | `0.0` | `{"runtime_or_parse_failure": 4.0}` |
-| `dnsmasq` | `bind9_vs_dnsmasq` | `5` | `ok` | `4.0` | `0.0` | `4.0` | `4.0` | `{"oracle_diff": 4.0}` |
-| `smartdns` | `bind9_vs_smartdns` | `5` | `ok` | `4.0` | `4.0` | `0.0` | `0.0` | `{"runtime_or_parse_failure": 4.0}` |
-| `maradns` | `bind9_vs_maradns` | `5` | `ok` | `4.0` | `0.0` | `4.0` | `4.0` | `{"oracle_diff": 4.0}` |
-| `knot-resolver` | `bind9_vs_knot-resolver` | `5` | `ok` | `4.0` | `0.0` | `0.0` | `0.0` | `{"no_diff": 4.0}` |
+| `unbound` | `bind9_vs_unbound` | `5` | `ok` | `8.0` | `0.0` | `8.0` | `8.0` | `{"oracle_and_cache_diff": 8.0}` |
+| `dnsmasq` | `bind9_vs_dnsmasq` | `5` | `ok` | `8.0` | `0.0` | `8.0` | `8.0` | `{"oracle_diff": 8.0}` |
+| `smartdns` | `bind9_vs_smartdns` | `5` | `ok` | `8.0` | `0.0` | `8.0` | `8.0` | `{"oracle_and_cache_diff": 2.0, "oracle_diff": 6.0}` |
+| `maradns` | `bind9_vs_maradns` | `5` | `ok` | `8.0` | `0.0` | `8.0` | `8.0` | `{"oracle_diff": 8.0}` |
+| `knot-resolver` | `bind9_vs_knot-resolver` | `5` | `ok` | `8.0` | `0.0` | `0.0` | `0.0` | `{"no_diff": 8.0}` |
 
 当前可直接写入正文的表述：
 
-> 在 `full_stack` 主线、`queue_limit=4`、`repeat=5`、`budget_sec=12` 的真实批次中，5 个 secondary resolver 全部完成了稳定重复，`variance_status` 均为 `ok`。其中，`bind9_vs_dnsmasq` 与 `bind9_vs_maradns` 在所有重复中都稳定落为 `oracle_diff`，`bind9_vs_knot-resolver` 在同一批样本上持续表现为 `no_diff`，而 `bind9_vs_unbound` 与 `bind9_vs_smartdns` 当前仍主要落在保守的失败标签上。这说明当前稳定 transcript 子集已经能够在更大样本池下继续把不同 resolver 分化成至少三类结果。
+> 在 `full_stack` 主线、`queue_limit=8`、`repeat=5`、`budget_sec=120` 的真实批次中，5 个 secondary resolver 全部完成了稳定重复，`variance_status` 均为 `ok`，`unknown_samples_mean` 全部为 0（先前批次中 unbound/smartdns 的 `runtime_or_parse_failure` 问题已消除）。其中，`bind9_vs_unbound` 在所有 8 个样本上稳定表现为 `oracle_and_cache_diff`（同时存在 oracle 差异和 cache 差异），`bind9_vs_dnsmasq` 与 `bind9_vs_maradns` 稳定落为 `oracle_diff`，`bind9_vs_smartdns` 呈现混合分布（6 个 `oracle_diff` + 2 个 `oracle_and_cache_diff`），`bind9_vs_knot-resolver` 持续表现为 `no_diff`。这说明当前稳定 transcript 子集在更大样本池和更长预算下，能够将 5 个 resolver 分化成三类可区分的语义结果：oracle+cache 双差异、仅 oracle 差异、无差异。
 
 ## RQ5 failure refinement
 
@@ -159,16 +159,9 @@
 
 - [RQ5FailureRefinement.tsv](/home/egoist/codex/symcc/docs/RQ5FailureRefinement.tsv)
 
-当前结果：
+当前状态：
 
-| resolver | total_samples | completed_samples | bind9_parse_ok_samples | secondary_parse_ok_samples | semantic_outcome | diff_class | interpretation |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `unbound` | `20` | `20` | `20` | `20` | `runtime_or_parse_failure` | `oracle_parse_incomplete` | 样本已完成 replay，当前只是 oracle 证据不完整 |
-| `smartdns` | `20` | `20` | `20` | `20` | `runtime_or_parse_failure` | `oracle_parse_incomplete` | 样本已完成 replay，当前只是 oracle 证据不完整 |
-
-当前可直接写入正文的表述：
-
-> 在当前 `queue_limit=4` 的多样本批次中，`unbound` 和 `smartdns` 的 `20/20` 个样本均完成 replay，且 `bind9` 与 secondary 的 `parse_ok` 都为真。当前 `runtime_or_parse_failure` 更适合被保守地解释为 `oracle_parse_incomplete`，而不是目标未运行或目标崩溃。
+> **已解决**。在 `queue_limit=8`、`budget_sec=120` 的新批次中，`unbound` 和 `smartdns` 的 `unknown_samples_mean` 均降为 0，所有样本都成功完成 replay 并产出有效 oracle 证据。先前的 `runtime_or_parse_failure` 问题已通过增加预算和样本池得到消除。`unbound` 现在稳定表现为 `oracle_and_cache_diff`，`smartdns` 表现为 `oracle_diff` + `oracle_and_cache_diff` 混合分布。
 
 ## 当前最有价值的 case study
 
@@ -187,19 +180,19 @@
 ## 当前可以稳定声称的结论
 
 1. `DST1 transcript` 在当前 producer 接口上具备稳定可接入性
-2. 多 resolver full_stack 主线已经从 smoke 推进到 `repeat=5` 的真实多样本批次
-3. `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已出现可区分的三类结果
+2. 多 resolver full_stack 主线已经在 `queue_limit=8`、`budget_sec=120`、`repeat=5` 的真实多样本批次上完整跑通
+3. `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已出现可区分的三类语义结果（oracle+cache 双差异、仅 oracle 差异、无差异）
 4. `dnsmasq / maradns` 的四个 RQ3 变体稳定落为 `oracle_diff`，`knot-resolver` 的四个变体稳定落为 `no_diff`
+5. `unbound` 与 `smartdns` 在新批次中已不再落入 `runtime_or_parse_failure`，分别稳定表现为 `oracle_and_cache_diff` 与 `oracle_diff`+`oracle_and_cache_diff` 混合
 
 ## 当前仍应保守处理的结论
 
-1. 不能写“RQ1 已证明 DST1 的 post-check 优势”
-2. 不能写“RQ3 已证明 Hybrid 组件有显著增益”
-3. 不能写“`runtime_or_parse_failure` 等于真实运行崩溃”
-4. 不能写“现有结果已经达到长期预算终稿级统计”
+1. 不能写"RQ1 已证明 DST1 的 post-check 优势"
+2. 不能写"RQ3 已证明 Hybrid 组件有显著增益"（4 变体仍未拉开差距）
+3. 不能写"现有结果已经达到长期预算终稿级统计"（budget=120s 仍属中等预算）
 
 ## 当前最自然的后续路线
 
-1. 保持 `full_stack only`，把 `queue_limit` 从 `4` 提到 `8` 或延长 `budget_sec`
-2. 在当前 `dnsmasq / maradns / knot-resolver` 主表之上补“无 high-value gate”和更大样本池
-3. 将当前结果浓缩成论文正文里的 3 张主表和 1 张 failure refinement 表
+1. 在当前 `queue_limit=8`、`budget_sec=120` 基础上延长预算到 `budget_sec=600+`，验证大预算下变体差异是否显现
+2. 在当前 RQ3 基础上补"无 high-value gate"对照
+3. 将当前结果浓缩成论文正文里的 3 张主表和 1 张 case study 表
