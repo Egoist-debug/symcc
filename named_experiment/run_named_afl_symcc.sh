@@ -12,7 +12,7 @@ NAMED_HIGH_VALUE_MANIFEST="$WORK_DIR/high_value_samples.txt"
 UNBOUND_REPORT_HIGH_VALUE_MANIFEST="$UNBOUND_REPORT_WORK_DIR/high_value_samples.txt"
 DEFAULT_SYMCC_HIGH_VALUE_MANIFEST="$NAMED_HIGH_VALUE_MANIFEST"
 PATCH_ROOT="$ROOT_DIR/patch"
-PATCH_VARIANT="${PATCH_VARIANT:-cache}"
+PATCH_VARIANT="${PATCH_VARIANT:-fuzz}"
 RESOLVERS_LOCK_FILE="${RESOLVERS_LOCK_FILE:-$ROOT_DIR/experiments/resolvers.lock.json}"
 LEGACY_SRC_TREE="$ROOT_DIR/bind-9.18.46"
 LEGACY_AFL_TREE="$ROOT_DIR/bind-9.18.46-afl"
@@ -131,7 +131,7 @@ usage() {
 
 常用环境变量:
   FUZZ_PROFILE=poison-stateful
-  PATCH_VARIANT=cache|fuzz (兼容旧值 diff->cache；默认 cache)
+  PATCH_VARIANT=cache|fuzz (兼容旧值 diff->cache；producer 默认 fuzz)
   JOBS=2
   ENABLE_SECONDARY=1
   AFL_TIMEOUT_MS=7000+
@@ -672,13 +672,19 @@ patch_variant_mappings() {
 			"include/named/resolver_afl_symcc_mutator_server.h:bin/named/include/named/resolver_afl_symcc_mutator_server.h" \
 			"lib/isc/managers.c:lib/isc/managers.c" \
 			"lib/dns/dispatch.c:lib/dns/dispatch.c" \
-			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h" \
-			"lib/ns/client.c:lib/ns/client.c"
+			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h"
 		;;
 	fuzz)
 		printf '%s\n' \
-			"bin/named/fuzz.c:bin/named/fuzz.c" \
-			"lib/ns/client.c:lib/ns/client.c"
+			"bin/named/Makefile.am:bin/named/Makefile.am" \
+			"bin/named/main.c:bin/named/main.c" \
+			"bin/named/resolver_afl_symcc_orchestrator.c:bin/named/resolver_afl_symcc_orchestrator.c" \
+			"bin/named/resolver_afl_symcc_mutator_server.c:bin/named/resolver_afl_symcc_mutator_server.c" \
+			"include/named/resolver_afl_symcc_orchestrator.h:bin/named/include/named/resolver_afl_symcc_orchestrator.h" \
+			"include/named/resolver_afl_symcc_mutator_server.h:bin/named/include/named/resolver_afl_symcc_mutator_server.h" \
+			"lib/isc/managers.c:lib/isc/managers.c" \
+			"lib/dns/dispatch.c:lib/dns/dispatch.c" \
+			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h"
 		;;
 	esac
 }
@@ -703,6 +709,7 @@ apply_bind9_tree_compat_fixes() {
 	local qp_file="$tree/lib/dns/qp.c"
 	local baseline_root="$tree/.symcc_patch_baseline/files"
 	local full_restore_files=(
+		"bin/named/fuzz.c"
 		"lib/ns/client.c"
 	)
 	local legacy_print_include_files=(

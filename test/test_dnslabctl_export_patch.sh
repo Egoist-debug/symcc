@@ -49,9 +49,11 @@ if str(actual) != expected:
 PY
 }
 
-SUBJECT_ROOT="$WORKDIR/experiments/subjects/bind9/v9.20.22"
-PATCH_PATH="$WORKDIR/patch/cache/bind9/v9.20.22.patch"
-mkdir -p "$SUBJECT_ROOT"
+BIND9_SUBJECT_ROOT="$WORKDIR/experiments/subjects/bind9/v9.20.22"
+BIND9_PATCH_PATH="$WORKDIR/patch/cache/bind9/v9.20.22.patch"
+DNSMASQ_SUBJECT_ROOT="$WORKDIR/experiments/subjects/dnsmasq/v2.92"
+DNSMASQ_PATCH_PATH="$WORKDIR/patch/cache/dnsmasq/v2.92.patch"
+mkdir -p "$BIND9_SUBJECT_ROOT" "$DNSMASQ_SUBJECT_ROOT"
 
 cat >"$WORKDIR/experiments/resolvers.lock.json" <<'EOF'
 {
@@ -66,18 +68,51 @@ cat >"$WORKDIR/experiments/resolvers.lock.json" <<'EOF'
       "resolved_tag": "v9.20.22",
       "resolver": "bind9",
       "status": "locked"
+    },
+    {
+      "commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "desired_tag": "v2.92",
+      "note": "dnsmasq",
+      "repo_url": "https://example/dnsmasq.git",
+      "resolved_tag": "v2.92",
+      "resolver": "dnsmasq",
+      "status": "locked"
     }
   ]
 }
 EOF
 
 (
-	cd "$SUBJECT_ROOT"
+	cd "$BIND9_SUBJECT_ROOT"
 	git init -q
 	printf 'old\n' > sample.txt
 	git add sample.txt
 	git -c user.name=test -c user.email=test@example.com -c commit.gpgsign=false commit -qm init
 	printf 'new\n' > sample.txt
+)
+
+(
+	cd "$DNSMASQ_SUBJECT_ROOT"
+	git init -q
+	printf 'dnsmasq-old\n' > sample.txt
+	git add sample.txt
+	git -c user.name=test -c user.email=test@example.com -c commit.gpgsign=false commit -qm init
+	printf 'dnsmasq-new\n' > sample.txt
+)
+
+(
+	cd "$ROOT_DIR"
+	"$DNSLABCTL_BIN" export-patch \
+		--workspace-root "$(python3 - "$ROOT_DIR" "$WORKDIR" <<'PY'
+import os
+import pathlib
+import sys
+print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
+PY
+		)" \
+		--resolver bind9 \
+		--purpose cache \
+		>"$WORKDIR/export-patch-bind9.json"
 )
 
 (
@@ -90,17 +125,25 @@ import sys
 print(os.path.relpath(pathlib.Path(sys.argv[2]).resolve(), pathlib.Path(sys.argv[1]).resolve()))
 PY
 )" \
-		--resolver bind9 \
+		--resolver dnsmasq \
 		--purpose cache \
-		>"$WORKDIR/export-patch.json"
+		>"$WORKDIR/export-patch-dnsmasq.json"
 )
 
-assert_file_exists "$PATCH_PATH"
-assert_file_contains "$PATCH_PATH" "diff --git a/sample.txt b/sample.txt"
-assert_file_contains "$PATCH_PATH" "+new"
-assert_json_field "$WORKDIR/export-patch.json" "resolver" "bind9"
-assert_json_field "$WORKDIR/export-patch.json" "purpose" "cache"
-assert_json_field "$WORKDIR/export-patch.json" "tag" "v9.20.22"
-assert_json_field "$WORKDIR/export-patch.json" "output_path" "$PATCH_PATH"
+assert_file_exists "$BIND9_PATCH_PATH"
+assert_file_contains "$BIND9_PATCH_PATH" "diff --git a/sample.txt b/sample.txt"
+assert_file_contains "$BIND9_PATCH_PATH" "+new"
+assert_json_field "$WORKDIR/export-patch-bind9.json" "resolver" "bind9"
+assert_json_field "$WORKDIR/export-patch-bind9.json" "purpose" "cache"
+assert_json_field "$WORKDIR/export-patch-bind9.json" "tag" "v9.20.22"
+assert_json_field "$WORKDIR/export-patch-bind9.json" "output_path" "$BIND9_PATCH_PATH"
+
+assert_file_exists "$DNSMASQ_PATCH_PATH"
+assert_file_contains "$DNSMASQ_PATCH_PATH" "diff --git a/sample.txt b/sample.txt"
+assert_file_contains "$DNSMASQ_PATCH_PATH" "+dnsmasq-new"
+assert_json_field "$WORKDIR/export-patch-dnsmasq.json" "resolver" "dnsmasq"
+assert_json_field "$WORKDIR/export-patch-dnsmasq.json" "purpose" "cache"
+assert_json_field "$WORKDIR/export-patch-dnsmasq.json" "tag" "v2.92"
+assert_json_field "$WORKDIR/export-patch-dnsmasq.json" "output_path" "$DNSMASQ_PATCH_PATH"
 
 printf 'PASS: dnslabctl export-patch regression test passed\n'

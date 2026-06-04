@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_PATH="$ROOT_DIR/named_experiment/run_named_afl_symcc.sh"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/symcc-named-patch-split.XXXXXX")"
 EVIDENCE_DIR="$ROOT_DIR/.sisyphus/evidence/task-3-patch-split"
-PATCH_VARIANT_REQUESTED="${PATCH_VARIANT:-cache}"
+PATCH_VARIANT_REQUESTED="${PATCH_VARIANT:-fuzz}"
 
 cleanup() {
 	rm -rf "$WORKDIR"
@@ -41,6 +41,7 @@ import sys
 
 tree = Path(sys.argv[1])
 baseline = {
+    "bin/named/Makefile.am": "baseline makefile\n",
     "bin/named/main.c": "baseline main\n",
     "bin/named/fuzz.c": "baseline fuzz\n",
     "bin/named/resolver_afl_symcc_orchestrator.c": "baseline orchestrator\n",
@@ -49,6 +50,8 @@ baseline = {
     "bin/named/include/named/resolver_afl_symcc_mutator_server.h": "baseline mutator header\n",
     "lib/dns/dispatch.c": "baseline dispatch\n",
     "lib/dns/include/dns/dispatch.h": "baseline dispatch header\n",
+    "lib/isc/include/isc/print.h": "baseline print header\n",
+    "lib/isc/managers.c": "baseline managers\n",
     "lib/ns/client.c": "baseline client\n",
 }
 for rel_path, content in baseline.items():
@@ -60,7 +63,7 @@ PY
 
 assert_diff_variant_tree() {
 	local tree="$1"
-	assert_same_file "$PATCH_ROOT/cache/bind9/lib/ns/client.c" "$tree/lib/ns/client.c"
+	assert_same_file "$PATCH_ROOT/cache/bind9/bin/named/Makefile.am" "$tree/bin/named/Makefile.am"
 	assert_same_file "$PATCH_ROOT/cache/bind9/bin/named/main.c" "$tree/bin/named/main.c"
 	assert_same_file "$PATCH_ROOT/cache/bind9/bin/named/resolver_afl_symcc_orchestrator.c" "$tree/bin/named/resolver_afl_symcc_orchestrator.c"
 	assert_same_file "$PATCH_ROOT/cache/bind9/bin/named/resolver_afl_symcc_mutator_server.c" "$tree/bin/named/resolver_afl_symcc_mutator_server.c"
@@ -68,20 +71,24 @@ assert_diff_variant_tree() {
 	assert_same_file "$PATCH_ROOT/cache/bind9/include/named/resolver_afl_symcc_mutator_server.h" "$tree/bin/named/include/named/resolver_afl_symcc_mutator_server.h"
 	assert_same_file "$PATCH_ROOT/cache/bind9/lib/dns/dispatch.c" "$tree/lib/dns/dispatch.c"
 	assert_same_file "$PATCH_ROOT/cache/bind9/lib/dns/include/dns/dispatch.h" "$tree/lib/dns/include/dns/dispatch.h"
+	assert_same_file "$PATCH_ROOT/cache/bind9/lib/isc/managers.c" "$tree/lib/isc/managers.c"
+	assert_file_contains_text "$tree/lib/ns/client.c" "baseline client"
 	assert_file_contains_text "$tree/bin/named/fuzz.c" "baseline fuzz"
 }
 
 assert_fuzz_variant_tree() {
 	local tree="$1"
-	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/ns/client.c" "$tree/lib/ns/client.c"
-	assert_same_file "$PATCH_ROOT/fuzz/bind9/bin/named/fuzz.c" "$tree/bin/named/fuzz.c"
-	assert_file_contains_text "$tree/bin/named/main.c" "baseline main"
-	assert_file_contains_text "$tree/bin/named/resolver_afl_symcc_orchestrator.c" "baseline orchestrator"
-	assert_file_contains_text "$tree/bin/named/resolver_afl_symcc_mutator_server.c" "baseline mutator"
-	assert_file_contains_text "$tree/bin/named/include/named/resolver_afl_symcc_orchestrator.h" "baseline orchestrator header"
-	assert_file_contains_text "$tree/bin/named/include/named/resolver_afl_symcc_mutator_server.h" "baseline mutator header"
-	assert_file_contains_text "$tree/lib/dns/dispatch.c" "baseline dispatch"
-	assert_file_contains_text "$tree/lib/dns/include/dns/dispatch.h" "baseline dispatch header"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/bin/named/Makefile.am" "$tree/bin/named/Makefile.am"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/bin/named/main.c" "$tree/bin/named/main.c"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/bin/named/resolver_afl_symcc_orchestrator.c" "$tree/bin/named/resolver_afl_symcc_orchestrator.c"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/bin/named/resolver_afl_symcc_mutator_server.c" "$tree/bin/named/resolver_afl_symcc_mutator_server.c"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/include/named/resolver_afl_symcc_orchestrator.h" "$tree/bin/named/include/named/resolver_afl_symcc_orchestrator.h"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/include/named/resolver_afl_symcc_mutator_server.h" "$tree/bin/named/include/named/resolver_afl_symcc_mutator_server.h"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/dns/dispatch.c" "$tree/lib/dns/dispatch.c"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/dns/include/dns/dispatch.h" "$tree/lib/dns/include/dns/dispatch.h"
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/isc/managers.c" "$tree/lib/isc/managers.c"
+	assert_file_contains_text "$tree/bin/named/fuzz.c" "baseline fuzz"
+	assert_file_contains_text "$tree/lib/ns/client.c" "baseline client"
 }
 
 run_variant_case() {
@@ -113,7 +120,7 @@ Path(sys.argv[1]).parent.mkdir(parents=True, exist_ok=True)
 Path(sys.argv[1]).write_text(
     "variant=cache\n"
     "resolver=bind9\n"
-    "overwritten=cache/bind9/lib/ns/client.c\n"
+    "overwritten=cache/bind9/bin/named/Makefile.am\n"
     "overwritten=cache/bind9/bin/named/main.c\n"
     "overwritten=cache/bind9/bin/named/resolver_afl_symcc_orchestrator.c\n"
     "overwritten=cache/bind9/bin/named/resolver_afl_symcc_mutator_server.c\n"
@@ -121,6 +128,8 @@ Path(sys.argv[1]).write_text(
     "overwritten=cache/bind9/include/named/resolver_afl_symcc_mutator_server.h\n"
     "overwritten=cache/bind9/lib/dns/dispatch.c\n"
     "overwritten=cache/bind9/lib/dns/include/dns/dispatch.h\n"
+    "overwritten=cache/bind9/lib/isc/managers.c\n"
+    "retained=lib/ns/client.c\n"
     "retained=bin/named/fuzz.c\n",
     encoding="utf-8",
 )
@@ -138,15 +147,17 @@ Path(sys.argv[1]).parent.mkdir(parents=True, exist_ok=True)
 Path(sys.argv[1]).write_text(
     "variant=fuzz\n"
     "resolver=bind9\n"
-    "overwritten=fuzz/bind9/lib/ns/client.c\n"
-    "overwritten=fuzz/bind9/bin/named/fuzz.c\n"
-    "retained=bin/named/main.c\n"
-    "retained=bin/named/resolver_afl_symcc_orchestrator.c\n"
-    "retained=bin/named/resolver_afl_symcc_mutator_server.c\n"
-    "retained=bin/named/include/named/resolver_afl_symcc_orchestrator.h\n"
-    "retained=bin/named/include/named/resolver_afl_symcc_mutator_server.h\n"
-    "retained=lib/dns/dispatch.c\n"
-    "retained=lib/dns/include/dns/dispatch.h\n",
+    "overwritten=fuzz/bind9/bin/named/Makefile.am\n"
+    "overwritten=fuzz/bind9/bin/named/main.c\n"
+    "overwritten=fuzz/bind9/bin/named/resolver_afl_symcc_orchestrator.c\n"
+    "overwritten=fuzz/bind9/bin/named/resolver_afl_symcc_mutator_server.c\n"
+    "overwritten=fuzz/bind9/include/named/resolver_afl_symcc_orchestrator.h\n"
+    "overwritten=fuzz/bind9/include/named/resolver_afl_symcc_mutator_server.h\n"
+    "overwritten=fuzz/bind9/lib/dns/dispatch.c\n"
+    "overwritten=fuzz/bind9/lib/dns/include/dns/dispatch.h\n"
+    "overwritten=fuzz/bind9/lib/isc/managers.c\n"
+    "retained=bin/named/fuzz.c\n"
+    "retained=lib/ns/client.c\n",
     encoding="utf-8",
 )
 PY
