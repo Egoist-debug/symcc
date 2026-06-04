@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -339,6 +340,96 @@ def _ensure_empty_run_dir(run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=False)
 
 
+def _sync_live_source_queue(target_queue_dir: Path) -> None:
+    raw_source = os.environ.get("CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_DIR", "").strip()
+    if not raw_source:
+        return
+    raw_limit = os.environ.get("CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_LIMIT", "").strip()
+    source_limit = 0
+    if raw_limit:
+        try:
+            source_limit = int(raw_limit)
+        except ValueError as exc:
+            raise CampaignMatrixError(
+                f"live source queue limit 必须是整数: {raw_limit}"
+            ) from exc
+        if source_limit < 0:
+            raise CampaignMatrixError(
+                f"live source queue limit 必须大于等于 0: {raw_limit}"
+            )
+
+    source_queue_dir = Path(raw_source).expanduser().resolve()
+    if not source_queue_dir.is_dir():
+        raise CampaignMatrixError(
+            f"live source queue 目录不存在或不是目录: {source_queue_dir}"
+        )
+
+    target_queue_dir.mkdir(parents=True, exist_ok=True)
+    source_files = sorted(path for path in source_queue_dir.iterdir() if path.is_file())
+    if source_limit > 0:
+        source_files = source_files[:source_limit]
+
+    existing_names = {
+        path.name for path in target_queue_dir.iterdir() if path.is_file()
+    }
+    source_names = {path.name for path in source_files}
+    materialized_source_names: set[str] = set()
+    next_prepared_index = 1
+    prepared_mode = False
+    for name in existing_names:
+        source_name = _prepared_queue_source_name(name)
+        index = _prepared_queue_index(name)
+        if index is not None:
+            next_prepared_index = max(next_prepared_index, index + 1)
+        if source_name is None:
+            continue
+        materialized_source_names.add(source_name)
+        if source_name in source_names:
+            prepared_mode = True
+
+    for source_file in source_files:
+        if source_file.name in existing_names:
+            continue
+        if source_file.name in materialized_source_names:
+            continue
+        if prepared_mode:
+            while True:
+                target_name = f"id:{next_prepared_index:06d},orig:{source_file.name}"
+                next_prepared_index += 1
+                if target_name not in existing_names:
+                    break
+        else:
+            target_name = source_file.name
+        target_file = target_queue_dir / target_name
+        tmp_file = target_file.with_name(target_file.name + ".tmp")
+        shutil.copy2(source_file, tmp_file)
+        tmp_file.replace(target_file)
+        existing_names.add(target_name)
+        if prepared_mode:
+            materialized_source_names.add(source_file.name)
+
+
+def _prepared_queue_source_name(file_name: str) -> Optional[str]:
+    marker = ",orig:"
+    if not file_name.startswith("id:") or marker not in file_name:
+        return None
+    prefix, source_name = file_name.split(marker, 1)
+    raw_index = prefix.removeprefix("id:")
+    if len(raw_index) != 6 or not raw_index.isdigit() or not source_name:
+        return None
+    return source_name
+
+
+def _prepared_queue_index(file_name: str) -> Optional[int]:
+    marker = ",orig:"
+    if not file_name.startswith("id:") or marker not in file_name:
+        return None
+    raw_index = file_name.split(marker, 1)[0].removeprefix("id:")
+    if len(raw_index) != 6 or not raw_index.isdigit():
+        return None
+    return int(raw_index)
+
+
 def _resolve_latest_report_dir(run_dir: Path) -> Path:
     report_base = run_dir / "campaign_reports"
     if not report_base.is_dir():
@@ -392,6 +483,7 @@ def _run_single_matrix_entry(
     run_dir: Path,
 ) -> MatrixRunRecord:
     _ensure_empty_run_dir(run_dir)
+    _sync_live_source_queue(config.source_queue_dir)
 
     env_overrides = dict(variant.env)
     env_overrides.update(config.runtime_env)

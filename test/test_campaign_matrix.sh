@@ -562,9 +562,110 @@ def run_missing_comparability_scenario() -> None:
         )
 
 
+def run_live_source_queue_sync_scenario() -> None:
+    with tempfile.TemporaryDirectory(prefix="symcc-campaign-matrix-live.") as tmp:
+        work_root = pathlib.Path(tmp)
+        live_queue_dir = work_root / "live_handoff" / "producer_queue"
+        live_queue_dir.mkdir(parents=True, exist_ok=True)
+        (live_queue_dir / "seed-a").write_text("seed-a\n", encoding="utf-8")
+
+        matrix_queue_dir = work_root / "afl_out" / "master" / "queue"
+        matrix_queue_dir.mkdir(parents=True, exist_ok=True)
+        (matrix_queue_dir / "id:000001,orig:seed-a").write_text(
+            "seed-a\n",
+            encoding="utf-8",
+        )
+
+        observed_queue_files: list[str] = []
+
+        def fake_close(*, budget_sec: float) -> int:
+            env = dict(os.environ)
+            variant_name = detect_variant(env)
+            work_dir = pathlib.Path(env["WORK_DIR"])
+            repeat_index = repeat_index_from_work_dir(work_dir)
+            source_queue = pathlib.Path(env["FOLLOW_DIFF_SOURCE_DIR"])
+            observed_queue_files.append(
+                f"{variant_name}:{repeat_index}:"
+                + ",".join(path.name for path in sorted(source_queue.iterdir()))
+            )
+            if variant_name == "full_stack" and repeat_index == 1:
+                (live_queue_dir / "seed-b").write_text(
+                    "seed-b\n",
+                    encoding="utf-8",
+                )
+                (live_queue_dir / "seed-c").write_text(
+                    "seed-c\n",
+                    encoding="utf-8",
+                )
+
+            summary = base_summary(40 + repeat_index, 8 + repeat_index, 0.5)
+            summary["comparability"] = {
+                "status": "comparable",
+                "reason": "ok",
+                "aggregation_key": expected_aggregation_key(
+                    work_root=work_root,
+                    variant_name=variant_name,
+                    budget_sec=5,
+                ),
+                "baseline_compare_key": expected_baseline_compare_key(
+                    work_root=work_root,
+                    budget_sec=5,
+                    repeat_count=2,
+                ),
+            }
+            report_dir = work_dir / "campaign_reports" / f"report-{repeat_index:02d}"
+            write_summary(report_dir, summary)
+            (work_dir / "campaign_close.summary.json").write_text(
+                json.dumps({"status": "success"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            return 0
+
+        old_live_source = os.environ.get("CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_DIR")
+        old_live_limit = os.environ.get("CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_LIMIT")
+        os.environ["CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_DIR"] = str(live_queue_dir)
+        os.environ["CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_LIMIT"] = "2"
+        try:
+            with patched_close(fake_close):
+                exit_code = cli_main(
+                    [
+                        "campaign-matrix",
+                        "--matrix-file",
+                        str(DEFAULT_MATRIX_FILE),
+                        "--budget-sec",
+                        "5",
+                        "--repeat",
+                        "2",
+                        "--work-root",
+                        str(work_root),
+                    ]
+                )
+        finally:
+            if old_live_source is None:
+                os.environ.pop("CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_DIR", None)
+            else:
+                os.environ["CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_DIR"] = old_live_source
+            if old_live_limit is None:
+                os.environ.pop("CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_LIMIT", None)
+            else:
+                os.environ["CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_LIMIT"] = old_live_limit
+
+        assert_true(exit_code == 0, f"live source sync 场景 exit_code={exit_code!r} != 0")
+        assert_true(
+            observed_queue_files[0] == "full_stack:1:id:000001,orig:seed-a",
+            f"第一个 run 不应重复复制已物化 seed: {observed_queue_files!r}",
+        )
+        assert_true(
+            observed_queue_files[1]
+            == "full_stack:2:id:000001,orig:seed-a,id:000002,orig:seed-b",
+            f"第二个 run 未按 prepared queue 命名和 queue limit 同步新 seed: {observed_queue_files!r}",
+        )
+
+
 run_comparable_scenario()
 run_non_comparable_scenario()
 run_runtime_env_scenario()
 run_missing_comparability_scenario()
+run_live_source_queue_sync_scenario()
 print("PASS: campaign matrix regression test passed")
 PY

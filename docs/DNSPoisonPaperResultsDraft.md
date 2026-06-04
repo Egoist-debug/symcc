@@ -126,6 +126,37 @@
 
 > `knot-resolver` 上的四个变体也都完成了 `repeat=5`，并且在 `queue_limit=8` 样本池下全部收敛到 `no_diff`。这让 RQ3 当前同时拥有两条稳定 `oracle_diff` 路径（dnsmasq、maradns）和一条稳定 `no_diff` 路径（knot-resolver），说明四个 hybrid 变体在 4 倍样本池的真实批次里仍未拉开主导语义差异。
 
+## RQ3 unbound/smartdns 多样本消融
+
+当前正式表：
+
+- [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
+- [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
+
+当前批次：
+
+- `experiments/results/real_rq3_multi_resolver_ablation/20260603_121445`
+- `queue_limit = 8`
+- `repeat = 5`
+- `budget_sec = 120`
+
+当前结果：
+
+| resolver | variant_name | run_count | variance_status | total_samples_mean | unknown_samples_mean | cluster_count_mean | semantic_counts_mean_json |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `unbound` | `full_stack` | `5` | `ok` | `8.000000` | `0.000000` | `1.000000` | `{"oracle_and_cache_diff": 8.0}` |
+| `unbound` | `afl_only` | `5` | `ok` | `8.000000` | `0.000000` | `1.000000` | `{"oracle_and_cache_diff": 8.0}` |
+| `unbound` | `no_mutator` | `5` | `ok` | `8.000000` | `0.000000` | `1.000000` | `{"oracle_and_cache_diff": 8.0}` |
+| `unbound` | `no_cache_delta` | `5` | `ok` | `8.000000` | `0.000000` | `1.000000` | `{"oracle_and_cache_diff": 8.0}` |
+| `smartdns` | `full_stack` | `5` | `ok` | `8.000000` | `0.000000` | `2.000000` | `{"oracle_and_cache_diff": 2.0, "oracle_diff": 6.0}` |
+| `smartdns` | `afl_only` | `5` | `ok` | `8.000000` | `0.000000` | `2.000000` | `{"oracle_and_cache_diff": 2.0, "oracle_diff": 6.0}` |
+| `smartdns` | `no_mutator` | `5` | `ok` | `8.000000` | `0.000000` | `2.000000` | `{"oracle_and_cache_diff": 2.0, "oracle_diff": 6.0}` |
+| `smartdns` | `no_cache_delta` | `5` | `ok` | `8.000000` | `0.000000` | `2.000000` | `{"oracle_and_cache_diff": 2.0, "oracle_diff": 6.0}` |
+
+当前可直接写入正文的表述：
+
+> `unbound` 与 `smartdns` 的 RQ3 补跑也完成了 `repeat=5` 的四变体消融，并且所有行均为 `variance_status=ok`、`unknown_samples_mean=0`。`unbound` 的四个变体全部稳定为 `oracle_and_cache_diff`，`smartdns` 的四个变体全部稳定为 `6` 个 `oracle_diff` 加 `2` 个 `oracle_and_cache_diff` 的混合分布。这说明 RQ3 当前已在 5 个 secondary resolver 上形成同一保守结论：当前稳定样本池里四个 hybrid 变体没有拉开主导语义差异，但不同 resolver 之间的语义类别可以稳定区分。
+
 ## RQ5 多 resolver 多样本主表
 
 当前正式表：
@@ -182,8 +213,8 @@
 1. `DST1 transcript` 在当前 producer 接口上具备稳定可接入性
 2. 多 resolver full_stack 主线已经在 `queue_limit=8`、`budget_sec=120`、`repeat=5` 的真实多样本批次上完整跑通
 3. `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已出现可区分的三类语义结果（oracle+cache 双差异、仅 oracle 差异、无差异）
-4. `dnsmasq / maradns` 的四个 RQ3 变体稳定落为 `oracle_diff`，`knot-resolver` 的四个变体稳定落为 `no_diff`
-5. `unbound` 与 `smartdns` 在新批次中已不再落入 `runtime_or_parse_failure`，分别稳定表现为 `oracle_and_cache_diff` 与 `oracle_diff`+`oracle_and_cache_diff` 混合
+4. `dnsmasq / maradns / knot-resolver / unbound / smartdns` 的四个 RQ3 变体都在各自 resolver 内保持主导语义一致，当前未观测到变体差异
+5. `unbound` 与 `smartdns` 在 RQ3/RQ5 新批次中已不再落入 `runtime_or_parse_failure`，分别稳定表现为 `oracle_and_cache_diff` 与 `oracle_diff`+`oracle_and_cache_diff` 混合
 
 ## 当前仍应保守处理的结论
 

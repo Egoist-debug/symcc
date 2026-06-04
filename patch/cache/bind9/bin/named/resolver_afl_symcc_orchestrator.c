@@ -1131,8 +1131,8 @@ request_injector_thread(void *arg) {
 
 	if (use_afl_persistent_driver()) {
 		/*
-		 * 这里保留现有的 SIGSTOP 持久化节奏，因为 testcase 注入运行在
-		 * 独立线程里；只把输入来源切换到 AFL shared-memory buffer。
+		 * testcase 注入仍在独立线程里执行；持久化握手交给
+		 * AFL 官方的 __AFL_LOOP 驱动。
 		 */
 		if (persistent_debug_enabled()) {
 			fprintf(stderr,
@@ -1155,9 +1155,9 @@ request_injector_thread(void *arg) {
 				"[resolver-afl-symcc][debug] testcase buffer ready\n");
 		}
 
-		for (int loop = 0; loop < 100000; loop++) {
+		for (int loop = 0; __AFL_LOOP(100000); loop++) {
 #ifdef NAMED_AFL_FUZZ_FALLBACK
-			length = read(STDIN_FILENO, (void *)afl_request, 65536);
+			length = named_afl_fuzz_len;
 #else
 			length = (ssize_t)__AFL_FUZZ_TESTCASE_LEN;
 #endif
@@ -1173,9 +1173,8 @@ request_injector_thread(void *arg) {
 				if (persistent_debug_enabled()) {
 					fprintf(stderr,
 						"[resolver-afl-symcc][debug] "
-						"empty testcase, SIGSTOP\n");
+						"empty testcase, skipping\n");
 				}
-				raise(SIGSTOP);
 #endif
 				continue;
 			}
@@ -1185,10 +1184,9 @@ request_injector_thread(void *arg) {
 				if (persistent_debug_enabled()) {
 					fprintf(stderr,
 						"[resolver-afl-symcc][debug] "
-						"unsupported len=%zd, SIGSTOP\n",
+						"unsupported len=%zd, skipping\n",
 						length);
 				}
-				raise(SIGSTOP);
 				continue;
 			}
 
@@ -1208,9 +1206,8 @@ request_injector_thread(void *arg) {
 			if (persistent_debug_enabled()) {
 				fprintf(stderr,
 					"[resolver-afl-symcc][debug] case done, "
-					"SIGSTOP\n");
+					"continuing AFL loop\n");
 			}
-			raise(SIGSTOP);
 		}
 
 		shutdown_named();

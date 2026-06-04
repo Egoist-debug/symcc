@@ -78,7 +78,7 @@
 
 状态：
 
-- `部分完成（3 个 resolver 的 repeat=5 多样本消融已完成，长期预算与 gate 对照未完成）`
+- `部分完成（5 个 resolver 的 repeat=5 多样本消融已完成，长期预算与 gate 对照未完成）`
 
 证据：
 
@@ -88,13 +88,17 @@
 - [RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)
 - [DNSPoisonRQ3KnotMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3KnotMultiSample.md)
 - [RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)
+- [DNSPoisonRQ3UnboundSmartdnsMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3UnboundSmartdnsMultiSample.md)
+- [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
+- [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
 - 原始统计表：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260522_083406/resolver_variant_summary.tsv`
   - `experiments/results/real_rq3_multi_resolver_ablation/20260523_093620/resolver_variant_summary.tsv`
+  - `experiments/results/real_rq3_multi_resolver_ablation/20260603_121445/resolver_variant_summary.tsv`
 
 边界：
 
-- `dnsmasq / maradns / knot-resolver` 已完成 `queue_limit=2`、`repeat=5`、`budget-sec=12` 的真实多样本消融
+- `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已完成 `queue_limit=8`、`repeat=5`、`budget-sec=120` 的真实多样本消融主表
 - 当前覆盖 `full_stack / afl_only / no_mutator / no_cache_delta`
 - 仍未覆盖“无 high-value gate”，也还没达到计划要求的更大样本池和长期预算
 
@@ -147,7 +151,7 @@
 | 验收项 | 状态 | 证据 | 当前边界 |
 | --- | --- | --- | --- |
 | 固定预算实验 | `部分完成` | `queue_limit=4`、`budget-sec=12` 的正式主表已落盘；批次见 `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260523_095431` | 还没有 `1h/6h/24h` 三档 |
-| 每个配置至少 5 次重复 | `部分完成` | [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)、[RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)、[RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)、[RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv) | RQ1/RQ2/RQ4 仍未达到同口径重复次数 |
+| 每个配置至少 5 次重复 | `部分完成` | [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)、[RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)、[RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)、[RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)、[RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)、[RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv) | RQ1/RQ2/RQ4 仍未达到同口径重复次数 |
 | 每个 run 生成 `evidence_bundle.json/summary.json/oracle_audit.tsv/failure_taxonomy.tsv/cluster.tsv/case_studies/index.tsv` | `部分完成` | 真实 `campaign_reports/...` 已有 `summary.json/ablation_matrix.tsv/cluster_counts.tsv/repro_rate.tsv/oracle_audit.tsv/oracle_reliability.json/failure_taxonomy.tsv/exclusion_summary.tsv/evidence_bundle.json` | 真实 batch 目前没有看到 `cluster.tsv` 与 `case_studies/index.tsv` 的统一落盘 |
 | 至少 2 到 5 个端到端 case study | `已完成` | `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260522_073442/manual_case_studies/index.tsv` | 当前已有 `4` 个代表性 case；当前 queue_limit=4 主表仍可补同批次案例说明 |
 | 失败样本明确分类 | `部分完成` | `failure_taxonomy.tsv`、`resolver_semantic_distribution.tsv` 已存在 | 论文级 failure taxonomy 仍需更大样本 |
@@ -166,8 +170,8 @@
    - 虽然 `dnslabctl backend` 已完成真实 backend 对照，但默认主链仍是 Python。
 2. **RQ1/RQ2/RQ4 缺少正式对照实验结果**
    - 当前主要正式证据集中在 RQ3/RQ5。
-3. **RQ5 仍缺更大队列与更长预算，RQ3 仍缺 gate 对照**
-   - `queue_limit=4`、`budget_sec=12` 仍偏保守，`no_high_value_gate` 还未纳入正式表。
+3. **RQ5/RQ3 仍缺长期预算，RQ3 仍缺 gate 对照**
+   - RQ3 当前已有 `queue_limit=8`、`budget_sec=120`、`repeat=5` 主表，但 `no_high_value_gate` 和 `600s+` 长预算还未纳入正式表。
 4. **当前 queue_limit=4 主表仍缺同批次人工 case study 说明**
    - 现有 `4` 个代表性案例来自上一轮主表，当前可继续补齐同批次说明。
 

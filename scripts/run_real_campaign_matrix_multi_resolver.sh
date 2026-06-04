@@ -175,6 +175,8 @@ run_matrix() {
 		SMARTDNS_BUILD_TREE="$secondary_build" \
 		MARADNS_BUILD_TREE="$secondary_build" \
 		KNOT_RESOLVER_BUILD_TREE="$secondary_build" \
+		CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_DIR="$PRODUCER_QUEUE_DIR" \
+		CAMPAIGN_MATRIX_LIVE_SOURCE_QUEUE_LIMIT="$QUEUE_LIMIT" \
 		python3 -m tools.dns_diff.cli campaign-matrix \
 			--matrix-file "$matrix_file" \
 			--budget-sec "$BUDGET_SEC" \

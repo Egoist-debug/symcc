@@ -76,7 +76,9 @@ salvage_run() {
 run_resolver() {
 	local resolver="$1" src="" build="" env_resolver="" queue_dir="$BASE_DIR/$resolver/afl_out/master/queue"
 	case "$resolver" in
+		unbound) src="$ROOT_DIR/experiments/subjects/unbound/release-1.24.2"; build="$ROOT_DIR/experiments/subjects/unbound/release-1.24.2-build/unbound-afl"; env_resolver="unbound" ;;
 		dnsmasq) src="$ROOT_DIR/experiments/subjects/dnsmasq/v2.92"; build="$ROOT_DIR/experiments/subjects/dnsmasq/v2.92-build"; env_resolver="dnsmasq" ;;
+		smartdns) src="$ROOT_DIR/experiments/subjects/smartdns/Release47.1"; build="$ROOT_DIR/experiments/subjects/smartdns/Release47.1-build"; env_resolver="smartdns" ;;
 		maradns) src="$ROOT_DIR/experiments/subjects/maradns/deadwood-3.3.02"; build="$ROOT_DIR/experiments/subjects/maradns/deadwood-3.3.02-build"; env_resolver="maradns" ;;
 		knot) src="$ROOT_DIR/experiments/subjects/knot-resolver/v6.2.0"; build="$ROOT_DIR/experiments/subjects/knot-resolver/v6.2.0-build"; env_resolver="knot-resolver" ;;
 		*) printf 'ASSERT FAIL: 未知 resolver %s\n' "$resolver" >&2; exit 1 ;;
@@ -99,15 +101,18 @@ run_resolver() {
 				ENABLE_TRIAGE=1 \
 				ENABLE_SYMCC="$(variant_env_value "$variant" ENABLE_SYMCC)" \
 				BIND9_AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/v9.20.22-build/bind9-afl" \
-				BIND9_SRC_TREE="$ROOT_DIR/experiments/subjects/bind9/v9.20.22" \
-				BIND9_NAMED_CONF_TEMPLATE="$ROOT_DIR/named_experiment/runtime/named.conf" \
-				RESPONSE_CORPUS_DIR="$ROOT_DIR/named_experiment/work/response_corpus" \
-				DNSMASQ_SRC_TREE="$src" \
-				MARADNS_SRC_TREE="$src" \
-				KNOT_RESOLVER_SRC_TREE="$src" \
-				AFL_TREE="$build" \
-				DNSMASQ_BUILD_TREE="$build" \
-				MARADNS_BUILD_TREE="$build" \
+					BIND9_SRC_TREE="$ROOT_DIR/experiments/subjects/bind9/v9.20.22" \
+					BIND9_NAMED_CONF_TEMPLATE="$ROOT_DIR/named_experiment/runtime/named.conf" \
+					RESPONSE_CORPUS_DIR="$ROOT_DIR/named_experiment/work/response_corpus" \
+					UNBOUND_SRC_TREE="$src" \
+					DNSMASQ_SRC_TREE="$src" \
+					SMARTDNS_SRC_TREE="$src" \
+					MARADNS_SRC_TREE="$src" \
+					KNOT_RESOLVER_SRC_TREE="$src" \
+					AFL_TREE="$build" \
+					DNSMASQ_BUILD_TREE="$build" \
+					SMARTDNS_BUILD_TREE="$build" \
+					MARADNS_BUILD_TREE="$build" \
 				KNOT_RESOLVER_BUILD_TREE="$build" \
 				python3 -m tools.dns_diff.cli campaign-close --budget-sec "$BUDGET_SEC"; then
 				run_status="pass"

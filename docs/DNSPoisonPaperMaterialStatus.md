@@ -149,14 +149,14 @@
 1. 一张新的 RQ1 多样本输入可接入性表
 2. 一张 `queue_limit=4`、`repeat=5` 的 RQ5 多样本 full_stack 主表
 3. 一组 `5 resolver` 全部 `pass` 的真实 smoke batch
-4. 一组 `dnsmasq / maradns / knot-resolver` 的 RQ3 多 resolver 多样本消融表
+4. 一组 `dnsmasq / maradns / knot-resolver / unbound / smartdns` 的 RQ3 多 resolver 多样本消融表
 5. 一张明确显示 `dnsmasq / maradns / knot-resolver / unbound / smartdns` 已开始分化的 RQ5 结果说明
 6. 一组 `4` 个端到端人工 case study
 
 当前仓库距离“整份论文实验完成”还差三步：
 
 1. 把 `queue_limit` 从 `4` 继续抬到 `8`，或在 `queue_limit=4` 下延长预算
-2. 在现有 `dnsmasq / maradns / knot-resolver` 三条路径基础上补“无 high-value gate”与更大样本池，继续验证 RQ3 增益
+2. 在现有 `5 resolver` RQ3 主表基础上补“无 high-value gate”与长期预算，继续验证 RQ3 增益
 3. 把 `runtime_or_parse_failure` 再细分成更可发表的真值类别
 
 ### dnsmasq 多样本 RQ3 消融结果
@@ -171,13 +171,13 @@
 当前可直接写入论文的保守结论：
 
 - `dnsmasq` 上的 `full_stack / afl_only / no_mutator / no_cache_delta` 四个变体都完成了 `repeat=5`
-- 当前 `queue_limit=2` 的样本池下，四个变体都收敛到相同的 `oracle_diff`
+- 当前 `queue_limit=8`、`budget_sec=120` 的样本池下，四个变体都收敛到相同的 `oracle_diff`
 - 这表示当前批次还看不出明确的 hybrid 增益，后续需要继续扩大样本池再做判断
 
 当前结论边界：
 
 - 这不是对 `SYMCC / mutator / cache-delta` 价值的否定
-- 这只是对当前 `dnsmasq + queue_limit=2` 批次的真实观测
+- 这只是对当前 `dnsmasq + queue_limit=8 + budget_sec=120` 批次的真实观测
 - 后续若样本池扩大，结果可能发生变化
 
 ### maradns 多样本 RQ3 消融结果
@@ -209,6 +209,24 @@
 - `knot-resolver` 现在也已经在 `full_stack / afl_only / no_mutator / no_cache_delta` 四个变体上全部完成 `repeat=5`
 - 四个变体都稳定收敛到 `no_diff`
 - 当前 RQ3 已经同时拥有 `oracle_diff` 正样例路径和 `no_diff` 负对照路径，三条 resolver 的保守结论一致指向“当前变体差异不显著”
+
+### unbound/smartdns 多样本 RQ3 消融结果
+
+- 批次目录：
+  - `experiments/results/real_rq3_multi_resolver_ablation/20260603_121445`
+- repo 内正式表：
+  - [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
+  - [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
+- 结果说明：
+  - [DNSPoisonRQ3UnboundSmartdnsMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3UnboundSmartdnsMultiSample.md)
+
+这说明：
+
+- `unbound` 与 `smartdns` 也已经在 `full_stack / afl_only / no_mutator / no_cache_delta` 四个变体上全部完成 `repeat=5`
+- 所有行均为 `variance_status=ok`、`unknown_samples_mean=0`
+- `unbound` 四个变体稳定收敛到 `oracle_and_cache_diff`
+- `smartdns` 四个变体稳定收敛到 `6` 个 `oracle_diff` 加 `2` 个 `oracle_and_cache_diff` 的混合分布
+- 当前 RQ3 已经扩展到 5 个 secondary resolver；它足够支撑“当前稳定样本池下变体差异不显著”的论文保守结论，但仍不足以宣称 hybrid 组件显著增益
 
 ### RQ5 failure refinement
 
