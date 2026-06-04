@@ -36,6 +36,14 @@ printf '%s\n' "$OUT" | grep -F "FUZZ_PROFILE=poison-stateful" >/dev/null || {
 	printf 'ASSERT FAIL: dry-run 未包含 poison-stateful producer profile\n' >&2
 	exit 1
 }
+printf '%s\n' "$OUT" | grep -F "DST1_MUTATOR_ONLY=1" >/dev/null || {
+	printf 'ASSERT FAIL: dry-run 未启用 DST1 mutator-only producer 默认值\n' >&2
+	exit 1
+}
+printf '%s\n' "$OUT" | grep -F "NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS=100000" >/dev/null || {
+	printf 'ASSERT FAIL: dry-run 未包含 persistent iters producer 默认值\n' >&2
+	exit 1
+}
 printf '%s\n' "$OUT" | grep -F "DRY-RUN producer-long background=1" >/dev/null || {
 	printf 'ASSERT FAIL: all dry-run 未说明 producer-long 后台运行\n' >&2
 	exit 1

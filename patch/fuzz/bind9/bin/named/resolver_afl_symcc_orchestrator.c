@@ -147,8 +147,6 @@ maybe_dump_cache(void) {
 	for (view = ISC_LIST_HEAD(named_g_server->viewlist); view != NULL;
 	     view = ISC_LIST_NEXT(view, link))
 	{
-		isc_result_t result;
-
 		if (view->cachedb == NULL) {
 			continue;
 		}
@@ -264,6 +262,27 @@ load_reply_timeout_ms(void) {
 	return value;
 }
 
+static unsigned int
+load_persistent_loop_limit(void) {
+	const char *env = getenv("NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS");
+	char *endp = NULL;
+	unsigned long value;
+
+	if (env == NULL || *env == '\0') {
+		return 100000U;
+	}
+
+	errno = 0;
+	value = strtoul(env, &endp, 10);
+	if (errno != 0 || endp == env || *endp != '\0' || value == 0 ||
+	    value > 1000000UL)
+	{
+		return 100000U;
+	}
+
+	return (unsigned int)value;
+}
+
 static bool
 load_request_input_path(const char *config, char *path, size_t path_size) {
 	const char *cursor = config;
@@ -330,16 +349,6 @@ read_request_bytes(const char *config, uint8_t *request, size_t request_size) {
 	length = read(fd, request, request_size);
 	close(fd);
 	return length;
-}
-
-static void
-shutdown_named(void) {
-	if (named_g_server != NULL) {
-		named_server_flushonshutdown(named_g_server, false);
-	}
-	if (named_g_loopmgr != NULL) {
-		isc_loopmgr_shutdown(named_g_loopmgr);
-	}
 }
 
 static void
@@ -736,9 +745,11 @@ cancel_request_client(ns_client_t *client) {
 
 static void
 resolver_afl_symcc_request_done_notify(void) {
-	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
-
-	finish_request_context(ctx, ISC_R_SUCCESS);
+	/*
+	 * ns_client_endrequest() can be called again from handle reset after the
+	 * injector thread has already moved to the next testcase.  Completion is
+	 * therefore reported from sendcb, which is tied to the active reply path.
+	 */
 }
 
 static void
@@ -777,6 +788,7 @@ resolver_afl_symcc_client_sendcb(isc_buffer_t *buffer) {
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->reply_sent = true;
 	pthread_mutex_unlock(&ctx->mutex);
+	finish_request_context(ctx, ISC_R_SUCCESS);
 }
 
 static void
@@ -795,25 +807,34 @@ resolver_afl_symcc_request_connected(isc_nmhandle_t *handle,
 		return;
 	}
 
+	pthread_mutex_lock(&ctx->mutex);
+	timed_out = ctx->timed_out;
+	pthread_mutex_unlock(&ctx->mutex);
+	if (timed_out) {
+		isc_nmhandle_detach(&handle);
+		finish_request_context(ctx, ISC_R_TIMEDOUT);
+		return;
+	}
+
 	ifp.mgr = named_g_server->interfacemgr;
 	clientmgr = ns_interfacemgr_getclientmgr(ifp.mgr);
 	client = isc_nmhandle_getdata(handle);
 	if (client == NULL) {
 		client = isc_mem_get(clientmgr->mctx, sizeof(*client));
 		ns__client_setup(client, clientmgr, true);
+	} else {
+		ns__client_setup(client, NULL, false);
+	}
+	client->state = NS_CLIENTSTATE_READY;
+	if (client->handle == NULL) {
 		isc_nmhandle_setdata(handle, client, ns__client_reset_cb,
 				     ns__client_put_cb);
 		client->handle = handle;
-	} else {
-		ns__client_setup(client, NULL, false);
 	}
 
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->client = client;
 	timed_out = ctx->timed_out;
-	if (ctx->result == ISC_R_UNSET) {
-		ctx->result = ISC_R_SUCCESS;
-	}
 	pthread_mutex_unlock(&ctx->mutex);
 
 	if (timed_out) {
@@ -913,9 +934,7 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 		rc = pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &deadline);
 		if (rc == ETIMEDOUT) {
 			ctx->timed_out = true;
-			if (ctx->result == ISC_R_UNSET) {
-				ctx->result = ISC_R_TIMEDOUT;
-			}
+			ctx->result = ISC_R_TIMEDOUT;
 			client = ctx->client;
 			break;
 		}
@@ -1124,10 +1143,12 @@ request_injector_thread(void *arg) {
 	long timeout_ms;
 	ssize_t length;
 	isc_result_t result;
+	unsigned int persistent_loop_limit;
 
 	wait_until_named_running();
 
 	timeout_ms = load_reply_timeout_ms();
+	persistent_loop_limit = load_persistent_loop_limit();
 
 	if (use_afl_persistent_driver()) {
 		/*
@@ -1155,7 +1176,7 @@ request_injector_thread(void *arg) {
 				"[resolver-afl-symcc][debug] testcase buffer ready\n");
 		}
 
-		for (int loop = 0; __AFL_LOOP(100000); loop++) {
+		for (int loop = 0; __AFL_LOOP(persistent_loop_limit); loop++) {
 #ifdef NAMED_AFL_FUZZ_FALLBACK
 			length = named_afl_fuzz_len;
 #else
@@ -1199,8 +1220,7 @@ request_injector_thread(void *arg) {
 					result);
 			}
 			if (result == ISC_R_TIMEDOUT) {
-				shutdown_named();
-				return NULL;
+				continue;
 			}
 
 			if (persistent_debug_enabled()) {
@@ -1210,8 +1230,7 @@ request_injector_thread(void *arg) {
 			}
 		}
 
-		shutdown_named();
-		return NULL;
+		print_stats_and_exit(orchestrator);
 	}
 
 	length = read_request_bytes(orchestrator->config, request,

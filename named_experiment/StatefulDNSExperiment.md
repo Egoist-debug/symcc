@@ -51,7 +51,8 @@ export FUZZ_PROFILE=poison-stateful
 
 ```bash
 export TRANSCRIPT_MAX_ITER=512
-export AFL_TIMEOUT_MS=5000+
+export AFL_TIMEOUT_MS=7000
+export NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS=100000
 export REPLY_TIMEOUT_MS=120
 ```
 
@@ -232,7 +233,7 @@ named_experiment/run_named_afl_symcc.sh stop
 export FUZZ_PROFILE=poison-stateful
 export TRANSCRIPT_MAX_ITER=512
 export RESPONSE_MAX_ITER=512
-export AFL_TIMEOUT_MS=5000+
+export AFL_TIMEOUT_MS=7000
 . named_experiment/profiles/poison-stateful.env
 named_experiment/run_named_afl_symcc.sh prepare
 named_experiment/run_named_afl_symcc.sh start

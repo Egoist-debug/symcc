@@ -675,6 +675,12 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_post_process
     return geninput::storeOutput(*State, *Canonical, OutBuf);
   }
 
+  if (geninput::isMutatorOnlyEnabled()) {
+    *OutBuf = nullptr;
+    State->Output.clear();
+    return 0;
+  }
+
   if (Input.empty()) {
     return 0;
   }

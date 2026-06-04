@@ -76,7 +76,10 @@ then
 fi
 
 assert_file_contains "$POISON_TRACE" "export ENABLE_DST1_MUTATOR=1"
-assert_file_contains "$POISON_TRACE" "export DST1_MUTATOR_ONLY=0"
+assert_file_contains "$POISON_TRACE" "export DST1_MUTATOR_ONLY=1"
+assert_file_contains "$POISON_TRACE" "AFL_TIMEOUT_MS=7000"
+assert_file_not_contains "$POISON_TRACE" "AFL_TIMEOUT_MS=7000+"
+assert_file_contains "$POISON_TRACE" "export NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS=100000"
 assert_file_contains "$POISON_TRACE" "export SYMCC_FRONTIER_RELOAD_SEC=15"
 assert_file_contains "$POISON_TRACE" "export SYMCC_FRONTIER_RETRY_LIMIT=1"
 assert_file_contains "$POISON_TRACE" "SRC_TREE=$EXPECTED_SRC_TREE"

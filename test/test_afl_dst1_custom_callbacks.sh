@@ -372,6 +372,24 @@ std::vector<uint8_t> callPostProcess(const MutatorApi &api,
   return std::vector<uint8_t>(outBuf, outBuf + outLen);
 }
 
+std::vector<uint8_t> callPostProcessAllowEmpty(
+    const MutatorApi &api,
+    void *state,
+    const std::vector<uint8_t> &input) {
+  std::vector<uint8_t> inputCopy = input;
+  unsigned char *outBuf = nullptr;
+  size_t outLen = api.postProcess(state,
+                                  inputCopy.empty() ? nullptr : inputCopy.data(),
+                                  inputCopy.size(), &outBuf);
+  if (outLen == 0) {
+    require(outBuf == nullptr,
+            "afl_custom_post_process 空结果不应设置 OutBuf");
+    return {};
+  }
+  require(outBuf != nullptr, "afl_custom_post_process 非空结果未设置 OutBuf");
+  return std::vector<uint8_t>(outBuf, outBuf + outLen);
+}
+
 void testFuzzAndCount(const MutatorApi &api) {
   const auto base = buildBaseTranscript();
   const auto donor = buildCompatibleDonorTranscript();
@@ -490,13 +508,24 @@ void testPostProcess(const MutatorApi &api) {
   require(canonicalized == *canonical,
           "post_process 必须执行 parse/serialize 规范化");
 
+  require(setenv("DST1_MUTATOR_ONLY", "0", 1) == 0,
+          "无法设置 DST1_MUTATOR_ONLY=0");
   auto fallback = callPostProcess(api, session.state, invalid);
   require(!fallback.empty(), "post_process fallback 不得输出空结果");
   require(fallback == invalid,
-          "post_process 解析失败时必须安全回退到原始非空输入");
+          "非 mutator-only 模式解析失败时必须安全回退到原始非空输入");
+
+  require(setenv("DST1_MUTATOR_ONLY", "1", 1) == 0,
+          "无法设置 DST1_MUTATOR_ONLY=1");
+  auto filtered = callPostProcessAllowEmpty(api, session.state, invalid);
+  require(filtered.empty(),
+          "DST1_MUTATOR_ONLY=1 时 post_process 必须丢弃 non-parseable 输入");
+  require(unsetenv("DST1_MUTATOR_ONLY") == 0,
+          "无法清理 DST1_MUTATOR_ONLY");
 
   std::cout << "PASS post_process_canonicalization" << std::endl;
   std::cout << "PASS post_process_nonempty_fallback" << std::endl;
+  std::cout << "PASS post_process_mutator_only_filter" << std::endl;
 }
 
 void testTrim(const MutatorApi &api) {
@@ -598,6 +627,7 @@ assert_file_contains "$LOG_FILE" 'PASS malformed_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS queue_get_mutator_only_filter'
 assert_file_contains "$LOG_FILE" 'PASS post_process_canonicalization'
 assert_file_contains "$LOG_FILE" 'PASS post_process_nonempty_fallback'
+assert_file_contains "$LOG_FILE" 'PASS post_process_mutator_only_filter'
 assert_file_contains "$LOG_FILE" 'PASS trim_preserves_parseability'
 assert_file_contains "$LOG_FILE" 'PASS trim_makes_forward_progress'
 assert_file_contains "$LOG_FILE" 'PASS all_custom_callback_checks'
