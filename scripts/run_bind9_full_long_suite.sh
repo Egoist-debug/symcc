@@ -333,6 +333,7 @@ feedback_root = pathlib.Path(sys.argv[1])
 text_manifest = pathlib.Path(sys.argv[2])
 json_manifest = pathlib.Path(sys.argv[3])
 producer_root = pathlib.Path(sys.argv[4]).resolve()
+producer_queue = producer_root / "afl_out" / "master" / "queue"
 
 def utc_now() -> str:
     return (
@@ -346,6 +347,28 @@ def coerce_tier(value) -> int:
         return 0
     return max(0, min(value, 3))
 
+def producer_queue_equivalent(sample: pathlib.Path) -> pathlib.Path:
+    sample_name = sample.name
+    candidate_names = [sample_name]
+    marker = ",orig:"
+    if marker in sample_name:
+        candidate_names.append(sample_name.split(marker, 1)[1])
+
+    seen_names: set[str] = set()
+    for candidate_name in candidate_names:
+        if not candidate_name or candidate_name in seen_names:
+            continue
+        seen_names.add(candidate_name)
+        candidate = producer_queue / candidate_name
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.resolve() == sample.resolve() or candidate.read_bytes() == sample.read_bytes():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return sample
+
 def normalize_entry(entry: dict, source_manifest: pathlib.Path) -> dict | None:
     sample_path = entry.get("sample_path")
     if not isinstance(sample_path, str) or not sample_path.strip():
@@ -353,12 +376,13 @@ def normalize_entry(entry: dict, source_manifest: pathlib.Path) -> dict | None:
     resolved_sample = pathlib.Path(sample_path).expanduser().resolve()
     if not resolved_sample.is_file():
         return None
+    producer_sample = producer_queue_equivalent(resolved_sample)
     priority_tier = coerce_tier(entry.get("priority_tier"))
     if priority_tier <= 0:
         return None
     return {
-        "sample_path": str(resolved_sample),
-        "sample_id": str(entry.get("sample_id") or resolved_sample.name),
+        "sample_path": str(producer_sample),
+        "sample_id": str(entry.get("sample_id") or producer_sample.name),
         "analysis_state": str(entry.get("analysis_state") or "unknown"),
         "semantic_outcome": str(entry.get("semantic_outcome") or "unknown"),
         "oracle_audit_candidate": bool(entry.get("oracle_audit_candidate")),
@@ -522,6 +546,7 @@ resolver_long() {
 run_all() {
 	local producer_pid=""
 	local producer_status=0
+	local resolver_status=0
 
 	if is_dry_run; then
 		preflight
@@ -546,11 +571,15 @@ run_all() {
 	}
 	trap cleanup_all EXIT INT TERM
 
-	resolver_long
-	set +e
-	wait "$producer_pid"
-	producer_status="$?"
-	set -e
+	resolver_long || resolver_status="$?"
+	if [ "$resolver_status" -ne 0 ]; then
+		cleanup_all
+		producer_pid=""
+		trap - EXIT INT TERM
+		return "$resolver_status"
+	fi
+
+	wait "$producer_pid" || producer_status="$?"
 	producer_pid=""
 	scan_resolver_feedback
 	trap - EXIT INT TERM
@@ -578,4 +607,6 @@ main() {
 	esac
 }
 
-main "${1:-help}"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	main "${1:-help}"
+fi

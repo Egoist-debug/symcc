@@ -168,6 +168,47 @@ manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n
 PY
 }
 
+write_feedback_json_manifest() {
+  local manifest_path="$1"
+  local root_path="$2"
+  shift 2
+  python3 - "$manifest_path" "$root_path" "$@" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+root_path = pathlib.Path(sys.argv[2])
+entries = []
+for spec in sys.argv[3:]:
+    sample_path, tier = spec.split(":::", 1)
+    sample_name = pathlib.Path(sample_path).name
+    entries.append(
+        {
+            "sample_path": sample_path,
+            "sample_id": sample_name,
+            "analysis_state": "included" if int(tier) >= 3 else "excluded",
+            "semantic_outcome": "oracle_diff" if int(tier) >= 3 else "no_diff",
+            "oracle_audit_candidate": int(tier) >= 2,
+            "needs_manual_review": int(tier) >= 1,
+            "priority_tier": int(tier),
+            "source_manifest": str((root_path / "resolver" / "semantic_frontier_manifest.json").resolve()),
+        }
+    )
+
+payload = {
+    "contract_name": "semantic_frontier_manifest",
+    "contract_version": 1,
+    "generated_at": "2026-03-25T00:00:00Z",
+    "root": str(root_path),
+    "feedback_result_root": str((root_path / "resolver-feedback").resolve()),
+    "entries": entries,
+}
+manifest_path.parent.mkdir(parents=True, exist_ok=True)
+manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 prepare_fixture() {
   local work_root="$1"
   local out_dir="$work_root/afl_out"
@@ -331,6 +372,32 @@ scenario_same_tier_order_stable() {
     "$base_a_sample"
 }
 
+scenario_feedback_json_allows_metadata_fields() {
+  local helper_bin="$1"
+  local work_root="$2"
+  local queue_dir feedback_sample coverage_sample json_manifest log_file
+
+  queue_dir="$(prepare_fixture "$work_root")"
+  feedback_sample="$queue_dir/id:000001,src:000000,feedback"
+  coverage_sample="$queue_dir/id:000002,src:000000,+cov"
+  json_manifest="$work_root/semantic_frontier_manifest.json"
+  log_file="$work_root/helper.log"
+
+  printf 'feedback\n' > "$feedback_sample"
+  printf 'coverage\n' > "$coverage_sample"
+  write_feedback_json_manifest "$json_manifest" "$queue_dir" "$feedback_sample:::3"
+
+  env \
+    SYMCC_SEMANTIC_FRONTIER_MANIFEST="$json_manifest" \
+    timeout -k 1 4 "$helper_bin" \
+      -a master -o "$work_root/afl_out" -n exp -- /bin/true @@ >"$log_file" 2>&1 || true
+
+  assert_running_sequence "$log_file" "$feedback_sample"
+  assert_file_contains "$log_file" 'Loaded semantic frontier snapshot from semantic JSON manifest'
+  assert_file_contains "$log_file" "Picked high-value request sample from semantic JSON manifest (tier=3): $feedback_sample"
+  assert_file_not_contains "$log_file" 'semantic frontier JSON contract error: unexpected field'
+}
+
 main() {
   local helper_bin=""
   local work_root=""
@@ -342,6 +409,7 @@ main() {
   scenario_relative_json_priority_and_canonicalization "$helper_bin" "$work_root/relative-json"
   scenario_bad_json_reload_keeps_last_known_good "$helper_bin" "$work_root/reload-keep"
   scenario_same_tier_order_stable "$helper_bin" "$work_root/same-tier-order"
+  scenario_feedback_json_allows_metadata_fields "$helper_bin" "$work_root/feedback-json"
 
   printf 'PASS: semantic priority regression test passed\n'
 }

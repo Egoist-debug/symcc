@@ -349,18 +349,14 @@ static const JsonValue& require_json_field(
   return it->second;
 }
 
-static void require_exact_json_fields(
+static void require_json_required_fields(
     const std::map<std::string, JsonValue>& object,
-    const std::unordered_set<std::string>& expected_fields,
+    const std::unordered_set<std::string>& required_fields,
     const std::string& context) {
-  if (object.size() != expected_fields.size()) {
-    throw std::runtime_error("semantic frontier JSON contract error: unexpected field count in " +
-                             context);
-  }
-  for (const auto& [key, _] : object) {
-    if (expected_fields.find(key) == expected_fields.end()) {
-      throw std::runtime_error("semantic frontier JSON contract error: unexpected field '" +
-                               key + "' in " + context);
+  for (const auto& field : required_fields) {
+    if (object.find(field) == object.end()) {
+      throw std::runtime_error("semantic frontier JSON contract error: missing field '" +
+                               field + "' in " + context);
     }
   }
 }
@@ -766,9 +762,9 @@ static SemanticFrontierLoadResult load_json_frontier_snapshot(
   try {
     const auto payload = JsonParser(buffer.str()).parse();
     const auto& root_object = require_json_object(payload, "semantic frontier manifest");
-    require_exact_json_fields(root_object,
-                              {"contract_name", "contract_version", "generated_at", "root", "entries"},
-                              "semantic frontier manifest");
+    require_json_required_fields(root_object,
+                                 {"contract_name", "contract_version", "generated_at", "root", "entries"},
+                                 "semantic frontier manifest");
 
     const auto contract_name =
         require_json_string(require_json_field(root_object, "contract_name", "semantic frontier manifest"),
@@ -805,10 +801,10 @@ static SemanticFrontierLoadResult load_json_frontier_snapshot(
     for (std::size_t index = 0; index < entries.size(); ++index) {
       const auto entry_context = "semantic frontier manifest.entries[" + std::to_string(index) + "]";
       const auto& entry = require_json_object(entries[index], entry_context);
-      require_exact_json_fields(entry,
-                                {"sample_path", "sample_id", "analysis_state", "semantic_outcome",
-                                 "oracle_audit_candidate", "needs_manual_review", "priority_tier"},
-                                entry_context);
+      require_json_required_fields(entry,
+                                   {"sample_path", "sample_id", "analysis_state", "semantic_outcome",
+                                    "oracle_audit_candidate", "needs_manual_review", "priority_tier"},
+                                   entry_context);
 
       const auto sample_path =
           require_json_string(require_json_field(entry, "sample_path", entry_context),

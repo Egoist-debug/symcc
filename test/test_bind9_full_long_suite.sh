@@ -223,6 +223,8 @@ RUN_ROOT="$FEEDBACK_ROOT/dnsmasq/matrix_runs/full_stack/run-01/follow_diff"
 mkdir -p "$RUN_ROOT"
 HIGH_SAMPLE="$LIVE_QUEUE_DIR/id:000002,orig:b"
 LOW_SAMPLE="$LIVE_QUEUE_DIR/id:000001,orig:a"
+PRODUCER_HIGH_SAMPLE="$QUEUE_DIR/id:000002,orig:b"
+PRODUCER_LOW_SAMPLE="$QUEUE_DIR/id:000001,orig:a"
 python3 - "$RUN_ROOT/semantic_frontier_manifest.json" "$RUN_ROOT/high_value_samples.txt" "$HIGH_SAMPLE" "$LOW_SAMPLE" <<'PY'
 import json
 import pathlib
@@ -280,7 +282,7 @@ printf '%s\n' "$FEEDBACK_OUT" | grep -F "resolver feedback:" >/dev/null || {
 	printf 'ASSERT FAIL: scan-resolver-feedback 未写 producer semantic frontier manifest\n' >&2
 	exit 1
 }
-python3 - "$PRODUCER_WORK/high_value_samples.txt" "$PRODUCER_WORK/semantic_frontier_manifest.json" "$HIGH_SAMPLE" "$LOW_SAMPLE" <<'PY'
+python3 - "$PRODUCER_WORK/high_value_samples.txt" "$PRODUCER_WORK/semantic_frontier_manifest.json" "$PRODUCER_HIGH_SAMPLE" "$PRODUCER_LOW_SAMPLE" "$LOW_SAMPLE" <<'PY'
 import json
 import pathlib
 import sys
@@ -288,19 +290,143 @@ import sys
 text_manifest = pathlib.Path(sys.argv[1])
 json_manifest = pathlib.Path(sys.argv[2])
 high_sample = str(pathlib.Path(sys.argv[3]).resolve())
-low_sample = str(pathlib.Path(sys.argv[4]).resolve())
+producer_low_sample = str(pathlib.Path(sys.argv[4]).resolve())
+live_low_sample = str(pathlib.Path(sys.argv[5]).resolve())
 lines = text_manifest.read_text(encoding="utf-8").splitlines()
 if lines != [high_sample]:
-    raise SystemExit(f"ASSERT FAIL: high_value manifest 内容不正确: {lines!r}")
+	raise SystemExit(f"ASSERT FAIL: high_value manifest 内容不正确: {lines!r}")
 payload = json.loads(json_manifest.read_text(encoding="utf-8"))
 entries = payload.get("entries")
 if not isinstance(entries, list) or len(entries) != 1:
     raise SystemExit(f"ASSERT FAIL: semantic frontier entries 不正确: {payload!r}")
 entry = entries[0]
 if entry.get("sample_path") != high_sample or entry.get("priority_tier") != 3:
-    raise SystemExit(f"ASSERT FAIL: semantic frontier entry 不正确: {entry!r}")
-if low_sample in json.dumps(payload, ensure_ascii=False):
-    raise SystemExit("ASSERT FAIL: semantic frontier 不应包含 priority_tier=0 的 no_diff 样本")
+	raise SystemExit(f"ASSERT FAIL: semantic frontier entry 不正确: {entry!r}")
+serialized = json.dumps(payload, ensure_ascii=False)
+if producer_low_sample in serialized or live_low_sample in serialized:
+	raise SystemExit("ASSERT FAIL: semantic frontier 不应包含 priority_tier=0 的 no_diff 样本")
 PY
+
+MAPPED_STAMP=resolver-copy-feedback
+MAPPED_FEEDBACK_ROOT="$WORKDIR/live-suite/resolver_long_matrix/$MAPPED_STAMP"
+MAPPED_RUN_ROOT="$MAPPED_FEEDBACK_ROOT/dnsmasq/matrix_runs/full_stack/run-01/follow_diff"
+MAPPED_RESOLVER_QUEUE="$MAPPED_FEEDBACK_ROOT/dnsmasq/afl_out/master/queue"
+mkdir -p "$MAPPED_RUN_ROOT" "$MAPPED_RESOLVER_QUEUE"
+MAPPED_RESOLVER_SAMPLE="$MAPPED_RESOLVER_QUEUE/id:000001,orig:$(basename "$HIGH_SAMPLE")"
+cp "$HIGH_SAMPLE" "$MAPPED_RESOLVER_SAMPLE"
+python3 - "$MAPPED_RUN_ROOT/semantic_frontier_manifest.json" "$MAPPED_RESOLVER_SAMPLE" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = pathlib.Path(sys.argv[1])
+resolver_sample = pathlib.Path(sys.argv[2]).resolve()
+payload = {
+    "contract_name": "semantic_frontier_manifest",
+    "contract_version": 1,
+    "generated_at": "2026-06-03T00:00:00Z",
+    "root": str(manifest.parent.resolve()),
+    "entries": [
+        {
+            "sample_path": str(resolver_sample),
+            "sample_id": "resolver-copy",
+            "analysis_state": "included",
+            "semantic_outcome": "oracle_diff",
+            "oracle_audit_candidate": False,
+            "needs_manual_review": False,
+            "priority_tier": 3,
+        },
+    ],
+}
+manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+env \
+	PRODUCER_WORK_DIR="$PRODUCER_WORK" \
+	SUITE_ROOT="$WORKDIR/live-suite" \
+	STAMP="$MAPPED_STAMP" \
+	"$ROOT_DIR/scripts/run_bind9_full_long_suite.sh" scan-resolver-feedback >/dev/null
+python3 - "$PRODUCER_WORK/high_value_samples.txt" "$PRODUCER_WORK/semantic_frontier_manifest.json" "$PRODUCER_HIGH_SAMPLE" "$MAPPED_RESOLVER_SAMPLE" <<'PY'
+import json
+import pathlib
+import sys
+
+text_manifest = pathlib.Path(sys.argv[1])
+json_manifest = pathlib.Path(sys.argv[2])
+expected_sample = str(pathlib.Path(sys.argv[3]).resolve())
+resolver_copy = str(pathlib.Path(sys.argv[4]).resolve())
+lines = text_manifest.read_text(encoding="utf-8").splitlines()
+if lines != [expected_sample]:
+	raise SystemExit(
+		"ASSERT FAIL: resolver feedback 副本路径应映射回 producer AFL queue 样本:\n"
+		f"actual={lines!r}\nexpected={[expected_sample]!r}"
+	)
+payload = json.loads(json_manifest.read_text(encoding="utf-8"))
+entries = payload.get("entries")
+if not isinstance(entries, list) or len(entries) != 1:
+    raise SystemExit(f"ASSERT FAIL: resolver-copy semantic frontier entries 不正确: {payload!r}")
+entry = entries[0]
+if entry.get("sample_path") != expected_sample:
+	raise SystemExit(f"ASSERT FAIL: resolver-copy sample_path 未映射回 producer queue 样本: {entry!r}")
+if resolver_copy in json.dumps(payload, ensure_ascii=False):
+	raise SystemExit("ASSERT FAIL: producer semantic frontier 不应保留 resolver queue 副本路径")
+PY
+
+RUN_ALL_PROBE="$WORKDIR/run_all_failure_probe.sh"
+RUN_ALL_PRODUCER_PID="$WORKDIR/run_all_producer.pid"
+RUN_ALL_PRODUCER_TERM="$WORKDIR/run_all_producer.term"
+cat >"$RUN_ALL_PROBE" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$1"
+PRODUCER_PID_FILE="$2"
+PRODUCER_TERM_FILE="$3"
+
+# shellcheck source=/dev/null
+source "$ROOT_DIR/scripts/run_bind9_full_long_suite.sh" help >/dev/null
+
+preflight() { :; }
+producer_smoke() { :; }
+producer_long() {
+	echo "$BASHPID" >"$PRODUCER_PID_FILE"
+	trap 'echo terminated >"$PRODUCER_TERM_FILE"; exit 0' INT TERM
+	while true; do
+		sleep 1
+	done
+}
+resolver_long() { return 42; }
+scan_resolver_feedback() { :; }
+
+start=$SECONDS
+set +e
+run_all
+status="$?"
+set -e
+elapsed=$((SECONDS - start))
+printf 'status=%s elapsed=%s\n' "$status" "$elapsed"
+exit "$status"
+SH
+chmod +x "$RUN_ALL_PROBE"
+set +e
+RUN_ALL_OUT="$(timeout 5 "$RUN_ALL_PROBE" "$ROOT_DIR" "$RUN_ALL_PRODUCER_PID" "$RUN_ALL_PRODUCER_TERM" 2>&1)"
+RUN_ALL_STATUS="$?"
+set -e
+if [ "$RUN_ALL_STATUS" -eq 124 ]; then
+	printf 'ASSERT FAIL: run_all 在 resolver-long 失败后仍等待后台 producer:\n%s\n' "$RUN_ALL_OUT" >&2
+	exit 1
+fi
+if [ "$RUN_ALL_STATUS" -ne 42 ]; then
+	printf 'ASSERT FAIL: run_all 应返回 resolver-long 的失败码 42，实际 rc=%s output=%s\n' "$RUN_ALL_STATUS" "$RUN_ALL_OUT" >&2
+	exit 1
+fi
+printf '%s\n' "$RUN_ALL_OUT" | grep -F "status=42" >/dev/null || {
+	printf 'ASSERT FAIL: run_all failure probe 未输出 resolver 失败状态: %s\n' "$RUN_ALL_OUT" >&2
+	exit 1
+}
+if [ -f "$RUN_ALL_PRODUCER_PID" ] && kill -0 "$(cat "$RUN_ALL_PRODUCER_PID")" 2>/dev/null; then
+	printf 'ASSERT FAIL: run_all 返回后后台 producer 仍在运行: pid=%s\n' "$(cat "$RUN_ALL_PRODUCER_PID")" >&2
+	kill "$(cat "$RUN_ALL_PRODUCER_PID")" 2>/dev/null || true
+	exit 1
+fi
 
 printf 'PASS: bind9 full long suite dry-run contract holds\n'
