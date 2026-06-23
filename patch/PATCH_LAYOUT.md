@@ -35,9 +35,6 @@
 | `cache/bind9/lib/dns/dispatch.c` | cache | cache 模式 UDP response hook plumbing。 |
 | `cache/bind9/lib/dns/include/dns/dispatch.h` | cache | cache 模式 dispatcher hook 声明。 |
 | `cache/bind9/lib/isc/managers.c` | cache | cache 模式 manager lifecycle 兼容修正。 |
-| `cache/bind9/residual/main.c` | residual | 历史顶层副本，不参与同步。 |
-| `cache/bind9/residual/resolver_afl_symcc_orchestrator.c` | residual | 历史顶层 orchestrator 副本，不参与同步。 |
-| `cache/bind9/residual/resolver_afl_symcc_mutator_server.c` | residual | 历史顶层 mutator 副本，不参与同步。 |
 
 ## Unbound
 
