@@ -31,7 +31,10 @@
 #include <isc/util.h>
 
 #include <dns/cache.h>
+#include <dns/db.h>
 #include <dns/dispatch.h>
+#include <dns/masterdump.h>
+#include <dns/types.h>
 #include <dns/view.h>
 
 #include <ns/client.h>
@@ -147,6 +150,9 @@ maybe_dump_cache(void) {
 	for (view = ISC_LIST_HEAD(named_g_server->viewlist); view != NULL;
 	     view = ISC_LIST_NEXT(view, link))
 	{
+		dns_db_t *cachedb = NULL;
+		isc_result_t result;
+
 		if (view->cachedb == NULL) {
 			continue;
 		}
@@ -157,7 +163,34 @@ maybe_dump_cache(void) {
 			dumped_shared_cache = true;
 		}
 
-		dns_cache_dumpstats(view->cache, fp);
+		/*
+		 * 记录级 cache dump（实验 B0，C0 前置修复）。
+		 *
+		 * 原实现调 dns_cache_dumpstats() 只输出缓存聚合统计（hits/
+		 * misses/nodes 计数），不含任何 RR 记录，导致解析器
+		 * iterBind9Records 恒解出 0 条 → before=after=0 空 dump。
+		 * 改用记录级 dns_master_dumptostream() 导出真实缓存内容，
+		 * 并补一行 "; Cache dump of view '<name>'" 段头，与 rndc
+		 * dumpdb 输出格式一致，使 iterBind9Records 能进入 RRSET 段
+		 * 解析。dumptostream 为同步 API（不依赖 mainloop），适配
+		 * orchestrator 独立线程语境；server.c 用的 async 版依赖
+		 * named_g_mainloop 在跑，此处不满足。
+		 */
+		fprintf(fp, ";\n; Cache dump of view '%s'\n;\n", view->name);
+
+		dns_db_attach(view->cachedb, &cachedb);
+		result = dns_master_dumptostream(
+			named_g_mctx, cachedb, NULL, &dns_master_style_cache,
+			dns_masterformat_text, NULL, fp);
+		if (result != ISC_R_SUCCESS) {
+			fprintf(fp, "; cache dump failed: %s\n",
+				isc_result_totext(result));
+			fprintf(stderr,
+				"[resolver-afl-symcc] cache dump failed for "
+				"view '%s': %s\n",
+				view->name, isc_result_totext(result));
+		}
+		dns_db_detach(&cachedb);
 	}
 
 	fclose(fp);

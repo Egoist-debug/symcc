@@ -49,6 +49,46 @@ typedef struct named_resolver_afl_symcc_mutator_server {
 static named_resolver_afl_symcc_mutator_server_t *g_server = NULL;
 
 /*
+ * SymCC 符号源注入（实验 B2a′，C2 白盒证据线）。
+ *
+ * 把 dispatch hook 合成的伪造上游响应字节标记为符号输入，使 SymCC 能沿
+ * 已插桩的 libdns 缓存插入路径（dns__db_addrdataset 等）传播 taint，
+ * 进而求解"攻击者字节是否因果流入被缓存 rdata"。
+ *
+ * 安全约束（双重门控，确保不破坏现有 build / campaign）：
+ *  1. weak 声明：同一份源码也会编译进 afl build（不链接 libsymcc-rt）。
+ *     weak 符号在缺少 runtime 时解析为 NULL，afl build 仍可正常链接。
+ *  2. 运行时 env 门控：仅当 NAMED_RESOLVER_AFL_SYMCC_MARK_SYMBOLIC 与
+ *     SYMCC_MEMORY_INPUT 同时设置时才调用。symcc_make_symbolic 在
+ *     SYMCC_MEMORY_INPUT 未设时会抛 C++ 异常（穿过 C 栈即崩溃），故
+ *     必须先确认 MEMORY_INPUT 已开。默认不设任一开关 => 现有 campaign
+ *     行为完全不变（opt-in）。
+ */
+extern void symcc_make_symbolic(const void *start, size_t byte_length)
+	__attribute__((weak));
+
+static void
+named_resolver_afl_symcc_mark_response_symbolic(const unsigned char *buf,
+						size_t len) {
+	if (buf == NULL || len == 0) {
+		return;
+	}
+	/* opt-in 开关：未显式开启则什么都不做。 */
+	if (getenv("NAMED_RESOLVER_AFL_SYMCC_MARK_SYMBOLIC") == NULL) {
+		return;
+	}
+	/* MEMORY_INPUT 未开时 symcc_make_symbolic 会抛异常，拒绝调用。 */
+	if (getenv("SYMCC_MEMORY_INPUT") == NULL) {
+		return;
+	}
+	/* weak 符号：afl build（无 runtime）下为 NULL，跳过。 */
+	if (symcc_make_symbolic == NULL) {
+		return;
+	}
+	symcc_make_symbolic(buf, len);
+}
+
+/*
  * Parse DNS header from buffer.
  * Returns 0 on success, -1 on error.
  */
@@ -474,6 +514,17 @@ named_resolver_afl_symcc_mutator_dispatch_hook(
 
 	response->base = response_buf;
 	response->length = (unsigned int)response_len;
+
+	/*
+	 * 把真正注入 resolver 的伪造响应字节标记为符号（opt-in，见上方
+	 * named_resolver_afl_symcc_mark_response_symbolic 的门控说明）。
+	 * 此处 response_buf 是 build_dns_response 刚合成、即将经 dispatch
+	 * 返回给 libdns 解析/缓存路径的具体字节——在此打符号标记可绕开
+	 * 此前 write->fread round-trip 对 taint 的剥离。
+	 */
+	named_resolver_afl_symcc_mark_response_symbolic(response_buf,
+							(size_t)response_len);
+
 	g_server->replied++;
 	return ISC_R_SUCCESS;
 }
