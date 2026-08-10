@@ -75,12 +75,22 @@ CommandResult runProcess(const ProcessRequest &Request) {
   Command << "2> " << shellQuote(StderrPath.string());
 
   const int RawCode = std::system(Command.str().c_str());
-  const int ExitCode = WIFEXITED(RawCode) ? WEXITSTATUS(RawCode) : RawCode;
+  int ExitCode = -1;
+  if (RawCode != -1) {
+    if (WIFEXITED(RawCode)) {
+      ExitCode = WEXITSTATUS(RawCode);
+    } else if (WIFSIGNALED(RawCode)) {
+      ExitCode = 128 + WTERMSIG(RawCode);
+    } else {
+      ExitCode = RawCode;
+    }
+  }
 
   CommandResult Output;
   Output.ExitCode = ExitCode;
   Output.StdoutText = readTextFile(StdoutPath);
   Output.StderrText = readTextFile(StderrPath);
+  Output.ProcessStarted = RawCode != -1;
 
   std::filesystem::remove(StdoutPath);
   std::filesystem::remove(StderrPath);

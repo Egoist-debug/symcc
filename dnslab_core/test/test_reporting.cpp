@@ -24,7 +24,11 @@ dnslab::ClusterRecord makeRecord(const std::string &SampleId,
   Record.Meta.Aggregation.SourceQueueDir = "/queue";
   Record.Meta.Aggregation.BudgetSec = 3600;
   Record.Meta.Aggregation.SeedTimeoutSec = 5;
-  Record.Meta.Aggregation.AblationStatus = "enabled";
+  Record.Meta.Aggregation.AblationStatus =
+      std::map<std::string, std::string>{{"mutator", "on"},
+                                         {"cache-delta", "on"},
+                                         {"triage", "on"},
+                                         {"symcc", "on"}};
   Record.Meta.BaselineCompare.ResolverPair = "bind9->unbound";
   Record.Meta.BaselineCompare.ProducerProfile = "poison-stateful";
   Record.Meta.BaselineCompare.InputModel = "DST1 transcript";

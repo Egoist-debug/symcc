@@ -49,15 +49,51 @@ if [ ! -d "$FOLLOW_ROOT" ]; then
 fi
 
 LEGACY_SAMPLE_DIR="$FOLLOW_ROOT/legacy-only"
+LEGACY_QUEUE_SAMPLE_DIR="$FOLLOW_ROOT/id:009998,orig:legacy__deadbeef"
 mkdir -p "$LEGACY_SAMPLE_DIR"
+mkdir -p "$LEGACY_QUEUE_SAMPLE_DIR"
 printf '\x01\x02\x03\x04' >"$LEGACY_SAMPLE_DIR/sample.bin"
+printf '\x05\x06\x07\x08' >"$LEGACY_QUEUE_SAMPLE_DIR/sample.bin"
 
 run_cli follow-diff-once >/dev/null
 assert_file_exists "$LEGACY_SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$LEGACY_SAMPLE_DIR/state_fingerprint.json"
 assert_file_exists "$LEGACY_SAMPLE_DIR/cache_diff.json"
 assert_file_exists "$LEGACY_SAMPLE_DIR/triage.json"
+assert_file_exists "$LEGACY_QUEUE_SAMPLE_DIR/sample.meta.json"
 assert_file_exists "$STATE_FILE"
+
+python3 - "$LEGACY_SAMPLE_DIR" "$LEGACY_QUEUE_SAMPLE_DIR" <<'PY'
+import json
+import pathlib
+import sys
+
+legacy_dir = pathlib.Path(sys.argv[1])
+queue_legacy_dir = pathlib.Path(sys.argv[2])
+legacy_meta = json.loads((legacy_dir / "sample.meta.json").read_text(encoding="utf-8"))
+legacy_triage = json.loads((legacy_dir / "triage.json").read_text(encoding="utf-8"))
+queue_meta = json.loads((queue_legacy_dir / "sample.meta.json").read_text(encoding="utf-8"))
+
+for field in ("queue_event_id", "source_queue_file"):
+    if field not in legacy_meta:
+        raise SystemExit(f"ASSERT FAIL: legacy sample meta 缺少字段 {field}")
+if legacy_meta["queue_event_id"] is not None or legacy_meta["source_queue_file"] is not None:
+    raise SystemExit("ASSERT FAIL: 无 queue 身份的 legacy sample 应保留 null provenance")
+if legacy_triage.get("status") != "failed_replay":
+    raise SystemExit("ASSERT FAIL: legacy sample triage.status 应为 failed_replay")
+if legacy_triage.get("diff_class") != "replay_incomplete":
+    raise SystemExit("ASSERT FAIL: legacy sample triage.diff_class 应为 replay_incomplete")
+if legacy_triage.get("filter_labels") != ["oracle_missing"]:
+    raise SystemExit(
+        "ASSERT FAIL: legacy sample triage.filter_labels 不符合缺失 oracle 契约: "
+        f"{legacy_triage.get('filter_labels')!r}"
+    )
+
+if queue_meta.get("queue_event_id") != "id:009998,orig:legacy":
+    raise SystemExit("ASSERT FAIL: queue-shaped legacy sample 未恢复 queue_event_id")
+if queue_meta.get("source_queue_file") is not None:
+    raise SystemExit("ASSERT FAIL: legacy sample 不应合成 source_queue_file")
+PY
 
 python3 - "$STATE_FILE" <<'PY'
 import json

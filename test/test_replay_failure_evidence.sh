@@ -73,6 +73,13 @@ sys.stderr.write(\"fake missing artifact\\n\")
 sys.stderr.flush()
 sys.exit(0)
 """,
+    "subprocess_failure": """#!/usr/bin/env python3
+import sys
+
+sys.stderr.write(\"fake subprocess failure\\n\")
+sys.stderr.flush()
+sys.exit(42)
+""",
 }
 
 script = scripts.get(mode)
@@ -403,5 +410,26 @@ assert_replay_failure \
 	"replay_missing_artifact" \
 	"infra_failure" \
 	"infra_failure"
+
+init_scenario "subprocess-failure" "subprocess_failure"
+run_follow_diff_once
+assert_replay_failure \
+	"$SAMPLE_DIR" \
+	"subprocess_failed" \
+	4 \
+	"replay_subprocess_failed" \
+	"失败" \
+	"unbound.before" \
+	"unbound" \
+	42 \
+	"-" \
+	"unbound.stderr" \
+	"-" \
+	true \
+	"unknown" \
+	"target_runtime_failure" \
+	"replay_subprocess_failed" \
+	"-" \
+	"runtime_or_parse_failure"
 
 echo "PASS: replay failure evidence regression test passed"

@@ -7,6 +7,8 @@ target("dnslab_core")
         "src/process.cpp",
         "src/transcript.cpp",
         "src/evidence_contract.cpp",
+        "src/experiment_config.cpp",
+        "src/replay_failure.cpp",
         "src/cache_analysis.cpp",
         "src/concrete_adapters.cpp",
         "src/oracle.cpp",
@@ -94,6 +96,20 @@ configure_test_target(
 configure_test_target(
     "dnslab_core_cache_analysis_test",
     "test/test_cache_analysis.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
+
+configure_test_target(
+    "dnslab_core_experiment_config_test",
+    "test/test_experiment_config.cpp",
+    {"dnslab_core"},
+    {"include"}
+)
+
+configure_test_target(
+    "dnslab_core_replay_failure_test",
+    "test/test_replay_failure.cpp",
     {"dnslab_core"},
     {"include"}
 )

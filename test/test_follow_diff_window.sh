@@ -388,7 +388,7 @@ expected_last_queue_event_id = sys.argv[3]
 expected_completed_count = sys.argv[4]
 expected_failed_count = sys.argv[5]
 expected_last_exit_reason = sys.argv[6]
-expected_retry_count = sys.argv[7]
+expected_retry_count = int(sys.argv[7])
 expected_source_queue_dir = sys.argv[8]
 expected_budget_sec = float(sys.argv[9])
 if expected_budget_sec.is_integer():
@@ -586,14 +586,9 @@ if state.get("last_exit_reason") != expected_last_exit_reason:
 retry_count = state.get("retry_count")
 if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
     raise SystemExit("ASSERT FAIL: state.retry_count 应为非负整数")
-if expected_retry_count == "__positive__":
-    if retry_count <= 0:
-        raise SystemExit(
-            f"ASSERT FAIL: state.retry_count={retry_count!r} 应大于 0"
-        )
-elif retry_count != int(expected_retry_count):
+if retry_count != expected_retry_count:
     raise SystemExit(
-        f"ASSERT FAIL: state.retry_count={retry_count!r} != {int(expected_retry_count)!r}"
+        f"ASSERT FAIL: state.retry_count={retry_count!r} != {expected_retry_count!r}"
     )
 if not isinstance(state.get("last_attempt_ts"), str) or not state["last_attempt_ts"]:
     raise SystemExit("ASSERT FAIL: state.last_attempt_ts 应为非空字符串")
@@ -913,6 +908,29 @@ if actual_count < expected_min_count:
 PY
 }
 
+retry_count_from_invocations() {
+	local log_path="$1"
+	local expected_mode="$2"
+	python3 - "$log_path" "$expected_mode" <<'PY'
+import pathlib
+import sys
+
+log_path = pathlib.Path(sys.argv[1])
+expected_mode = sys.argv[2]
+
+if not log_path.is_file():
+    raise SystemExit(f"ASSERT FAIL: 缺少调用日志 {log_path}")
+
+lines = [line.strip() for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+invocation_count = sum(1 for line in lines if line.endswith(f"\t{expected_mode}"))
+if invocation_count < 2:
+    raise SystemExit(
+        f"ASSERT FAIL: 模式 {expected_mode!r} 至少需要一次初始执行和一次重试; lines={lines!r}"
+    )
+print(invocation_count - 1)
+PY
+}
+
 emit_follow_window_evidence() {
 	local scenario="$1"
 	local summary_path="$2"
@@ -1008,7 +1026,17 @@ PY
 }
 
 init_scenario "quiescent" "dump_success"
+WINDOW_LEGACY_DIR="$FOLLOW_ROOT/id:009998,orig:window-legacy__deadbeef"
+(
+	sleep 0.05
+	mkdir -p "$WINDOW_LEGACY_DIR"
+	printf '\x01\x02\x03\x04' >"$WINDOW_LEGACY_DIR/sample.bin"
+) &
+WINDOW_LEGACY_WRITER_PID=$!
+export FOLLOW_DIFF_WINDOW_IDLE_ROUNDS=100
 run_follow_diff_window_capture 5
+unset FOLLOW_DIFF_WINDOW_IDLE_ROUNDS
+wait "$WINDOW_LEGACY_WRITER_PID"
 if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
 	printf 'ASSERT FAIL: quiescent 场景期望 follow-diff-window 返回 0，实际 %s\n' "$WINDOW_EXIT_CODE" >&2
 	printf 'stderr:\n' >&2
@@ -1017,6 +1045,18 @@ if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
 fi
 assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
+assert_file_exists "$WINDOW_LEGACY_DIR/sample.meta.json"
+python3 - "$WINDOW_LEGACY_DIR/sample.meta.json" <<'PY'
+import json
+import pathlib
+import sys
+
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if meta.get("queue_event_id") != "id:009998,orig:window-legacy":
+    raise SystemExit("ASSERT FAIL: window scan 未 backfill 动态 legacy sample")
+if meta.get("source_queue_file") is not None:
+    raise SystemExit("ASSERT FAIL: window legacy sample 不应合成 source_queue_file")
+PY
 assert_completed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "$QUEUE_DIR" 5 1 "no_mutator" 1
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 1 0 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
 assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
@@ -1077,7 +1117,8 @@ fi
 assert_file_exists "$WINDOW_SUMMARY"
 assert_file_exists "$STATE_FILE"
 assert_follow_window_summary_contract "$WINDOW_SUMMARY" "deadline_exceeded" "$WINDOW_EXIT_CODE" "__any__" "__any__" "$QUEUE_EVENT_ID" "__nonempty_or_null__"
-assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" "__positive__" "$QUEUE_DIR" 1 1 "no_mutator" 1
+EXPECTED_RETRY_COUNT="$(retry_count_from_invocations "$INVOCATION_LOG" "missing_artifact")"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "__nonempty_or_null__" "__any__" "__any__" "deadline_exceeded" "$EXPECTED_RETRY_COUNT" "$QUEUE_DIR" 1 1 "no_mutator" 1
 assert_invocation_count_at_least "$INVOCATION_LOG" "missing_artifact" 2
 
 python3 - "$WINDOW_SUMMARY" <<'PY'
@@ -1092,6 +1133,140 @@ if not isinstance(summary.get("run_id"), str) or not summary["run_id"]:
     raise SystemExit("ASSERT FAIL: --retry-failed 场景 summary.run_id 应为非空字符串")
 PY
 emit_follow_window_evidence "failed-sample-retry-enabled" "$WINDOW_SUMMARY" "$STATE_FILE"
+
+init_scenario "recovery-deadline" "timeout"
+python3 - "$STATE_FILE" "$SAMPLE_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+sample_id = sys.argv[2]
+path.write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "last_scan_ts": "2026-03-24T00:00:00Z",
+            "last_queue_event_id": None,
+            "running_sample_id": sample_id,
+            "completed_count": 0,
+            "failed_count": 0,
+        },
+        ensure_ascii=False,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+run_follow_diff_window_capture 1
+if [ "$WINDOW_EXIT_CODE" -ne 6 ]; then
+	printf 'ASSERT FAIL: 恢复耗尽预算后应返回 deadline exit 6，实际 %s\n' "$WINDOW_EXIT_CODE" >&2
+	cat "$WINDOW_STDERR" >&2
+	exit 1
+fi
+assert_file_exists "$WINDOW_SUMMARY"
+assert_file_exists "$STATE_FILE"
+assert_follow_window_summary_contract "$WINDOW_SUMMARY" "deadline_exceeded" 6 0 1 "$QUEUE_EVENT_ID" "__nonempty_or_null__"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 0 1 "deadline_exceeded" 0 "$QUEUE_DIR" 1 1 "no_mutator" 1
+python3 - "$WINDOW_SUMMARY" "$SAMPLE_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+sample_id = sys.argv[2]
+if summary.get("recovery_status") != "recovery_failed":
+    raise SystemExit("ASSERT FAIL: 超时恢复 recovery_status 应为 recovery_failed")
+if summary.get("recovery_detail") != "sample_failed":
+    raise SystemExit("ASSERT FAIL: 超时恢复 recovery_detail 应为 sample_failed")
+if summary.get("recovery_sample_id") != sample_id:
+    raise SystemExit("ASSERT FAIL: 超时恢复 recovery_sample_id 不匹配")
+PY
+emit_follow_window_evidence "recovery-deadline" "$WINDOW_SUMMARY" "$STATE_FILE" "$SAMPLE_DIR/sample.meta.json" "$SAMPLE_DIR/triage.json" "$SAMPLE_ID"
+
+init_scenario "interrupted-recovery" "dump_success" "timeout"
+SEED_TIMEOUT_SEC_OVERRIDE=10
+setsid env \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+	ROOT_DIR="$ROOT_DIR" \
+	WORK_DIR="$SCENARIO_WORK" \
+	BIND9_AFL_TREE="$BIND9_TREE" \
+	AFL_TREE="$UNBOUND_TREE" \
+	RESPONSE_CORPUS_DIR="$RESPONSE_DIR" \
+	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
+	FOLLOW_DIFF_INTERVAL_SEC=0.01 \
+	SEED_TIMEOUT_SEC="$SEED_TIMEOUT_SEC_OVERRIDE" \
+	ENABLE_DST1_MUTATOR=0 \
+	ENABLE_CACHE_DELTA=1 \
+	ENABLE_TRIAGE=1 \
+	ENABLE_SYMCC=1 \
+	FAKE_BINARY_LOG_PATH="$INVOCATION_LOG" \
+	python3 -m tools.dns_diff.cli follow-diff-window --budget-sec 20 \
+	>"$WINDOW_STDOUT" 2>"$WINDOW_STDERR" &
+INTERRUPTED_PID=$!
+RUNNING_STATE_OBSERVED=0
+for _ in $(seq 1 100); do
+	if python3 - "$STATE_FILE" "$SAMPLE_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(1)
+state = json.loads(path.read_text(encoding="utf-8"))
+raise SystemExit(0 if state.get("running_sample_id") == sys.argv[2] else 1)
+PY
+	then
+		RUNNING_STATE_OBSERVED=1
+		break
+	fi
+	sleep 0.05
+done
+if [ "$RUNNING_STATE_OBSERVED" -ne 1 ]; then
+	printf 'ASSERT FAIL: replay 运行期间未持久化 running_sample_id\n' >&2
+	kill -TERM -- "-$INTERRUPTED_PID" 2>/dev/null || true
+	wait "$INTERRUPTED_PID" 2>/dev/null || true
+	exit 1
+fi
+kill -TERM -- "-$INTERRUPTED_PID" 2>/dev/null || true
+wait "$INTERRUPTED_PID" 2>/dev/null || true
+python3 - "$STATE_FILE" "$SAMPLE_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if state.get("running_sample_id") != sys.argv[2]:
+    raise SystemExit("ASSERT FAIL: 中断后 running_sample_id 未保留")
+PY
+write_fake_binary "$BIND9_BIN" "dump_success"
+SEED_TIMEOUT_SEC_OVERRIDE=1
+run_follow_diff_window_capture 5
+if [ "$WINDOW_EXIT_CODE" -ne 0 ]; then
+	printf 'ASSERT FAIL: 中断恢复场景期望返回 0，实际 %s\n' "$WINDOW_EXIT_CODE" >&2
+	cat "$WINDOW_STDERR" >&2
+	exit 1
+fi
+assert_completed_sample_contract "$SAMPLE_DIR" "$SAMPLE_ID" "$QUEUE_DIR" 5 1 "no_mutator" 1
+assert_follow_window_summary_contract "$WINDOW_SUMMARY" "quiescent" 0 1 0 "$QUEUE_EVENT_ID" "$QUEUE_EVENT_ID"
+assert_state_contract "$STATE_FILE" "$WINDOW_SUMMARY" "$QUEUE_EVENT_ID" 1 0 "quiescent" 0 "$QUEUE_DIR" 5 1 "no_mutator" 1
+python3 - "$WINDOW_SUMMARY" "$SAMPLE_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+sample_id = sys.argv[2]
+if summary.get("recovery_status") != "recovered":
+    raise SystemExit("ASSERT FAIL: 中断样本 recovery_status 应为 recovered")
+if summary.get("recovery_detail") != "sample_processed":
+    raise SystemExit("ASSERT FAIL: 中断样本 recovery_detail 应为 sample_processed")
+if summary.get("recovery_sample_id") != sample_id:
+    raise SystemExit("ASSERT FAIL: 中断样本 recovery_sample_id 不匹配")
+PY
+emit_follow_window_evidence "interrupted-recovery" "$WINDOW_SUMMARY" "$STATE_FILE" "$SAMPLE_DIR/sample.meta.json" "$SAMPLE_DIR/triage.json" "$SAMPLE_ID"
 
 init_scenario "stale-running" "dump_success"
 STALE_SAMPLE_ID="id:009999,orig:stale__deadbeef"

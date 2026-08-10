@@ -2,6 +2,7 @@
 
 #include "dnslab_core/json_value.hpp"
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -25,7 +26,7 @@ struct AggregationKey {
   std::optional<int> BudgetSec;
   std::optional<int> SeedTimeoutSec;
   std::optional<std::string> VariantName;
-  std::optional<std::string> AblationStatus;
+  std::optional<std::map<std::string, std::string>> AblationStatus;
   int ContractVersion = kContractVersion;
 };
 
@@ -60,6 +61,7 @@ struct FailureEvidence {
   std::optional<std::string> Message;
   std::optional<int> ExitCode;
   std::optional<int> ReturnCode;
+  std::optional<int> TimeoutSec;
   std::optional<std::string> Stage;
   std::optional<std::string> Resolver;
   std::optional<bool> ProcessStarted;

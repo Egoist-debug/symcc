@@ -1,7 +1,9 @@
 #include "dnslab_core/concrete_adapters.hpp"
 
+#include "dnslab_core/experiment_config.hpp"
 #include "dnslab_core/oracle.hpp"
 
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -24,6 +26,24 @@ std::filesystem::path requireExisting(const std::filesystem::path &InputPath,
                                       const std::string &Message) {
   if (!std::filesystem::exists(InputPath)) {
     throw std::runtime_error(Message + ": " + InputPath.string());
+  }
+  return InputPath;
+}
+
+std::filesystem::path requireExecutable(
+    const std::filesystem::path &InputPath, const std::string &Message) {
+  std::error_code Error;
+  const bool IsRegular = std::filesystem::is_regular_file(InputPath, Error);
+  const auto Permissions =
+      IsRegular ? std::filesystem::status(InputPath, Error).permissions()
+                : std::filesystem::perms::none;
+  const auto ExecutableBits = std::filesystem::perms::owner_exec |
+                              std::filesystem::perms::group_exec |
+                              std::filesystem::perms::others_exec;
+  if (Error || !IsRegular ||
+      (Permissions & ExecutableBits) == std::filesystem::perms::none) {
+    throw ResolverExecutableError(Message + "不可执行: " + InputPath.string(),
+                                  InputPath);
   }
   return InputPath;
 }
@@ -395,12 +415,16 @@ void renderNamedConf(const std::filesystem::path &TemplatePath,
 
 std::filesystem::path firstExisting(
     const std::vector<std::filesystem::path> &Candidates) {
+  std::filesystem::path FirstCandidate;
   for (const auto &Candidate : Candidates) {
+    if (FirstCandidate.empty() && !Candidate.empty()) {
+      FirstCandidate = Candidate;
+    }
     if (std::filesystem::exists(Candidate)) {
       return Candidate;
     }
   }
-  return {};
+  return FirstCandidate;
 }
 
 std::optional<std::filesystem::path> envRootPath(const char *EnvName) {
@@ -456,7 +480,7 @@ CommandResult runScriptedResolverMode(
     const std::filesystem::path &NativeOutputPath,
     const std::filesystem::path &RunRoot,
     const std::optional<std::filesystem::path> &TranscriptPath = std::nullopt) {
-  const auto Binary = requireExisting(BinaryPath, MissingBinaryMessage);
+  const auto Binary = requireExecutable(BinaryPath, MissingBinaryMessage);
   const auto Harness = requireExisting(HarnessPath, MissingHarnessMessage);
   std::vector<std::string> HarnessArgs = {"python3", Harness.string(),
                                           BinaryArgName, Binary.string(),
@@ -843,8 +867,8 @@ CommandResult Bind9ResolverAdapter::build(const std::filesystem::path &SourceRoo
 
 CommandResult
 Bind9ResolverAdapter::runSample(const RunSampleRequest &Request) const {
-  const auto Binary = requireExisting(bind9BinaryPath(Config_, Request.BuildRoot),
-                                      "缺少 bind9 可执行文件");
+  const auto Binary = requireExecutable(
+      bind9BinaryPath(Config_, Request.BuildRoot), "bind9 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 bind9 response 语料目录");
   const auto LdLibraryPath = collectDotLibs(Request.BuildRoot);
@@ -879,8 +903,8 @@ Bind9ResolverAdapter::runSample(const RunSampleRequest &Request) const {
 CommandResult
 Bind9ResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                 const std::filesystem::path &OutputFile) const {
-  const auto Binary = requireExisting(
-      bind9BinaryPath(Config_, RunRoot), "缺少 bind9 dump-cache 可执行文件");
+  const auto Binary = requireExecutable(bind9BinaryPath(Config_, RunRoot),
+                                        "bind9 dump-cache 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 bind9 response 语料目录");
   const auto BuildRoot = std::filesystem::path(
@@ -1021,8 +1045,8 @@ UnboundResolverAdapter::build(const std::filesystem::path &SourceRoot,
 
 CommandResult
 UnboundResolverAdapter::runSample(const RunSampleRequest &Request) const {
-  const auto Binary = requireExisting(unboundBinaryPath(Config_, Request.BuildRoot),
-                                      "缺少 unbound 可执行文件");
+  const auto Binary = requireExecutable(
+      unboundBinaryPath(Config_, Request.BuildRoot), "unbound 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 unbound response 语料目录");
   const auto LdLibraryPath = collectDotLibs(Request.BuildRoot);
@@ -1048,8 +1072,8 @@ UnboundResolverAdapter::runSample(const RunSampleRequest &Request) const {
 CommandResult
 UnboundResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
                                   const std::filesystem::path &OutputFile) const {
-  const auto Binary = requireExisting(
-      unboundBinaryPath(Config_, RunRoot), "缺少 unbound dump-cache 可执行文件");
+  const auto Binary = requireExecutable(unboundBinaryPath(Config_, RunRoot),
+                                        "unbound dump-cache 可执行文件");
   const auto ResponseCorpusDir =
       requireExisting(Config_.ResponseCorpusDir, "缺少 unbound response 语料目录");
   const auto BuildRoot = std::filesystem::path(
@@ -1133,8 +1157,8 @@ DnsmasqResolverAdapter::build(const std::filesystem::path &SourceRoot,
   if (Result.ExitCode != 0) {
     return Result;
   }
-  requireExisting(dnsmasqBinaryPath(Config_, BuildRoot),
-                  "缺少 dnsmasq 可执行文件");
+  requireExecutable(dnsmasqBinaryPath(Config_, BuildRoot),
+                    "dnsmasq 可执行文件");
   return Result;
 }
 
@@ -1213,8 +1237,8 @@ SmartdnsResolverAdapter::build(const std::filesystem::path &SourceRoot,
   if (Result.ExitCode != 0) {
     return Result;
   }
-  requireExisting(smartdnsBinaryPath(Config_, TargetRoot),
-                  "缺少 smartdns 可执行文件");
+  requireExecutable(smartdnsBinaryPath(Config_, TargetRoot),
+                    "smartdns 可执行文件");
   return Result;
 }
 
@@ -1302,8 +1326,8 @@ MaradnsResolverAdapter::build(const std::filesystem::path &SourceRoot,
   if (BuildResult.ExitCode != 0) {
     return BuildResult;
   }
-  requireExisting(maradnsBinaryPath(Config_, BuildRoot),
-                  "缺少 maradns/deadwood 可执行文件");
+  requireExecutable(maradnsBinaryPath(Config_, BuildRoot),
+                    "maradns/deadwood 可执行文件");
   return BuildResult;
 }
 
@@ -1426,8 +1450,8 @@ KnotResolverAdapter::build(const std::filesystem::path &SourceRoot,
     return InstallResult;
   }
   prepareKnotRuntimeAssets(SourceRoot, TargetRoot, RuntimePrefix);
-  requireExisting(knotResolverBinaryPath(Config_, BuildRoot),
-                  "缺少 knot-resolver 可执行文件");
+  requireExecutable(knotResolverBinaryPath(Config_, BuildRoot),
+                    "knot-resolver 可执行文件");
   return BuildResult;
 }
 
@@ -1484,6 +1508,7 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   Bind9Config.ResponseCorpusDir = resolveEnvPathOrDefault(
       "RESPONSE_CORPUS_DIR",
       WorkspaceRoot / "named_experiment" / "work" / "response_corpus");
+  Bind9Config.SeedTimeoutSec = resolveSeedTimeoutSec();
   Bind9Config.SourceFallbackPath = std::nullopt;
   Bind9Config.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(
@@ -1495,6 +1520,7 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
       "RESPONSE_CORPUS_DIR",
       WorkspaceRoot / "unbound_experiment" / "work_stateful" /
           "response_corpus");
+  UnboundConfig.SeedTimeoutSec = resolveSeedTimeoutSec();
   UnboundConfig.SourceFallbackPath = std::nullopt;
   UnboundConfig.BinaryPathOverride = std::nullopt;
   Registry.registerAdapter(

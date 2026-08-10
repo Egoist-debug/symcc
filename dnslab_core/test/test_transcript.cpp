@@ -47,6 +47,7 @@ int main() {
   require(RoundTrip == Wire, "serializeTranscript round-trip 失败");
 
   const auto Identity = dnslab::buildSampleIdentity("id:000001", Wire);
+  require(Identity.QueueEventId == "id:000001", "QueueEventId 不匹配");
   require(Identity.SampleSize == Wire.size(), "SampleSize 不匹配");
   require(Identity.SampleId.rfind("id:000001__", 0) == 0,
           "SampleId 前缀不匹配");

@@ -19,7 +19,11 @@ dnslab::SampleMeta makeMeta(const std::string &SampleId) {
   Meta.Aggregation.BudgetSec = 3600;
   Meta.Aggregation.SeedTimeoutSec = 5;
   Meta.Aggregation.VariantName = "full_stack";
-  Meta.Aggregation.AblationStatus = "enabled";
+  Meta.Aggregation.AblationStatus =
+      std::map<std::string, std::string>{{"mutator", "on"},
+                                         {"cache-delta", "on"},
+                                         {"triage", "on"},
+                                         {"symcc", "on"}};
   Meta.BaselineCompare.ResolverPair = "bind9->unbound";
   Meta.BaselineCompare.ProducerProfile = "poison-stateful";
   Meta.BaselineCompare.InputModel = "DST1 transcript";
@@ -60,5 +64,14 @@ int main() {
   assert(!DivergedPayload.Comparable);
   assert(DivergedPayload.Reason == "aggregation_key_conflict");
   assert(!DivergedPayload.AggregationKeyConflictFields.empty());
+
+  dnslab::FailureEvidence Failure;
+  Failure.Kind = "replay_error";
+  Failure.Reason = "timeout";
+  Failure.TimeoutSec = 7;
+  const auto FailurePayload =
+      std::get<dnslab::json::Value::Object>(dnslab::toJson(Failure).storage());
+  assert(std::get<std::int64_t>(FailurePayload.at("timeout_sec").storage()) ==
+         7);
   return 0;
 }

@@ -1,5 +1,7 @@
 #include "dnslab_core/reporting.hpp"
 
+#include "dnslab_core/experiment_config.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <ctime>
@@ -2912,26 +2914,9 @@ CampaignReportArtifacts buildCampaignReportArtifactsResult(
 
 json::Value::Object buildCampaignAblationStatus() {
   json::Value::Object Output;
-  Output["mutator"] =
-      (std::getenv("ENABLE_DST1_MUTATOR") &&
-       std::string(std::getenv("ENABLE_DST1_MUTATOR")) == "1")
-          ? "on"
-          : "off";
-  Output["cache-delta"] =
-      (!std::getenv("ENABLE_CACHE_DELTA") ||
-       std::string(std::getenv("ENABLE_CACHE_DELTA")) == "1")
-          ? "on"
-          : "off";
-  Output["triage"] =
-      (!std::getenv("ENABLE_TRIAGE") ||
-       std::string(std::getenv("ENABLE_TRIAGE")) == "1")
-          ? "on"
-          : "off";
-  Output["symcc"] =
-      (!std::getenv("ENABLE_SYMCC") ||
-       std::string(std::getenv("ENABLE_SYMCC")) == "1")
-          ? "on"
-          : "off";
+  for (const auto &[Name, Status] : resolveAblationConfig().status()) {
+    Output[Name] = Status;
+  }
   return Output;
 }
 

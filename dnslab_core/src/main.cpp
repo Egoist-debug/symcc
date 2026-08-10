@@ -1,8 +1,10 @@
 #include "dnslab_core/concrete_adapters.hpp"
 #include "dnslab_core/cache_analysis.hpp"
 #include "dnslab_core/evidence_contract.hpp"
+#include "dnslab_core/experiment_config.hpp"
 #include "dnslab_core/follow_diff.hpp"
 #include "dnslab_core/oracle.hpp"
+#include "dnslab_core/replay_failure.hpp"
 #include "dnslab_core/reporting.hpp"
 #include "dnslab_core/resolver_lock.hpp"
 #include "dnslab_core/transcript.hpp"
@@ -182,42 +184,6 @@ std::filesystem::path resolveDefaultSourceRootForWorkspace(
     }
   }
   return FallbackRoot;
-}
-
-std::string resolveVariantName() {
-  const auto IsEnabled = [](const char *Name, bool DefaultValue) {
-    const char *Value = std::getenv(Name);
-    if (Value == nullptr) {
-      return DefaultValue;
-    }
-    return std::string(Value) == "1";
-  };
-
-  const bool Mutator = IsEnabled("ENABLE_DST1_MUTATOR", false);
-  const bool CacheDelta = IsEnabled("ENABLE_CACHE_DELTA", true);
-  const bool Triage = IsEnabled("ENABLE_TRIAGE", true);
-  const bool Symcc = IsEnabled("ENABLE_SYMCC", true);
-
-  if (Mutator && CacheDelta && Triage && Symcc) {
-    return "full_stack";
-  }
-  if (Mutator && CacheDelta && Triage && !Symcc) {
-    return "afl_only";
-  }
-  if (!Mutator && CacheDelta && Triage && Symcc) {
-    return "no_mutator";
-  }
-  if (Mutator && !CacheDelta && Triage && Symcc) {
-    return "no_cache_delta";
-  }
-
-  std::ostringstream Output;
-  Output << "custom-"
-         << "mutator-" << (Mutator ? "on" : "off") << "-"
-         << "cache-delta-" << (CacheDelta ? "on" : "off") << "-"
-         << "triage-" << (Triage ? "on" : "off") << "-"
-         << "symcc-" << (Symcc ? "on" : "off");
-  return Output.str();
 }
 
 struct ResolverPathSpec {
@@ -436,6 +402,7 @@ struct ResolverRunResult {
   std::filesystem::path AfterCache;
   std::filesystem::path StderrPath;
   std::vector<std::filesystem::path> Logs;
+  std::optional<dnslab::FailureEvidence> Failure;
 };
 
 struct SyncReplayResult {
@@ -455,6 +422,8 @@ struct SyncReplayResult {
   ResolverRunResult Secondary;
   std::string SecondaryResolver = "unbound";
   std::filesystem::path ArtifactDir;
+  std::optional<dnslab::FailureEvidence> Failure;
+  int ExitCode = 0;
   bool Failed = false;
 };
 
@@ -500,6 +469,12 @@ struct ResolverExecutionMaps {
   std::map<std::string, dnslab::json::Value::Object> OracleByResolver;
 };
 
+struct SyncReplayResolverExecutions {
+  std::map<std::string, ResolverExecution> ExecutedResolvers;
+  std::map<std::string, std::string> SkippedResolvers;
+  std::optional<dnslab::FailureEvidence> Failure;
+};
+
 ResolverRunResult runSyncReplayResolver(
     const std::string &ResolverName, const dnslab::ResolverAdapter &Adapter,
     const std::filesystem::path &ArtifactRoot,
@@ -515,9 +490,6 @@ dnslab::StateFingerprint
 buildSyncReplayFingerprint(const dnslab::SampleIdentity &SampleIdentity);
 void copySyncReplaySampleArtifact(const std::filesystem::path &SamplePath,
                                   const std::filesystem::path &ArtifactRoot);
-std::optional<dnslab::FailureEvidence> buildSyncReplayFailure(
-    const ResolverRunResult &Bind9Run, const ResolverRunResult &SecondaryRun,
-    const std::string &SecondaryResolverName);
 double readSyncReplayBudgetSec();
 dnslab::SampleMeta buildSyncReplayMeta(
     const dnslab::SampleIdentity &SampleIdentity,
@@ -535,6 +507,7 @@ SyncReplayResult buildSyncReplayResult(
     const std::map<std::string, std::string> &SkippedResolvers,
     const SyncReplayResolverRoots &ResolverRoots,
     const dnslab::CacheDiffResult &CacheDiff, const dnslab::TriageRecord &Triage,
+    const std::optional<dnslab::FailureEvidence> &Failure,
     const std::string &SecondaryResolverName,
     const std::filesystem::path &ArtifactRoot);
 void writeSyncReplayArtifacts(
@@ -659,7 +632,10 @@ buildExecutedResolversJson(const std::vector<std::string> &Resolvers) {
 dnslab::json::Value::Object
 buildSyncReplayCliOutput(const SyncReplayResult &ReplayResult) {
   dnslab::json::Value::Object Output;
+  Output["status"] = ReplayResult.Failed ? "failed" : "completed";
+  Output["exit_code"] = ReplayResult.ExitCode;
   Output["sample_id"] = ReplayResult.Identity.SampleId;
+  Output["queue_event_id"] = ReplayResult.Identity.QueueEventId;
   Output["sample_sha1"] = ReplayResult.Identity.SampleSha1;
   Output["sample_size"] =
       static_cast<std::int64_t>(ReplayResult.Identity.SampleSize);
@@ -679,6 +655,9 @@ buildSyncReplayCliOutput(const SyncReplayResult &ReplayResult) {
   Output["diff_detected"] = ReplayResult.Triage.DiffDetected;
   Output["resolver_diffs"] = buildResolverDiffsJson(ReplayResult.Triage);
   Output["artifact_dir"] = normalizePath(ReplayResult.ArtifactDir).string();
+  if (ReplayResult.Failure.has_value()) {
+    Output["failure"] = dnslab::toJson(*ReplayResult.Failure);
+  }
   return Output;
 }
 
@@ -764,9 +743,7 @@ resolveSyncReplayCommandContext(
   return Output;
 }
 
-std::pair<std::map<std::string, ResolverExecution>,
-          std::map<std::string, std::string>>
-executeSyncReplayResolvers(
+SyncReplayResolverExecutions executeSyncReplayResolvers(
     const dnslab::ResolverRegistry &RuntimeRegistry,
     const std::vector<std::string> &RequestedResolvers,
     const std::string &SecondaryResolverName,
@@ -775,8 +752,7 @@ executeSyncReplayResolvers(
     const std::filesystem::path &ArtifactRoot,
     const std::filesystem::path &SamplePath,
     const dnslab::SampleIdentity &SampleIdentity) {
-  std::map<std::string, ResolverExecution> ExecutedResolvers;
-  std::map<std::string, std::string> SkippedResolvers;
+  SyncReplayResolverExecutions Output;
   for (const auto &ResolverName : RequestedResolvers) {
     const bool RequiredResolver =
         ResolverName == "bind9" || ResolverName == SecondaryResolverName;
@@ -787,17 +763,37 @@ executeSyncReplayResolvers(
                                        SamplePath, SampleIdentity.SampleId,
                                        SourceRoots.at(ResolverName),
                                        BuildRoots.at(ResolverName));
-      ExecutedResolvers.emplace(ResolverName,
-                                buildResolverExecution(ResolverName,
-                                                       std::move(Run)));
+      const auto Failure = Run.Failure;
+      if (Failure.has_value() && !RequiredResolver) {
+        Output.SkippedResolvers[ResolverName] =
+            Failure->Message.value_or("resolver replay 失败");
+        continue;
+      }
+      Output.ExecutedResolvers.emplace(
+          ResolverName, buildResolverExecution(ResolverName, std::move(Run)));
+      if (Failure.has_value()) {
+        Output.Failure = Failure;
+        break;
+      }
+    } catch (const dnslab::ResolverExecutableError &Error) {
+      if (RequiredResolver) {
+        Output.Failure = dnslab::buildMissingExecutableFailure(
+            ResolverName, Error.executablePath(), Error.what());
+        break;
+      }
+      Output.SkippedResolvers[ResolverName] = Error.what();
     } catch (const std::exception &Error) {
       if (RequiredResolver) {
-        throw;
+        dnslab::ReplayStageContext Context;
+        Context.Resolver = ResolverName;
+        Context.Stage = ResolverName + ".preflight";
+        Output.Failure = dnslab::buildReplayLaunchFailure(Context, Error.what());
+        break;
       }
-      SkippedResolvers[ResolverName] = Error.what();
+      Output.SkippedResolvers[ResolverName] = Error.what();
     }
   }
-  return {std::move(ExecutedResolvers), std::move(SkippedResolvers)};
+  return Output;
 }
 
 SyncReplayResult executeSyncReplay(
@@ -811,9 +807,11 @@ SyncReplayResult executeSyncReplay(
     const std::filesystem::path &Bind9SourceRoot,
     const std::filesystem::path &SecondarySourceRoot,
     const std::string &SecondaryResolverName,
-    const std::optional<std::string> &RequestedResolversCsv = std::nullopt) {
+    const std::optional<std::string> &RequestedResolversCsv = std::nullopt,
+    const std::optional<std::string> &QueueEventId = std::nullopt) {
   const auto SampleBytes = readBinaryFile(SamplePath);
-  const auto SampleIdentity = dnslab::buildSampleIdentity("manual", SampleBytes);
+  const auto SampleIdentity = dnslab::buildSampleIdentity(
+      QueueEventId.value_or("manual"), SampleBytes);
   const auto ArtifactRoot =
       NestBySampleId ? (RunRoot / SampleIdentity.SampleId) : RunRoot;
 
@@ -822,16 +820,26 @@ SyncReplayResult executeSyncReplay(
       SecondaryResolverName, RequestedResolversCsv, Bind9BuildRoot,
       SecondaryBuildRoot, Bind9SourceRoot, SecondarySourceRoot);
 
-  auto [ExecutedResolvers, SkippedResolvers] = executeSyncReplayResolvers(
+  auto ResolverExecutions = executeSyncReplayResolvers(
       RuntimeRegistry, ResolverRoots.RequestedResolvers, SecondaryResolverName,
       ResolverRoots.BuildRoots, ResolverRoots.SourceRoots, ArtifactRoot,
       SamplePath, SampleIdentity);
+  auto &ExecutedResolvers = ResolverExecutions.ExecutedResolvers;
+  auto &SkippedResolvers = ResolverExecutions.SkippedResolvers;
+  auto Failure = ResolverExecutions.Failure;
 
   const auto Bind9Found = ExecutedResolvers.find("bind9");
   const auto SecondaryFound = ExecutedResolvers.find(SecondaryResolverName);
-  if (Bind9Found == ExecutedResolvers.end() ||
-      SecondaryFound == ExecutedResolvers.end()) {
-    throw std::runtime_error("缺少必要 resolver 执行结果");
+  if (!Failure.has_value() &&
+      (Bind9Found == ExecutedResolvers.end() ||
+       SecondaryFound == ExecutedResolvers.end())) {
+    const std::string MissingResolver =
+        Bind9Found == ExecutedResolvers.end() ? "bind9" : SecondaryResolverName;
+    dnslab::ReplayStageContext Context;
+    Context.Resolver = MissingResolver;
+    Context.Stage = MissingResolver + ".preflight";
+    Failure = dnslab::buildReplayLaunchFailure(
+        Context, "缺少必要 resolver 执行结果: " + MissingResolver);
   }
 
   const auto ExecutionMaps = buildResolverExecutionMaps(ExecutedResolvers);
@@ -851,16 +859,14 @@ SyncReplayResult executeSyncReplay(
       SampleIdentity.SampleId, ExecutionMaps.BeforeByResolver,
       ExecutionMaps.AfterByResolver, Triggered, SecondaryResolverName);
 
-  const auto OraclePayload =
-      buildSyncReplayOraclePayload(ExecutionMaps.OracleByResolver,
-                                   SecondaryResolverName);
+  dnslab::json::Value::Object OraclePayload;
+  if (!Failure.has_value()) {
+    OraclePayload = buildSyncReplayOraclePayload(
+        ExecutionMaps.OracleByResolver, SecondaryResolverName);
+  }
 
   const auto Fingerprint = buildSyncReplayFingerprint(SampleIdentity);
   copySyncReplaySampleArtifact(SamplePath, ArtifactRoot);
-
-  const auto Failure = buildSyncReplayFailure(
-      Bind9Found->second.Run, SecondaryFound->second.Run,
-      SecondaryResolverName);
 
   const auto Triage = dnslab::buildTriageRecord(
       SampleIdentity.SampleId, ExecutionMaps.OracleByResolver, CacheDiff,
@@ -877,7 +883,7 @@ SyncReplayResult executeSyncReplay(
   auto Result = buildSyncReplayResult(
       SampleIdentity, Fingerprint, OraclePayload, ExecutionMaps,
       ExecutedResolvers, SkippedResolvers, ResolverRoots, CacheDiff, Triage,
-      SecondaryResolverName, ArtifactRoot);
+      Failure, SecondaryResolverName, ArtifactRoot);
   Result.Meta = Meta;
   return Result;
 }
@@ -909,10 +915,13 @@ dnslab::json::Value::Object buildSyncReplayOraclePayload(
 }
 
 dnslab::json::Value::Object buildSyncReplayArtifactsPayload(
-    const std::map<std::string, ResolverExecution> &ExecutedResolvers) {
+    const std::map<std::string, ResolverExecution> &ExecutedResolvers,
+    bool ReplayFailed) {
   dnslab::json::Value::Object Artifacts;
   Artifacts["sample_bin"] = "sample.bin";
-  Artifacts["oracle"] = "oracle.json";
+  if (!ReplayFailed) {
+    Artifacts["oracle"] = "oracle.json";
+  }
   for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
     const auto ResolverPrefix = ResolverName + "/";
     Artifacts[ResolverName + "_stderr"] =
@@ -965,30 +974,6 @@ void appendSyncReplayContractFields(
   }
 }
 
-std::optional<dnslab::FailureEvidence> buildSyncReplayFailure(
-    const ResolverRunResult &Bind9Run, const ResolverRunResult &SecondaryRun,
-    const std::string &SecondaryResolverName) {
-  if (Bind9Run.RunResult.ExitCode != 0) {
-    dnslab::FailureEvidence Evidence;
-    Evidence.Kind = "replay_error";
-    Evidence.Reason = "subprocess_failed";
-    Evidence.Stage = "bind9.after";
-    Evidence.Resolver = "bind9";
-    Evidence.ProcessStarted = true;
-    return Evidence;
-  }
-  if (SecondaryRun.RunResult.ExitCode != 0) {
-    dnslab::FailureEvidence Evidence;
-    Evidence.Kind = "replay_error";
-    Evidence.Reason = "subprocess_failed";
-    Evidence.Stage = SecondaryResolverName + ".after";
-    Evidence.Resolver = SecondaryResolverName;
-    Evidence.ProcessStarted = true;
-    return Evidence;
-  }
-  return std::nullopt;
-}
-
 dnslab::SampleMeta buildSyncReplayMeta(
     const dnslab::SampleIdentity &SampleIdentity,
     const std::filesystem::path &SamplePath,
@@ -997,7 +982,7 @@ dnslab::SampleMeta buildSyncReplayMeta(
     const dnslab::TriageRecord &Triage,
     const std::optional<dnslab::FailureEvidence> &Failure) {
   auto Meta = dnslab::buildSampleMeta(SampleIdentity.SampleId);
-  Meta.QueueEventId = "manual";
+  Meta.QueueEventId = SampleIdentity.QueueEventId;
   Meta.SourceQueueFile = SamplePath.string();
   Meta.SourceResolver = "bind9";
   Meta.SampleSha1 = SampleIdentity.SampleSha1;
@@ -1011,15 +996,16 @@ dnslab::SampleMeta buildSyncReplayMeta(
   Meta.Aggregation.InputModel = "DST1 transcript";
   Meta.Aggregation.SourceQueueDir = SamplePath.parent_path().string();
   Meta.Aggregation.BudgetSec = ReplayBudgetSec;
-  Meta.Aggregation.SeedTimeoutSec = 5;
-  Meta.Aggregation.VariantName = resolveVariantName();
-  Meta.Aggregation.AblationStatus = "enabled";
+  const auto Ablation = dnslab::resolveAblationConfig();
+  Meta.Aggregation.SeedTimeoutSec = dnslab::resolveSeedTimeoutSec();
+  Meta.Aggregation.VariantName = Ablation.variantName();
+  Meta.Aggregation.AblationStatus = Ablation.status();
   Meta.BaselineCompare.ResolverPair = "bind9_vs_" + SecondaryResolverName;
   Meta.BaselineCompare.ProducerProfile = "poison-stateful";
   Meta.BaselineCompare.InputModel = "DST1 transcript";
   Meta.BaselineCompare.SourceQueueDir = SamplePath.parent_path().string();
   Meta.BaselineCompare.BudgetSec = ReplayBudgetSec;
-  Meta.BaselineCompare.SeedTimeoutSec = 5;
+  Meta.BaselineCompare.SeedTimeoutSec = dnslab::resolveSeedTimeoutSec();
   Meta.BaselineCompare.RepeatCount = 1;
   Meta.Failure = Failure;
   return Meta;
@@ -1045,6 +1031,7 @@ SyncReplayResult buildSyncReplayResult(
     const std::map<std::string, std::string> &SkippedResolvers,
     const SyncReplayResolverRoots &ResolverRoots,
     const dnslab::CacheDiffResult &CacheDiff, const dnslab::TriageRecord &Triage,
+    const std::optional<dnslab::FailureEvidence> &Failure,
     const std::string &SecondaryResolverName,
     const std::filesystem::path &ArtifactRoot) {
   SyncReplayResult Result;
@@ -1059,12 +1046,22 @@ SyncReplayResult buildSyncReplayResult(
   Result.ResolverBuildRoots = ResolverRoots.BuildRoots;
   Result.ResolverSourceRoots = ResolverRoots.SourceRoots;
   Result.ExecutedResolvers = CacheDiff.ExecutedResolvers;
-  Result.Bind9 = ExecutedResolvers.at("bind9").Run;
-  Result.Secondary = ExecutedResolvers.at(SecondaryResolverName).Run;
+  if (const auto Found = ExecutedResolvers.find("bind9");
+      Found != ExecutedResolvers.end()) {
+    Result.Bind9 = Found->second.Run;
+  }
+  if (const auto Found = ExecutedResolvers.find(SecondaryResolverName);
+      Found != ExecutedResolvers.end()) {
+    Result.Secondary = Found->second.Run;
+  }
   Result.SecondaryResolver = SecondaryResolverName;
   Result.ArtifactDir = ArtifactRoot;
-  Result.Failed = Result.Bind9.RunResult.ExitCode != 0 ||
-                  Result.Secondary.RunResult.ExitCode != 0;
+  Result.Failure = Failure;
+  Result.ExitCode =
+      Failure.has_value() ? Failure->ExitCode.value_or(
+                                dnslab::kReplayExitRuntimeFailure)
+                          : 0;
+  Result.Failed = Failure.has_value();
   Result.CacheDiff = CacheDiff;
   Result.Triage = Triage;
   return Result;
@@ -1078,21 +1075,94 @@ ResolverRunResult runSyncReplayResolver(
     const std::filesystem::path &BuildRoot) {
   const auto ResolverRunRoot = ArtifactRoot / ResolverName;
   std::filesystem::create_directories(ResolverRunRoot);
-  const auto BeforeCache =
-      ResolverRunRoot / (ResolverName + ".before.cache.txt");
-  const auto DumpResult = Adapter.dumpCache(ResolverRunRoot, BeforeCache);
-  const auto RunResult = Adapter.runSample(
-      {SourceRoot, BuildRoot, ResolverRunRoot, SamplePath, SampleId, {}});
-  const auto Oracle =
-      Adapter.parseOracle(ResolverRunRoot / (ResolverName + ".stderr"));
   ResolverRunResult Result;
-  Result.DumpResult = DumpResult;
-  Result.RunResult = RunResult;
-  Result.Oracle = Oracle;
-  Result.BeforeCache = BeforeCache;
-  Result.AfterCache =
-      ResolverRunRoot / (ResolverName + ".after.cache.txt");
+  Result.BeforeCache =
+      ResolverRunRoot / (ResolverName + ".before.cache.txt");
+  Result.AfterCache = ResolverRunRoot / (ResolverName + ".after.cache.txt");
   Result.StderrPath = ResolverRunRoot / (ResolverName + ".stderr");
+  const auto RootStderrPath = ArtifactRoot / (ResolverName + ".stderr");
+
+  std::error_code Error;
+  std::filesystem::remove(Result.BeforeCache, Error);
+  std::filesystem::remove(Result.AfterCache, Error);
+  std::filesystem::remove(Result.StderrPath, Error);
+  std::filesystem::remove(RootStderrPath, Error);
+
+  const auto MirrorStderr = [&]() {
+    std::error_code CopyError;
+    if (std::filesystem::is_regular_file(Result.StderrPath, CopyError)) {
+      std::filesystem::copy_file(
+          Result.StderrPath, RootStderrPath,
+          std::filesystem::copy_options::overwrite_existing, CopyError);
+    }
+  };
+  const auto BuildStageContext = [&](const std::string &Stage,
+                                     const std::filesystem::path &Artifact) {
+    dnslab::ReplayStageContext Context;
+    Context.Resolver = ResolverName;
+    Context.Stage = ResolverName + "." + Stage;
+    Context.StderrPath = RootStderrPath.filename();
+    Context.ArtifactPath = Artifact;
+    Context.TimeoutSec = dnslab::resolveSeedTimeoutSec();
+    Context.OkReturnCodes = ResolverName == "unbound"
+                                ? std::vector<int>{0, 1}
+                                : std::vector<int>{0};
+    return Context;
+  };
+
+  try {
+    Result.DumpResult = Adapter.dumpCache(ResolverRunRoot, Result.BeforeCache);
+  } catch (const dnslab::ResolverExecutableError &ExecutableError) {
+    Result.Failure = dnslab::buildMissingExecutableFailure(
+        ResolverName, ExecutableError.executablePath(), ExecutableError.what());
+    return Result;
+  } catch (const std::exception &Exception) {
+    auto Context = BuildStageContext("preflight", {});
+    Context.ArtifactPath.reset();
+    Result.Failure =
+        dnslab::buildReplayLaunchFailure(Context, Exception.what());
+    return Result;
+  }
+  MirrorStderr();
+  const auto BeforeContext = BuildStageContext("before", Result.BeforeCache);
+  Result.Failure =
+      dnslab::classifyReplayCommandResult(BeforeContext, Result.DumpResult);
+  if (!Result.Failure.has_value()) {
+    Result.Failure = dnslab::classifyMissingReplayArtifact(
+        BeforeContext, Result.DumpResult.ProcessStarted);
+  }
+  if (Result.Failure.has_value()) {
+    Result.Logs = Adapter.collectLogs(ResolverRunRoot);
+    return Result;
+  }
+
+  try {
+    Result.RunResult = Adapter.runSample(
+        {SourceRoot, BuildRoot, ResolverRunRoot, SamplePath, SampleId, {}});
+  } catch (const dnslab::ResolverExecutableError &ExecutableError) {
+    Result.Failure = dnslab::buildMissingExecutableFailure(
+        ResolverName, ExecutableError.executablePath(), ExecutableError.what());
+    return Result;
+  } catch (const std::exception &Exception) {
+    auto Context = BuildStageContext("after", Result.AfterCache);
+    Result.Failure =
+        dnslab::buildReplayLaunchFailure(Context, Exception.what());
+    return Result;
+  }
+  MirrorStderr();
+  const auto AfterContext = BuildStageContext("after", Result.AfterCache);
+  Result.Failure =
+      dnslab::classifyReplayCommandResult(AfterContext, Result.RunResult);
+  if (!Result.Failure.has_value()) {
+    Result.Failure = dnslab::classifyMissingReplayArtifact(
+        AfterContext, Result.RunResult.ProcessStarted);
+  }
+  if (Result.Failure.has_value()) {
+    Result.Logs = Adapter.collectLogs(ResolverRunRoot);
+    return Result;
+  }
+
+  Result.Oracle = Adapter.parseOracle(Result.StderrPath);
   Result.Logs = Adapter.collectLogs(ResolverRunRoot);
   return Result;
 }
@@ -1123,16 +1193,23 @@ void writeSyncReplayArtifacts(
     const std::map<std::string, ResolverExecution> &ExecutedResolvers,
     const dnslab::json::Value::Object &OraclePayload, const dnslab::TriageRecord &Triage,
     const dnslab::SampleMeta &Meta, const dnslab::StateFingerprint &Fingerprint) {
-  dnslab::json::Value::Object OracleDocument = OraclePayload;
-  appendSyncReplayContractFields(
-      OracleDocument, SecondaryResolverName, CacheDiff.ExecutedResolvers,
-      SkippedResolvers, Triage, ExecutionMaps.OracleByResolver);
-  writeJsonFile(ArtifactRoot / "oracle.json", dnslab::json::Value(OracleDocument));
+  if (!Meta.Failure.has_value()) {
+    dnslab::json::Value::Object OracleDocument = OraclePayload;
+    appendSyncReplayContractFields(
+        OracleDocument, SecondaryResolverName, CacheDiff.ExecutedResolvers,
+        SkippedResolvers, Triage, ExecutionMaps.OracleByResolver);
+    writeJsonFile(ArtifactRoot / "oracle.json",
+                  dnslab::json::Value(OracleDocument));
+  } else {
+    std::error_code Error;
+    std::filesystem::remove(ArtifactRoot / "oracle.json", Error);
+  }
 
   auto MetaPayload =
       std::get<dnslab::json::Value::Object>(dnslab::toJson(Meta).storage());
-  MetaPayload["artifacts"] =
-      dnslab::json::Value(buildSyncReplayArtifactsPayload(ExecutedResolvers));
+  MetaPayload["artifacts"] = dnslab::json::Value(
+      buildSyncReplayArtifactsPayload(ExecutedResolvers,
+                                      Meta.Failure.has_value()));
   MetaPayload["oracle_provenance"] =
       dnslab::json::Value(buildSyncReplayOracleProvenancePayload(ExecutedResolvers));
   MetaPayload["output_dir"] = ArtifactRoot.string();
@@ -1713,6 +1790,7 @@ int runSyncReplayCliCommand(
     const dnslab::ResolverRegistry &RuntimeRegistry) {
   const auto SamplePath = requireCommandPath(Args, "--sample");
   const auto RunRoot = requireCommandPath(Args, "--run-root");
+  const auto QueueEventId = optionalOption(Args, "--queue-event-id");
   const auto Context =
       resolveSyncReplayCommandContext(Args, WorkspaceRoot, DefaultResolverLock);
 
@@ -1720,11 +1798,12 @@ int runSyncReplayCliCommand(
       WorkspaceRoot, DefaultResolverLock, RuntimeRegistry, SamplePath, RunRoot,
       false, Context.Bind9BuildRoot, Context.SecondaryBuildRoot,
       Context.Bind9SourceRoot, Context.SecondarySourceRoot,
-      Context.SecondaryResolverName, Context.RequestedResolversCsv);
+      Context.SecondaryResolverName, Context.RequestedResolversCsv,
+      QueueEventId);
 
   const auto Output = buildSyncReplayCliOutput(ReplayResult);
   printJsonValue(dnslab::json::Value(Output));
-  return ReplayResult.Failed ? 4 : 0;
+  return ReplayResult.ExitCode;
 }
 
 int runBatchSyncReplayCommand(
@@ -2446,7 +2525,8 @@ void printUsage() {
          " --bind9-build-root <path> --unbound-build-root <path>"
          " [--bind9-source-root <path>] [--unbound-source-root <path>]"
          " [--secondary-resolver <name>] [--secondary-build-root <path>]"
-         " [--secondary-source-root <path>] [--resolvers <csv>]\n"
+         " [--secondary-source-root <path>] [--resolvers <csv>]"
+         " [--queue-event-id <id>]\n"
       << "  dnslabctl batch-sync-replay --sample-dir <path> --run-root <path>"
          " --bind9-build-root <path>"
          " [--unbound-build-root <path>] [--secondary-resolver <name>]"

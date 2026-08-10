@@ -1,6 +1,8 @@
 #include "dnslab_core/follow_diff.hpp"
 
+#include "dnslab_core/cache_analysis.hpp"
 #include "dnslab_core/evidence_contract.hpp"
+#include "dnslab_core/experiment_config.hpp"
 #include "dnslab_core/process.hpp"
 #include "dnslab_core/reporting.hpp"
 #include "dnslab_core/transcript.hpp"
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -29,7 +32,7 @@ constexpr const char *kFollowDiffWindowSummaryFileName =
 constexpr const char *kCampaignCloseSummaryFileName =
     "campaign_close.summary.json";
 constexpr const char *kFollowDiffOutputDirName = "follow_diff";
-constexpr int kExitDeadlineExceeded = 124;
+constexpr int kExitDeadlineExceeded = 6;
 
 struct ProcessFailure : std::runtime_error {
   ProcessFailure(std::string Message, int Code)
@@ -55,6 +58,7 @@ struct FollowDiffConfig {
   std::string SecondaryResolver = "unbound";
   double IntervalSec = 1.0;
   int IdleRounds = 1;
+  int SeedTimeoutSec = 5;
 };
 
 struct BatchSummary {
@@ -64,6 +68,12 @@ struct BatchSummary {
   size_t Failed = 0;
   size_t Skipped = 0;
   std::optional<std::string> LastQueueEventId;
+};
+
+struct RecoveryAudit {
+  std::string Status = "none";
+  std::optional<std::string> SampleId;
+  std::optional<std::string> Detail;
 };
 
 struct FollowDiffStateData {
@@ -618,6 +628,7 @@ FollowDiffConfig collectConfig() {
       resolvePositiveDoubleEnv("FOLLOW_DIFF_INTERVAL_SEC", 1.0);
   Config.IdleRounds =
       resolvePositiveIntEnv("FOLLOW_DIFF_WINDOW_IDLE_ROUNDS", 1);
+  Config.SeedTimeoutSec = resolveSeedTimeoutSec();
   return Config;
 }
 
@@ -644,8 +655,6 @@ std::string buildResolverPair(const std::string &SecondaryResolver) {
   return "bind9_vs_" + SecondaryResolver;
 }
 
-std::string resolveVariantName();
-
 AggregationKey buildAggregationKey(const FollowDiffConfig &Config,
                                    double BudgetSec) {
   AggregationKey Output;
@@ -654,9 +663,10 @@ AggregationKey buildAggregationKey(const FollowDiffConfig &Config,
   Output.InputModel = "DST1 transcript";
   Output.SourceQueueDir = Config.SourceDir.string();
   Output.BudgetSec = static_cast<int>(std::max(1.0, std::floor(BudgetSec)));
-  Output.SeedTimeoutSec = 5;
-  Output.VariantName = resolveVariantName();
-  Output.AblationStatus = "enabled";
+  Output.SeedTimeoutSec = Config.SeedTimeoutSec;
+  const auto Ablation = resolveAblationConfig();
+  Output.VariantName = Ablation.variantName();
+  Output.AblationStatus = Ablation.status();
   Output.ContractVersion = kContractVersion;
   return Output;
 }
@@ -669,7 +679,7 @@ BaselineCompareKey buildBaselineCompareKey(const FollowDiffConfig &Config,
   Output.InputModel = "DST1 transcript";
   Output.SourceQueueDir = Config.SourceDir.string();
   Output.BudgetSec = static_cast<int>(std::max(1.0, std::floor(BudgetSec)));
-  Output.SeedTimeoutSec = 5;
+  Output.SeedTimeoutSec = Config.SeedTimeoutSec;
   Output.RepeatCount = 1;
   Output.ContractVersion = kContractVersion;
   return Output;
@@ -677,63 +687,10 @@ BaselineCompareKey buildBaselineCompareKey(const FollowDiffConfig &Config,
 
 json::Value::Object buildAblationStatusPayload() {
   json::Value::Object Output;
-  Output["mutator"] =
-      (std::getenv("ENABLE_DST1_MUTATOR") &&
-       std::string(std::getenv("ENABLE_DST1_MUTATOR")) == "1")
-          ? "on"
-          : "off";
-  Output["cache-delta"] =
-      (!std::getenv("ENABLE_CACHE_DELTA") ||
-       std::string(std::getenv("ENABLE_CACHE_DELTA")) == "1")
-          ? "on"
-          : "off";
-  Output["triage"] =
-      (!std::getenv("ENABLE_TRIAGE") ||
-       std::string(std::getenv("ENABLE_TRIAGE")) == "1")
-          ? "on"
-          : "off";
-  Output["symcc"] =
-      (!std::getenv("ENABLE_SYMCC") ||
-       std::string(std::getenv("ENABLE_SYMCC")) == "1")
-          ? "on"
-          : "off";
+  for (const auto &[Name, Status] : resolveAblationConfig().status()) {
+    Output[Name] = Status;
+  }
   return Output;
-}
-
-std::string resolveVariantName() {
-  const auto IsEnabled = [](const char *Name, bool DefaultValue) {
-    const char *Value = std::getenv(Name);
-    if (Value == nullptr) {
-      return DefaultValue;
-    }
-    return std::string(Value) == "1";
-  };
-
-  const bool Mutator = IsEnabled("ENABLE_DST1_MUTATOR", false);
-  const bool CacheDelta = IsEnabled("ENABLE_CACHE_DELTA", true);
-  const bool Triage = IsEnabled("ENABLE_TRIAGE", true);
-  const bool Symcc = IsEnabled("ENABLE_SYMCC", true);
-
-  if (Mutator && CacheDelta && Triage && Symcc) {
-    return "full_stack";
-  }
-  if (Mutator && CacheDelta && Triage && !Symcc) {
-    return "afl_only";
-  }
-  if (!Mutator && CacheDelta && Triage && Symcc) {
-    return "no_mutator";
-  }
-  if (Mutator && !CacheDelta && Triage && Symcc) {
-    return "no_cache_delta";
-  }
-
-  std::ostringstream Output;
-  Output << "custom-"
-         << "mutator-" << (Mutator ? "on" : "off") << "-"
-         << "cache-delta-" << (CacheDelta ? "on" : "off") << "-"
-         << "triage-" << (Triage ? "on" : "off") << "-"
-         << "symcc-" << (Symcc ? "on" : "off");
-  return Output.str();
 }
 
 json::Value::Object buildAggregationKeyPayload(const FollowDiffConfig &Config,
@@ -744,8 +701,9 @@ json::Value::Object buildAggregationKeyPayload(const FollowDiffConfig &Config,
   Output["input_model"] = "DST1 transcript";
   Output["source_queue_dir"] = Config.SourceDir.string();
   Output["budget_sec"] = budgetJsonValue(BudgetSec);
-  Output["seed_timeout_sec"] = static_cast<std::int64_t>(5);
-  Output["variant_name"] = resolveVariantName();
+  Output["seed_timeout_sec"] =
+      static_cast<std::int64_t>(Config.SeedTimeoutSec);
+  Output["variant_name"] = resolveAblationConfig().variantName();
   Output["ablation_status"] = buildAblationStatusPayload();
   Output["contract_version"] = static_cast<std::int64_t>(kContractVersion);
   return Output;
@@ -759,7 +717,8 @@ json::Value::Object buildBaselineCompareKeyPayload(const FollowDiffConfig &Confi
   Output["input_model"] = "DST1 transcript";
   Output["source_queue_dir"] = Config.SourceDir.string();
   Output["budget_sec"] = budgetJsonValue(BudgetSec);
-  Output["seed_timeout_sec"] = static_cast<std::int64_t>(5);
+  Output["seed_timeout_sec"] =
+      static_cast<std::int64_t>(Config.SeedTimeoutSec);
   Output["repeat_count"] = static_cast<std::int64_t>(1);
   Output["contract_version"] = static_cast<std::int64_t>(kContractVersion);
   return Output;
@@ -768,6 +727,169 @@ json::Value::Object buildBaselineCompareKeyPayload(const FollowDiffConfig &Confi
 std::optional<json::Value::Object>
 loadSeedProvenancePayload(const FollowDiffConfig &Config) {
   return loadObjectIfPresent(Config.SeedProvenancePath);
+}
+
+void enrichSampleMetaContract(const FollowDiffConfig &Config,
+                              const std::filesystem::path &QueueFile,
+                              const std::filesystem::path &SampleDir,
+                              const SampleIdentity &Identity,
+                              double BudgetSec) {
+  auto Payload = loadObjectIfPresent(SampleDir / "sample.meta.json");
+  if (!Payload.has_value()) {
+    return;
+  }
+  (*Payload)["sample_id"] = Identity.SampleId;
+  (*Payload)["queue_event_id"] = Identity.QueueEventId;
+  (*Payload)["source_queue_file"] = QueueFile.string();
+  (*Payload)["sample_sha1"] = Identity.SampleSha1;
+  (*Payload)["sample_size"] =
+      static_cast<std::int64_t>(Identity.SampleSize);
+  (*Payload)["aggregation_key"] =
+      buildAggregationKeyPayload(Config, BudgetSec);
+  (*Payload)["baseline_compare_key"] =
+      buildBaselineCompareKeyPayload(Config, BudgetSec);
+  if (const auto SeedProvenance = loadSeedProvenancePayload(Config);
+      SeedProvenance.has_value()) {
+    (*Payload)["seed_provenance"] = *SeedProvenance;
+  }
+  writeJsonFile(SampleDir / "sample.meta.json", *Payload);
+}
+
+void setObjectDefault(json::Value::Object &Object, const std::string &Name,
+                      json::Value Value) {
+  if (Object.find(Name) == Object.end()) {
+    Object.emplace(Name, std::move(Value));
+  }
+}
+
+void backfillExistingSampleContracts(const FollowDiffConfig &Config,
+                                     double BudgetSec) {
+  if (!std::filesystem::is_directory(Config.OutputRoot)) {
+    return;
+  }
+
+  for (const auto &Entry :
+       std::filesystem::directory_iterator(Config.OutputRoot)) {
+    if (!Entry.is_directory()) {
+      continue;
+    }
+    const auto SampleDir = Entry.path();
+    const auto SamplePath = SampleDir / "sample.bin";
+    if (!std::filesystem::is_regular_file(SamplePath)) {
+      continue;
+    }
+
+    const auto SampleId = SampleDir.filename().string();
+    const auto SampleBytes = readBinaryFile(SamplePath);
+    const auto SampleSha1 = sha1Hex(SampleBytes);
+    auto Meta = loadObjectIfPresent(SampleDir / "sample.meta.json")
+                    .value_or(json::Value::Object{});
+    const auto ExistingTriage =
+        loadObjectIfPresent(SampleDir / "triage.json")
+            .value_or(json::Value::Object{});
+
+    std::string Status = "pending";
+    if (const auto ExistingStatus =
+            coerceOptionalText(findObjectValue(Meta, "status"));
+        ExistingStatus.has_value()) {
+      Status = *ExistingStatus;
+    } else if (const auto TriageStatus =
+                   coerceOptionalText(findObjectValue(ExistingTriage, "status"));
+               TriageStatus.has_value()) {
+      if (TriageStatus->rfind("completed", 0) == 0) {
+        Status = "completed";
+      } else if (TriageStatus->rfind("failed", 0) == 0) {
+        Status = "failed";
+      }
+    }
+
+    setObjectDefault(Meta, "schema_version",
+                     static_cast<std::int64_t>(kSchemaVersion));
+    setObjectDefault(Meta, "contract_version",
+                     static_cast<std::int64_t>(kContractVersion));
+    setObjectDefault(Meta, "generated_at", utcTimestampNow());
+    setObjectDefault(Meta, "first_seen_ts", utcTimestampNow());
+    Meta["sample_id"] = SampleId;
+    if (!coerceOptionalText(findObjectValue(Meta, "queue_event_id"))
+             .has_value()) {
+      const auto Delimiter = SampleId.find("__");
+      Meta["queue_event_id"] =
+          Delimiter == std::string::npos
+              ? json::Value()
+              : json::Value(SampleId.substr(0, Delimiter));
+    }
+    if (!coerceOptionalText(findObjectValue(Meta, "source_queue_file"))
+             .has_value()) {
+      Meta["source_queue_file"] = json::Value();
+    }
+    Meta["sample_sha1"] = SampleSha1;
+    Meta["sample_size"] = static_cast<std::int64_t>(SampleBytes.size());
+    Meta["is_stateful"] = parseTranscript(SampleBytes).has_value();
+    Meta["status"] = Status;
+    setObjectDefault(Meta, "source_resolver", "bind9");
+    setObjectDefault(Meta, "afl_tags", json::Value::Array{});
+    setObjectDefault(Meta, "analysis_state", "unknown");
+    setObjectDefault(Meta, "exclude_reason", json::Value());
+    setObjectDefault(Meta, "aggregation_key",
+                     buildAggregationKeyPayload(Config, BudgetSec));
+    setObjectDefault(Meta, "baseline_compare_key",
+                     buildBaselineCompareKeyPayload(Config, BudgetSec));
+    Meta["output_dir"] = SampleDir.string();
+    if (const auto SeedProvenance = loadSeedProvenancePayload(Config);
+        SeedProvenance.has_value() &&
+        Meta.find("seed_provenance") == Meta.end()) {
+      Meta["seed_provenance"] = *SeedProvenance;
+    }
+    writeJsonFile(SampleDir / "sample.meta.json", Meta);
+
+    if (!std::filesystem::is_regular_file(SampleDir / "oracle.json")) {
+      writeJsonFile(SampleDir / "oracle.json", json::Value::Object{});
+    }
+
+    if (!std::filesystem::is_regular_file(SampleDir /
+                                          "state_fingerprint.json")) {
+      json::Value::Object Fingerprint;
+      Fingerprint["schema_version"] =
+          static_cast<std::int64_t>(kSchemaVersion);
+      Fingerprint["generated_at"] = utcTimestampNow();
+      Fingerprint["sample_id"] = SampleId;
+      for (const auto *Name : {
+               "bind9.forwarding_path", "bind9.retry_seen",
+               "bind9.msg_cache_seen", "bind9.rrset_cache_seen",
+               "bind9.negative_cache_seen", "unbound.forwarding_path",
+               "unbound.retry_seen", "unbound.msg_cache_seen",
+               "unbound.rrset_cache_seen", "unbound.negative_cache_seen"}) {
+        Fingerprint[Name] = json::Value();
+      }
+      writeJsonFile(SampleDir / "state_fingerprint.json", Fingerprint);
+    }
+
+    CacheDiffResult CacheDiff;
+    if (!std::filesystem::is_regular_file(SampleDir / "cache_diff.json")) {
+      std::map<std::string, std::vector<CacheRecord>> BeforeByResolver = {
+          {"bind9", {}}, {Config.SecondaryResolver, {}}};
+      const auto AfterByResolver = BeforeByResolver;
+      CacheDiff = buildCacheDiff(SampleId, BeforeByResolver, AfterByResolver,
+                                 false, Config.SecondaryResolver);
+      writeJsonFile(SampleDir / "cache_diff.json", toJson(CacheDiff));
+    }
+
+    if (!std::filesystem::is_regular_file(SampleDir / "triage.json")) {
+      if (CacheDiff.SampleId.empty()) {
+        std::map<std::string, std::vector<CacheRecord>> EmptyByResolver = {
+            {"bind9", {}}, {Config.SecondaryResolver, {}}};
+        CacheDiff = buildCacheDiff(SampleId, EmptyByResolver, EmptyByResolver,
+                                   false, Config.SecondaryResolver);
+      }
+      StateFingerprint Fingerprint;
+      Fingerprint.GeneratedAt = utcTimestampNow();
+      Fingerprint.SampleId = SampleId;
+      const std::map<std::string, json::Value::Object> EmptyOracle;
+      const auto Triage = buildTriageRecord(
+          SampleId, EmptyOracle, CacheDiff, Fingerprint, std::nullopt);
+      writeJsonFile(SampleDir / "triage.json", toJson(Triage));
+    }
+  }
 }
 
 std::optional<std::string>
@@ -887,9 +1009,70 @@ void writeFailureMeta(const FollowDiffConfig &Config,
   writeJsonFile(SampleDir / "sample.meta.json", toJson(Meta));
 }
 
-void runSyncReplay(const FollowDiffConfig &Config,
-                   const std::filesystem::path &QueueFile,
-                   const std::filesystem::path &SampleDir, double BudgetSec) {
+enum class SampleProcessStatus {
+  Skipped,
+  Completed,
+  Failed,
+};
+
+SampleProcessStatus parseSyncReplayEnvelope(
+    const CommandResult &Result, const SampleIdentity &ExpectedIdentity) {
+  const auto Parsed = JsonParser(Result.StdoutText).parse();
+  const auto *Envelope =
+      std::get_if<json::Value::Object>(&Parsed.storage());
+  if (Envelope == nullptr) {
+    throw std::runtime_error("sync-replay 输出顶层不是 JSON 对象");
+  }
+
+  const auto Status = coerceOptionalText(findObjectValue(*Envelope, "status"));
+  const auto SampleId =
+      coerceOptionalText(findObjectValue(*Envelope, "sample_id"));
+  const auto QueueEventId =
+      coerceOptionalText(findObjectValue(*Envelope, "queue_event_id"));
+  const auto ExitCode = coerceInt64(findObjectValue(*Envelope, "exit_code"), -1);
+  if (!Status.has_value() || !SampleId.has_value() ||
+      !QueueEventId.has_value() || *SampleId != ExpectedIdentity.SampleId ||
+      *QueueEventId != ExpectedIdentity.QueueEventId || ExitCode < 0 ||
+      ExitCode != Result.ExitCode) {
+    throw std::runtime_error("sync-replay 输出身份或退出码不匹配");
+  }
+
+  if (*Status == "completed") {
+    if (ExitCode != 0) {
+      throw std::runtime_error("sync-replay completed envelope 使用非零退出码");
+    }
+    return SampleProcessStatus::Completed;
+  }
+  if (*Status != "failed") {
+    throw std::runtime_error("sync-replay 输出 status 非法: " + *Status);
+  }
+
+  const auto *FailureValue = findObjectValue(*Envelope, "failure");
+  const auto *Failure =
+      FailureValue == nullptr
+          ? nullptr
+          : std::get_if<json::Value::Object>(&FailureValue->storage());
+  const auto *ProcessStarted =
+      Failure == nullptr ? nullptr
+                         : findObjectValue(*Failure, "process_started");
+  if (Failure == nullptr ||
+      !coerceOptionalText(findObjectValue(*Failure, "kind")).has_value() ||
+      !coerceOptionalText(findObjectValue(*Failure, "reason")).has_value() ||
+      !coerceOptionalText(findObjectValue(*Failure, "stage")).has_value() ||
+      !coerceOptionalText(findObjectValue(*Failure, "resolver")).has_value() ||
+      coerceInt64(findObjectValue(*Failure, "exit_code"), -1) != ExitCode ||
+      ProcessStarted == nullptr ||
+      std::get_if<bool>(&ProcessStarted->storage()) == nullptr) {
+    throw std::runtime_error("sync-replay failed envelope 缺少完整 failure");
+  }
+  return SampleProcessStatus::Failed;
+}
+
+SampleProcessStatus runSyncReplay(const FollowDiffConfig &Config,
+                                  const std::filesystem::path &QueueFile,
+                                  const std::filesystem::path &SampleDir,
+                                  const SampleIdentity &Identity,
+                                  double BudgetSec) {
   std::string RequestedResolvers = "bind9";
   if (Config.SecondaryResolver != "bind9") {
     RequestedResolvers += "," + Config.SecondaryResolver;
@@ -904,6 +1087,8 @@ void runSyncReplay(const FollowDiffConfig &Config,
       "sync-replay",
       "--sample",
       QueueFile.string(),
+      "--queue-event-id",
+      QueueFile.filename().string(),
       "--run-root",
       SampleDir.string(),
       "--bind9-build-root",
@@ -922,36 +1107,41 @@ void runSyncReplay(const FollowDiffConfig &Config,
       Config.SecondaryBuildRoot.string(),
   };
   const auto Result = runProcess(Request);
-  if (Result.ExitCode != 0) {
+  try {
+    return parseSyncReplayEnvelope(Result, Identity);
+  } catch (const std::exception &EnvelopeError) {
     const auto Message = !Result.StderrText.empty()
                              ? Result.StderrText
                              : (!Result.StdoutText.empty()
                                     ? Result.StdoutText
                                     : ("dnslabctl sync-replay 返回 " +
                                        std::to_string(Result.ExitCode)));
-    throw ProcessFailure(Message, Result.ExitCode);
+    throw ProcessFailure("sync-replay 协议错误: " +
+                             std::string(EnvelopeError.what()) + ": " + Message,
+                         Result.ExitCode == 0 ? 1 : Result.ExitCode);
   }
 }
 
-enum class SampleProcessStatus {
-  Skipped,
-  Completed,
-  Failed,
-};
-
 SampleProcessStatus processOneSample(const FollowDiffConfig &Config,
                                      const std::filesystem::path &QueueFile,
-                                     bool RetryFailed, double BudgetSec) {
+                                     bool ReplayFailedSample,
+                                     bool CountAsRetry, double BudgetSec,
+                                     FollowDiffStateData &State) {
   const auto SampleBytes = readBinaryFile(QueueFile);
   const auto Identity = buildSampleIdentity(QueueFile.filename().string(),
                                             SampleBytes);
   const auto SampleDir = Config.OutputRoot / Identity.SampleId;
   const auto ExistingStatus = readSampleStatus(SampleDir);
   if (ExistingStatus.has_value() && *ExistingStatus == "completed") {
+    if (State.RunningSampleId ==
+        std::optional<std::string>(Identity.SampleId)) {
+      State.RunningSampleId.reset();
+      saveState(Config.StatePath, State);
+    }
     return SampleProcessStatus::Skipped;
   }
   if (ExistingStatus.has_value() && *ExistingStatus == "failed" &&
-      !RetryFailed) {
+      !ReplayFailedSample) {
     return SampleProcessStatus::Skipped;
   }
 
@@ -959,24 +1149,44 @@ SampleProcessStatus processOneSample(const FollowDiffConfig &Config,
   std::filesystem::copy_file(QueueFile, SampleDir / "sample.bin",
                              std::filesystem::copy_options::overwrite_existing);
 
+  State.RunningSampleId = Identity.SampleId;
+  State.LastQueueEventId = Identity.QueueEventId;
+  State.LastAttemptTs = utcTimestampNow();
+  if (CountAsRetry &&
+      ExistingStatus == std::optional<std::string>("failed")) {
+    ++State.RetryCount;
+  }
+  saveState(Config.StatePath, State);
+
+  SampleProcessStatus Status = SampleProcessStatus::Failed;
   try {
-    runSyncReplay(Config, QueueFile, SampleDir, BudgetSec);
-    return SampleProcessStatus::Completed;
+    Status = runSyncReplay(Config, QueueFile, SampleDir, Identity, BudgetSec);
+    enrichSampleMetaContract(Config, QueueFile, SampleDir, Identity, BudgetSec);
   } catch (const ProcessFailure &Error) {
     writeFailureMeta(Config, QueueFile, SampleDir, Identity, SampleBytes,
                      Error.what(), Error.ExitCode, BudgetSec);
-    return SampleProcessStatus::Failed;
+    enrichSampleMetaContract(Config, QueueFile, SampleDir, Identity, BudgetSec);
   } catch (const std::exception &Error) {
     writeFailureMeta(Config, QueueFile, SampleDir, Identity, SampleBytes,
                      Error.what(), 1, BudgetSec);
-    return SampleProcessStatus::Failed;
+    enrichSampleMetaContract(Config, QueueFile, SampleDir, Identity, BudgetSec);
   }
+
+  if (Status == SampleProcessStatus::Completed) {
+    ++State.CompletedCount;
+  } else if (Status == SampleProcessStatus::Failed) {
+    ++State.FailedCount;
+  }
+  State.RunningSampleId.reset();
+  saveState(Config.StatePath, State);
+  return Status;
 }
 
 BatchSummary processQueueEntries(const FollowDiffConfig &Config,
                                  bool RetryFailed,
                                  const std::optional<std::string> &QueueTailId,
-                                 double BudgetSec) {
+                                 double BudgetSec,
+                                 FollowDiffStateData &State) {
   BatchSummary Summary;
   auto QueueEntries = listQueueEntries(Config.SourceDir);
   if (QueueTailId.has_value()) {
@@ -993,8 +1203,8 @@ BatchSummary processQueueEntries(const FollowDiffConfig &Config,
   }
 
   for (const auto &QueueFile : QueueEntries) {
-    const auto Status =
-        processOneSample(Config, QueueFile, RetryFailed, BudgetSec);
+    const auto Status = processOneSample(Config, QueueFile, RetryFailed,
+                                         RetryFailed, BudgetSec, State);
     if (Status == SampleProcessStatus::Skipped) {
       ++Summary.Skipped;
       continue;
@@ -1016,7 +1226,8 @@ json::Value buildWindowSummaryPayload(const FollowDiffConfig &Config,
                                       int ExitCode,
                                       const BatchSummary &Summary,
                                       const std::string &RunId,
-                                      bool RetryFailed) {
+                                      bool RetryFailed,
+                                      const RecoveryAudit &Recovery) {
   FollowDiffWindowSummary WindowSummary;
   WindowSummary.BudgetSec = BudgetSec;
   WindowSummary.DeadlineTs = utcTimestampNow();
@@ -1039,6 +1250,11 @@ json::Value buildWindowSummaryPayload(const FollowDiffConfig &Config,
   Payload["aggregation_key"] = buildAggregationKeyPayload(Config, BudgetSec);
   Payload["baseline_compare_key"] =
       buildBaselineCompareKeyPayload(Config, BudgetSec);
+  if (Recovery.Status != "none") {
+    Payload["recovery_status"] = Recovery.Status;
+    json::setOptional(Payload, "recovery_sample_id", Recovery.SampleId);
+    json::setOptional(Payload, "recovery_detail", Recovery.Detail);
+  }
   if (const auto SeedProvenance = loadSeedProvenancePayload(Config);
       SeedProvenance.has_value()) {
     Payload["seed_provenance"] = *SeedProvenance;
@@ -1050,11 +1266,79 @@ void saveWindowSummary(const FollowDiffConfig &Config, double BudgetSec,
                        const std::optional<std::string> &QueueTailId,
                        const std::string &ExitReason, int ExitCode,
                        const BatchSummary &Summary, const std::string &RunId,
-                       bool RetryFailed) {
+                       bool RetryFailed, const RecoveryAudit &Recovery) {
   writeJsonFile(
       Config.WindowSummaryPath,
       buildWindowSummaryPayload(Config, BudgetSec, QueueTailId, ExitReason,
-                                ExitCode, Summary, RunId, RetryFailed));
+                                ExitCode, Summary, RunId, RetryFailed,
+                                Recovery));
+}
+
+RecoveryAudit recoverRunningSample(
+    const FollowDiffConfig &Config, FollowDiffStateData &State,
+    const std::optional<std::string> &QueueTailId, double BudgetSec) {
+  RecoveryAudit Audit;
+  if (!State.RunningSampleId.has_value()) {
+    return Audit;
+  }
+
+  const auto RunningSampleId = *State.RunningSampleId;
+  const auto ExistingStatus =
+      readSampleStatus(Config.OutputRoot / RunningSampleId);
+  if (ExistingStatus == std::optional<std::string>("completed")) {
+    std::cerr << "dns-diff: 检测到上次运行中的样本已完成，清理状态后继续: "
+              << RunningSampleId << '\n';
+    State.RunningSampleId.reset();
+    saveState(Config.StatePath, State);
+    Audit.Status = "cleared";
+    Audit.SampleId = RunningSampleId;
+    Audit.Detail = "already_completed";
+    return Audit;
+  }
+
+  std::optional<std::filesystem::path> QueueFileForSample;
+  for (const auto &QueueFile : listQueueEntries(Config.SourceDir)) {
+    if (QueueTailId.has_value() &&
+        QueueFile.filename().string() > *QueueTailId) {
+      continue;
+    }
+    const auto Bytes = readBinaryFile(QueueFile);
+    const auto Identity =
+        buildSampleIdentity(QueueFile.filename().string(), Bytes);
+    if (Identity.SampleId == RunningSampleId) {
+      QueueFileForSample = QueueFile;
+      break;
+    }
+  }
+  if (!QueueFileForSample.has_value()) {
+    std::cerr << "dns-diff: queue 中未找到待恢复样本，已清理运行中状态: "
+              << RunningSampleId << '\n';
+    State.RunningSampleId.reset();
+    saveState(Config.StatePath, State);
+    Audit.Status = "cleared";
+    Audit.SampleId = RunningSampleId;
+    Audit.Detail = "stale_missing";
+    return Audit;
+  }
+
+  std::cerr << "dns-diff: 检测到未完成样本，启动时先恢复一次: "
+            << RunningSampleId << '\n';
+  const auto Status = processOneSample(Config, *QueueFileForSample, true, false,
+                                       BudgetSec, State);
+  Audit.SampleId = RunningSampleId;
+  if (Status == SampleProcessStatus::Failed) {
+    std::cerr << "dns-diff: running_sample 恢复失败，保留失败证据并继续流程: "
+              << RunningSampleId << '\n';
+    Audit.Status = "recovery_failed";
+    Audit.Detail = "sample_failed";
+    return Audit;
+  }
+
+  std::cerr << "dns-diff: running_sample 恢复成功，后续本轮不重复处理: "
+            << RunningSampleId << '\n';
+  Audit.Status = "recovered";
+  Audit.Detail = "sample_processed";
+  return Audit;
 }
 
 void markPhaseStarted(PhaseRecord &Phase) {
@@ -1135,16 +1419,13 @@ FollowDiffRunArtifacts runFollowDiffOnce() {
   const auto DeadlineTs = utcTimestampNow();
 
   auto State = loadState(Config.StatePath);
-  State.RunId.reset();
-  State.LastExitReason = "once_completed";
-  State.LastAttemptTs = utcTimestampNow();
   State.LastScanTs = utcTimestampNow();
-  State.RunningSampleId.reset();
+  recoverRunningSample(Config, State, std::nullopt, 1.0);
 
-  const auto Summary = processQueueEntries(Config, false, std::nullopt, 1.0);
+  const auto Summary =
+      processQueueEntries(Config, false, std::nullopt, 1.0, State);
+  backfillExistingSampleContracts(Config, 1.0);
   State.LastQueueEventId = Summary.LastQueueEventId;
-  State.CompletedCount = Summary.Completed;
-  State.FailedCount = Summary.Failed;
   State.ScannedCount = Summary.Scanned;
   saveState(Config.StatePath, State);
 
@@ -1173,6 +1454,7 @@ runFollowDiffWindow(double BudgetSec, bool RetryFailed,
   const auto Config = collectConfig();
   std::filesystem::create_directories(Config.WorkDir);
   std::filesystem::create_directories(Config.OutputRoot);
+  backfillExistingSampleContracts(Config, BudgetSec);
 
   if (!QueueTailId.has_value()) {
     const auto QueueEntries = listQueueEntries(Config.SourceDir);
@@ -1181,23 +1463,21 @@ runFollowDiffWindow(double BudgetSec, bool RetryFailed,
     }
   }
 
+  const auto Deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration<double>(BudgetSec);
   const auto RunId = newRunId();
   auto State = loadState(Config.StatePath);
   State.RunId = RunId;
-  State.RetryCount = RetryFailed ? 1U : 0U;
+  State.RetryCount = 0;
   State.LastExitReason.reset();
   State.LastAttemptTs = utcTimestampNow();
   State.LastScanTs = utcTimestampNow();
-  State.RunningSampleId.reset();
   State.AggregationKey = buildAggregationKeyPayload(Config, BudgetSec);
   State.BaselineCompareKey = buildBaselineCompareKeyPayload(Config, BudgetSec);
-  State.CompletedCount = 0;
-  State.FailedCount = 0;
-  State.ScannedCount = 0;
+  const auto Recovery =
+      recoverRunningSample(Config, State, QueueTailId, BudgetSec);
   saveState(Config.StatePath, State);
 
-  const auto Deadline = std::chrono::steady_clock::now() +
-                        std::chrono::duration<double>(BudgetSec);
   int IdleRounds = 0;
   BatchSummary LastSummary;
   while (true) {
@@ -1210,7 +1490,7 @@ runFollowDiffWindow(double BudgetSec, bool RetryFailed,
       SummaryForOutput.Scanned = State.ScannedCount;
       saveWindowSummary(Config, BudgetSec, QueueTailId, "deadline_exceeded",
                         kExitDeadlineExceeded, SummaryForOutput, RunId,
-                        RetryFailed);
+                        RetryFailed, Recovery);
 
       FollowDiffRunArtifacts Output;
       Output.WorkDir = Config.WorkDir;
@@ -1228,14 +1508,13 @@ runFollowDiffWindow(double BudgetSec, bool RetryFailed,
     }
 
     const auto Summary =
-        processQueueEntries(Config, RetryFailed, QueueTailId, BudgetSec);
+        processQueueEntries(Config, RetryFailed, QueueTailId, BudgetSec, State);
+    backfillExistingSampleContracts(Config, BudgetSec);
     LastSummary = Summary;
     State.LastAttemptTs = utcTimestampNow();
     State.LastScanTs = utcTimestampNow();
     State.LastQueueEventId = Summary.LastQueueEventId;
     State.RunningSampleId.reset();
-    State.CompletedCount += Summary.Completed;
-    State.FailedCount += Summary.Failed;
     State.ScannedCount = Summary.Scanned;
     saveState(Config.StatePath, State);
 
@@ -1255,7 +1534,7 @@ runFollowDiffWindow(double BudgetSec, bool RetryFailed,
       SummaryForOutput.Failed = State.FailedCount;
       SummaryForOutput.Scanned = State.ScannedCount;
       saveWindowSummary(Config, BudgetSec, QueueTailId, "quiescent", 0,
-                        SummaryForOutput, RunId, RetryFailed);
+                        SummaryForOutput, RunId, RetryFailed, Recovery);
 
       FollowDiffRunArtifacts Output;
       Output.WorkDir = Config.WorkDir;

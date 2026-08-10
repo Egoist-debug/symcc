@@ -429,7 +429,13 @@ json::Value toJson(const AggregationKey &Input) {
   json::setOptional(Output, "budget_sec", Input.BudgetSec);
   json::setOptional(Output, "seed_timeout_sec", Input.SeedTimeoutSec);
   json::setOptional(Output, "variant_name", Input.VariantName);
-  json::setOptional(Output, "ablation_status", Input.AblationStatus);
+  if (Input.AblationStatus.has_value()) {
+    json::Value::Object AblationStatus;
+    for (const auto &[Name, Status] : *Input.AblationStatus) {
+      AblationStatus[Name] = Status;
+    }
+    Output["ablation_status"] = std::move(AblationStatus);
+  }
   Output["contract_version"] = Input.ContractVersion;
   return Output;
 }
@@ -473,6 +479,7 @@ json::Value toJson(const FailureEvidence &Input) {
   json::setOptional(Output, "message", Input.Message);
   json::setOptional(Output, "exit_code", Input.ExitCode);
   json::setOptional(Output, "returncode", Input.ReturnCode);
+  json::setOptional(Output, "timeout_sec", Input.TimeoutSec);
   json::setOptional(Output, "stage", Input.Stage);
   json::setOptional(Output, "resolver", Input.Resolver);
   json::setOptional(Output, "process_started", Input.ProcessStarted);

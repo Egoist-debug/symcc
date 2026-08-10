@@ -431,6 +431,35 @@ int main() {
   assert(std::filesystem::exists(RunRoot / "dnsmasq-relative" / "dnsmasq.stderr"));
   ::unsetenv("DNSMASQ_HARNESS_SCRIPT");
 
+  std::filesystem::permissions(
+      UnboundBinary,
+      std::filesystem::perms::owner_read |
+          std::filesystem::perms::owner_write |
+          std::filesystem::perms::group_read,
+      std::filesystem::perm_options::replace);
+  bool NonExecutableRejected = false;
+  try {
+    Unbound.dumpCache(RunRoot / "unbound-nonexec",
+                      RunRoot / "unbound-nonexec.cache.txt");
+  } catch (const dnslab::ResolverExecutableError &Error) {
+    NonExecutableRejected = true;
+    assert(Error.executablePath() == UnboundBinary);
+  }
+  assert(NonExecutableRejected);
+
+  const auto MissingBinary = Root / "missing" / "unbound-fuzzme";
+  dnslab::UnboundResolverAdapter MissingUnbound(dnslab::UnboundAdapterConfig{
+      Root, ResponseCorpus, 5, std::nullopt, MissingBinary});
+  bool MissingExecutableRejected = false;
+  try {
+    MissingUnbound.dumpCache(RunRoot / "unbound-missing",
+                             RunRoot / "unbound-missing.cache.txt");
+  } catch (const dnslab::ResolverExecutableError &Error) {
+    MissingExecutableRejected = true;
+    assert(Error.executablePath() == MissingBinary);
+  }
+  assert(MissingExecutableRejected);
+
   std::filesystem::remove_all(Root);
   return 0;
 }

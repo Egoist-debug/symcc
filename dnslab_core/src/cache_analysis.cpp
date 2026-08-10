@@ -1072,6 +1072,51 @@ TriageRecord projectionFromStatus(const std::string &Status,
   return Output;
 }
 
+std::string replayFailureDetail(
+    const std::optional<FailureEvidence> &Failure) {
+  const auto Reason =
+      Failure.has_value() ? Failure->Reason.value_or("") : std::string();
+  if (Reason == "missing_artifact") {
+    return "replay_missing_artifact";
+  }
+  if (Reason == "missing_executable") {
+    return "replay_missing_executable";
+  }
+  if (Reason == "subprocess_launch_error") {
+    return "replay_subprocess_launch_error";
+  }
+  if (Reason == "timeout") {
+    return "replay_timeout";
+  }
+  return "replay_subprocess_failed";
+}
+
+void applyReplayFailureProjection(
+    TriageRecord &Output, const std::optional<FailureEvidence> &Failure) {
+  const auto Detail = replayFailureDetail(Failure);
+  Output.FailureBucketDetail = Detail;
+  Output.OracleAuditCandidate = false;
+  Output.CaseStudyCandidate = false;
+  Output.ManualTruthStatus = "not_applicable";
+  if (Detail == "replay_missing_artifact" ||
+      Detail == "replay_missing_executable") {
+    Output.AnalysisState = "excluded";
+    Output.ExcludeReason = "infra_failure";
+    Output.SemanticOutcome = "infra_failure";
+    Output.FailureBucketPrimary = "infra_artifact_failure";
+  } else if (Detail == "replay_subprocess_launch_error") {
+    Output.AnalysisState = "excluded";
+    Output.ExcludeReason = "infra_failure";
+    Output.SemanticOutcome = "infra_failure";
+    Output.FailureBucketPrimary = "orchestrator_compat_failure";
+  } else {
+    Output.AnalysisState = "unknown";
+    Output.ExcludeReason.reset();
+    Output.SemanticOutcome = "runtime_or_parse_failure";
+    Output.FailureBucketPrimary = "target_runtime_failure";
+  }
+}
+
 } // namespace
 
 std::vector<std::string> CacheRecord::toFields() const {
@@ -1310,25 +1355,17 @@ TriageRecord buildTriageRecord(
   std::string Status;
   std::string DiffClass;
 
-  if (OracleByResolver.empty()) {
+  if (Failure.has_value() || OracleByResolver.empty()) {
     Status = "failed_replay";
-    if (Failure.has_value() && Failure->Reason.has_value()) {
-      if (*Failure->Reason == "missing_artifact") {
-        DiffClass = "replay_missing_artifact";
-      } else if (*Failure->Reason == "missing_executable") {
-        DiffClass = "replay_missing_executable";
-      } else if (*Failure->Reason == "subprocess_launch_error") {
-        DiffClass = "replay_subprocess_launch_error";
-      } else if (*Failure->Reason == "timeout") {
-        DiffClass = "replay_timeout";
-      } else {
-        DiffClass = "replay_subprocess_failed";
-      }
-    } else {
-      DiffClass = "replay_subprocess_failed";
-    }
+    DiffClass = "replay_incomplete";
     Labels.push_back("oracle_missing");
+    if (Failure.has_value()) {
+      Labels.push_back(replayFailureDetail(Failure));
+    }
     Notes.push_back("oracle.json 缺失，当前样本按 replay 失败处理");
+    if (Failure.has_value() && Failure->Reason.has_value()) {
+      Notes.push_back("reason=" + *Failure->Reason);
+    }
     NeedsManualReview = true;
   } else if (!allResolversParseOk(OracleByResolver)) {
     Status = "failed_parse";
@@ -1399,6 +1436,9 @@ TriageRecord buildTriageRecord(
   Output.OracleAuditCandidate = Projection.OracleAuditCandidate;
   Output.CaseStudyCandidate = Projection.CaseStudyCandidate;
   Output.ManualTruthStatus = Projection.ManualTruthStatus;
+  if (Status == "failed_replay") {
+    applyReplayFailureProjection(Output, Failure);
+  }
   Output.FilterLabels = Labels;
   Output.NeedsManualReview = NeedsManualReview;
   Output.Notes = Notes;

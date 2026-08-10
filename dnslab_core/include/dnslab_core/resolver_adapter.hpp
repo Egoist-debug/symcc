@@ -17,6 +17,22 @@ struct CommandResult {
   int ExitCode = 0;
   std::string StdoutText;
   std::string StderrText;
+  bool ProcessStarted = false;
+};
+
+class ResolverExecutableError : public std::runtime_error {
+public:
+  ResolverExecutableError(std::string Message,
+                          std::filesystem::path ExecutablePath)
+      : std::runtime_error(std::move(Message)),
+        ExecutablePath_(std::move(ExecutablePath)) {}
+
+  const std::filesystem::path &executablePath() const {
+    return ExecutablePath_;
+  }
+
+private:
+  std::filesystem::path ExecutablePath_;
 };
 
 struct RunSampleRequest {

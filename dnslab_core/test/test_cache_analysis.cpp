@@ -1,5 +1,6 @@
 #include "dnslab_core/cache_analysis.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -225,6 +226,71 @@ int main() {
           "multi resolver triage 未保留 resolver 列表");
   require(!MultiTriage.ResolverDifferences.empty(),
           "multi resolver triage 未记录 resolver_diffs");
+
+  dnslab::FailureEvidence MissingExecutable;
+  MissingExecutable.Kind = "replay_error";
+  MissingExecutable.Reason = "missing_executable";
+  MissingExecutable.ExitCode = 3;
+  MissingExecutable.Stage = "unbound.preflight";
+  MissingExecutable.Resolver = "unbound";
+  MissingExecutable.ProcessStarted = false;
+  const auto FailedTriage = dnslab::buildTriageRecord(
+      "sample-2", OracleByResolver, MultiDiff, Fingerprint,
+      MissingExecutable);
+  require(FailedTriage.Status == "failed_replay",
+          "显式 replay failure 未优先生成 failed_replay");
+  require(FailedTriage.DiffClass == "replay_incomplete",
+          "replay failure diff_class 不匹配");
+  require(FailedTriage.AnalysisState == "excluded",
+          "missing executable analysis_state 不匹配");
+  require(FailedTriage.FailureBucketPrimary == "infra_artifact_failure",
+          "missing executable primary taxonomy 不匹配");
+  require(FailedTriage.FailureBucketDetail == "replay_missing_executable",
+          "missing executable detail taxonomy 不匹配");
+  require(FailedTriage.ExcludeReason ==
+              std::optional<std::string>("infra_failure"),
+          "missing executable exclude_reason 不匹配");
+  require(std::find(FailedTriage.FilterLabels.begin(),
+                    FailedTriage.FilterLabels.end(), "oracle_missing") !=
+              FailedTriage.FilterLabels.end(),
+          "replay failure 缺少 oracle_missing label");
+  require(std::find(FailedTriage.FilterLabels.begin(),
+                    FailedTriage.FilterLabels.end(),
+                    "replay_missing_executable") !=
+              FailedTriage.FilterLabels.end(),
+          "replay failure 缺少 reason label");
+
+  auto TimeoutFailure = MissingExecutable;
+  TimeoutFailure.Reason = "timeout";
+  TimeoutFailure.ExitCode = 4;
+  TimeoutFailure.ProcessStarted = true;
+  const auto TimeoutTriage = dnslab::buildTriageRecord(
+      "sample-2", OracleByResolver, MultiDiff, Fingerprint, TimeoutFailure);
+  require(TimeoutTriage.AnalysisState == "unknown",
+          "timeout analysis_state 不匹配");
+  require(TimeoutTriage.FailureBucketPrimary == "target_runtime_failure",
+          "timeout primary taxonomy 不匹配");
+  require(TimeoutTriage.FailureBucketDetail == "replay_timeout",
+          "timeout detail taxonomy 不匹配");
+  require(TimeoutTriage.SemanticOutcome == "runtime_or_parse_failure",
+          "timeout semantic_outcome 不匹配");
+
+  const std::map<std::string, dnslab::json::Value::Object> MissingOracle;
+  const auto LegacyTriage = dnslab::buildTriageRecord(
+      "legacy-sample", MissingOracle, MultiDiff, Fingerprint, std::nullopt);
+  require(LegacyTriage.Status == "failed_replay",
+          "缺失 oracle 未生成 failed_replay");
+  require(LegacyTriage.DiffClass == "replay_incomplete",
+          "缺失 oracle diff_class 不匹配");
+  require(std::find(LegacyTriage.FilterLabels.begin(),
+                    LegacyTriage.FilterLabels.end(), "oracle_missing") !=
+              LegacyTriage.FilterLabels.end(),
+          "缺失 oracle 未生成 oracle_missing label");
+  require(std::find(LegacyTriage.FilterLabels.begin(),
+                    LegacyTriage.FilterLabels.end(),
+                    "replay_subprocess_failed") ==
+              LegacyTriage.FilterLabels.end(),
+          "无 failure evidence 时不应生成 replay reason label");
 
   std::filesystem::remove(BindPath);
   std::filesystem::remove(UnboundPath);
