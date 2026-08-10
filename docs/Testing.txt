@@ -57,6 +57,29 @@ checks should not depend on the relative ordering of backend logs and messages
 that the test program writes to standard output (use stderr instead).
 
 
+                        DNS differential regressions
+
+The DNS regression scripts use the C++ dnslabctl backend. Build it before
+running the scripts so that the result does not depend on a stale or missing
+local binary:
+
+$ xmake f -c
+$ xmake build dnslabctl
+$ bash test/test_dns_diff_cli_smoke.sh
+$ bash test/test_follow_diff_pipeline.sh
+$ bash test/test_follow_diff_window.sh
+$ bash test/test_campaign_close_loop.sh
+$ bash test/test_replay_failure_evidence.sh
+$ bash test/test_triage_contract.sh
+$ bash test/test_campaign_report.sh
+
+This is the same script sequence used by
+".github/workflows/dns_diff_regressions.yml". Automatic LLVM discovery is
+covered separately by:
+
+$ bash test/test_xmake_llvm_discovery.sh
+
+
                                 Regression tests
 
 In addition to the hand-written tests that exercise compiler functionality via C
