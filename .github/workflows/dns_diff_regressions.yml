@@ -11,6 +11,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - name: Set up xmake
+        uses: xmake-io/setup-xmake-action@v1
+        with:
+          xmake-version: latest
+      - name: Build dnslabctl backend
+        shell: bash
+        run: |
+          xmake f -c
+          xmake build dnslabctl
       - name: Run DNS diff regression scripts
         shell: bash
         run: |
