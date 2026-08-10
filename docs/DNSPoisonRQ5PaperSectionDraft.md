@@ -23,9 +23,9 @@ RQ5 关注所提出的 `transcript-guided hybrid fuzzing + single-producer multi
 
 当前章节对应的 repo 内正式表为：
 
-- [RQ5ResolverAdapterCost.tsv](/home/ubuntu/codex/symcc/docs/RQ5ResolverAdapterCost.tsv)
-- [RQ5ResolverBuildReplayMatrix.tsv](/home/ubuntu/codex/symcc/docs/RQ5ResolverBuildReplayMatrix.tsv)
-- [RQ5ResolverSemanticDistribution.tsv](/home/ubuntu/codex/symcc/docs/RQ5ResolverSemanticDistribution.tsv)
+- [RQ5ResolverAdapterCost.tsv](./RQ5ResolverAdapterCost.tsv)
+- [RQ5ResolverBuildReplayMatrix.tsv](./RQ5ResolverBuildReplayMatrix.tsv)
+- [RQ5ResolverSemanticDistribution.tsv](./RQ5ResolverSemanticDistribution.tsv)
 
 ## 当前结果
 

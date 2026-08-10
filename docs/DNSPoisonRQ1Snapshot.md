@@ -14,7 +14,7 @@
 
 repo 内快照表：
 
-- [RQ1InputModelSnapshot.tsv](/home/ubuntu/codex/symcc/docs/RQ1InputModelSnapshot.tsv)
+- [RQ1InputModelSnapshot.tsv](./RQ1InputModelSnapshot.tsv)
 
 原始真实产物：
 

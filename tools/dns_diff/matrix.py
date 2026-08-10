@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from .artifact_digest import file_integrity
 from .aggregate import (
     METRIC_NAMES,
     _aggregation_key_signature,
-    _compute_metric_statistics,
     _extract_metrics,
     _has_missing_comparability_metadata,
     _normalize_json_payload,
@@ -17,6 +17,11 @@ from .aggregate import (
     _stable_key_fingerprint,
 )
 from .close_loop import CampaignCloseError, run_campaign_close
+from .statistics import (
+    StatisticsError,
+    compute_metric_statistics,
+    statistics_contract,
+)
 from .schema import (
     AGGREGATION_KEY_FIELDS,
     BASELINE_COMPARE_KEY_FIELDS,
@@ -584,9 +589,15 @@ def _aggregate_variant(
     aggregates: Dict[str, Dict[str, float]] = {}
     if variance_status == "ok":
         for metric_name in METRIC_NAMES:
-            aggregates[metric_name] = _compute_metric_statistics(
-                [_extract_metrics(record["summary"])[metric_name] for record in records]
-            )
+            try:
+                aggregates[metric_name] = compute_metric_statistics(
+                    [
+                        _extract_metrics(record["summary"])[metric_name]
+                        for record in records
+                    ]
+                )
+            except StatisticsError as exc:
+                raise CampaignMatrixError(str(exc)) from exc
 
     baseline_compare_key_status, baseline_compare_key = _evaluate_shared_contract_key(
         records,
@@ -686,6 +697,7 @@ def _write_matrix_manifest(
         "input_model": config.input_model,
         "seed_timeout_sec": config.seed_timeout_sec,
         "contract_version": config.contract_version,
+        "statistics": statistics_contract(),
         "source_queue_dir": str(config.source_queue_dir),
         "runtime_env": dict(config.runtime_env),
         "variants": [],
@@ -699,21 +711,28 @@ def _write_matrix_manifest(
 
     for variant in config.variants:
         records = run_records_by_variant.get(variant.variant_name, ())
+        run_payloads = []
+        for record in records:
+            evidence_bundle_path = record.report_dir / "evidence_bundle.json"
+            run_payloads.append(
+                {
+                    "repeat_index": record.repeat_index,
+                    "run_dir": str(record.run_dir),
+                    "report_dir": str(record.report_dir),
+                    "summary_path": str(record.summary_path),
+                    "close_summary_path": str(record.close_summary_path),
+                    "evidence_bundle_path": str(evidence_bundle_path),
+                    "evidence_bundle_integrity": file_integrity(
+                        evidence_bundle_path
+                    ),
+                }
+            )
         payload["variants"].append(
             {
                 "variant_name": variant.variant_name,
                 "repeat_count": int(repeat_count),
                 "env": dict(variant.env),
-                "runs": [
-                    {
-                        "repeat_index": record.repeat_index,
-                        "run_dir": str(record.run_dir),
-                        "report_dir": str(record.report_dir),
-                        "summary_path": str(record.summary_path),
-                        "close_summary_path": str(record.close_summary_path),
-                    }
-                    for record in records
-                ],
+                "runs": run_payloads,
             }
         )
 
@@ -738,7 +757,16 @@ def _write_variant_summary_tsv(
         "baseline_compare_key",
     ]
     for metric_name in METRIC_NAMES:
-        header.extend([f"{metric_name}_mean", f"{metric_name}_stddev"])
+        header.extend(
+            [
+                f"{metric_name}_mean",
+                f"{metric_name}_stddev",
+                f"{metric_name}_sample_stddev",
+                f"{metric_name}_standard_error",
+                f"{metric_name}_ci95_lower",
+                f"{metric_name}_ci95_upper",
+            ]
+        )
 
     lines = ["\t".join(header)]
     for variant_name in EXPECTED_VARIANT_ORDER:
@@ -777,8 +805,20 @@ def _write_variant_summary_tsv(
             if isinstance(stats, Mapping):
                 row.append(_format_metric_value(float(stats.get("mean", 0.0))))
                 row.append(_format_metric_value(float(stats.get("stddev", 0.0))))
+                row.append(
+                    _format_metric_value(float(stats.get("sample_stddev", 0.0)))
+                )
+                row.append(
+                    _format_metric_value(float(stats.get("standard_error", 0.0)))
+                )
+                row.append(
+                    _format_metric_value(float(stats.get("ci95_lower", 0.0)))
+                )
+                row.append(
+                    _format_metric_value(float(stats.get("ci95_upper", 0.0)))
+                )
             else:
-                row.extend(["", ""])
+                row.extend(["", "", "", "", "", ""])
         lines.append("\t".join(row))
 
     (output_dir / "variant_summary.tsv").write_text(

@@ -1,5 +1,7 @@
 # DNS Poison 论文结果草稿
 
+> 证据状态：本文件中的数值来自历史快照。当前工作树未包含对应原始矩阵目录；在矩阵通过 `publication-audit` 并生成 `status=ready` 的 `publication_readiness.json` 前，以下结果只用于草稿推演，不作为终稿可复核证据。
+
 ## 当前研究主线
 
 本文当前最稳的主线是：`BIND9` 作为单一 producer，`DST1 transcript` 作为统一输入模型，通过同步 replay/triage 将同一批样本投递给多个 secondary resolver，并以结构化 `oracle / cache diff / triage / campaign report` 作为论文证据链。
@@ -14,7 +16,7 @@
 
 当前正式表：
 
-- [RQ1InputModelMultiSample.tsv](/home/egoist/codex/symcc/docs/RQ1InputModelMultiSample.tsv)
+- [RQ1InputModelMultiSample.tsv](./RQ1InputModelMultiSample.tsv)
 
 当前口径：
 
@@ -46,7 +48,7 @@
 
 当前正式表：
 
-- [RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)
+- [RQ3DnsmasqVariantSummary.tsv](./RQ3DnsmasqVariantSummary.tsv)
 
 当前批次：
 
@@ -78,7 +80,7 @@
 
 当前正式表：
 
-- [RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)
+- [RQ3MaradnsVariantSummary.tsv](./RQ3MaradnsVariantSummary.tsv)
 
 当前批次：
 
@@ -104,7 +106,7 @@
 
 当前正式表：
 
-- [RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)
+- [RQ3KnotVariantSummary.tsv](./RQ3KnotVariantSummary.tsv)
 
 当前批次：
 
@@ -130,8 +132,8 @@
 
 当前正式表：
 
-- [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
-- [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
+- [RQ3UnboundVariantSummary.tsv](./RQ3UnboundVariantSummary.tsv)
+- [RQ3SmartdnsVariantSummary.tsv](./RQ3SmartdnsVariantSummary.tsv)
 
 当前批次：
 
@@ -161,7 +163,7 @@
 
 当前正式表：
 
-- [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)
+- [RQ5FullStackMultiSampleSummary.tsv](./RQ5FullStackMultiSampleSummary.tsv)
 
 当前批次：
 
@@ -188,7 +190,7 @@
 
 当前正式表：
 
-- [RQ5FailureRefinement.tsv](/home/egoist/codex/symcc/docs/RQ5FailureRefinement.tsv)
+- [RQ5FailureRefinement.tsv](./RQ5FailureRefinement.tsv)
 
 当前状态：
 

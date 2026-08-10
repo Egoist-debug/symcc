@@ -14,7 +14,7 @@
   - `no_mutator`
   - `no_cache_delta`
 - repo 内正式表：
-  - [RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)
+  - [RQ3DnsmasqVariantSummary.tsv](./RQ3DnsmasqVariantSummary.tsv)
 
 ## 主表结论
 

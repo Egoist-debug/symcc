@@ -31,3 +31,6 @@ jobs:
           bash test/test_replay_failure_evidence.sh
           bash test/test_triage_contract.sh
           bash test/test_campaign_report.sh
+          bash test/test_multi_run_aggregate.sh
+          bash test/test_publication_evidence_bundle.sh
+          bash test/test_publication_readiness_audit.sh

@@ -13,6 +13,7 @@ from .audit import (
     write_oracle_audit_tsv,
     write_oracle_reliability_json,
 )
+from .artifact_digest import file_integrity
 from .path_defaults import (
     resolve_dnslabctl_bin,
     resolve_follow_diff_work_dir,
@@ -161,6 +162,7 @@ def _build_artifact_reference(
         "optional": optional,
         "regeneration_command": regeneration_command,
     }
+    payload.update(file_integrity(path))
     if field_paths is not None:
         payload["field_paths"] = list(field_paths)
     if column_paths is not None:

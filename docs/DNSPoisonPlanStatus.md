@@ -28,15 +28,15 @@
 
 | 计划项 | 状态 | 证据 | 当前边界 |
 | --- | --- | --- | --- |
-| `dnslab_core` 作为 C++ 主体模块存在 | `部分完成` | [dnslab_core/xmake.lua](/home/ubuntu/codex/symcc/dnslab_core/xmake.lua), [dnslab_core/src/main.cpp](/home/ubuntu/codex/symcc/dnslab_core/src/main.cpp), [dnslab_core/src/concrete_adapters.cpp](/home/ubuntu/codex/symcc/dnslab_core/src/concrete_adapters.cpp) | 已覆盖 transcript、adapter、sync-replay、batch-sync-replay、evidence-bundle；`follow-diff/replay/matrix/campaign` 仍主要在 Python |
-| 复用 `gen_input` 与 `DST1Mutator`，固定统一 transcript 输入模型 | `部分完成` | [gen_input/include/DST1Transcript.h](/home/ubuntu/codex/symcc/gen_input/include/DST1Transcript.h), [gen_input/src/afl_dst1_mutator.cpp](/home/ubuntu/codex/symcc/gen_input/src/afl_dst1_mutator.cpp), [test/test_dns_diff_replay_unbound_smoke.sh](/home/ubuntu/codex/symcc/test/test_dns_diff_replay_unbound_smoke.sh) | 10 字节头协议已在真实链路可用；仍存在旧样本/旧 fake transcript 兼容层，仓库还未完全清理旧格式依赖 |
-| 将 `schema.py` 证据契约迁移为 C++ 数据结构 | `部分完成` | [dnslab_core/include/dnslab_core/evidence_contract.hpp](/home/ubuntu/codex/symcc/dnslab_core/include/dnslab_core/evidence_contract.hpp), [dnslab_core/src/evidence_contract.cpp](/home/ubuntu/codex/symcc/dnslab_core/src/evidence_contract.cpp), [dnslab_core/include/dnslab_core/reporting.hpp](/home/ubuntu/codex/symcc/dnslab_core/include/dnslab_core/reporting.hpp) | C++ 已有契约结构；真实主链仍由 Python 侧 `schema.py / report.py / campaign.py` 驱动 |
-| 泛化为 `ResolverAdapter` 接口 | `已完成` | [dnslab_core/include/dnslab_core/resolver_adapter.hpp](/home/ubuntu/codex/symcc/dnslab_core/include/dnslab_core/resolver_adapter.hpp), [dnslab_core/include/dnslab_core/concrete_adapters.hpp](/home/ubuntu/codex/symcc/dnslab_core/include/dnslab_core/concrete_adapters.hpp) | 已覆盖 `bind9/unbound/dnsmasq/smartdns/maradns/knot-resolver` |
-| 六个 resolver 按 tag 冻结并可准备源码树 | `已完成` | [experiments/resolvers.lock.json](/home/ubuntu/codex/symcc/experiments/resolvers.lock.json), `experiments/subjects/*`, `dnslabctl prepare-subject(s)` 路径 | 当前 freeze 证据已齐 |
-| `BIND9` 作为 producer，其他 resolver 作为 replay target | `已完成` | [tools/dns_diff/config/poison_stateful_longbudget_matrix.json](/home/ubuntu/codex/symcc/tools/dns_diff/config/poison_stateful_longbudget_matrix.json), [tools/dns_diff/config/poison_stateful_dnsmasq_matrix.json](/home/ubuntu/codex/symcc/tools/dns_diff/config/poison_stateful_dnsmasq_matrix.json), [tools/dns_diff/config/poison_stateful_smartdns_matrix.json](/home/ubuntu/codex/symcc/tools/dns_diff/config/poison_stateful_smartdns_matrix.json), [tools/dns_diff/config/poison_stateful_maradns_matrix.json](/home/ubuntu/codex/symcc/tools/dns_diff/config/poison_stateful_maradns_matrix.json), [tools/dns_diff/config/poison_stateful_knot_matrix.json](/home/ubuntu/codex/symcc/tools/dns_diff/config/poison_stateful_knot_matrix.json) | 真实 batch 已按 `bind9_vs_<resolver>` 跑通 |
-| Python 只保留聚合/制图，复杂逻辑进入 C++ | `未完成` | Python 主链仍集中在 [tools/dns_diff/follow_diff.py](/home/ubuntu/codex/symcc/tools/dns_diff/follow_diff.py), [tools/dns_diff/replay.py](/home/ubuntu/codex/symcc/tools/dns_diff/replay.py), [tools/dns_diff/matrix.py](/home/ubuntu/codex/symcc/tools/dns_diff/matrix.py), [tools/dns_diff/campaign.py](/home/ubuntu/codex/symcc/tools/dns_diff/campaign.py) | 当前最主要未完成项之一 |
-| `follow_diff` 开始具备 `dnslabctl sync-replay` 后端 | `部分完成` | [tools/dns_diff/follow_diff.py](/home/ubuntu/codex/symcc/tools/dns_diff/follow_diff.py), [test/test_follow_diff_dnslabctl_backend_knot_smoke.sh](/home/ubuntu/codex/symcc/test/test_follow_diff_dnslabctl_backend_knot_smoke.sh), [test/test_follow_diff_dnslabctl_backend_dnsmasq_smoke.sh](/home/ubuntu/codex/symcc/test/test_follow_diff_dnslabctl_backend_dnsmasq_smoke.sh), [test/test_follow_diff_dnslabctl_backend_smartdns_smoke.sh](/home/ubuntu/codex/symcc/test/test_follow_diff_dnslabctl_backend_smartdns_smoke.sh), [test/test_follow_diff_dnslabctl_backend_maradns_smoke.sh](/home/ubuntu/codex/symcc/test/test_follow_diff_dnslabctl_backend_maradns_smoke.sh), 真实 5 resolver 探针结果 `/home/ubuntu/tmp/follow-diff-dnslabctl-real.WGbbQE/result.tsv`，真实多 resolver backend 对照 `/home/ubuntu/tmp/real_campaign_matrix_batch_dnslabctl/20260514_082501/_backend_compare/resolver_backend_compare.tsv` | 当前仍是受控开关 `DNS_DIFF_REPLAY_BACKEND=dnslabctl`，尚未成为默认路径；但 `unbound/dnsmasq/smartdns/maradns/knot-resolver` 的真实 `follow-diff-once` 探针都已达到 `sample.meta.status=completed` 且 `triage.status=completed_oracle_diff`，并且真实 multi-resolver batch 已与 Python backend 做完一轮统一对照 |
-| `git ls-remote --tags` 驱动 lock 文件生成 | `已完成` | `dnslabctl lock-generate`, [experiments/resolvers.lock.json](/home/ubuntu/codex/symcc/experiments/resolvers.lock.json) | 当前 lock 文件已可复用 |
+| `dnslab_core` 作为 C++ 主体模块存在 | `部分完成` | [dnslab_core/xmake.lua](../dnslab_core/xmake.lua), [dnslab_core/src/main.cpp](../dnslab_core/src/main.cpp), [dnslab_core/src/concrete_adapters.cpp](../dnslab_core/src/concrete_adapters.cpp) | 已覆盖 transcript、adapter、sync-replay、batch-sync-replay、evidence-bundle；`follow-diff/replay/matrix/campaign` 仍主要在 Python |
+| 复用 `gen_input` 与 `DST1Mutator`，固定统一 transcript 输入模型 | `部分完成` | [gen_input/include/DST1Transcript.h](../gen_input/include/DST1Transcript.h), [gen_input/src/afl_dst1_mutator.cpp](../gen_input/src/afl_dst1_mutator.cpp), [test/test_dns_diff_replay_unbound_smoke.sh](../test/test_dns_diff_replay_unbound_smoke.sh) | 10 字节头协议已在真实链路可用；仍存在旧样本/旧 fake transcript 兼容层，仓库还未完全清理旧格式依赖 |
+| 将 `schema.py` 证据契约迁移为 C++ 数据结构 | `部分完成` | [dnslab_core/include/dnslab_core/evidence_contract.hpp](../dnslab_core/include/dnslab_core/evidence_contract.hpp), [dnslab_core/src/evidence_contract.cpp](../dnslab_core/src/evidence_contract.cpp), [dnslab_core/include/dnslab_core/reporting.hpp](../dnslab_core/include/dnslab_core/reporting.hpp) | C++ 已有契约结构；真实主链仍由 Python 侧 `schema.py / report.py / campaign.py` 驱动 |
+| 泛化为 `ResolverAdapter` 接口 | `已完成` | [dnslab_core/include/dnslab_core/resolver_adapter.hpp](../dnslab_core/include/dnslab_core/resolver_adapter.hpp), [dnslab_core/include/dnslab_core/concrete_adapters.hpp](../dnslab_core/include/dnslab_core/concrete_adapters.hpp) | 已覆盖 `bind9/unbound/dnsmasq/smartdns/maradns/knot-resolver` |
+| 六个 resolver 按 tag 冻结并可准备源码树 | `已完成` | [experiments/resolvers.lock.json](../experiments/resolvers.lock.json), `experiments/subjects/*`, `dnslabctl prepare-subject(s)` 路径 | 当前 freeze 证据已齐 |
+| `BIND9` 作为 producer，其他 resolver 作为 replay target | `已完成` | [tools/dns_diff/config/poison_stateful_longbudget_matrix.json](../tools/dns_diff/config/poison_stateful_longbudget_matrix.json), [tools/dns_diff/config/poison_stateful_dnsmasq_matrix.json](../tools/dns_diff/config/poison_stateful_dnsmasq_matrix.json), [tools/dns_diff/config/poison_stateful_smartdns_matrix.json](../tools/dns_diff/config/poison_stateful_smartdns_matrix.json), [tools/dns_diff/config/poison_stateful_maradns_matrix.json](../tools/dns_diff/config/poison_stateful_maradns_matrix.json), [tools/dns_diff/config/poison_stateful_knot_matrix.json](../tools/dns_diff/config/poison_stateful_knot_matrix.json) | 真实 batch 已按 `bind9_vs_<resolver>` 跑通 |
+| Python 只保留聚合/制图，复杂逻辑进入 C++ | `未完成` | Python 主链仍集中在 [tools/dns_diff/follow_diff.py](../tools/dns_diff/follow_diff.py), [tools/dns_diff/replay.py](../tools/dns_diff/replay.py), [tools/dns_diff/matrix.py](../tools/dns_diff/matrix.py), [tools/dns_diff/campaign.py](../tools/dns_diff/campaign.py) | 当前最主要未完成项之一 |
+| `follow_diff` 开始具备 `dnslabctl sync-replay` 后端 | `部分完成` | [tools/dns_diff/follow_diff.py](../tools/dns_diff/follow_diff.py), [test/test_follow_diff_dnslabctl_backend_knot_smoke.sh](../test/test_follow_diff_dnslabctl_backend_knot_smoke.sh), [test/test_follow_diff_dnslabctl_backend_dnsmasq_smoke.sh](../test/test_follow_diff_dnslabctl_backend_dnsmasq_smoke.sh), [test/test_follow_diff_dnslabctl_backend_smartdns_smoke.sh](../test/test_follow_diff_dnslabctl_backend_smartdns_smoke.sh), [test/test_follow_diff_dnslabctl_backend_maradns_smoke.sh](../test/test_follow_diff_dnslabctl_backend_maradns_smoke.sh), 真实 5 resolver 探针结果 `/home/ubuntu/tmp/follow-diff-dnslabctl-real.WGbbQE/result.tsv`，真实多 resolver backend 对照 `/home/ubuntu/tmp/real_campaign_matrix_batch_dnslabctl/20260514_082501/_backend_compare/resolver_backend_compare.tsv` | 当前仍是受控开关 `DNS_DIFF_REPLAY_BACKEND=dnslabctl`，尚未成为默认路径；但 `unbound/dnsmasq/smartdns/maradns/knot-resolver` 的真实 `follow-diff-once` 探针都已达到 `sample.meta.status=completed` 且 `triage.status=completed_oracle_diff`，并且真实 multi-resolver batch 已与 Python backend 做完一轮统一对照 |
+| `git ls-remote --tags` 驱动 lock 文件生成 | `已完成` | `dnslabctl lock-generate`, [experiments/resolvers.lock.json](../experiments/resolvers.lock.json) | 当前 lock 文件已可复用 |
 
 ## 二、实验设计审计
 
@@ -48,8 +48,8 @@
 
 证据：
 
-- [DNSPoisonRQ1Snapshot.md](/home/ubuntu/codex/symcc/docs/DNSPoisonRQ1Snapshot.md)
-- [RQ1InputModelSnapshot.tsv](/home/ubuntu/codex/symcc/docs/RQ1InputModelSnapshot.tsv)
+- [DNSPoisonRQ1Snapshot.md](./DNSPoisonRQ1Snapshot.md)
+- [RQ1InputModelSnapshot.tsv](./RQ1InputModelSnapshot.tsv)
 - 真实产物：`/home/ubuntu/tmp/rq1_input_model_snapshot/20260514_084505/out/summary.tsv`
 
 边界：
@@ -65,9 +65,9 @@
 
 证据：
 
-- [dnslab_core/src/main.cpp](/home/ubuntu/codex/symcc/dnslab_core/src/main.cpp) 的 `sync-replay / batch-sync-replay`
-- [test/test_dnslabctl_sync_replay_secondary_knot.sh](/home/ubuntu/codex/symcc/test/test_dnslabctl_sync_replay_secondary_knot.sh)
-- [test/test_real_campaign_matrix_multi_resolver.sh](/home/ubuntu/codex/symcc/test/test_real_campaign_matrix_multi_resolver.sh)
+- [dnslab_core/src/main.cpp](../dnslab_core/src/main.cpp) 的 `sync-replay / batch-sync-replay`
+- [test/test_dnslabctl_sync_replay_secondary_knot.sh](../test/test_dnslabctl_sync_replay_secondary_knot.sh)
+- [test/test_real_campaign_matrix_multi_resolver.sh](../test/test_real_campaign_matrix_multi_resolver.sh)
 
 边界：
 
@@ -82,15 +82,15 @@
 
 证据：
 
-- [DNSPoisonRQ3DnsmasqMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3DnsmasqMultiSample.md)
-- [RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)
-- [DNSPoisonRQ3MaradnsMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3MaradnsMultiSample.md)
-- [RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)
-- [DNSPoisonRQ3KnotMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3KnotMultiSample.md)
-- [RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)
-- [DNSPoisonRQ3UnboundSmartdnsMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3UnboundSmartdnsMultiSample.md)
-- [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
-- [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
+- [DNSPoisonRQ3DnsmasqMultiSample.md](./DNSPoisonRQ3DnsmasqMultiSample.md)
+- [RQ3DnsmasqVariantSummary.tsv](./RQ3DnsmasqVariantSummary.tsv)
+- [DNSPoisonRQ3MaradnsMultiSample.md](./DNSPoisonRQ3MaradnsMultiSample.md)
+- [RQ3MaradnsVariantSummary.tsv](./RQ3MaradnsVariantSummary.tsv)
+- [DNSPoisonRQ3KnotMultiSample.md](./DNSPoisonRQ3KnotMultiSample.md)
+- [RQ3KnotVariantSummary.tsv](./RQ3KnotVariantSummary.tsv)
+- [DNSPoisonRQ3UnboundSmartdnsMultiSample.md](./DNSPoisonRQ3UnboundSmartdnsMultiSample.md)
+- [RQ3UnboundVariantSummary.tsv](./RQ3UnboundVariantSummary.tsv)
+- [RQ3SmartdnsVariantSummary.tsv](./RQ3SmartdnsVariantSummary.tsv)
 - 原始统计表：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260522_083406/resolver_variant_summary.tsv`
   - `experiments/results/real_rq3_multi_resolver_ablation/20260523_093620/resolver_variant_summary.tsv`
@@ -127,10 +127,10 @@
 
 核心证据：
 
-- [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)
-- [DNSPoisonRQ5MultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ5MultiSample.md)
-- [RQ5FailureRefinement.tsv](/home/egoist/codex/symcc/docs/RQ5FailureRefinement.tsv)
-- [DNSPoisonRQ5FailureRefinement.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ5FailureRefinement.md)
+- [RQ5FullStackMultiSampleSummary.tsv](./RQ5FullStackMultiSampleSummary.tsv)
+- [DNSPoisonRQ5MultiSample.md](./DNSPoisonRQ5MultiSample.md)
+- [RQ5FailureRefinement.tsv](./RQ5FailureRefinement.tsv)
+- [DNSPoisonRQ5FailureRefinement.md](./DNSPoisonRQ5FailureRefinement.md)
 - 当前正式批次：
   - `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260523_095431`
 
@@ -151,7 +151,7 @@
 | 验收项 | 状态 | 证据 | 当前边界 |
 | --- | --- | --- | --- |
 | 固定预算实验 | `部分完成` | `queue_limit=4`、`budget-sec=12` 的正式主表已落盘；批次见 `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260523_095431` | 还没有 `1h/6h/24h` 三档 |
-| 每个配置至少 5 次重复 | `部分完成` | [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)、[RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)、[RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)、[RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)、[RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)、[RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv) | RQ1/RQ2/RQ4 仍未达到同口径重复次数 |
+| 每个配置至少 5 次重复 | `部分完成` | [RQ5FullStackMultiSampleSummary.tsv](./RQ5FullStackMultiSampleSummary.tsv)、[RQ3DnsmasqVariantSummary.tsv](./RQ3DnsmasqVariantSummary.tsv)、[RQ3MaradnsVariantSummary.tsv](./RQ3MaradnsVariantSummary.tsv)、[RQ3KnotVariantSummary.tsv](./RQ3KnotVariantSummary.tsv)、[RQ3UnboundVariantSummary.tsv](./RQ3UnboundVariantSummary.tsv)、[RQ3SmartdnsVariantSummary.tsv](./RQ3SmartdnsVariantSummary.tsv) | RQ1/RQ2/RQ4 仍未达到同口径重复次数 |
 | 每个 run 生成 `evidence_bundle.json/summary.json/oracle_audit.tsv/failure_taxonomy.tsv/cluster.tsv/case_studies/index.tsv` | `部分完成` | 真实 `campaign_reports/...` 已有 `summary.json/ablation_matrix.tsv/cluster_counts.tsv/repro_rate.tsv/oracle_audit.tsv/oracle_reliability.json/failure_taxonomy.tsv/exclusion_summary.tsv/evidence_bundle.json` | 真实 batch 目前没有看到 `cluster.tsv` 与 `case_studies/index.tsv` 的统一落盘 |
 | 至少 2 到 5 个端到端 case study | `已完成` | `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260522_073442/manual_case_studies/index.tsv` | 当前已有 `4` 个代表性 case；当前 queue_limit=4 主表仍可补同批次案例说明 |
 | 失败样本明确分类 | `部分完成` | `failure_taxonomy.tsv`、`resolver_semantic_distribution.tsv` 已存在 | 论文级 failure taxonomy 仍需更大样本 |

@@ -2,7 +2,29 @@
 
 ## 更新时间
 
-- `2026-05-23`
+- `2026-08-10`
+
+## 论文就绪状态
+
+当前仓库已经具备机器可执行的论文证据质量门，但历史结果尚未全部通过该质量门：
+
+- 新生成的多轮统计包含样本标准差、标准误与 95% 置信区间；
+- Python 与 `dnslabctl` 两个报告后端都会为必需证据写入文件大小和 SHA-256；
+- `publication-audit` 会检查四变体完整性、至少 5 次独立重复、闭环成功状态、
+  run 可比性、seed provenance、原始样本、claim 可追溯性、汇总统计可重算性、
+  证据包及其产物哈希，以及至少 2 个 case study；
+- 当前工作树未包含下文历史表所引用的 `experiments/results` 原始目录，因此这些表只能视为历史快照，不能单独作为可复核的投稿证据。
+
+后续正式实验必须保留完整矩阵目录，并在结果冻结前运行：
+
+```bash
+python3 -m tools.dns_diff.cli publication-audit \
+  --matrix-root MATRIX_ROOT \
+  --minimum-runs 5 \
+  --minimum-case-studies 2
+```
+
+只有 `publication_readiness.json` 中 `status=ready` 的矩阵才进入论文主表。现有 RQ1/RQ3/RQ5 TSV 在原始矩阵补回并通过审计前，不升级为“终稿级统计”。
 
 ## 本轮新增真实产物
 
@@ -11,7 +33,7 @@
 - 运行结果目录：
   - `experiments/results/rq1_input_model_multi_sample_20260522_071746/out`
 - repo 内落盘表：
-  - [RQ1InputModelMultiSample.tsv](/home/egoist/codex/symcc/docs/RQ1InputModelMultiSample.tsv)
+  - [RQ1InputModelMultiSample.tsv](./RQ1InputModelMultiSample.tsv)
 - 运行口径：
   - `dst1_transcript`：取 `named_experiment/work/stable_transcript_corpus` 前 `16` 个稳定样本
   - `query_only`：取 `named_experiment/work/query_corpus` 前 `16` 个裸 query
@@ -60,7 +82,7 @@
 ### 当前可直接引用的 RQ5 语义分布表
 
 - repo 内表：
-  - [RQ5ResolverSemanticDistribution.tsv](/home/egoist/codex/symcc/docs/RQ5ResolverSemanticDistribution.tsv)
+  - [RQ5ResolverSemanticDistribution.tsv](./RQ5ResolverSemanticDistribution.tsv)
 
 当前表格结论：
 
@@ -81,9 +103,9 @@
 - 批次目录：
   - `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260523_095431`
 - repo 内正式表：
-  - [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)
+  - [RQ5FullStackMultiSampleSummary.tsv](./RQ5FullStackMultiSampleSummary.tsv)
 - 结果说明：
-  - [DNSPoisonRQ5MultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ5MultiSample.md)
+  - [DNSPoisonRQ5MultiSample.md](./DNSPoisonRQ5MultiSample.md)
 - 人工 case study：
   - `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260522_073442/manual_case_studies/index.tsv`
 
@@ -164,9 +186,9 @@
 - 批次目录：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260522_083406/dnsmasq`
 - repo 内正式表：
-  - [RQ3DnsmasqVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3DnsmasqVariantSummary.tsv)
+  - [RQ3DnsmasqVariantSummary.tsv](./RQ3DnsmasqVariantSummary.tsv)
 - 结果说明：
-  - [DNSPoisonRQ3DnsmasqMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3DnsmasqMultiSample.md)
+  - [DNSPoisonRQ3DnsmasqMultiSample.md](./DNSPoisonRQ3DnsmasqMultiSample.md)
 
 当前可直接写入论文的保守结论：
 
@@ -185,9 +207,9 @@
 - 批次目录：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260522_084931/maradns`
 - repo 内正式表：
-  - [RQ3MaradnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3MaradnsVariantSummary.tsv)
+  - [RQ3MaradnsVariantSummary.tsv](./RQ3MaradnsVariantSummary.tsv)
 - 结果说明：
-  - [DNSPoisonRQ3MaradnsMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3MaradnsMultiSample.md)
+  - [DNSPoisonRQ3MaradnsMultiSample.md](./DNSPoisonRQ3MaradnsMultiSample.md)
 
 这说明：
 
@@ -200,9 +222,9 @@
 - 批次目录：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260523_093620/knot`
 - repo 内正式表：
-  - [RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)
+  - [RQ3KnotVariantSummary.tsv](./RQ3KnotVariantSummary.tsv)
 - 结果说明：
-  - [DNSPoisonRQ3KnotMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3KnotMultiSample.md)
+  - [DNSPoisonRQ3KnotMultiSample.md](./DNSPoisonRQ3KnotMultiSample.md)
 
 这说明：
 
@@ -215,10 +237,10 @@
 - 批次目录：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260603_121445`
 - repo 内正式表：
-  - [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
-  - [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
+  - [RQ3UnboundVariantSummary.tsv](./RQ3UnboundVariantSummary.tsv)
+  - [RQ3SmartdnsVariantSummary.tsv](./RQ3SmartdnsVariantSummary.tsv)
 - 结果说明：
-  - [DNSPoisonRQ3UnboundSmartdnsMultiSample.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ3UnboundSmartdnsMultiSample.md)
+  - [DNSPoisonRQ3UnboundSmartdnsMultiSample.md](./DNSPoisonRQ3UnboundSmartdnsMultiSample.md)
 
 这说明：
 
@@ -231,9 +253,9 @@
 ### RQ5 failure refinement
 
 - 汇总表：
-  - [RQ5FailureRefinement.tsv](/home/egoist/codex/symcc/docs/RQ5FailureRefinement.tsv)
+  - [RQ5FailureRefinement.tsv](./RQ5FailureRefinement.tsv)
 - 结果说明：
-  - [DNSPoisonRQ5FailureRefinement.md](/home/egoist/codex/symcc/docs/DNSPoisonRQ5FailureRefinement.md)
+  - [DNSPoisonRQ5FailureRefinement.md](./DNSPoisonRQ5FailureRefinement.md)
 
 当前可直接写入论文的保守结论：
 

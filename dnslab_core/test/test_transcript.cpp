@@ -52,5 +52,19 @@ int main() {
   require(Identity.SampleId.rfind("id:000001__", 0) == 0,
           "SampleId 前缀不匹配");
   require(Identity.SampleSha1.size() == 40U, "SampleSha1 长度不匹配");
+  require(
+      dnslab::sha256Hex({}) ==
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "空输入 SHA-256 计算结果不匹配");
+  const std::vector<uint8_t> DigestInput = {'a', 'b', 'c'};
+  require(
+      dnslab::sha256Hex(DigestInput) ==
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      "SHA-256 计算结果不匹配");
+  const std::vector<uint8_t> MillionAs(1000000U, 'a');
+  require(
+      dnslab::sha256Hex(MillionAs) ==
+          "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+      "跨块 SHA-256 计算结果不匹配");
   return 0;
 }

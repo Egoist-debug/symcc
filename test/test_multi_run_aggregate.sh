@@ -127,6 +127,13 @@ summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 aggregates = summary.get("aggregates")
 if not isinstance(aggregates, dict):
     raise SystemExit("ASSERT FAIL: summary.aggregates 应为对象")
+if summary.get("statistics") != {
+    "confidence_level": 0.95,
+    "confidence_interval_method": "student_t_df_le_30_normal_asymptotic",
+    "sample_stddev_denominator": "n-1",
+    "legacy_stddev_semantics": "population",
+}:
+    raise SystemExit(f"ASSERT FAIL: summary.statistics 口径非法: {summary.get('statistics')!r}")
 
 required_metrics = {
     "total_samples",
@@ -153,6 +160,14 @@ if abs(float(total.get("max", -1)) - 20.0) > 1e-9:
     raise SystemExit(f"ASSERT FAIL: total_samples.max 非预期: {total!r}")
 if abs(float(total.get("stddev", -1)) - 5.0) > 1e-9:
     raise SystemExit(f"ASSERT FAIL: total_samples.stddev 非预期: {total!r}")
+if abs(float(total.get("sample_stddev", -1)) - math.sqrt(50.0)) > 1e-9:
+    raise SystemExit(f"ASSERT FAIL: total_samples.sample_stddev 非预期: {total!r}")
+if abs(float(total.get("standard_error", -1)) - 5.0) > 1e-9:
+    raise SystemExit(f"ASSERT FAIL: total_samples.standard_error 非预期: {total!r}")
+if abs(float(total.get("ci95_lower", -1)) - (-48.53)) > 1e-9:
+    raise SystemExit(f"ASSERT FAIL: total_samples.ci95_lower 非预期: {total!r}")
+if abs(float(total.get("ci95_upper", -1)) - 78.53) > 1e-9:
+    raise SystemExit(f"ASSERT FAIL: total_samples.ci95_upper 非预期: {total!r}")
 
 repro = aggregates["repro_rate"]
 if abs(float(repro.get("mean", -1)) - 0.5) > 1e-9:
@@ -252,7 +267,7 @@ assert_file_exists "$OK_LATEST/comparability.tsv"
 assert_summary_status "$OK_LATEST/summary.json" 2 "ok"
 assert_variance_ok_payload "$OK_LATEST/summary.json"
 assert_file_contains "$OK_LATEST/run_matrix.tsv" $'run_id\tsummary_path\ttotal_samples'
-assert_file_contains "$OK_LATEST/variance.tsv" $'metric\tmean\tmin\tmax\tstddev'
+assert_file_contains "$OK_LATEST/variance.tsv" $'metric\tcount\tmean\tmin\tmax\tstddev\tsample_stddev\tstandard_error\tci95_lower\tci95_upper'
 assert_file_contains "$OK_LATEST/variance.tsv" "oracle_audit_candidate_count"
 assert_file_contains "$OK_LATEST/variance.tsv" "semantic_diff_count"
 

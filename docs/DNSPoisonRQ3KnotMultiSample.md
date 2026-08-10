@@ -14,7 +14,7 @@
   - `no_mutator`
   - `no_cache_delta`
 - repo 内正式表：
-  - [RQ3KnotVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3KnotVariantSummary.tsv)
+  - [RQ3KnotVariantSummary.tsv](./RQ3KnotVariantSummary.tsv)
 
 ## 主表结论
 

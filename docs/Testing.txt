@@ -72,6 +72,13 @@ $ bash test/test_campaign_close_loop.sh
 $ bash test/test_replay_failure_evidence.sh
 $ bash test/test_triage_contract.sh
 $ bash test/test_campaign_report.sh
+$ bash test/test_multi_run_aggregate.sh
+$ bash test/test_publication_evidence_bundle.sh
+$ bash test/test_publication_readiness_audit.sh
+
+最后三项检查覆盖论文证据质量门，分别验证多轮实验置信区间、证据包内容哈希，
+以及矩阵结果的端到端论文就绪审计。审计回归还会分别篡改报告产物、证据包和
+汇总统计，确认三类漂移都会阻止结果进入 `ready` 状态。
 
 This is the same script sequence used by
 ".github/workflows/dns_diff_regressions.yml". Automatic LLVM discovery is

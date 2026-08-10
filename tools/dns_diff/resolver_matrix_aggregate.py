@@ -161,10 +161,16 @@ def run_resolver_matrix_aggregate(
         "baseline_compare_key",
         "runtime_env_json",
     ]
+    metric_suffixes = (
+        "_mean",
+        "_stddev",
+        "_sample_stddev",
+        "_standard_error",
+        "_ci95_lower",
+        "_ci95_upper",
+    )
     metric_columns = [
-        key
-        for key in collected[0].keys()
-        if key.endswith("_mean") or key.endswith("_stddev")
+        key for key in collected[0].keys() if key.endswith(metric_suffixes)
     ]
     header = preferred_columns + [
         key for key in metric_columns if key not in preferred_columns

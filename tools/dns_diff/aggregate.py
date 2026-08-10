@@ -4,6 +4,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from .statistics import (
+    StatisticsError,
+    compute_metric_statistics,
+    statistics_contract,
+)
+
 EXIT_USAGE = 2
 
 METRIC_NAMES: Sequence[str] = (
@@ -275,17 +281,10 @@ def _shared_aggregation_key(
 
 
 def _compute_metric_statistics(values: Sequence[float]) -> Dict[str, float]:
-    if not values:
-        raise CampaignAggregateError("统计指标不能为空")
-    count = float(len(values))
-    mean = sum(values) / count
-    variance = sum((value - mean) ** 2 for value in values) / count
-    return {
-        "mean": mean,
-        "min": min(values),
-        "max": max(values),
-        "stddev": math.sqrt(variance),
-    }
+    try:
+        return compute_metric_statistics(values)
+    except StatisticsError as exc:
+        raise CampaignAggregateError(str(exc)) from exc
 
 
 def _write_variance_tsv(
@@ -294,7 +293,10 @@ def _write_variance_tsv(
     variance_status: str,
     aggregates: Mapping[str, Mapping[str, float]],
 ) -> None:
-    lines = ["metric\tmean\tmin\tmax\tstddev"]
+    lines = [
+        "metric\tcount\tmean\tmin\tmax\tstddev\tsample_stddev"
+        "\tstandard_error\tci95_lower\tci95_upper"
+    ]
     if variance_status == "ok":
         for metric_name in METRIC_NAMES:
             stats = aggregates.get(metric_name)
@@ -304,10 +306,15 @@ def _write_variance_tsv(
                 "\t".join(
                     [
                         metric_name,
+                        str(int(_coerce_float(stats.get("count")))),
                         f"{_coerce_float(stats.get('mean')):.6f}",
                         f"{_coerce_float(stats.get('min')):.6f}",
                         f"{_coerce_float(stats.get('max')):.6f}",
                         f"{_coerce_float(stats.get('stddev')):.6f}",
+                        f"{_coerce_float(stats.get('sample_stddev')):.6f}",
+                        f"{_coerce_float(stats.get('standard_error')):.6f}",
+                        f"{_coerce_float(stats.get('ci95_lower')):.6f}",
+                        f"{_coerce_float(stats.get('ci95_upper')):.6f}",
                     ]
                 )
             )
@@ -331,6 +338,7 @@ def _build_summary_payload(
         "run_count": run_count,
         "variance_status": variance_status,
         "aggregate_metrics": list(METRIC_NAMES),
+        "statistics": statistics_contract(),
         "reports_root": str(reports_root),
         "output_dir": str(output_dir),
         "generated_at": datetime.now().isoformat(timespec="seconds"),

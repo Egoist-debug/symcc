@@ -18,7 +18,7 @@
   - `repeat = 5`
   - `budget_sec = 12`
 - repo 内正式表：
-  - [RQ5FullStackMultiSampleSummary.tsv](/home/egoist/codex/symcc/docs/RQ5FullStackMultiSampleSummary.tsv)
+  - [RQ5FullStackMultiSampleSummary.tsv](./RQ5FullStackMultiSampleSummary.tsv)
 - 人工 case study 索引：
   - `experiments/results/real_full_stack_multi_resolver_dnslabctl/20260522_073442/manual_case_studies/index.tsv`
   - 当前仍沿用上一轮代表性样本说明；新批次 `run-01` 的四类语义仍保持相同样本角色

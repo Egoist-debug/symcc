@@ -13,7 +13,7 @@
 
 repo 内对照表：
 
-- [RQ5ResolverBackendCompare.tsv](/home/ubuntu/codex/symcc/docs/RQ5ResolverBackendCompare.tsv)
+- [RQ5ResolverBackendCompare.tsv](./RQ5ResolverBackendCompare.tsv)
 
 原始真实产物：
 

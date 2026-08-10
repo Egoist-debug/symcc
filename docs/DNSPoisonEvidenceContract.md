@@ -128,3 +128,55 @@
 - `seed_provenance`：旧 artifact 缺失时允许缺省，不得伪造默认 cold-start 结论
 
 兼容默认值只能由 schema owner（`tools/dns_diff/schema.py`）统一装配，避免并行真相源。
+
+## 7. 多轮统计契约
+
+`campaign-aggregate` 与 `campaign-matrix` 对每个数值指标同时保留以下字段：
+
+- `mean`、`min`、`max`
+- `stddev`：为兼容既有结果，继续表示总体标准差
+- `sample_stddev`：按 `n-1` 计算的样本标准差
+- `standard_error`：`sample_stddev / sqrt(n)`
+- `ci95_lower`、`ci95_upper`：基于双侧 Student-t 临界值的 95% 均值置信区间
+
+论文正文引用离散度时必须优先使用 `sample_stddev`，引用均值不确定性时必须同时给出 95% 置信区间。`stddev` 只用于兼容旧表，不得与样本标准差混写。
+
+`matrix_manifest.json.statistics` 同时冻结计算口径：`confidence_level=0.95`、`confidence_interval_method=student_t_df_le_30_normal_asymptotic`、`sample_stddev_denominator=n-1`。自由度不超过 30 时使用双侧 Student-t 临界值表，超过 30 时使用正态渐近值 `1.96`。缺少或改变这些字段的矩阵不得与当前正式结果合并。
+
+## 8. 证据完整性与论文就绪审计
+
+`publication_evidence_bundle` 中每个必需产物引用必须包含：
+
+- 绝对路径
+- `size_bytes`
+- SHA-256 摘要
+- 再生成命令
+
+`matrix_manifest.json` 还必须记录每个 run 的 `evidence_bundle_path`、
+`evidence_bundle_integrity.size_bytes` 与 `evidence_bundle_integrity.sha256`。
+这使矩阵清单可以发现 evidence bundle 本身在聚合完成后的漂移，而 bundle 内部的
+SHA-256 则继续保护各个报告产物。
+
+正式矩阵完成后运行：
+
+```bash
+python3 -m tools.dns_diff.cli publication-audit \
+  --matrix-root MATRIX_ROOT \
+  --minimum-runs 5 \
+  --minimum-case-studies 2
+```
+
+审计结果落盘为 `publication_readiness.json` 与 `publication_readiness_issues.tsv`。只有 `status=ready` 的矩阵才允许进入论文主表。审计至少检查：
+
+1. 四个消融变体完整且每个变体达到最低独立重复次数；
+2. 每个指标具备总体标准差、样本标准差、标准误与 95% 置信区间，并可由各 run
+   的 `summary.json` 重算得到；
+3. 每个 run 的目录关系、`campaign_close.summary.json` 成功状态与
+   `comparability.status=comparable`；
+4. evidence bundle 契约版本、seed provenance、重建命令、claims 与原始样本
+   目录完整，claim 值与其 `summary.json` 字段一致；
+5. 必需产物文件以及 evidence bundle 自身存在，大小与 SHA-256 未发生漂移；
+6. 原始样本目录至少保留一份同时含 `sample.meta.json` 和 `sample.bin` 的样本；
+7. 去重后的 case study 数量达到设定门槛，且每条索引都指向真实导出产物。
+
+审计失败仍会写出完整问题清单并返回非零状态，便于 CI 和批量实验驱动脚本直接阻止未就绪结果进入正式材料。

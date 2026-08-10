@@ -18,6 +18,7 @@ from .follow_diff import (
 )
 from .input_model_eval import InputModelEvalError, run_input_model_eval
 from .matrix import CampaignMatrixError, run_campaign_matrix
+from .publication_audit import PublicationAuditError, run_publication_audit
 from .report import ReportError, default_follow_diff_root, generate_report
 from .replay import ReplayError, replay_diff_cache
 from .rq3_snapshot import RQ3SnapshotError, run_rq3_snapshot
@@ -403,6 +404,19 @@ def _cmd_resolver_backend_matrix_compare(args: argparse.Namespace) -> int:
         return exc.exit_code
 
 
+def _cmd_publication_audit(args: argparse.Namespace) -> int:
+    try:
+        return run_publication_audit(
+            matrix_roots=[Path(path) for path in args.matrix_root],
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            minimum_runs=args.minimum_runs,
+            minimum_case_studies=args.minimum_case_studies,
+        )
+    except PublicationAuditError as exc:
+        sys.stderr.write(f"dns-diff: publication-audit 失败: {exc}\n")
+        return exc.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m tools.dns_diff.cli",
@@ -696,6 +710,34 @@ def build_parser() -> argparse.ArgumentParser:
     resolver_backend_matrix_compare.set_defaults(
         handler=_cmd_resolver_backend_matrix_compare
     )
+
+    publication_audit = subparsers.add_parser(
+        "publication-audit",
+        help="审计矩阵统计、可比性、证据哈希与 case study 是否达到论文引用门槛",
+    )
+    publication_audit.add_argument(
+        "--matrix-root",
+        action="append",
+        required=True,
+        help="campaign-matrix 工作根目录，可重复传入",
+    )
+    publication_audit.add_argument(
+        "--output-dir",
+        help="可选输出目录；默认写入首个 matrix-root 同级 publication_audits/<ts>/",
+    )
+    publication_audit.add_argument(
+        "--minimum-runs",
+        type=int,
+        default=5,
+        help="每个变体最低独立重复次数（默认 5）",
+    )
+    publication_audit.add_argument(
+        "--minimum-case-studies",
+        type=int,
+        default=2,
+        help="每个矩阵最低 case study 总数（默认 2）",
+    )
+    publication_audit.set_defaults(handler=_cmd_publication_audit)
 
     return parser
 

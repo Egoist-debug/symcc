@@ -3,13 +3,10 @@ import json
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
+from .matrix import EXPECTED_VARIANT_ORDER
+
 EXIT_USAGE = 2
-EXPECTED_VARIANTS: Sequence[str] = (
-    "full_stack",
-    "afl_only",
-    "no_mutator",
-    "no_cache_delta",
-)
+EXPECTED_VARIANTS: Sequence[str] = EXPECTED_VARIANT_ORDER
 
 
 class RQ3SnapshotError(RuntimeError):
@@ -65,10 +62,25 @@ def run_rq3_snapshot(
         "triage",
         "symcc",
         "total_samples_mean",
+        "total_samples_sample_stddev",
+        "total_samples_ci95_lower",
+        "total_samples_ci95_upper",
         "needs_review_count_mean",
+        "needs_review_count_sample_stddev",
+        "needs_review_count_ci95_lower",
+        "needs_review_count_ci95_upper",
         "cluster_count_mean",
+        "cluster_count_sample_stddev",
+        "cluster_count_ci95_lower",
+        "cluster_count_ci95_upper",
         "oracle_audit_candidate_count_mean",
+        "oracle_audit_candidate_count_sample_stddev",
+        "oracle_audit_candidate_count_ci95_lower",
+        "oracle_audit_candidate_count_ci95_upper",
         "semantic_diff_count_mean",
+        "semantic_diff_count_sample_stddev",
+        "semantic_diff_count_ci95_lower",
+        "semantic_diff_count_ci95_upper",
     ]
     rows_out: List[Dict[str, str]] = []
     for row in filtered:

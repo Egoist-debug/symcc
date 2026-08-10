@@ -48,6 +48,7 @@ PY
 
 write_fixtures() {
 	python3 - "$FOLLOW_ROOT" <<'PY'
+import hashlib
 import json
 import pathlib
 import sys
@@ -244,6 +245,7 @@ PY
 assert_evidence_bundle_contract() {
 	local report_dir="$1"
 	python3 - "$report_dir" "$FOLLOW_ROOT" <<'PY'
+import hashlib
 import json
 import pathlib
 import sys
@@ -293,11 +295,27 @@ for key, expected_path in expected_paths.items():
         raise SystemExit(
             f"ASSERT FAIL: {key}.path={actual_path!s} != {expected_path!s}"
         )
+    reference = bundle[key]
+    if expected_path.is_file():
+        content = expected_path.read_bytes()
+        if reference.get("size_bytes") != len(content):
+            raise SystemExit(
+                f"ASSERT FAIL: {key}.size_bytes={reference.get('size_bytes')!r} != {len(content)}"
+            )
+        expected_sha256 = hashlib.sha256(content).hexdigest()
+        if reference.get("sha256") != expected_sha256:
+            raise SystemExit(
+                f"ASSERT FAIL: {key}.sha256={reference.get('sha256')!r} != {expected_sha256!r}"
+            )
 
 if bundle["case_study_index"].get("exists") is not False:
     raise SystemExit("ASSERT FAIL: 未执行 case-study-export 时 case_study_index.exists 应为 false")
 if bundle["case_study_index"].get("optional") is not True:
     raise SystemExit("ASSERT FAIL: case_study_index.optional 应为 true")
+if bundle["case_study_index"].get("size_bytes") is not None:
+    raise SystemExit("ASSERT FAIL: 缺失的 case_study_index.size_bytes 应为 null")
+if bundle["case_study_index"].get("sha256") is not None:
+    raise SystemExit("ASSERT FAIL: 缺失的 case_study_index.sha256 应为 null")
 
 raw_sample_root = bundle["raw_sample_root"]
 if pathlib.Path(raw_sample_root["path"]).resolve() != follow_root:

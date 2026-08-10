@@ -17,8 +17,8 @@
   - `no_mutator`
   - `no_cache_delta`
 - repo 内正式表：
-  - [RQ3UnboundVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3UnboundVariantSummary.tsv)
-  - [RQ3SmartdnsVariantSummary.tsv](/home/egoist/codex/symcc/docs/RQ3SmartdnsVariantSummary.tsv)
+  - [RQ3UnboundVariantSummary.tsv](./RQ3UnboundVariantSummary.tsv)
+  - [RQ3SmartdnsVariantSummary.tsv](./RQ3SmartdnsVariantSummary.tsv)
 - 原始汇总表：
   - `experiments/results/real_rq3_multi_resolver_ablation/20260603_121445/resolver_variant_summary.tsv`
   - `experiments/results/real_rq3_multi_resolver_ablation/20260603_121445/resolver_variant_summary.json`

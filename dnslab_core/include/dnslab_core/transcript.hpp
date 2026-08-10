@@ -34,6 +34,7 @@ std::vector<uint8_t> serializeTranscript(const TranscriptView &Input);
 TranscriptSummary summarizeTranscript(const TranscriptView &Input);
 
 std::string sha1Hex(const std::vector<uint8_t> &Input);
+std::string sha256Hex(const std::vector<uint8_t> &Input);
 SampleIdentity buildSampleIdentity(const std::string &QueueEventId,
                                    const std::vector<uint8_t> &SampleBytes);
 

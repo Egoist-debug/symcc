@@ -1,6 +1,7 @@
 #include "dnslab_core/reporting.hpp"
 
 #include "dnslab_core/experiment_config.hpp"
+#include "dnslab_core/transcript.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -2346,6 +2347,19 @@ json::Value::Object buildEvidenceBundleArtifactReference(
   Payload["exists"] = std::filesystem::is_regular_file(Path);
   Payload["optional"] = Optional;
   Payload["regeneration_command"] = RegenerationCommand;
+  if (std::filesystem::is_regular_file(Path)) {
+    std::ifstream Input(Path, std::ios::binary);
+    if (!Input) {
+      throw std::runtime_error("无法读取证据产物: " + Path.string());
+    }
+    std::vector<uint8_t> Bytes((std::istreambuf_iterator<char>(Input)),
+                               std::istreambuf_iterator<char>());
+    Payload["size_bytes"] = static_cast<std::int64_t>(Bytes.size());
+    Payload["sha256"] = sha256Hex(Bytes);
+  } else {
+    Payload["size_bytes"] = json::Value();
+    Payload["sha256"] = json::Value();
+  }
   if (!FieldPaths.empty()) {
     Payload["field_paths"] = buildStringArray(FieldPaths);
   }

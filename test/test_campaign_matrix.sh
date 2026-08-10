@@ -81,6 +81,7 @@ def base_summary(total_samples: int, cluster_count: int, repro_rate: float) -> d
         "cluster_count": cluster_count,
         "repro_rate": repro_rate,
         "oracle_audit_candidate_count": 5,
+        "semantic_diff_count": 2,
         "semantic_counts": {
             "no_diff": max(total_samples - 2, 0),
             "cache_diff_interesting": 2,
@@ -242,6 +243,18 @@ def run_comparable_scenario() -> None:
         assert_true(
             manifest.get("matrix_internal_baseline_variant") == "full_stack",
             "manifest 未显式标记 matrix_internal_baseline_variant=full_stack",
+        )
+        assert_true(
+            manifest.get("statistics")
+            == {
+                "confidence_level": 0.95,
+                "confidence_interval_method": (
+                    "student_t_df_le_30_normal_asymptotic"
+                ),
+                "sample_stddev_denominator": "n-1",
+                "legacy_stddev_semantics": "population",
+            },
+            f"manifest statistics 口径非法: {manifest.get('statistics')!r}",
         )
         variants = manifest.get("variants")
         assert_true(isinstance(variants, list) and len(variants) == 4, "manifest 变体数非法")
