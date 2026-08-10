@@ -1,53 +1,116 @@
 add_rules("mode.debug", "mode.release")
 
 local function nonempty(value)
-    return value ~= nil and value ~= ""
+    return value ~= nil and value ~= false and value ~= ""
 end
 
-local function detect_default_symcc_llvm()
-    local env_prefix = os.getenv("SYMCC_LLVM_PREFIX")
-    local env_major = os.getenv("SYMCC_LLVM_MAJOR")
-
-    if nonempty(env_prefix) then
-        local inferred_major = env_prefix:match("llvm%-(%d+)$") or env_major or "18"
-        return env_prefix, inferred_major
+local function llvm_major_from_prefix(prefix)
+    if not nonempty(prefix) then
+        return nil
     end
+    local normalized = prefix:gsub("[/\\]+$", "")
+    return normalized:match("llvm%-(%d+)$")
+end
 
-    if nonempty(env_major) then
-        local prefixed = path.join("/usr/lib", "llvm-" .. env_major)
-        if os.isfile(path.join(prefixed, "bin", "clang++")) then
-            return prefixed, env_major
+local function has_llvm_compilers(prefix, find_program)
+    if not nonempty(prefix) then
+        return false
+    end
+    local bindir = path.join(prefix, "bin")
+    return find_program(path.join(bindir, "clang")) ~= nil and
+           find_program(path.join(bindir, "clang++")) ~= nil
+end
+
+local function detect_default_symcc_llvm(find_program)
+    local candidates = {}
+    for _, prefix in ipairs(os.dirs("/usr/lib/llvm-*")) do
+        local major = llvm_major_from_prefix(prefix)
+        if major then
+            table.insert(candidates, {prefix = prefix, major = tonumber(major)})
+        end
+    end
+    table.sort(candidates, function (left, right)
+        return left.major > right.major
+    end)
+
+    for _, candidate in ipairs(candidates) do
+        if has_llvm_compilers(candidate.prefix, find_program) then
+            return candidate.prefix, tostring(candidate.major)
         end
     end
 
-    for _, major in ipairs({"20", "19", "18", "17", "16", "15", "14"}) do
-        local prefix = path.join("/usr/lib", "llvm-" .. major)
-        if os.isfile(path.join(prefix, "bin", "clang++")) then
-            return prefix, major
-        end
-    end
-
-    return "/usr/lib/llvm-18", "18"
+    return nil, nil
 end
 
-local DEFAULT_SYMCC_LLVM_PREFIX, DEFAULT_SYMCC_LLVM_MAJOR = detect_default_symcc_llvm()
+local function llvm_prefix_validation_error(prefix, find_program)
+    if not nonempty(prefix) then
+        return "No usable versioned LLVM installation was found under /usr/lib. " ..
+               "Set --symcc_llvm_prefix and --symcc_llvm_major (or " ..
+               "SYMCC_LLVM_PREFIX and SYMCC_LLVM_MAJOR) explicitly."
+    end
+
+    local clang = path.join(prefix, "bin", "clang")
+    local clangxx = path.join(prefix, "bin", "clang++")
+    if not has_llvm_compilers(prefix, find_program) then
+        return string.format("Invalid SymCC LLVM prefix '%s': expected executable " ..
+                             "compiler files at '%s' and '%s'.", prefix, clang, clangxx)
+    end
+    return nil
+end
 
 option("symcc_llvm_prefix")
-    set_default(DEFAULT_SYMCC_LLVM_PREFIX)
     set_description("LLVM installation prefix for SymCC build/runtime alignment.")
+    on_check(function (option)
+        local find_program = import("lib.detect.find_program")
+        local value = option:value()
+        if not nonempty(value) then
+            local env_prefix = os.getenv("SYMCC_LLVM_PREFIX")
+            local configured_major = get_config("symcc_llvm_major")
+            local env_major = os.getenv("SYMCC_LLVM_MAJOR")
+            if nonempty(env_prefix) then
+                value = env_prefix
+            elseif nonempty(configured_major) then
+                value = path.join("/usr/lib", "llvm-" .. configured_major)
+            elseif nonempty(env_major) then
+                value = path.join("/usr/lib", "llvm-" .. env_major)
+            else
+                value = detect_default_symcc_llvm(find_program)
+            end
+            option:set_value(value)
+        end
+        local validation_error = llvm_prefix_validation_error(value, find_program)
+        if validation_error then
+            raise(validation_error)
+        end
+    end)
 option_end()
 
 option("symcc_llvm_major")
-    set_default(DEFAULT_SYMCC_LLVM_MAJOR)
+    add_deps("symcc_llvm_prefix")
     set_description("LLVM major version for SymCC build/runtime alignment.")
+    on_check(function (option)
+        local value = option:value()
+        if not nonempty(value) then
+            value = os.getenv("SYMCC_LLVM_MAJOR") or
+                    llvm_major_from_prefix(get_config("symcc_llvm_prefix")) or
+                    "18"
+            option:set_value(value)
+        end
+        local major = nonempty(value) and tonumber(value) or nil
+        if not major or major < 1 or major % 1 ~= 0 then
+            raise("Invalid SymCC LLVM major version '%s'; expected a positive integer.",
+                  tostring(value))
+        end
+    end)
 option_end()
 
 local function symcc_llvm_prefix()
-    return get_config("symcc_llvm_prefix") or DEFAULT_SYMCC_LLVM_PREFIX
+    return get_config("symcc_llvm_prefix") or ""
 end
 
 local function symcc_llvm_major()
-    return tonumber(get_config("symcc_llvm_major") or DEFAULT_SYMCC_LLVM_MAJOR) or tonumber(DEFAULT_SYMCC_LLVM_MAJOR)
+    local value = get_config("symcc_llvm_major")
+    return nonempty(value) and tonumber(value) or nil
 end
 
 local function symcc_llvm_bindir()
