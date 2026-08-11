@@ -1,4 +1,5 @@
 #include "afl.hpp"
+#include "DST1Mutator.h"
 #include "symcc.hpp"
 #include "testcase.hpp"
 #include "util.hpp"
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <thread>
@@ -450,6 +452,7 @@ struct CLI {
   std::optional<std::filesystem::path> response_tail_dir;
   std::string response_tail_placeholder = "@@RESP_TAIL@@";
   std::optional<std::string> response_tail_env;
+  bool require_poison_eligible = false;
 };
 
 static void usage() {
@@ -465,6 +468,8 @@ static void usage() {
       << "  -r <dir>     Optional response-tail corpus directory\n"
       << "  -p <token>   Response-tail placeholder token in target args (default: @@RESP_TAIL@@)\n"
       << "  -e <name>    Optional env var name to pass response-tail sample path\n"
+      << "  --require-poison-eligible\n"
+      << "               Reject non-DST1 or poison-ineligible inputs and outputs\n"
       << "  @@           Use @@ in command for file input mode\n";
 }
 
@@ -503,6 +508,8 @@ static CLI parse_args(int argc, char** argv) {
         usage();
         throw std::runtime_error("-e requires a non-empty environment variable name");
       }
+    } else if (a == "--require-poison-eligible") {
+      o.require_poison_eligible = true;
     } else if (a == "-h" || a == "--help") {
       usage();
       std::exit(0);
@@ -536,6 +543,8 @@ struct Stats {
   std::uint64_t high_value_processed = 0;
   std::uint64_t high_value_new_coverage = 0;
   std::uint64_t high_value_new_interesting = 0;
+  std::uint64_t poison_ineligible_inputs = 0;
+  std::uint64_t poison_ineligible_outputs = 0;
 
   void add(const SymCCResult& r) {
     if (r.killed) {
@@ -569,12 +578,15 @@ struct Stats {
     out << "high_value_processed: " << high_value_processed << "\n";
     out << "high_value_new_coverage: " << high_value_new_coverage << "\n";
     out << "high_value_new_interesting: " << high_value_new_interesting << "\n";
+    out << "poison_ineligible_inputs: " << poison_ineligible_inputs << "\n";
+    out << "poison_ineligible_outputs: " << poison_ineligible_outputs << "\n";
     out << "--------------------------------------------------------------------------------\n";
   }
 };
 
 struct State {
   AflMap current_bitmap;
+  AflMap afl_bitmap;
   struct ProcessedTestcaseMetadata {
     std::string canonical_path_key;
     int highest_consumed_tier = 0;
@@ -583,6 +595,7 @@ struct State {
   };
 
   std::unordered_map<std::string, ProcessedTestcaseMetadata> processed_files;
+  std::unordered_set<std::string> afl_coverage_inputs;
   TestcaseDir queue;
   TestcaseDir hangs;
   TestcaseDir crashes;
@@ -590,6 +603,7 @@ struct State {
   std::uint64_t last_stats_ms = 0;
   std::ofstream stats_file;
   std::uint64_t response_tail_pick_count = 0;
+  std::uint64_t afl_bitmap_sequence = 0;
 };
 
 static State init_state(const std::filesystem::path& symcc_dir) {
@@ -600,12 +614,15 @@ static State init_state(const std::filesystem::path& symcc_dir) {
   State s{
       {},
       {},
+      {},
+      {},
       TestcaseDir::create(symcc_dir / "queue"),
       TestcaseDir::create(symcc_dir / "hangs"),
       TestcaseDir::create(symcc_dir / "crashes"),
       {},
       now_ms(),
       std::ofstream(symcc_dir / "stats"),
+      0,
       0};
   if (!s.stats_file) throw std::runtime_error("Failed to open stats file");
   return s;
@@ -983,6 +1000,62 @@ static void maybe_reload_frontier_manifest(SemanticFrontierManager& frontier,
 
 enum class TestcaseResult { Uninteresting, New, Hang, Crash };
 
+static geninput::DST1Mutator::ValidationResult validate_poison_eligible_file(
+    const std::filesystem::path& testcase) {
+  std::ifstream in(testcase, std::ios::binary);
+  if (!in) {
+    return {geninput::DST1Mutator::ValidationError::InputTooShort};
+  }
+  const std::vector<std::uint8_t> bytes{
+      std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+  return geninput::DST1Mutator::validatePoisonEligible(bytes);
+}
+
+static void sync_afl_queue_coverage(
+    const AflConfig& afl,
+    const std::filesystem::path& bitmap_dir,
+    const std::optional<std::filesystem::path>& response_tail_sample,
+    State& state,
+    const Logger& log) {
+  std::uint64_t scanned = 0;
+  std::uint64_t coverage_updates = 0;
+  const auto response_tail_key = response_tail_sample.has_value()
+                                     ? canonicalize_testcase_path(*response_tail_sample)
+                                     : std::string("<no-response-tail>");
+
+  for (const auto& testcase : afl.queue_testcases()) {
+    const auto key = canonicalize_testcase_path(testcase) + "\n" + response_tail_key;
+    if (state.afl_coverage_inputs.find(key) != state.afl_coverage_inputs.end()) continue;
+
+    const auto bitmap_path =
+        bitmap_dir / (".afl_queue_bitmap_" + std::to_string(state.afl_bitmap_sequence++));
+    try {
+      const auto result = afl.run_showmap(bitmap_path, testcase, response_tail_sample);
+      if (result.kind == AflShowmapResult::Kind::Success && result.bitmap.has_value()) {
+        state.afl_bitmap.merge(*result.bitmap);
+        if (state.current_bitmap.merge(*result.bitmap)) coverage_updates += 1;
+      } else {
+        log.warn("AFL queue baseline skipped non-successful testcase: " + testcase.string());
+      }
+      state.afl_coverage_inputs.insert(key);
+      scanned += 1;
+    } catch (const std::exception& e) {
+      log.warn("Failed to merge AFL queue coverage for " + testcase.string() + ": " +
+               std::string(e.what()));
+    }
+
+    std::error_code remove_ec;
+    std::filesystem::remove(bitmap_path, remove_ec);
+  }
+
+  if (scanned > 0) {
+    log.info("Merged AFL queue coverage baseline: scanned=" + std::to_string(scanned) +
+             " coverage_updates=" + std::to_string(coverage_updates) +
+             " total_scanned=" + std::to_string(state.afl_coverage_inputs.size()) +
+             " response_tail=" + response_tail_key);
+  }
+}
+
 // 从父测试用例文件名提取 ID (格式: id:NNNNNN,...)
 static std::string extract_parent_id(const std::filesystem::path& parent) {
   auto name = parent.filename().string();
@@ -999,8 +1072,18 @@ static TestcaseResult process_new_testcase(const std::filesystem::path& testcase
                                            const std::optional<std::filesystem::path>& response_tail_sample,
                                            const AflConfig& afl,
                                            State& state,
-                                           const Logger& log) {
+                                           const Logger& log,
+                                           bool require_poison_eligible) {
   // log.debug("Processing test case " + testcase.string());
+  if (require_poison_eligible) {
+    const auto validation = validate_poison_eligible_file(testcase);
+    if (!validation.ok()) {
+      state.stats.poison_ineligible_outputs += 1;
+      log.warn("Rejected poison-ineligible SymCC output " + testcase.string() +
+               ": " + geninput::DST1Mutator::validationErrorName(validation.Error));
+      return TestcaseResult::Uninteresting;
+    }
+  }
   // 每个测试用例使用不同的 bitmap 文件避免冲突
   const auto testcase_bitmap_path = tmp_dir / ("bitmap_" + testcase.filename().string());
   
@@ -1057,7 +1140,8 @@ static void test_input(const SymCCInput& input,
                        const Logger& log,
                        bool request_is_high_value,
                        int consumed_semantic_tier,
-                       bool consumed_retry_budget) {
+                       bool consumed_retry_budget,
+                       bool require_poison_eligible) {
   log.info("Running SymCC on request sample " + input.request_sample.string());
   if (input.response_tail_sample.has_value()) {
     log.info("Using response-tail sample " + input.response_tail_sample->string());
@@ -1069,6 +1153,9 @@ static void test_input(const SymCCInput& input,
   std::uint64_t num_interesting = 0;
   std::uint64_t num_total = 0;
   std::uint64_t num_new_coverage = 0;
+
+  // 覆盖依赖 request 与 response-tail 组合，执行前先合并该组合的 AFL 基线。
+  sync_afl_queue_coverage(afl, tmp_dir, input.response_tail_sample, state, log);
 
   SymCCResult res;
   try {
@@ -1083,9 +1170,13 @@ static void test_input(const SymCCInput& input,
     return;
   }
 
+  // SymCC 运行期间 AFL 仍可能扩展 queue，判定回流前先更新基线。
+  sync_afl_queue_coverage(afl, tmp_dir, input.response_tail_sample, state, log);
+
   for (const auto& new_test : res.test_cases) {
     const auto tr = process_new_testcase(new_test, input.request_sample, tmp_dir,
-                                         input.response_tail_sample, afl, state, log);
+                                         input.response_tail_sample, afl, state, log,
+                                         require_poison_eligible);
     num_total += 1;
     if (tr == TestcaseResult::New) {
       num_new_coverage += 1;
@@ -1202,6 +1293,10 @@ int main(int argc, char** argv) {
     State state = init_state(symcc_dir);
     log.info("SymCC directory created: " + symcc_dir.string());
 
+    if (!options.response_tail_dir.has_value()) {
+      sync_afl_queue_coverage(afl, symcc_dir, std::nullopt, state, log);
+    }
+
     SemanticFrontierManager frontier;
 
     if (const char* manifest_env = std::getenv("SYMCC_HIGH_VALUE_MANIFEST")) {
@@ -1251,6 +1346,16 @@ int main(int argc, char** argv) {
                    std::to_string(picked_semantic_tier) + "): " + next->string());
         }
         const auto canonical_path_key = canonicalize_testcase_path(*next);
+        if (options.require_poison_eligible) {
+          const auto validation = validate_poison_eligible_file(*next);
+          if (!validation.ok()) {
+            state.stats.poison_ineligible_inputs += 1;
+            log.warn("Rejected poison-ineligible AFL input " + next->string() +
+                     ": " + geninput::DST1Mutator::validationErrorName(validation.Error));
+            record_processed_testcase(state, *next, picked_semantic_tier, false);
+            continue;
+          }
+        }
         bool consumed_retry_budget = false;
         if (const auto it = state.processed_files.find(canonical_path_key);
             it != state.processed_files.end()) {
@@ -1274,7 +1379,8 @@ int main(int argc, char** argv) {
           state.response_tail_pick_count += 1;
         }
         test_input(symcc_input, symcc, afl, state, log, picked_high_value,
-                   picked_semantic_tier, consumed_retry_budget);
+                   picked_semantic_tier, consumed_retry_budget,
+                   options.require_poison_eligible);
       }
 
       const auto now = now_ms();

@@ -476,8 +476,8 @@ void testMalformedDonorFallback(const std::vector<uint8_t> &base,
   std::cout << "PASS malformed_donor_fallback" << std::endl;
 }
 
-void testParseableButIncompatibleDonorFallback(const std::vector<uint8_t> &base,
-                                                const std::vector<uint8_t> &donor) {
+void testParseableDonorQuestionNormalization(const std::vector<uint8_t> &base,
+                                             const std::vector<uint8_t> &donor) {
   DST1Mutator::MutationRequest request;
   request.DonorFamily = DST1Mutator::DonorMutationFamily::ResponseSpliceSameIndex;
   request.ResponseIndex = 0;
@@ -487,17 +487,32 @@ void testParseableButIncompatibleDonorFallback(const std::vector<uint8_t> &base,
   fallback.RCODE = 3;
   request.Response = fallback;
 
-  auto fallbackOnly = DST1Mutator::mutate(base, request);
-  require(fallbackOnly.has_value(),
-          "parseable-but-incompatible donor fallback 的基线变异失败");
-
   auto withDonor = DST1Mutator::mutate(base, request, donor);
   require(withDonor.has_value(),
-          "parseable-but-incompatible donor fallback 未返回回退结果");
-  require(*withDonor == *fallbackOnly,
-          "parseable-but-incompatible donor fallback 未退回原始自包含请求");
-  requireRoundTrip(*withDonor, "parseable-but-incompatible donor fallback");
-  std::cout << "PASS parseable_but_incompatible_donor_fallback" << std::endl;
+          "parseable donor question normalization 未生成结果");
+
+  auto normalized = requireParsedTranscript(
+      *withDonor, "parseable donor question normalization");
+  auto target = requireParsedTranscript(base, "normalization target");
+  auto source = requireParsedTranscript(donor, "normalization donor");
+  auto normalizedLayout = parseResponseLayout(normalized.Responses.at(0));
+  auto sourceLayout = parseResponseLayout(source.Responses.at(0));
+  auto normalizedQuestion = parseSingleQuestion(normalized.Responses.at(0));
+  auto sourceQuestion = parseSingleQuestion(source.Responses.at(0));
+  require(normalizedLayout.has_value() && sourceLayout.has_value(),
+          "parseable donor question normalization 响应布局解析失败");
+  require(normalizedQuestion.has_value() && sourceQuestion.has_value(),
+          "parseable donor question normalization question 解析失败");
+  require(normalizedLayout->answerRRs == sourceLayout->answerRRs,
+          "parseable donor question normalization 未保留 donor answer RRs");
+  require(normalizedQuestion->name != sourceQuestion->name,
+          "parseable donor question normalization 未重写 donor question");
+  requireResponsesMatchQuery(normalized,
+                             "parseable donor question normalization");
+  require(normalized.ClientQuery == target.ClientQuery,
+          "parseable donor question normalization 意外改写目标 query");
+  requireRoundTrip(*withDonor, "parseable donor question normalization");
+  std::cout << "PASS parseable_donor_question_normalization" << std::endl;
 }
 
 } // namespace
@@ -517,7 +532,7 @@ int main() {
   testPostCheckCoupledShift(base, shiftDonor);
   testMismatchedShiftDonorFallback(base, mismatchedShiftDonor);
   testMalformedDonorFallback(base, malformedDonor);
-  testParseableButIncompatibleDonorFallback(base, shiftDonor);
+  testParseableDonorQuestionNormalization(base, shiftDonor);
 
   std::cout << "PASS all_structured_splice_checks" << std::endl;
   return 0;
@@ -547,7 +562,7 @@ assert_file_contains "$LOG_FILE" 'PASS response_count_shrink_from_donor'
 assert_file_contains "$LOG_FILE" 'PASS post_check_coupled_name_or_type_shift'
 assert_file_contains "$LOG_FILE" 'PASS mismatched_shift_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS malformed_donor_fallback'
-assert_file_contains "$LOG_FILE" 'PASS parseable_but_incompatible_donor_fallback'
+assert_file_contains "$LOG_FILE" 'PASS parseable_donor_question_normalization'
 assert_file_contains "$LOG_FILE" 'PASS all_structured_splice_checks'
 
 printf '[dst1-structured-splice] PASS\n'

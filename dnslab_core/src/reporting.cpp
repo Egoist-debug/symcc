@@ -153,6 +153,19 @@ std::filesystem::path normalizePath(const std::filesystem::path &Input) {
   return Absolute.lexically_normal();
 }
 
+std::string shellQuote(const std::string &Input) {
+  std::string Output = "'";
+  for (const char Character : Input) {
+    if (Character == '\'') {
+      Output += "'\\''";
+    } else {
+      Output += Character;
+    }
+  }
+  Output += "'";
+  return Output;
+}
+
 std::filesystem::path resolveSelfExecutablePath() {
   if (const char *SelfExecutable = std::getenv("DNSLAB_SELF_EXECUTABLE");
       SelfExecutable != nullptr && *SelfExecutable != '\0') {
@@ -1214,6 +1227,10 @@ struct CaseStudyArtifacts {
   std::filesystem::path SampleBinPath;
   std::filesystem::path Bind9StderrPath;
   std::filesystem::path SecondaryStderrPath;
+  std::filesystem::path Bind9BeforeCachePath;
+  std::filesystem::path Bind9AfterCachePath;
+  std::filesystem::path SecondaryBeforeCachePath;
+  std::filesystem::path SecondaryAfterCachePath;
 };
 
 CaseStudyArtifacts loadCaseStudyArtifacts(
@@ -1241,6 +1258,14 @@ CaseStudyArtifacts loadCaseStudyArtifacts(
       Output.SampleDir / Output.ResolverContext.PrimaryStderrName);
   Output.SecondaryStderrPath = normalizePath(
       Output.SampleDir / Output.ResolverContext.SecondaryStderrName);
+  Output.Bind9BeforeCachePath = normalizePath(
+      Output.SampleDir / "bind9.before.cache.txt");
+  Output.Bind9AfterCachePath = normalizePath(
+      Output.SampleDir / "bind9.after.cache.txt");
+  Output.SecondaryBeforeCachePath = normalizePath(
+      Output.SampleDir / (Output.ResolverContext.Secondary + ".before.cache.txt"));
+  Output.SecondaryAfterCachePath = normalizePath(
+      Output.SampleDir / (Output.ResolverContext.Secondary + ".after.cache.txt"));
   return Output;
 }
 
@@ -1255,6 +1280,12 @@ json::Value::Object buildCaseStudyPathsPayload(
   Output["bind9_stderr_path"] = Artifacts.Bind9StderrPath.string();
   Output[Artifacts.ResolverContext.Secondary + "_stderr_path"] =
       Artifacts.SecondaryStderrPath.string();
+  Output["bind9_before_cache_path"] = Artifacts.Bind9BeforeCachePath.string();
+  Output["bind9_after_cache_path"] = Artifacts.Bind9AfterCachePath.string();
+  Output[Artifacts.ResolverContext.Secondary + "_before_cache_path"] =
+      Artifacts.SecondaryBeforeCachePath.string();
+  Output[Artifacts.ResolverContext.Secondary + "_after_cache_path"] =
+      Artifacts.SecondaryAfterCachePath.string();
   return Output;
 }
 
@@ -1278,7 +1309,7 @@ json::Value::Array buildCaseStudyClaimScope(
   Output.emplace_back(
       "原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、" +
       Artifacts.SampleBinPath.filename().string() + "、bind9.stderr、" +
-      Artifacts.ResolverContext.Secondary + ".stderr。");
+      Artifacts.ResolverContext.Secondary + ".stderr 及两端 before/after cache。");
   return Output;
 }
 
@@ -1413,6 +1444,9 @@ json::Value::Object buildCaseStudyPayload(
   json::Value::Object Output;
   Output["sample_id"] = Candidate.SampleId;
   Output["selection_reason"] = Candidate.SelectionReason;
+  Output["replay_command"] =
+      "dnslabctl sync-replay --sample " +
+      shellQuote(Artifacts.SampleBinPath.string());
   Output["raw_evidence"] =
       buildCaseStudyRawEvidence(Artifacts, Candidate.TriagePayload);
   Output["automated_summary"] = buildCaseStudyAutomatedSummary(
@@ -2418,6 +2452,12 @@ void appendPublicationEvidenceBundleArtifacts(
        false,
        {},
        {"failure_bucket_primary", "analysis_state", "count"}},
+      {"cluster",
+       ReportDir / "cluster.tsv",
+       CampaignReportCommand,
+       false,
+       {},
+       {"cluster_key", "sample_count", "sample_ids"}},
       {"case_study_index",
        ReportDir / "case_studies/index.tsv",
        CaseStudyExportCommand,
@@ -2839,6 +2879,8 @@ std::string buildCampaignAblationMatrixContent(
 std::string
 buildCampaignClusterCountsContent(const CampaignReportSnapshot &Snapshot);
 std::string
+buildCampaignClusterContent(const CampaignReportSnapshot &Snapshot);
+std::string
 buildCampaignFailureTaxonomyContent(const CampaignReportSnapshot &Snapshot);
 std::string
 buildCampaignExclusionSummaryContent(const CampaignReportSnapshot &Snapshot);
@@ -2852,6 +2894,7 @@ struct CampaignReportOutputPaths {
   std::filesystem::path SummaryPath;
   std::filesystem::path AblationMatrixPath;
   std::filesystem::path ClusterCountsPath;
+  std::filesystem::path ClusterPath;
   std::filesystem::path FailureTaxonomyPath;
   std::filesystem::path ExclusionSummaryPath;
   std::filesystem::path ReproRatePath;
@@ -2867,6 +2910,7 @@ CampaignReportOutputPaths buildCampaignReportOutputPaths(
   Output.SummaryPath = ReportDir / "summary.json";
   Output.AblationMatrixPath = ReportDir / "ablation_matrix.tsv";
   Output.ClusterCountsPath = ReportDir / "cluster_counts.tsv";
+  Output.ClusterPath = ReportDir / "cluster.tsv";
   Output.FailureTaxonomyPath = ReportDir / "failure_taxonomy.tsv";
   Output.ExclusionSummaryPath = ReportDir / "exclusion_summary.tsv";
   Output.ReproRatePath = ReportDir / "repro_rate.tsv";
@@ -2888,6 +2932,7 @@ void writeCampaignReportOutputs(
                 buildCampaignAblationMatrixContent(
                     SummaryMetrics.AblationStatus));
   writeTextFile(Paths.ClusterCountsPath, buildCampaignClusterCountsContent(Snapshot));
+  writeTextFile(Paths.ClusterPath, buildCampaignClusterContent(Snapshot));
   writeTextFile(Paths.FailureTaxonomyPath,
                 buildCampaignFailureTaxonomyContent(Snapshot));
   writeTextFile(Paths.ExclusionSummaryPath,
@@ -2897,6 +2942,8 @@ void writeCampaignReportOutputs(
                 buildCampaignOracleAuditContent(Snapshot.AuditRecords));
   writeJsonFile(Paths.OracleReliabilityPath,
                 buildOracleReliability(Snapshot.AuditRecords));
+  // case-study index 必须先生成，再冻结 evidence bundle 中的路径和摘要。
+  exportCaseStudies(ResolvedRoot, Paths.ReportDir, 5);
   writeJsonFile(Paths.EvidenceBundlePath,
                 buildPublicationEvidenceBundle(ResolvedRoot, Paths.ReportDir,
                                                Summary, Snapshot,
@@ -3048,6 +3095,30 @@ buildCampaignClusterCountsContent(const CampaignReportSnapshot &Snapshot) {
   }
   for (const auto &[ClusterKey, Count] : Snapshot.ClusterCounter) {
     Stream << ClusterKey << '\t' << Count << '\n';
+  }
+  return Stream.str();
+}
+
+std::string buildCampaignClusterContent(const CampaignReportSnapshot &Snapshot) {
+  std::ostringstream Stream;
+  Stream << "cluster_key\tsample_count\tsample_ids\n";
+  if (Snapshot.ClusterCounter.empty()) {
+    Stream << "_\t0\t-\n";
+    return Stream.str();
+  }
+  for (const auto &[ClusterKey, Count] : Snapshot.ClusterCounter) {
+    auto SampleIds = Snapshot.ClusterSamples.at(ClusterKey);
+    std::sort(SampleIds.begin(), SampleIds.end());
+    Stream << ClusterKey << '\t' << Count << '\t';
+    if (SampleIds.empty()) {
+      Stream << '-';
+    } else {
+      for (size_t Index = 0; Index < SampleIds.size(); ++Index) {
+        if (Index != 0) Stream << ',';
+        Stream << SampleIds[Index];
+      }
+    }
+    Stream << '\n';
   }
   return Stream.str();
 }
@@ -3253,6 +3324,7 @@ json::Value toJson(const CampaignReportArtifacts &Input) {
   Output["summary"] = Input.SummaryPath.string();
   Output["ablation_matrix"] = Input.AblationMatrixPath.string();
   Output["cluster_counts"] = Input.ClusterCountsPath.string();
+  Output["cluster"] = Input.ClusterPath.string();
   Output["failure_taxonomy"] = Input.FailureTaxonomyPath.string();
   Output["exclusion_summary"] = Input.ExclusionSummaryPath.string();
   Output["repro_rate"] = Input.ReproRatePath.string();

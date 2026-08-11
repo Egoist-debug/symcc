@@ -207,12 +207,7 @@ std::optional<std::filesystem::path> AflConfig::best_new_testcase(
   std::optional<std::filesystem::path> best;
   std::optional<TestcaseScore> best_score;
 
-  std::error_code ec;
-  for (auto it = std::filesystem::directory_iterator(queue_dir, ec);
-       !ec && it != std::filesystem::directory_iterator();
-       it.increment(ec)) {
-    const auto p = it->path();
-    if (!it->is_regular_file()) continue;
+  for (const auto& p : queue_testcases()) {
     const auto key = canonicalize_testcase_path(p);
     if (seen.find(key) != seen.end()) continue;
 
@@ -239,6 +234,20 @@ std::optional<std::filesystem::path> AflConfig::best_new_testcase(
     if (picked_semantic_tier != nullptr) *picked_semantic_tier = best_score->semantic_tier;
   }
   return best;
+}
+
+std::vector<std::filesystem::path> AflConfig::queue_testcases() const {
+  std::vector<std::filesystem::path> testcases;
+  std::error_code ec;
+  for (auto it = std::filesystem::directory_iterator(queue_dir, ec);
+       !ec && it != std::filesystem::directory_iterator();
+       it.increment(ec)) {
+    std::error_code type_ec;
+    if (!it->is_regular_file(type_ec) || type_ec) continue;
+    testcases.push_back(it->path());
+  }
+  std::sort(testcases.begin(), testcases.end());
+  return testcases;
 }
 
 static std::vector<std::string> insert_input_file(const std::vector<std::string>& cmd,

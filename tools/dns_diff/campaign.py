@@ -14,6 +14,7 @@ from .audit import (
     write_oracle_reliability_json,
 )
 from .artifact_digest import file_integrity
+from .case_study import export_case_studies
 from .path_defaults import (
     resolve_dnslabctl_bin,
     resolve_follow_diff_work_dir,
@@ -38,6 +39,11 @@ EXCLUSION_SUMMARY_COLUMNS: Tuple[str, ...] = (
     "failure_bucket_primary",
     "analysis_state",
     "count",
+)
+CLUSTER_COLUMNS: Tuple[str, ...] = (
+    "cluster_key",
+    "sample_count",
+    "sample_ids",
 )
 CASE_STUDY_INDEX_COLUMNS: Tuple[str, ...] = (
     "sample_id",
@@ -322,6 +328,7 @@ def _write_evidence_bundle(
     oracle_reliability_path = report_dir / "oracle_reliability.json"
     failure_taxonomy_path = report_dir / "failure_taxonomy.tsv"
     exclusion_summary_path = report_dir / "exclusion_summary.tsv"
+    cluster_path = report_dir / "cluster.tsv"
     case_study_index_path = report_dir / "case_studies" / "index.tsv"
     regeneration_commands = _build_regeneration_commands(root_path, report_dir)
 
@@ -369,6 +376,11 @@ def _write_evidence_bundle(
             exclusion_summary_path,
             regeneration_command=regeneration_commands["campaign_report"],
             column_paths=list(EXCLUSION_SUMMARY_COLUMNS),
+        ),
+        "cluster": _build_artifact_reference(
+            cluster_path,
+            regeneration_command=regeneration_commands["campaign_report"],
+            column_paths=list(CLUSTER_COLUMNS),
         ),
         "case_study_index": _build_artifact_reference(
             case_study_index_path,
@@ -482,6 +494,21 @@ def generate_campaign_report(root: Path, is_custom_root: bool = False) -> int:
         "\n".join(cluster_lines) + "\n", encoding="utf-8"
     )
 
+    cluster_rows = ["\t".join(CLUSTER_COLUMNS)]
+    if not cluster_counter:
+        cluster_rows.append("_\t0\t-")
+    else:
+        cluster_samples = snapshot["cluster_samples"]
+        for cluster_key in sorted(cluster_counter.keys()):
+            sample_ids = sorted(cluster_samples.get(cluster_key, []))
+            cluster_rows.append(
+                f"{cluster_key}\t{cluster_counter[cluster_key]}\t"
+                f"{','.join(sample_ids) if sample_ids else '-'}"
+            )
+    (report_dir / "cluster.tsv").write_text(
+        "\n".join(cluster_rows) + "\n", encoding="utf-8"
+    )
+
     _write_failure_taxonomy_tsv(
         report_dir,
         failure_taxonomy_counter=failure_taxonomy_counter,
@@ -506,6 +533,9 @@ def generate_campaign_report(root: Path, is_custom_root: bool = False) -> int:
     try:
         write_oracle_audit_tsv(report_dir, audit_records)
         write_oracle_reliability_json(report_dir, audit_records)
+        # case-study index 必须在 evidence bundle 冻结前落盘，避免 bundle
+        # 记录的可选索引引用过期。
+        export_case_studies(root_path, report_dir, top_n=5)
         _write_evidence_bundle(
             report_dir=report_dir, root_path=root_path, summary=summary
         )

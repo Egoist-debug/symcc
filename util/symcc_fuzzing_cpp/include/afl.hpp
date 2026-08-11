@@ -58,6 +58,7 @@ struct AflConfig {
 
   static AflConfig load_from_fuzzer_output(const std::filesystem::path& fuzzer_output_dir,
                                            const std::vector<std::string>& custom_target = {});
+  std::vector<std::filesystem::path> queue_testcases() const;
   std::optional<std::filesystem::path> best_new_testcase(
       const std::unordered_set<std::string>& seen,
       const std::unordered_map<std::string, int>* semantic_frontier = nullptr,

@@ -262,6 +262,7 @@ required_keys = {
     "oracle_reliability",
     "failure_taxonomy",
     "exclusion_summary",
+    "cluster",
     "case_study_index",
     "raw_sample_root",
     "seed_provenance",
@@ -287,6 +288,7 @@ expected_paths = {
     "oracle_reliability": report_dir / "oracle_reliability.json",
     "failure_taxonomy": report_dir / "failure_taxonomy.tsv",
     "exclusion_summary": report_dir / "exclusion_summary.tsv",
+    "cluster": report_dir / "cluster.tsv",
     "case_study_index": report_dir / "case_studies" / "index.tsv",
 }
 for key, expected_path in expected_paths.items():
@@ -308,14 +310,13 @@ for key, expected_path in expected_paths.items():
                 f"ASSERT FAIL: {key}.sha256={reference.get('sha256')!r} != {expected_sha256!r}"
             )
 
-if bundle["case_study_index"].get("exists") is not False:
-    raise SystemExit("ASSERT FAIL: 未执行 case-study-export 时 case_study_index.exists 应为 false")
+if bundle["case_study_index"].get("exists") is not True:
+    raise SystemExit("ASSERT FAIL: campaign report 必须先生成 case_study_index")
 if bundle["case_study_index"].get("optional") is not True:
     raise SystemExit("ASSERT FAIL: case_study_index.optional 应为 true")
-if bundle["case_study_index"].get("size_bytes") is not None:
-    raise SystemExit("ASSERT FAIL: 缺失的 case_study_index.size_bytes 应为 null")
-if bundle["case_study_index"].get("sha256") is not None:
-    raise SystemExit("ASSERT FAIL: 缺失的 case_study_index.sha256 应为 null")
+index_header = (report_dir / "case_studies" / "index.tsv").read_text(encoding="utf-8").splitlines()[0]
+if index_header != "sample_id\tsemantic_outcome\tselection_reason\tcase_study_path":
+    raise SystemExit(f"ASSERT FAIL: case_study_index header 非预期: {index_header!r}")
 
 raw_sample_root = bundle["raw_sample_root"]
 if pathlib.Path(raw_sample_root["path"]).resolve() != follow_root:

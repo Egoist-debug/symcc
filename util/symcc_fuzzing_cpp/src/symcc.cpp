@@ -123,15 +123,6 @@ SymCCResult SymCC::run(const SymCCInput& input,
     env[*response_tail_env] = response_tail_file.string();
   }
   
-  // 继承并扩展 LD_LIBRARY_PATH，确保能找到 libsymcc-rt.so
-  std::string ld_path;
-  if (const char* existing = std::getenv("LD_LIBRARY_PATH")) {
-    ld_path = existing;
-  }
-  if (!ld_path.empty()) ld_path += ":";
-  ld_path += "/home/ubuntu/symcc/build/linux/x86_64/release";
-  env["LD_LIBRARY_PATH"] = ld_path;
-
   // Debug: 打印执行命令
 //   std::cerr << "[DEBUG] SymCC command: ";
 //   for (const auto& a : argv) std::cerr << a << " ";
@@ -164,8 +155,11 @@ SymCCResult SymCC::run(const SymCCInput& input,
   for (auto it = std::filesystem::directory_iterator(output_dir, ec);
        !ec && it != std::filesystem::directory_iterator();
        it.increment(ec)) {
+    std::error_code type_ec;
+    if (!it->is_regular_file(type_ec) || type_ec) continue;
     tests.push_back(it->path());
   }
+  std::sort(tests.begin(), tests.end());
 
   SymCCResult r;
   r.test_cases = std::move(tests);

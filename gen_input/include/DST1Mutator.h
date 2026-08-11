@@ -4,6 +4,7 @@
 #define GENINPUT_DST1MUTATOR_H
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -12,6 +13,34 @@ namespace geninput {
 
 class DST1Mutator {
 public:
+  enum class ValidationError {
+    None,
+    InputTooShort,
+    InputTooLarge,
+    InvalidMagic,
+    InvalidReserved,
+    TooManyResponses,
+    TruncatedLengthTable,
+    EmptyQuery,
+    EmptyResponse,
+    LengthMismatch,
+    EmptyPostCheck,
+    MissingResponse,
+    InvalidQuery,
+    InvalidPostCheck,
+    QueryPostCheckMismatch,
+    InvalidResponse,
+    InvalidCompressionPointer,
+    ResponseQuestionMismatch,
+  };
+
+  struct ValidationResult {
+    ValidationError Error = ValidationError::None;
+    size_t ResponseIndex = std::numeric_limits<size_t>::max();
+
+    bool ok() const { return Error == ValidationError::None; }
+  };
+
   enum class DonorMutationFamily {
     ResponseSpliceSameIndex,
     AuthorityTransplant,
@@ -32,6 +61,7 @@ public:
     std::optional<bool> RD;
     std::optional<bool> TC;
     std::optional<bool> CD;
+    std::optional<uint16_t> QCLASS;
   };
 
   struct ResponseMutation {
@@ -52,6 +82,7 @@ public:
     std::optional<std::vector<std::vector<uint8_t>>> Responses;
     std::optional<std::string> PostCheckName;
     std::optional<uint16_t> PostCheckType;
+    std::optional<uint16_t> PostCheckClass;
   };
 
   struct MutationRequest {
@@ -63,6 +94,15 @@ public:
   };
 
   static std::optional<Transcript> parse(const std::vector<uint8_t> &Input);
+  static ValidationResult validateWire(const std::vector<uint8_t> &Input);
+  static ValidationResult
+  validatePoisonEligible(const std::vector<uint8_t> &Input);
+  static ValidationResult validatePoisonEligible(const Transcript &Input);
+  static const char *validationErrorName(ValidationError Error);
+
+  static std::optional<std::vector<uint8_t>> normalizeResponseForQuery(
+      const std::vector<uint8_t> &Response,
+      const std::vector<uint8_t> &Query);
   static std::optional<std::vector<uint8_t>>
   serialize(const Transcript &InputTranscript);
   static std::optional<std::vector<uint8_t>>

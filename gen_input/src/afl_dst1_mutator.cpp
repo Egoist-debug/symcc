@@ -11,6 +11,7 @@
 #include <iterator>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -227,20 +228,32 @@ size_t storeOutput(AFLDST1MutatorState &State,
                    const std::vector<uint8_t> &Bytes,
                    size_t MaxSize,
                    unsigned char **OutBuf) {
-  if (OutBuf == nullptr || MaxSize == 0) {
+  if (OutBuf == nullptr) {
     return 0;
   }
 
-  const size_t OutputSize = std::min(Bytes.size(), MaxSize);
-  State.Output.assign(Bytes.begin(), Bytes.begin() + OutputSize);
-  *OutBuf = State.Output.empty() ? nullptr : State.Output.data();
+  *OutBuf = nullptr;
+  State.Output.clear();
+  if (MaxSize == 0 || Bytes.empty() || Bytes.size() > MaxSize ||
+      !DST1Mutator::validatePoisonEligible(Bytes).ok()) {
+    return 0;
+  }
+
+  State.Output.assign(Bytes.begin(), Bytes.end());
+  *OutBuf = State.Output.data();
   return State.Output.size();
 }
 
 size_t storeOutput(AFLDST1MutatorState &State,
                    const std::vector<uint8_t> &Bytes,
                    unsigned char **OutBuf) {
-  if (OutBuf == nullptr || Bytes.empty()) {
+  if (OutBuf == nullptr) {
+    return 0;
+  }
+
+  *OutBuf = nullptr;
+  State.Output.clear();
+  if (Bytes.empty() || !DST1Mutator::validatePoisonEligible(Bytes).ok()) {
     return 0;
   }
 
@@ -271,7 +284,7 @@ std::optional<std::vector<uint8_t>> readFileBytes(const char *Path) {
 std::optional<std::vector<uint8_t>> canonicalizeTranscript(
     const std::vector<uint8_t> &Input) {
   auto Parsed = DST1Mutator::parse(Input);
-  if (!Parsed) {
+  if (!Parsed || !DST1Mutator::validatePoisonEligible(*Parsed).ok()) {
     return std::nullopt;
   }
 
@@ -284,7 +297,7 @@ std::optional<std::vector<uint8_t>> canonicalizeTranscript(
 }
 
 unsigned int determineFuzzCount(const std::vector<uint8_t> &Input) {
-  if (!DST1Mutator::parse(Input).has_value()) {
+  if (!DST1Mutator::validatePoisonEligible(Input).ok()) {
     return 1U;
   }
 
@@ -336,7 +349,8 @@ void addTrimCandidate(std::vector<std::vector<uint8_t>> &Candidates,
                       std::optional<std::vector<uint8_t>> Candidate,
                       size_t MaxSize) {
   if (!Candidate || Candidate->empty() || Candidate->size() >= MaxSize ||
-      Candidate->size() > MaxSize || !DST1Mutator::parse(*Candidate).has_value()) {
+      Candidate->size() > MaxSize ||
+      !DST1Mutator::validatePoisonEligible(*Candidate).ok()) {
     return;
   }
 
@@ -354,16 +368,20 @@ buildTrimCandidates(const std::vector<uint8_t> &Input) {
     return Candidates;
   }
 
-  for (size_t RemoveIndex = Parsed->Responses.size(); RemoveIndex > 0;
-       --RemoveIndex) {
-    DST1Mutator::MutationRequest Request;
-    DST1Mutator::TranscriptMutation Mutation;
-    auto Responses = Parsed->Responses;
-    Responses.erase(Responses.begin() + static_cast<std::ptrdiff_t>(RemoveIndex - 1));
-    Mutation.Responses = Responses;
-    Mutation.ResponseCount = static_cast<uint8_t>(Responses.size());
-    Request.Transcript = Mutation;
-    addTrimCandidate(Candidates, DST1Mutator::mutate(Input, Request), Input.size());
+  if (Parsed->Responses.size() > 1) {
+    for (size_t RemoveIndex = Parsed->Responses.size(); RemoveIndex > 0;
+         --RemoveIndex) {
+      DST1Mutator::MutationRequest Request;
+      DST1Mutator::TranscriptMutation Mutation;
+      auto Responses = Parsed->Responses;
+      Responses.erase(Responses.begin() +
+                      static_cast<std::ptrdiff_t>(RemoveIndex - 1));
+      Mutation.Responses = Responses;
+      Mutation.ResponseCount = static_cast<uint8_t>(Responses.size());
+      Request.Transcript = Mutation;
+      addTrimCandidate(Candidates, DST1Mutator::mutate(Input, Request),
+                       Input.size());
+    }
   }
 
   for (size_t ResponseIndex = 0; ResponseIndex < Parsed->Responses.size();
@@ -371,6 +389,17 @@ buildTrimCandidates(const std::vector<uint8_t> &Input) {
     auto Layout = parseResponseLayout(Parsed->Responses[ResponseIndex]);
     if (!Layout) {
       continue;
+    }
+
+    if (!Layout->AnswerRRs.empty()) {
+      DST1Mutator::MutationRequest Request;
+      DST1Mutator::ResponseMutation Mutation;
+      Request.ResponseIndex = ResponseIndex;
+      Mutation.ANCOUNT =
+          static_cast<uint16_t>(Layout->AnswerRRs.size() - 1);
+      Request.Response = Mutation;
+      addTrimCandidate(Candidates, DST1Mutator::mutate(Input, Request),
+                       Input.size());
     }
 
     if (!Layout->AuthorityRRs.empty()) {
@@ -397,6 +426,31 @@ buildTrimCandidates(const std::vector<uint8_t> &Input) {
   }
 
   return Candidates;
+}
+
+std::optional<std::vector<uint8_t>> fitTranscriptToMaxSize(
+    const std::vector<uint8_t> &Input, size_t MaxSize) {
+  if (MaxSize == 0 || !DST1Mutator::validatePoisonEligible(Input).ok()) {
+    return std::nullopt;
+  }
+  if (Input.size() <= MaxSize) {
+    return Input;
+  }
+
+  std::vector<std::vector<uint8_t>> Pending = {Input};
+  std::set<std::vector<uint8_t>> Seen = {Input};
+  for (size_t Index = 0; Index < Pending.size(); ++Index) {
+    for (auto &Candidate : buildTrimCandidates(Pending[Index])) {
+      if (Candidate.size() <= MaxSize) {
+        return Candidate;
+      }
+      if (Seen.insert(Candidate).second) {
+        Pending.push_back(std::move(Candidate));
+      }
+    }
+  }
+
+  return std::nullopt;
 }
 
 void refreshTrimState(AFLDST1MutatorState &State) {
@@ -530,12 +584,12 @@ buildMutationRequest(const DST1Mutator::Transcript &Transcript, std::mt19937 &Rn
     return Request;
   }
   default: {
-    if (Transcript.Responses.empty()) {
+    if (Transcript.Responses.size() <= 1) {
       return std::nullopt;
     }
 
     DST1Mutator::TranscriptMutation Mutation;
-    std::uniform_int_distribution<size_t> CountDist(0,
+    std::uniform_int_distribution<size_t> CountDist(1,
                                                     Transcript.Responses.size() - 1);
     Mutation.ResponseCount = static_cast<uint8_t>(CountDist(Rng));
     Request.Transcript = Mutation;
@@ -550,13 +604,17 @@ std::optional<std::vector<uint8_t>> mutateTranscript(
     size_t MaxSize,
     std::mt19937 &Rng) {
   auto Transcript = DST1Mutator::parse(Input);
-  if (!Transcript) {
+  if (!Transcript || !DST1Mutator::validatePoisonEligible(*Transcript).ok()) {
     return std::nullopt;
   }
 
   std::optional<DST1Mutator::Transcript> DonorTranscript;
   if (DonorInput != nullptr) {
     DonorTranscript = DST1Mutator::parse(*DonorInput);
+    if (DonorTranscript &&
+        !DST1Mutator::validatePoisonEligible(*DonorTranscript).ok()) {
+      DonorTranscript.reset();
+    }
   }
 
   for (size_t Attempt = 0; Attempt < 16; ++Attempt) {
@@ -573,6 +631,7 @@ std::optional<std::vector<uint8_t>> mutateTranscript(
                        ? DST1Mutator::mutate(Input, *Request, *DonorInput)
                        : DST1Mutator::mutate(Input, *Request);
     if (!Mutated || Mutated->empty() || Mutated->size() > MaxSize ||
+        !DST1Mutator::validatePoisonEligible(*Mutated).ok() ||
         *Mutated == Input) {
       continue;
     }
@@ -612,17 +671,18 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
     size_t AddBufSize,
     size_t MaxSize) {
   auto *State = static_cast<geninput::AFLDST1MutatorState *>(Data);
-  if (State == nullptr || Buf == nullptr || BufSize == 0) {
+  if (State == nullptr || OutBuf == nullptr) {
+    return 0;
+  }
+  *OutBuf = nullptr;
+  State->Output.clear();
+  if (Buf == nullptr || BufSize == 0 || MaxSize == 0) {
     return 0;
   }
 
   std::vector<uint8_t> Input(Buf, Buf + BufSize);
-  const bool InputParseable = geninput::DST1Mutator::parse(Input).has_value();
-  if (!InputParseable) {
-    if (geninput::isMutatorOnlyEnabled()) {
-      return 0;
-    }
-    return geninput::storeOutput(*State, Input, MaxSize, OutBuf);
+  if (!geninput::DST1Mutator::validatePoisonEligible(Input).ok()) {
+    return 0;
   }
 
   std::optional<std::vector<uint8_t>> DonorInput;
@@ -631,7 +691,8 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
   }
 
   const bool DonorParseable =
-      DonorInput.has_value() && geninput::DST1Mutator::parse(*DonorInput).has_value();
+      DonorInput.has_value() &&
+      geninput::DST1Mutator::validatePoisonEligible(*DonorInput).ok();
 
   auto Mutated = geninput::mutateTranscript(
       Input, DonorParseable ? &DonorInput.value() : nullptr, MaxSize, State->Rng);
@@ -639,7 +700,11 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_fuzz(
     return geninput::storeOutput(*State, *Mutated, MaxSize, OutBuf);
   }
 
-  return geninput::storeOutput(*State, Input, MaxSize, OutBuf);
+  auto Fitted = geninput::fitTranscriptToMaxSize(Input, MaxSize);
+  if (!Fitted) {
+    return 0;
+  }
+  return geninput::storeOutput(*State, *Fitted, MaxSize, OutBuf);
 }
 
 extern "C" __attribute__((visibility("default"))) unsigned char
@@ -652,7 +717,8 @@ afl_custom_queue_get(void *Data, const unsigned char *Filename) {
 
   auto Bytes =
       geninput::readFileBytes(reinterpret_cast<const char *>(Filename));
-  return Bytes.has_value() && geninput::DST1Mutator::parse(*Bytes).has_value();
+  return Bytes.has_value() &&
+         geninput::DST1Mutator::validatePoisonEligible(*Bytes).ok();
 }
 
 extern "C" __attribute__((visibility("default"))) size_t afl_custom_post_process(
@@ -675,17 +741,9 @@ extern "C" __attribute__((visibility("default"))) size_t afl_custom_post_process
     return geninput::storeOutput(*State, *Canonical, OutBuf);
   }
 
-  if (geninput::isMutatorOnlyEnabled()) {
-    *OutBuf = nullptr;
-    State->Output.clear();
-    return 0;
-  }
-
-  if (Input.empty()) {
-    return 0;
-  }
-
-  return geninput::storeOutput(*State, Input, OutBuf);
+  *OutBuf = nullptr;
+  State->Output.clear();
+  return 0;
 }
 
 extern "C" __attribute__((visibility("default"))) int afl_custom_init_trim(
@@ -698,7 +756,7 @@ extern "C" __attribute__((visibility("default"))) int afl_custom_init_trim(
   }
 
   std::vector<uint8_t> Input(Buf, Buf + BufSize);
-  if (!geninput::DST1Mutator::parse(Input).has_value()) {
+  if (!geninput::DST1Mutator::validatePoisonEligible(Input).ok()) {
     State->Trim = {};
     return 0;
   }

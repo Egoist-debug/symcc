@@ -3,6 +3,8 @@
 #include "../include/FormatAwareGenerator.h"
 
 #include <algorithm>
+#include <cctype>
+#include <set>
 
 namespace geninput {
 
@@ -31,33 +33,90 @@ void writeBe16(std::vector<uint8_t> &Input, size_t Offset, uint16_t Value) {
   Input[Offset + 1] = static_cast<uint8_t>(Value & 0xFF);
 }
 
-std::optional<size_t> consumeDnsName(const std::vector<uint8_t> &Packet,
-                                     size_t Offset) {
-  size_t Position = Offset;
-  size_t Guard = Packet.size();
+struct ParsedDnsName {
+  size_t WireEnd = 0;
+  std::string CanonicalName;
+};
 
-  while (Position < Packet.size() && Guard > 0) {
+struct DnsNameParseResult {
+  std::optional<ParsedDnsName> Name;
+  bool InvalidCompressionPointer = false;
+};
+
+DnsNameParseResult parseDnsName(const std::vector<uint8_t> &Packet,
+                                size_t Offset) {
+  size_t Position = Offset;
+  size_t WireEnd = Offset;
+  size_t DecodedLength = 0;
+  bool Jumped = false;
+  std::set<size_t> VisitedPointers;
+  std::string Name;
+
+  for (size_t Step = 0; Step <= Packet.size(); ++Step) {
+    if (Position >= Packet.size()) {
+      return {};
+    }
+
     const uint8_t Len = Packet[Position];
     if ((Len & 0xC0) == 0xC0) {
       if (Position + 1 >= Packet.size()) {
-        return std::nullopt;
+        DnsNameParseResult Result;
+        Result.InvalidCompressionPointer = true;
+        return Result;
       }
-      return Position + 2;
+
+      const size_t Target =
+          (static_cast<size_t>(Len & 0x3F) << 8) | Packet[Position + 1];
+      if (Target >= Position || Target >= Packet.size() ||
+          !VisitedPointers.insert(Target).second) {
+        DnsNameParseResult Result;
+        Result.InvalidCompressionPointer = true;
+        return Result;
+      }
+
+      if (!Jumped) {
+        WireEnd = Position + 2;
+      }
+      Position = Target;
+      Jumped = true;
+      continue;
+    }
+
+    if ((Len & 0xC0) != 0 || Len > 63) {
+      return {};
     }
 
     if (Len == 0) {
-      return Position + 1;
+      if (!Jumped) {
+        WireEnd = Position + 1;
+      }
+      DnsNameParseResult Result;
+      Result.Name = ParsedDnsName{WireEnd, Name};
+      return Result;
     }
 
-    if (Len > 63 || Position + 1 + Len > Packet.size()) {
-      return std::nullopt;
+    if (Position + 1 + Len > Packet.size() ||
+        DecodedLength + static_cast<size_t>(Len) + 1 > 255) {
+      return {};
     }
 
+    if (!Name.empty()) {
+      Name.push_back('.');
+    }
+    for (size_t Index = 0; Index < Len; ++Index) {
+      Name.push_back(static_cast<char>(std::tolower(
+          static_cast<unsigned char>(Packet[Position + 1 + Index]))));
+    }
+    DecodedLength += static_cast<size_t>(Len) + 1;
     Position += 1 + Len;
-    --Guard;
+    if (!Jumped) {
+      WireEnd = Position;
+    }
   }
 
-  return std::nullopt;
+  DnsNameParseResult Result;
+  Result.InvalidCompressionPointer = true;
+  return Result;
 }
 
 struct ParsedQuestionInfo {
@@ -72,23 +131,27 @@ struct ParsedQuestionInfo {
 };
 
 std::optional<ParsedQuestionInfo>
-parseSingleQuestion(const std::vector<uint8_t> &Packet) {
+parseSingleQuestion(const std::vector<uint8_t> &Packet,
+                    bool *InvalidCompressionPointer = nullptr) {
   if (Packet.size() < 12 || readBe16(Packet, 4) != 1) {
     return std::nullopt;
   }
 
   ParsedQuestionInfo Info;
   Info.NameStart = 12;
-  auto NameEnd = consumeDnsName(Packet, Info.NameStart);
-  if (!NameEnd || *NameEnd + 4 > Packet.size()) {
+  auto ParsedName = parseDnsName(Packet, Info.NameStart);
+  if (!ParsedName.Name || ParsedName.Name->WireEnd + 4 > Packet.size()) {
+    if (InvalidCompressionPointer != nullptr) {
+      *InvalidCompressionPointer = ParsedName.InvalidCompressionPointer;
+    }
     return std::nullopt;
   }
 
-  Info.NameEnd = *NameEnd;
-  Info.TypeOffset = *NameEnd;
-  Info.ClassOffset = *NameEnd + 2;
-  Info.EndOffset = *NameEnd + 4;
-  Info.Name = DNSNameCodec::decode(Packet, Info.NameStart);
+  Info.NameEnd = ParsedName.Name->WireEnd;
+  Info.TypeOffset = ParsedName.Name->WireEnd;
+  Info.ClassOffset = ParsedName.Name->WireEnd + 2;
+  Info.EndOffset = ParsedName.Name->WireEnd + 4;
+  Info.Name = ParsedName.Name->CanonicalName;
   Info.Type = readBe16(Packet, Info.TypeOffset);
   Info.DnsClass = readBe16(Packet, Info.ClassOffset);
 
@@ -108,19 +171,23 @@ struct RRInfo {
 };
 
 std::optional<RRInfo> parseRRAt(const std::vector<uint8_t> &Packet,
-                                size_t Offset) {
+                                size_t Offset,
+                                bool *InvalidCompressionPointer = nullptr) {
   RRInfo Info;
   Info.StartOffset = Offset;
-  auto NameEnd = consumeDnsName(Packet, Offset);
-  if (!NameEnd || *NameEnd + 10 > Packet.size()) {
+  auto ParsedName = parseDnsName(Packet, Offset);
+  if (!ParsedName.Name || ParsedName.Name->WireEnd + 10 > Packet.size()) {
+    if (InvalidCompressionPointer != nullptr) {
+      *InvalidCompressionPointer = ParsedName.InvalidCompressionPointer;
+    }
     return std::nullopt;
   }
 
-  Info.Type = readBe16(Packet, *NameEnd);
-  Info.DnsClass = readBe16(Packet, *NameEnd + 2);
-  Info.TTL = readBe32(Packet, *NameEnd + 4);
-  const uint16_t RdLength = readBe16(Packet, *NameEnd + 8);
-  const size_t RDataOffset = *NameEnd + 10;
+  Info.Type = readBe16(Packet, ParsedName.Name->WireEnd);
+  Info.DnsClass = readBe16(Packet, ParsedName.Name->WireEnd + 2);
+  Info.TTL = readBe32(Packet, ParsedName.Name->WireEnd + 4);
+  const uint16_t RdLength = readBe16(Packet, ParsedName.Name->WireEnd + 8);
+  const size_t RDataOffset = ParsedName.Name->WireEnd + 10;
   if (RDataOffset + RdLength > Packet.size()) {
     return std::nullopt;
   }
@@ -157,7 +224,8 @@ struct ParsedResponseLayout {
 };
 
 std::optional<ParsedResponseLayout>
-parseResponseLayout(const std::vector<uint8_t> &Packet) {
+parseResponseLayout(const std::vector<uint8_t> &Packet,
+                    bool *InvalidCompressionPointer = nullptr) {
   if (Packet.size() < 12 || (Packet[2] & 0x80) == 0) {
     return std::nullopt;
   }
@@ -167,8 +235,12 @@ parseResponseLayout(const std::vector<uint8_t> &Packet) {
     return std::nullopt;
   }
 
-  auto Question = parseSingleQuestion(Packet);
+  bool QuestionPointerInvalid = false;
+  auto Question = parseSingleQuestion(Packet, &QuestionPointerInvalid);
   if (!Question) {
+    if (InvalidCompressionPointer != nullptr) {
+      *InvalidCompressionPointer = QuestionPointerInvalid;
+    }
     return std::nullopt;
   }
 
@@ -184,8 +256,12 @@ parseResponseLayout(const std::vector<uint8_t> &Packet) {
   auto parseSection = [&](uint16_t Count,
                           std::vector<std::vector<uint8_t>> &Output) -> bool {
     for (uint16_t I = 0; I < Count; ++I) {
-      auto RR = parseRRAt(Packet, Cursor);
+      bool OwnerPointerInvalid = false;
+      auto RR = parseRRAt(Packet, Cursor, &OwnerPointerInvalid);
       if (!RR) {
+        if (InvalidCompressionPointer != nullptr) {
+          *InvalidCompressionPointer = OwnerPointerInvalid;
+        }
         return false;
       }
       Output.emplace_back(Packet.begin() + RR->StartOffset,
@@ -257,11 +333,13 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
     }
 
     const auto &Candidate = Donor.Responses[Request.ResponseIndex];
-    if (!responsePacketMatchesQuery(Candidate, Target.ClientQuery)) {
+    auto Normalized =
+        DST1Mutator::normalizeResponseForQuery(Candidate, Target.ClientQuery);
+    if (!Normalized) {
       return false;
     }
 
-    ensureResponseMutation(Request).Packet = Candidate;
+    ensureResponseMutation(Request).Packet = std::move(*Normalized);
     return true;
   }
 
@@ -273,7 +351,7 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
 
     const auto &Candidate = Donor.Responses[Request.ResponseIndex];
     auto Layout = parseResponseLayout(Candidate);
-    if (!Layout || !responsePacketMatchesQuery(Candidate, Target.ClientQuery)) {
+    if (!Layout) {
       return false;
     }
 
@@ -291,7 +369,7 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
 
     const auto &Candidate = Donor.Responses[Request.ResponseIndex];
     auto Layout = parseResponseLayout(Candidate);
-    if (!Layout || !responsePacketMatchesQuery(Candidate, Target.ClientQuery)) {
+    if (!Layout) {
       return false;
     }
 
@@ -309,12 +387,15 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
     if (DonorCount < Replacement.size()) {
       Replacement.resize(DonorCount);
     } else if (DonorCount > Replacement.size()) {
-      std::vector<std::vector<uint8_t>> Appended(
-          Donor.Responses.begin() + Replacement.size(), Donor.Responses.end());
-      if (!responseSetMatchesQuery(Appended, Target.ClientQuery)) {
-        return false;
+      for (size_t Index = Replacement.size(); Index < Donor.Responses.size();
+           ++Index) {
+        auto Normalized = DST1Mutator::normalizeResponseForQuery(
+            Donor.Responses[Index], Target.ClientQuery);
+        if (!Normalized) {
+          return false;
+        }
+        Replacement.push_back(std::move(*Normalized));
       }
-      Replacement.insert(Replacement.end(), Appended.begin(), Appended.end());
     }
 
     auto &Mutation = ensureTranscriptMutation(Request);
@@ -407,6 +488,10 @@ applyQuestionMutation(const std::vector<uint8_t> &Packet,
 
   if (Mutation.QTYPE.has_value()) {
     writeBe16(Updated, Question->TypeOffset, Mutation.QTYPE.value());
+  }
+
+  if (Mutation.QCLASS.has_value()) {
+    writeBe16(Updated, Question->ClassOffset, Mutation.QCLASS.value());
   }
 
   if (Mutation.QNAME.has_value()) {
@@ -521,88 +606,274 @@ applyResponseMutation(const std::vector<uint8_t> &Packet,
   return Rebuilt;
 }
 
-bool checkPostQueryNameAndType(const std::vector<uint8_t> &Query,
-                               const std::vector<uint8_t> &PostCheckQuery) {
+bool checkPostQueryIdentity(const std::vector<uint8_t> &Query,
+                            const std::vector<uint8_t> &PostCheckQuery) {
   auto Q = parseSingleQuestion(Query);
   auto P = parseSingleQuestion(PostCheckQuery);
-  return Q.has_value() && P.has_value() && Q->Name == P->Name &&
-         Q->Type == P->Type;
+  return Q.has_value() && P.has_value() &&
+         haveMatchingQuestionIdentity(*Q, *P);
+}
+
+DST1Mutator::ValidationResult
+validationError(DST1Mutator::ValidationError Error,
+                size_t ResponseIndex = std::numeric_limits<size_t>::max()) {
+  DST1Mutator::ValidationResult Result;
+  Result.Error = Error;
+  Result.ResponseIndex = ResponseIndex;
+  return Result;
+}
+
+std::optional<DST1Mutator::Transcript>
+parseWireTranscript(const std::vector<uint8_t> &Input,
+                    DST1Mutator::ValidationResult &Validation) {
+  using Error = DST1Mutator::ValidationError;
+
+  if (Input.size() > dst1::MAX_TRANSCRIPT_INPUT) {
+    Validation = validationError(Error::InputTooLarge);
+    return std::nullopt;
+  }
+  if (Input.size() < dst1::computePrefixSize(0)) {
+    Validation = validationError(Error::InputTooShort);
+    return std::nullopt;
+  }
+  if (!std::equal(dst1::MAGIC.begin(), dst1::MAGIC.end(), Input.begin())) {
+    Validation = validationError(Error::InvalidMagic);
+    return std::nullopt;
+  }
+  if (Input[dst1::RESERVED_OFFSET] != dst1::RESERVED_VALUE) {
+    Validation = validationError(Error::InvalidReserved);
+    return std::nullopt;
+  }
+
+  const uint8_t ResponseCount = Input[dst1::RESPONSE_COUNT_OFFSET];
+  if (ResponseCount > dst1::MAX_RESPONSES) {
+    Validation = validationError(Error::TooManyResponses);
+    return std::nullopt;
+  }
+
+  const size_t PrefixSize = dst1::computePrefixSize(ResponseCount);
+  if (PrefixSize > Input.size()) {
+    Validation = validationError(Error::TruncatedLengthTable);
+    return std::nullopt;
+  }
+
+  const auto QueryLength =
+      dst1::readU16Le(Input, dst1::QUERY_LENGTH_OFFSET);
+  const auto PostCheckLength =
+      dst1::readU16Le(Input, dst1::POST_CHECK_LENGTH_OFFSET);
+  if (!QueryLength || !PostCheckLength) {
+    Validation = validationError(Error::TruncatedLengthTable);
+    return std::nullopt;
+  }
+  if (*QueryLength == 0) {
+    Validation = validationError(Error::EmptyQuery);
+    return std::nullopt;
+  }
+
+  std::vector<uint16_t> ResponseLengths;
+  ResponseLengths.reserve(ResponseCount);
+  size_t ExpectedSize = PrefixSize + *QueryLength + *PostCheckLength;
+  for (uint8_t Index = 0; Index < ResponseCount; ++Index) {
+    const auto Length = dst1::readU16Le(
+        Input, dst1::RESPONSE_LENGTHS_OFFSET +
+                   static_cast<size_t>(Index) * dst1::LENGTH_FIELD_SIZE);
+    if (!Length) {
+      Validation = validationError(Error::TruncatedLengthTable, Index);
+      return std::nullopt;
+    }
+    if (*Length == 0) {
+      Validation = validationError(Error::EmptyResponse, Index);
+      return std::nullopt;
+    }
+    ResponseLengths.push_back(*Length);
+    ExpectedSize += *Length;
+  }
+
+  if (ExpectedSize != Input.size()) {
+    Validation = validationError(Error::LengthMismatch);
+    return std::nullopt;
+  }
+
+  DST1Mutator::Transcript Parsed;
+  size_t Cursor = PrefixSize;
+  Parsed.ClientQuery.assign(Input.begin() + Cursor,
+                            Input.begin() + Cursor + *QueryLength);
+  Cursor += *QueryLength;
+
+  Parsed.Responses.reserve(ResponseCount);
+  for (uint16_t Length : ResponseLengths) {
+    Parsed.Responses.emplace_back(Input.begin() + Cursor,
+                                  Input.begin() + Cursor + Length);
+    Cursor += Length;
+  }
+
+  Parsed.PostCheckQuery.assign(Input.begin() + Cursor, Input.end());
+  Validation = {};
+  return Parsed;
+}
+
+bool isCompleteDnsQuery(const std::vector<uint8_t> &Packet,
+                        ParsedQuestionInfo &Question,
+                        bool &InvalidCompressionPointer) {
+  auto Parsed = parseSingleQuestion(Packet, &InvalidCompressionPointer);
+  if (!Parsed || Packet.size() < 12 || (Packet[2] & 0x80) != 0 ||
+      readBe16(Packet, 4) != 1 || readBe16(Packet, 6) != 0 ||
+      readBe16(Packet, 8) != 0 || readBe16(Packet, 10) != 0 ||
+      Parsed->EndOffset != Packet.size()) {
+    return false;
+  }
+
+  Question = std::move(*Parsed);
+  return true;
+}
+
+DST1Mutator::ValidationResult
+validatePoisonTranscript(const DST1Mutator::Transcript &Input) {
+  using Error = DST1Mutator::ValidationError;
+
+  if (Input.Responses.empty()) {
+    return validationError(Error::MissingResponse);
+  }
+  if (Input.PostCheckQuery.empty()) {
+    return validationError(Error::EmptyPostCheck);
+  }
+  if (!dst1::validateSegments(Input.ClientQuery, Input.Responses,
+                              Input.PostCheckQuery)) {
+    return validationError(Error::LengthMismatch);
+  }
+
+  ParsedQuestionInfo Query;
+  bool InvalidPointer = false;
+  if (!isCompleteDnsQuery(Input.ClientQuery, Query, InvalidPointer)) {
+    return validationError(InvalidPointer ? Error::InvalidCompressionPointer
+                                          : Error::InvalidQuery);
+  }
+
+  ParsedQuestionInfo PostCheck;
+  InvalidPointer = false;
+  if (!isCompleteDnsQuery(Input.PostCheckQuery, PostCheck, InvalidPointer)) {
+    return validationError(InvalidPointer ? Error::InvalidCompressionPointer
+                                          : Error::InvalidPostCheck);
+  }
+  if (!haveMatchingQuestionIdentity(Query, PostCheck)) {
+    return validationError(Error::QueryPostCheckMismatch);
+  }
+
+  for (size_t Index = 0; Index < Input.Responses.size(); ++Index) {
+    bool ResponsePointerInvalid = false;
+    const auto Layout =
+        parseResponseLayout(Input.Responses[Index], &ResponsePointerInvalid);
+    if (!Layout) {
+      return validationError(ResponsePointerInvalid
+                                 ? Error::InvalidCompressionPointer
+                                 : Error::InvalidResponse,
+                             Index);
+    }
+    if (!packetsHaveMatchingQuestionIdentity(Input.Responses[Index],
+                                             Input.ClientQuery)) {
+      return validationError(Error::ResponseQuestionMismatch, Index);
+    }
+  }
+
+  return {};
 }
 
 }
 
 std::optional<DST1Mutator::Transcript>
 DST1Mutator::parse(const std::vector<uint8_t> &Input) {
-  if (Input.size() < dst1::computePrefixSize(0)) {
+  ValidationResult Validation;
+  return parseWireTranscript(Input, Validation);
+}
+
+DST1Mutator::ValidationResult
+DST1Mutator::validateWire(const std::vector<uint8_t> &Input) {
+  ValidationResult Validation;
+  (void)parseWireTranscript(Input, Validation);
+  return Validation;
+}
+
+DST1Mutator::ValidationResult
+DST1Mutator::validatePoisonEligible(const std::vector<uint8_t> &Input) {
+  ValidationResult Validation;
+  auto Parsed = parseWireTranscript(Input, Validation);
+  if (!Parsed) {
+    return Validation;
+  }
+  return validatePoisonTranscript(*Parsed);
+}
+
+DST1Mutator::ValidationResult
+DST1Mutator::validatePoisonEligible(const Transcript &Input) {
+  return validatePoisonTranscript(Input);
+}
+
+const char *DST1Mutator::validationErrorName(ValidationError Error) {
+  switch (Error) {
+  case ValidationError::None:
+    return "none";
+  case ValidationError::InputTooShort:
+    return "input_too_short";
+  case ValidationError::InputTooLarge:
+    return "input_too_large";
+  case ValidationError::InvalidMagic:
+    return "invalid_magic";
+  case ValidationError::InvalidReserved:
+    return "invalid_reserved";
+  case ValidationError::TooManyResponses:
+    return "too_many_responses";
+  case ValidationError::TruncatedLengthTable:
+    return "truncated_length_table";
+  case ValidationError::EmptyQuery:
+    return "empty_query";
+  case ValidationError::EmptyResponse:
+    return "empty_response";
+  case ValidationError::LengthMismatch:
+    return "length_mismatch";
+  case ValidationError::EmptyPostCheck:
+    return "empty_post_check";
+  case ValidationError::MissingResponse:
+    return "missing_response";
+  case ValidationError::InvalidQuery:
+    return "invalid_query";
+  case ValidationError::InvalidPostCheck:
+    return "invalid_post_check";
+  case ValidationError::QueryPostCheckMismatch:
+    return "query_post_check_mismatch";
+  case ValidationError::InvalidResponse:
+    return "invalid_response";
+  case ValidationError::InvalidCompressionPointer:
+    return "invalid_compression_pointer";
+  case ValidationError::ResponseQuestionMismatch:
+    return "response_question_mismatch";
+  }
+  return "unknown";
+}
+
+std::optional<std::vector<uint8_t>> DST1Mutator::normalizeResponseForQuery(
+    const std::vector<uint8_t> &Response,
+    const std::vector<uint8_t> &Query) {
+  ParsedQuestionInfo QueryQuestion;
+  bool InvalidPointer = false;
+  if (!isCompleteDnsQuery(Query, QueryQuestion, InvalidPointer)) {
     return std::nullopt;
   }
 
-  if (!std::equal(dst1::MAGIC.begin(), dst1::MAGIC.end(), Input.begin())) {
+  auto Layout = parseResponseLayout(Response);
+  if (!Layout) {
     return std::nullopt;
   }
 
-  const uint8_t response_count = Input[dst1::RESPONSE_COUNT_OFFSET];
-  if (response_count > dst1::MAX_RESPONSES ||
-      Input[dst1::RESERVED_OFFSET] != dst1::RESERVED_VALUE) {
+  Layout->Header[0] = Query[0];
+  Layout->Header[1] = Query[1];
+  Layout->QuestionBytes.assign(Query.begin() + QueryQuestion.NameStart,
+                               Query.begin() + QueryQuestion.EndOffset);
+
+  auto Normalized = buildResponsePacket(*Layout);
+  if (!Normalized || !responsePacketMatchesQuery(*Normalized, Query)) {
     return std::nullopt;
   }
-
-  const size_t PrefixSize = dst1::computePrefixSize(response_count);
-  if (PrefixSize > Input.size()) {
-    return std::nullopt;
-  }
-
-  auto QueryLengthOpt = dst1::readU16Le(Input, dst1::QUERY_LENGTH_OFFSET);
-  auto PostCheckLengthOpt =
-      dst1::readU16Le(Input, dst1::POST_CHECK_LENGTH_OFFSET);
-  if (!QueryLengthOpt || !PostCheckLengthOpt) {
-    return std::nullopt;
-  }
-
-  std::vector<uint16_t> ResponseLengths;
-  ResponseLengths.reserve(response_count);
-  for (uint8_t I = 0; I < response_count; ++I) {
-    auto Len = dst1::readU16Le(
-        Input, dst1::RESPONSE_LENGTHS_OFFSET +
-                   (static_cast<size_t>(I) * dst1::LENGTH_FIELD_SIZE));
-    if (!Len) {
-      return std::nullopt;
-    }
-    ResponseLengths.push_back(*Len);
-  }
-
-  size_t Cursor = PrefixSize;
-  if (Cursor + *QueryLengthOpt > Input.size()) {
-    return std::nullopt;
-  }
-
-  Transcript Parsed;
-  Parsed.ClientQuery.assign(Input.begin() + Cursor,
-                            Input.begin() + Cursor + *QueryLengthOpt);
-  Cursor += *QueryLengthOpt;
-
-  Parsed.Responses.reserve(response_count);
-  for (uint16_t Length : ResponseLengths) {
-    if (Cursor + Length > Input.size()) {
-      return std::nullopt;
-    }
-    Parsed.Responses.emplace_back(Input.begin() + Cursor,
-                                  Input.begin() + Cursor + Length);
-    Cursor += Length;
-  }
-
-  if (Cursor + *PostCheckLengthOpt != Input.size()) {
-    return std::nullopt;
-  }
-
-  Parsed.PostCheckQuery.assign(Input.begin() + Cursor, Input.end());
-
-  if (!dst1::validateSegments(Parsed.ClientQuery, Parsed.Responses,
-                              Parsed.PostCheckQuery)) {
-    return std::nullopt;
-  }
-
-  return Parsed;
+  return Normalized;
 }
 
 std::optional<std::vector<uint8_t>>
@@ -619,6 +890,32 @@ mutateTranscriptImpl(const std::vector<uint8_t> &Input,
       return std::nullopt;
     }
     Parsed->ClientQuery = std::move(*MutatedQuery);
+
+    const bool IdentityChanged = Request.Query->QNAME.has_value() ||
+                                 Request.Query->QTYPE.has_value() ||
+                                 Request.Query->QCLASS.has_value();
+    if (IdentityChanged) {
+      DST1Mutator::QueryMutation CoupledMutation;
+      CoupledMutation.QNAME = Request.Query->QNAME;
+      CoupledMutation.QTYPE = Request.Query->QTYPE;
+      CoupledMutation.QCLASS = Request.Query->QCLASS;
+
+      auto MutatedPost =
+          applyQuestionMutation(Parsed->PostCheckQuery, CoupledMutation);
+      if (!MutatedPost) {
+        return std::nullopt;
+      }
+      Parsed->PostCheckQuery = std::move(*MutatedPost);
+
+      for (auto &Response : Parsed->Responses) {
+        auto Normalized = DST1Mutator::normalizeResponseForQuery(
+            Response, Parsed->ClientQuery);
+        if (!Normalized) {
+          return std::nullopt;
+        }
+        Response = std::move(*Normalized);
+      }
+    }
   }
 
   if (Request.Response.has_value()) {
@@ -656,10 +953,13 @@ mutateTranscriptImpl(const std::vector<uint8_t> &Input,
       Parsed->Responses.resize(response_count);
     }
 
-    if (Mutation.PostCheckName.has_value() || Mutation.PostCheckType.has_value()) {
+    if (Mutation.PostCheckName.has_value() ||
+        Mutation.PostCheckType.has_value() ||
+        Mutation.PostCheckClass.has_value()) {
       DST1Mutator::QueryMutation PostMutation;
       PostMutation.QNAME = Mutation.PostCheckName;
       PostMutation.QTYPE = Mutation.PostCheckType;
+      PostMutation.QCLASS = Mutation.PostCheckClass;
       auto UpdatedPost = applyQuestionMutation(Parsed->PostCheckQuery, PostMutation);
       if (!UpdatedPost) {
         return std::nullopt;
@@ -672,7 +972,7 @@ mutateTranscriptImpl(const std::vector<uint8_t> &Input,
     return std::nullopt;
   }
 
-  if (!checkPostQueryNameAndType(Parsed->ClientQuery, Parsed->PostCheckQuery)) {
+  if (!checkPostQueryIdentity(Parsed->ClientQuery, Parsed->PostCheckQuery)) {
     return std::nullopt;
   }
 

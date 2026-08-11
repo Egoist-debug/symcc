@@ -18,7 +18,12 @@ from .follow_diff import (
 )
 from .input_model_eval import InputModelEvalError, run_input_model_eval
 from .matrix import CampaignMatrixError, run_campaign_matrix
-from .publication_audit import PublicationAuditError, run_publication_audit
+from .publication_audit import (
+    MINIMUM_PUBLICATION_CASE_STUDIES,
+    MINIMUM_PUBLICATION_RUNS,
+    PublicationAuditError,
+    run_publication_audit,
+)
 from .report import ReportError, default_follow_diff_root, generate_report
 from .replay import ReplayError, replay_diff_cache
 from .rq3_snapshot import RQ3SnapshotError, run_rq3_snapshot
@@ -728,14 +733,20 @@ def build_parser() -> argparse.ArgumentParser:
     publication_audit.add_argument(
         "--minimum-runs",
         type=int,
-        default=5,
-        help="每个变体最低独立重复次数（默认 5）",
+        default=MINIMUM_PUBLICATION_RUNS,
+        help=(
+            "每个变体最低独立重复次数；只能提高，"
+            f"论文硬门槛为 {MINIMUM_PUBLICATION_RUNS}"
+        ),
     )
     publication_audit.add_argument(
         "--minimum-case-studies",
         type=int,
-        default=2,
-        help="每个矩阵最低 case study 总数（默认 2）",
+        default=MINIMUM_PUBLICATION_CASE_STUDIES,
+        help=(
+            "每个矩阵最低完整且已裁决 case study 总数；只能提高，"
+            f"论文硬门槛为 {MINIMUM_PUBLICATION_CASE_STUDIES}"
+        ),
     )
     publication_audit.set_defaults(handler=_cmd_publication_audit)
 

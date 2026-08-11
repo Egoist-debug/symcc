@@ -349,7 +349,10 @@ def _validate_campaign_report_artifacts(work_dir: Path) -> None:
         latest_report_dir / "summary.json",
         latest_report_dir / "ablation_matrix.tsv",
         latest_report_dir / "cluster_counts.tsv",
+        latest_report_dir / "cluster.tsv",
         latest_report_dir / "repro_rate.tsv",
+        latest_report_dir / "evidence_bundle.json",
+        latest_report_dir / "case_studies" / "index.tsv",
     ]
     missing_paths = [path for path in required_files if not path.is_file()]
     if missing_paths:

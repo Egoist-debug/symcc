@@ -75,6 +75,7 @@ struct CampaignReportArtifacts {
   std::filesystem::path SummaryPath;
   std::filesystem::path AblationMatrixPath;
   std::filesystem::path ClusterCountsPath;
+  std::filesystem::path ClusterPath;
   std::filesystem::path FailureTaxonomyPath;
   std::filesystem::path ExclusionSummaryPath;
   std::filesystem::path ReproRatePath;

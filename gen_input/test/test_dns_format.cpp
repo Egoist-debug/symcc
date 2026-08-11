@@ -654,9 +654,13 @@ void testDST1MutatorMutationSafety() {
   auto transcript = buildSampleDst1Transcript();
 
   DST1Mutator::MutationRequest validRequest;
-  validRequest.Query = DST1Mutator::QueryMutation{
-      std::string("www.target.test"), static_cast<uint16_t>(28), false, true,
-      true};
+  DST1Mutator::QueryMutation validQueryMutation;
+  validQueryMutation.QNAME = std::string("www.target.test");
+  validQueryMutation.QTYPE = static_cast<uint16_t>(28);
+  validQueryMutation.RD = false;
+  validQueryMutation.TC = true;
+  validQueryMutation.CD = true;
+  validRequest.Query = validQueryMutation;
 
   auto nsRData = DNSNameCodec::encode("ns1.target.test");
   auto glueA = std::vector<uint8_t>{10, 10, 10, 10};
@@ -716,6 +720,147 @@ void testDST1MutatorMutationSafety() {
             << std::endl;
 }
 
+void testDST1CoupledQuestionMutations() {
+  std::cout << "=== Testing DST1 Coupled Question Mutations ===" << std::endl;
+
+  const auto transcript = buildSampleDst1Transcript();
+
+  DST1Mutator::MutationRequest nameRequest;
+  DST1Mutator::QueryMutation nameMutation;
+  nameMutation.QNAME = std::string("edge.target.test");
+  nameRequest.Query = nameMutation;
+
+  const auto nameMutated = DST1Mutator::mutate(transcript, nameRequest);
+  assert(nameMutated.has_value());
+  assert(DST1Mutator::validatePoisonEligible(*nameMutated).ok());
+
+  DST1Mutator::MutationRequest typeRequest;
+  DST1Mutator::QueryMutation typeMutation;
+  typeMutation.QTYPE = static_cast<uint16_t>(28);
+  typeRequest.Query = typeMutation;
+
+  const auto typeMutated = DST1Mutator::mutate(transcript, typeRequest);
+  assert(typeMutated.has_value());
+  assert(DST1Mutator::validatePoisonEligible(*typeMutated).ok());
+
+  DST1Mutator::MutationRequest classRequest;
+  DST1Mutator::QueryMutation classMutation;
+  classMutation.QCLASS = static_cast<uint16_t>(3);
+  classRequest.Query = classMutation;
+
+  const auto classMutated = DST1Mutator::mutate(transcript, classRequest);
+  assert(classMutated.has_value());
+  assert(DST1Mutator::validatePoisonEligible(*classMutated).ok());
+
+  std::cout << "DST1 coupled question mutation tests PASSED" << std::endl
+            << std::endl;
+}
+
+void testStatefulGeneratorFairBudget() {
+  std::cout << "=== Testing Stateful Generator Fair Budget ===" << std::endl;
+
+  StatefulDNSGenerator::Config config;
+  config.MaxTranscripts = 2;
+  config.MaxResponsesPerTranscript = 1;
+  config.GenerateResponseRaces = false;
+
+  StatefulDNSGenerator generator(config);
+  generator.addQuerySeed(DNSPacketBuilder::buildQuery("first.example.test", 1));
+  generator.addQuerySeed(DNSPacketBuilder::buildQuery("second.example.test", 1));
+
+  const auto transcripts = generator.generateStatefulTranscripts();
+  assert(transcripts.size() == 2);
+
+  std::set<std::string> queryNames;
+  for (const auto &transcript : transcripts) {
+    const auto parsed = DST1Mutator::parse(transcript);
+    assert(parsed.has_value());
+    assert(DST1Mutator::validatePoisonEligible(*parsed).ok());
+    queryNames.insert(DNSNameCodec::decode(parsed->ClientQuery, 12));
+  }
+
+  assert(queryNames.count("first.example.test") == 1);
+  assert(queryNames.count("second.example.test") == 1);
+
+  std::cout << "Stateful generator fair budget tests PASSED" << std::endl
+            << std::endl;
+}
+
+void testDST1ValidationContract() {
+  std::cout << "=== Testing DST1 Validation Contract ===" << std::endl;
+  using Error = DST1Mutator::ValidationError;
+
+  const auto valid = buildSampleDst1Transcript();
+  assert(DST1Mutator::validateWire(valid).ok());
+  assert(DST1Mutator::validatePoisonEligible(valid).ok());
+
+  std::vector<uint8_t> shortHeader = {'D', 'S', 'T', '1'};
+  assert(DST1Mutator::validateWire(shortHeader).Error == Error::InputTooShort);
+
+  std::vector<uint8_t> truncatedTable = {
+      'D', 'S', 'T', '1', 1, 0, 1, 0, 0, 0};
+  assert(DST1Mutator::validateWire(truncatedTable).Error ==
+         Error::TruncatedLengthTable);
+
+  auto lengthMismatch = valid;
+  lengthMismatch.pop_back();
+  assert(DST1Mutator::validateWire(lengthMismatch).Error ==
+         Error::LengthMismatch);
+
+  const auto query = DNSPacketBuilder::buildQuery("www.example.com", 1);
+  const auto postCheck = DNSPacketBuilder::buildQuery("www.example.com", 1);
+  const auto response = DNSPacketBuilder()
+                            .setID(0x1234)
+                            .asResponse()
+                            .addQuestion("www.example.com", 1, 1)
+                            .build();
+
+  const auto zeroResponse = dst1::buildTranscript(query, {}, postCheck);
+  assert(DST1Mutator::validateWire(zeroResponse).ok());
+  assert(DST1Mutator::validatePoisonEligible(zeroResponse).Error ==
+         Error::MissingResponse);
+
+  const auto emptyPost = dst1::buildTranscript(query, {response}, {});
+  assert(DST1Mutator::validateWire(emptyPost).ok());
+  assert(DST1Mutator::validatePoisonEligible(emptyPost).Error ==
+         Error::EmptyPostCheck);
+
+  const auto otherPost = DNSPacketBuilder::buildQuery("other.example.com", 1);
+  const auto mismatchedPost =
+      dst1::buildTranscript(query, {response}, otherPost);
+  assert(DST1Mutator::validatePoisonEligible(mismatchedPost).Error ==
+         Error::QueryPostCheckMismatch);
+
+  const auto otherResponse = DNSPacketBuilder()
+                                 .setID(0x1234)
+                                 .asResponse()
+                                 .addQuestion("other.example.com", 1, 1)
+                                 .build();
+  const auto mismatchedResponse =
+      dst1::buildTranscript(query, {otherResponse}, postCheck);
+  assert(DST1Mutator::validatePoisonEligible(mismatchedResponse).Error ==
+         Error::ResponseQuestionMismatch);
+
+  std::vector<uint8_t> pointerQuery = {
+      0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0xC0, 0xFF, 0x00, 0x01, 0x00, 0x01};
+  const auto invalidPointer =
+      dst1::buildTranscript(pointerQuery, {response}, postCheck);
+  assert(DST1Mutator::validateWire(invalidPointer).ok());
+  assert(DST1Mutator::validatePoisonEligible(invalidPointer).Error ==
+         Error::InvalidCompressionPointer);
+
+  std::vector<uint8_t> oversized(dst1::MAX_TRANSCRIPT_INPUT + 1, 0);
+  assert(DST1Mutator::validateWire(oversized).Error == Error::InputTooLarge);
+
+  assert(std::string(DST1Mutator::validationErrorName(
+             Error::ResponseQuestionMismatch)) ==
+         "response_question_mismatch");
+
+  std::cout << "DST1 validation contract tests PASSED" << std::endl
+            << std::endl;
+}
+
 int main() {
   std::cout << "gen_input DNS Format Tests" << std::endl;
   std::cout << "==========================" << std::endl << std::endl;
@@ -727,6 +872,9 @@ int main() {
   testDST1TranscriptProtocol();
   testDST1MutatorRoundtrip();
   testDST1MutatorMutationSafety();
+  testDST1CoupledQuestionMutations();
+  testStatefulGeneratorFairBudget();
+  testDST1ValidationContract();
   testFormatAwareGeneratorTimeoutStop();
   testDNSParserValidation();
   testInvalidDNSPackets();

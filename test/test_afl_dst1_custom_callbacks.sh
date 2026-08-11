@@ -359,6 +359,22 @@ std::vector<uint8_t> callFuzz(const MutatorApi &api,
   return std::vector<uint8_t>(outBuf, outBuf + outLen);
 }
 
+std::vector<uint8_t> callFuzzAllowEmpty(const MutatorApi &api,
+                                        void *state,
+                                        const std::vector<uint8_t> &input,
+                                        size_t maxSize) {
+  std::vector<uint8_t> inputCopy = input;
+  unsigned char *outBuf = nullptr;
+  const size_t outLen = api.fuzz(state, inputCopy.data(), inputCopy.size(),
+                                 &outBuf, nullptr, 0, maxSize);
+  if (outLen == 0) {
+    require(outBuf == nullptr, "afl_custom_fuzz 空结果不应设置 OutBuf");
+    return {};
+  }
+  require(outBuf != nullptr, "afl_custom_fuzz 非空结果未设置 OutBuf");
+  return std::vector<uint8_t>(outBuf, outBuf + outLen);
+}
+
 std::vector<uint8_t> callPostProcess(const MutatorApi &api,
                                      void *state,
                                      const std::vector<uint8_t> &input) {
@@ -510,10 +526,9 @@ void testPostProcess(const MutatorApi &api) {
 
   require(setenv("DST1_MUTATOR_ONLY", "0", 1) == 0,
           "无法设置 DST1_MUTATOR_ONLY=0");
-  auto fallback = callPostProcess(api, session.state, invalid);
-  require(!fallback.empty(), "post_process fallback 不得输出空结果");
-  require(fallback == invalid,
-          "非 mutator-only 模式解析失败时必须安全回退到原始非空输入");
+  auto rejected = callPostProcessAllowEmpty(api, session.state, invalid);
+  require(rejected.empty(),
+          "post_process 不得原样回传 non-parseable 输入");
 
   require(setenv("DST1_MUTATOR_ONLY", "1", 1) == 0,
           "无法设置 DST1_MUTATOR_ONLY=1");
@@ -524,7 +539,7 @@ void testPostProcess(const MutatorApi &api) {
           "无法清理 DST1_MUTATOR_ONLY");
 
   std::cout << "PASS post_process_canonicalization" << std::endl;
-  std::cout << "PASS post_process_nonempty_fallback" << std::endl;
+  std::cout << "PASS post_process_invalid_rejected" << std::endl;
   std::cout << "PASS post_process_mutator_only_filter" << std::endl;
 }
 
@@ -565,6 +580,29 @@ void testTrim(const MutatorApi &api) {
   std::cout << "PASS trim_makes_forward_progress" << std::endl;
 }
 
+void testMaxSizeNeverTruncates(const MutatorApi &api) {
+  MutatorSession session(api, 0xFA57U);
+  const auto base = buildBaseTranscript();
+
+  const auto reduced =
+      callFuzzAllowEmpty(api, session.state, base, base.size() - 1);
+  if (!reduced.empty()) {
+    require(reduced.size() < base.size(),
+            "max_size 缩减结果必须满足输出上限");
+    const auto parsed = DST1Mutator::parse(reduced);
+    require(parsed.has_value(),
+            "max_size 缩减不得返回截断的 DST1");
+    require(!parsed->Responses.empty(),
+            "max_size 缩减不得移除最后一个 response");
+  }
+
+  const auto impossible = callFuzzAllowEmpty(api, session.state, base, 1);
+  require(impossible.empty(),
+          "无法完整编码 DST1 时 afl_custom_fuzz 必须返回 0");
+
+  std::cout << "PASS max_size_never_truncates" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -597,6 +635,7 @@ int main(int argc, char **argv) {
   testQueueGet(api, argv[2]);
   testPostProcess(api);
   testTrim(api);
+  testMaxSizeNeverTruncates(api);
 
   dlclose(handle);
   std::cout << "PASS all_custom_callback_checks" << std::endl;
@@ -626,10 +665,11 @@ assert_file_contains "$LOG_FILE" 'PASS donor_consumed'
 assert_file_contains "$LOG_FILE" 'PASS malformed_donor_fallback'
 assert_file_contains "$LOG_FILE" 'PASS queue_get_mutator_only_filter'
 assert_file_contains "$LOG_FILE" 'PASS post_process_canonicalization'
-assert_file_contains "$LOG_FILE" 'PASS post_process_nonempty_fallback'
+assert_file_contains "$LOG_FILE" 'PASS post_process_invalid_rejected'
 assert_file_contains "$LOG_FILE" 'PASS post_process_mutator_only_filter'
 assert_file_contains "$LOG_FILE" 'PASS trim_preserves_parseability'
 assert_file_contains "$LOG_FILE" 'PASS trim_makes_forward_progress'
+assert_file_contains "$LOG_FILE" 'PASS max_size_never_truncates'
 assert_file_contains "$LOG_FILE" 'PASS all_custom_callback_checks'
 
 printf '[afl-dst1-custom-callbacks] PASS\n'

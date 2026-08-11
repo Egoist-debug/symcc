@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import math
 from datetime import datetime, timezone
@@ -8,18 +9,43 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from .aggregate import METRIC_NAMES, _extract_metrics
 from .artifact_digest import sha256_file
 from .io import atomic_write_json
-from .matrix import EXPECTED_VARIANT_ORDER
-from .schema import CONTRACT_VERSION, SEED_PROVENANCE_FIELDS
+from .matrix import EXPECTED_VARIANT_ENVS, EXPECTED_VARIANT_ORDER
+from .schema import (
+    AGGREGATION_KEY_FIELDS,
+    BASELINE_COMPARE_KEY_FIELDS,
+    CONTRACT_VERSION,
+    SEED_PROVENANCE_FIELDS,
+)
 from .statistics import compute_metric_statistics, statistics_contract
 
 EXIT_USAGE = 2
+MINIMUM_PUBLICATION_RUNS = 5
+MINIMUM_PUBLICATION_CASE_STUDIES = 2
+PUBLICATION_PRODUCER_PROFILE = "poison-stateful"
+PUBLICATION_INPUT_MODEL = "DST1 transcript"
 PUBLICATION_EVIDENCE_CONTRACT_NAME = "publication_evidence_bundle"
+PRODUCER_EXECUTION_CONTRACT_NAME = "rq3_producer_execution_manifest"
+PRODUCER_EXECUTION_MANIFEST_NAME = "producer_execution_manifest.json"
+QUEUE_SNAPSHOT_DIGEST_ALGORITHM = "sha256-relative-path-size-content-v1"
+JUDGED_MANUAL_TRUTH_STATUSES = {
+    "confirmed_relevant",
+    "false_positive",
+    "inconclusive",
+}
+REQUIRED_MANUAL_TRUTH_FIELDS: Tuple[str, ...] = (
+    "reviewer_primary",
+    "reviewer_secondary",
+    "adjudicator",
+    "judgment",
+    "decided_at",
+)
 REQUIRED_EVIDENCE_ARTIFACTS: Tuple[str, ...] = (
     "campaign_summary",
     "oracle_audit",
     "oracle_reliability",
     "failure_taxonomy",
     "exclusion_summary",
+    "cluster",
 )
 EVIDENCE_ARTIFACT_PATHS = {
     "campaign_summary": "summary.json",
@@ -27,6 +53,7 @@ EVIDENCE_ARTIFACT_PATHS = {
     "oracle_reliability": "oracle_reliability.json",
     "failure_taxonomy": "failure_taxonomy.tsv",
     "exclusion_summary": "exclusion_summary.tsv",
+    "cluster": "cluster.tsv",
     "case_study_index": "case_studies/index.tsv",
 }
 REQUIRED_CLAIMS: Tuple[str, ...] = (
@@ -139,6 +166,544 @@ def _coerce_finite_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _is_nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_positive_finite_number(value: Any) -> bool:
+    parsed = _coerce_finite_float(value)
+    return parsed is not None and parsed > 0
+
+
+def _contract_values_equal(actual: Any, expected: Any) -> bool:
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
+    return actual == expected
+
+
+def _expected_ablation_status(env: Mapping[str, str]) -> Dict[str, str]:
+    return {
+        "mutator": "on" if env.get("ENABLE_DST1_MUTATOR") == "1" else "off",
+        "cache-delta": "on" if env.get("ENABLE_CACHE_DELTA") == "1" else "off",
+        "triage": "on" if env.get("ENABLE_TRIAGE") == "1" else "off",
+        "symcc": "on" if env.get("ENABLE_SYMCC") == "1" else "off",
+    }
+
+
+def _parse_comparability_key(
+    value: Any,
+    *,
+    key_name: str,
+    matrix_root: Path,
+    scope: str,
+    path: Path,
+    issues: List[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    payload: Any = value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            payload = None
+    if not isinstance(payload, Mapping):
+        _issue(
+            issues,
+            code="invalid_comparability_key",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=path,
+            detail=f"{key_name} 必须是 JSON 对象",
+        )
+        return None
+    return dict(payload)
+
+
+def _audit_comparability_key_pair(
+    *,
+    aggregation_value: Any,
+    baseline_value: Any,
+    variant_name: str,
+    expected_env: Mapping[str, str],
+    manifest: Mapping[str, Any],
+    matrix_root: Path,
+    scope: str,
+    path: Path,
+    issues: List[Dict[str, str]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    aggregation_key = _parse_comparability_key(
+        aggregation_value,
+        key_name="aggregation_key",
+        matrix_root=matrix_root,
+        scope=scope,
+        path=path,
+        issues=issues,
+    )
+    baseline_key = _parse_comparability_key(
+        baseline_value,
+        key_name="baseline_compare_key",
+        matrix_root=matrix_root,
+        scope=scope,
+        path=path,
+        issues=issues,
+    )
+
+    expected_aggregation = {
+        "resolver_pair": manifest.get("resolver_pair"),
+        "producer_profile": PUBLICATION_PRODUCER_PROFILE,
+        "input_model": PUBLICATION_INPUT_MODEL,
+        "source_queue_dir": manifest.get("source_queue_dir"),
+        "budget_sec": manifest.get("budget_sec"),
+        "seed_timeout_sec": manifest.get("seed_timeout_sec"),
+        "variant_name": variant_name,
+        "ablation_status": _expected_ablation_status(expected_env),
+        "contract_version": CONTRACT_VERSION,
+    }
+    expected_baseline = {
+        "resolver_pair": manifest.get("resolver_pair"),
+        "producer_profile": PUBLICATION_PRODUCER_PROFILE,
+        "input_model": PUBLICATION_INPUT_MODEL,
+        "source_queue_dir": manifest.get("source_queue_dir"),
+        "budget_sec": manifest.get("budget_sec"),
+        "seed_timeout_sec": manifest.get("seed_timeout_sec"),
+        "repeat_count": manifest.get("repeat_count"),
+        "contract_version": CONTRACT_VERSION,
+    }
+
+    for key_name, payload, fields, expected in (
+        (
+            "aggregation_key",
+            aggregation_key,
+            AGGREGATION_KEY_FIELDS,
+            expected_aggregation,
+        ),
+        (
+            "baseline_compare_key",
+            baseline_key,
+            BASELINE_COMPARE_KEY_FIELDS,
+            expected_baseline,
+        ),
+    ):
+        if payload is None:
+            continue
+        expected_fields = set(fields)
+        actual_fields = set(payload)
+        missing_fields = sorted(expected_fields - actual_fields)
+        extra_fields = sorted(actual_fields - expected_fields)
+        if missing_fields or extra_fields:
+            _issue(
+                issues,
+                code="invalid_comparability_key_fields",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=path,
+                detail=(
+                    f"{key_name} 字段集合不符合冻结契约；"
+                    f"缺少={missing_fields!r}，多余={extra_fields!r}"
+                ),
+            )
+        invalid_text_fields = sorted(
+            field
+            for field in (
+                "resolver_pair",
+                "producer_profile",
+                "input_model",
+                "source_queue_dir",
+                "variant_name",
+            )
+            if field in expected_fields
+            and field in actual_fields
+            and not _is_nonempty_text(payload.get(field))
+        )
+        invalid_number_fields = sorted(
+            field
+            for field in ("budget_sec", "seed_timeout_sec")
+            if field in expected_fields
+            and field in actual_fields
+            and not _is_positive_finite_number(payload.get(field))
+        )
+        if "repeat_count" in expected_fields and "repeat_count" in actual_fields:
+            if _coerce_positive_int(payload.get("repeat_count")) is None:
+                invalid_number_fields.append("repeat_count")
+        if "contract_version" in actual_fields and (
+            isinstance(payload.get("contract_version"), bool)
+            or not isinstance(payload.get("contract_version"), int)
+        ):
+            invalid_number_fields.append("contract_version")
+        if invalid_text_fields or invalid_number_fields:
+            _issue(
+                issues,
+                code="invalid_comparability_key_value",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=path,
+                detail=(
+                    f"{key_name} 含空文本或非正数字段: "
+                    f"{sorted(invalid_text_fields + invalid_number_fields)!r}"
+                ),
+            )
+        mismatched_fields = sorted(
+            field
+            for field in expected_fields & actual_fields
+            if not _contract_values_equal(payload.get(field), expected.get(field))
+        )
+        if mismatched_fields:
+            _issue(
+                issues,
+                code="comparability_key_value_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=path,
+            detail=(
+                f"{key_name} 字段值不符合矩阵契约: {mismatched_fields!r}"
+            ),
+            )
+
+    if aggregation_key is not None and baseline_key is not None:
+        shared_fields = set(AGGREGATION_KEY_FIELDS) & set(
+            BASELINE_COMPARE_KEY_FIELDS
+        )
+        mismatched_shared_fields = sorted(
+            field
+            for field in shared_fields
+            if aggregation_key.get(field) != baseline_key.get(field)
+        )
+        if mismatched_shared_fields:
+            _issue(
+                issues,
+                code="comparability_key_pair_mismatch",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=path,
+                detail=(
+                    "aggregation_key 与 baseline_compare_key 的共享字段不一致: "
+                    f"{mismatched_shared_fields!r}"
+                ),
+            )
+    return aggregation_key, baseline_key
+
+
+def _queue_snapshot_digest(path: Path) -> Tuple[str, int, int]:
+    digest = hashlib.sha256()
+    file_count = 0
+    size_bytes = 0
+    for artifact_path in sorted(path.rglob("*")):
+        if artifact_path.is_symlink():
+            raise PublicationAuditError(
+                f"queue snapshot 不允许符号链接: {artifact_path}"
+            )
+        if not artifact_path.is_file():
+            continue
+        relative_path = artifact_path.relative_to(path).as_posix()
+        artifact_size = artifact_path.stat().st_size
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(artifact_size).encode("ascii"))
+        digest.update(b"\0")
+        with artifact_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        digest.update(b"\0")
+        file_count += 1
+        size_bytes += artifact_size
+    return digest.hexdigest(), file_count, size_bytes
+
+
+def _audit_producer_execution_manifest(
+    *,
+    run: Mapping[str, Any],
+    expected_run_dir: Path,
+    variant_name: str,
+    repeat_index: int,
+    expected_env: Mapping[str, str],
+    matrix_root: Path,
+    scope: str,
+    issues: List[Dict[str, str]],
+    producer_run_ids: Set[str],
+    random_seeds: Set[str],
+    queue_snapshot_ids: Set[str],
+    queue_snapshot_digests: Set[str],
+) -> None:
+    expected_manifest_path = expected_run_dir / PRODUCER_EXECUTION_MANIFEST_NAME
+    raw_manifest_path = run.get("producer_execution_manifest_path")
+    manifest_path = (
+        _resolve_path(raw_manifest_path, base_dir=matrix_root)
+        if raw_manifest_path is not None
+        else expected_manifest_path.resolve()
+    )
+    if manifest_path != expected_manifest_path.resolve():
+        _issue(
+            issues,
+            code="producer_manifest_path_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=manifest_path or expected_run_dir,
+            detail=f"producer manifest 必须指向 {expected_manifest_path}",
+        )
+    if not expected_manifest_path.is_file():
+        _issue(
+            issues,
+            code="missing_producer_execution_manifest",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail="RQ3 run 缺少 producer execution manifest",
+        )
+        return
+
+    try:
+        manifest = _read_json(expected_manifest_path)
+    except PublicationAuditError as exc:
+        _issue(
+            issues,
+            code="invalid_producer_execution_manifest",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=str(exc),
+        )
+        return
+
+    expected_values = {
+        "contract_name": PRODUCER_EXECUTION_CONTRACT_NAME,
+        "contract_version": CONTRACT_VERSION,
+        "status": "success",
+        "exit_code": 0,
+        "variant_name": variant_name,
+        "repeat_index": repeat_index,
+    }
+    mismatched_fields = sorted(
+        field
+        for field, expected_value in expected_values.items()
+        if manifest.get(field) != expected_value
+    )
+    if mismatched_fields:
+        _issue(
+            issues,
+            code="invalid_producer_execution_state",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=(
+                "producer manifest 终态或身份字段无效: "
+                f"{mismatched_fields!r}"
+            ),
+        )
+    missing_time_fields = [
+        field
+        for field in ("started_at", "finished_at")
+        if not _is_nonempty_text(manifest.get(field))
+    ]
+    if missing_time_fields:
+        _issue(
+            issues,
+            code="incomplete_producer_execution_manifest",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=f"producer manifest 缺少时间字段: {missing_time_fields!r}",
+        )
+
+    producer_run_id = manifest.get("producer_run_id")
+    if not _is_nonempty_text(producer_run_id):
+        _issue(
+            issues,
+            code="missing_producer_run_id",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail="producer_run_id 必须是非空字符串",
+        )
+    elif producer_run_id in producer_run_ids:
+        _issue(
+            issues,
+            code="duplicate_producer_run_id",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=f"producer_run_id 被多个 run 复用: {producer_run_id}",
+        )
+    else:
+        producer_run_ids.add(producer_run_id)
+
+    random_seed = manifest.get("random_seed")
+    random_seed_key = (
+        str(random_seed)
+        if not isinstance(random_seed, bool) and isinstance(random_seed, (int, str))
+        else ""
+    )
+    if not random_seed_key:
+        _issue(
+            issues,
+            code="missing_producer_random_seed",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail="random_seed 必须是非空字符串或整数",
+        )
+    elif random_seed_key in random_seeds:
+        _issue(
+            issues,
+            code="duplicate_producer_random_seed",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=f"random_seed 被多个 run 复用: {random_seed_key}",
+        )
+    else:
+        random_seeds.add(random_seed_key)
+
+    toggles = manifest.get("toggles")
+    if not isinstance(toggles, Mapping) or dict(toggles) != dict(expected_env):
+        _issue(
+            issues,
+            code="producer_toggle_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=f"producer toggles={toggles!r}，要求 {dict(expected_env)!r}",
+        )
+    components = manifest.get("components")
+    symcc = components.get("symcc") if isinstance(components, Mapping) else None
+    expected_symcc = expected_env.get("ENABLE_SYMCC") == "1"
+    if (
+        not isinstance(symcc, Mapping)
+        or symcc.get("enabled") is not expected_symcc
+        or symcc.get("started") is not expected_symcc
+    ):
+        _issue(
+            issues,
+            code="producer_symcc_state_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=(
+                f"components.symcc 必须记录 enabled=started={expected_symcc}"
+            ),
+        )
+
+    queue_snapshot = manifest.get("queue_snapshot")
+    if not isinstance(queue_snapshot, Mapping):
+        _issue(
+            issues,
+            code="missing_queue_snapshot_evidence",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail="producer manifest 缺少 queue_snapshot 对象",
+        )
+        return
+    snapshot_id = queue_snapshot.get("snapshot_id")
+    if not _is_nonempty_text(snapshot_id):
+        _issue(
+            issues,
+            code="missing_queue_snapshot_id",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail="queue_snapshot.snapshot_id 必须是非空字符串",
+        )
+    elif snapshot_id in queue_snapshot_ids:
+        _issue(
+            issues,
+            code="duplicate_queue_snapshot_id",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=f"queue snapshot id 被多个 run 复用: {snapshot_id}",
+        )
+    else:
+        queue_snapshot_ids.add(snapshot_id)
+
+    snapshot_path = _resolve_path(queue_snapshot.get("path"), base_dir=expected_run_dir)
+    if snapshot_path is None or not snapshot_path.is_dir():
+        _issue(
+            issues,
+            code="missing_queue_snapshot_directory",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=snapshot_path or expected_run_dir,
+            detail="queue_snapshot.path 不存在或不是目录",
+        )
+        return
+    try:
+        snapshot_path.relative_to(expected_run_dir.resolve())
+    except ValueError:
+        _issue(
+            issues,
+            code="queue_snapshot_path_escape",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=snapshot_path,
+            detail="queue snapshot 必须位于对应 run_dir 内",
+        )
+        return
+    if queue_snapshot.get("algorithm") != QUEUE_SNAPSHOT_DIGEST_ALGORITHM:
+        _issue(
+            issues,
+            code="invalid_queue_snapshot_algorithm",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=(
+                "queue snapshot 摘要算法必须为 "
+                f"{QUEUE_SNAPSHOT_DIGEST_ALGORITHM}"
+            ),
+        )
+    try:
+        actual_sha256, actual_count, actual_size = _queue_snapshot_digest(snapshot_path)
+    except (OSError, PublicationAuditError) as exc:
+        _issue(
+            issues,
+            code="invalid_queue_snapshot_directory",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=snapshot_path,
+            detail=str(exc),
+        )
+        return
+    if actual_count < 1:
+        _issue(
+            issues,
+            code="empty_queue_snapshot",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=snapshot_path,
+            detail="queue snapshot 至少需要一个常规文件",
+        )
+    if (
+        queue_snapshot.get("sha256") != actual_sha256
+        or queue_snapshot.get("file_count") != actual_count
+        or queue_snapshot.get("size_bytes") != actual_size
+    ):
+        _issue(
+            issues,
+            code="queue_snapshot_integrity_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=snapshot_path,
+            detail=(
+                "queue snapshot 的 SHA-256、文件数或大小与实际目录不一致"
+            ),
+        )
+    if actual_sha256 in queue_snapshot_digests:
+        _issue(
+            issues,
+            code="duplicate_queue_snapshot",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=snapshot_path,
+            detail=(
+                "多个正式 run 复用了内容完全相同的固定 "
+                "queue snapshot"
+            ),
+        )
+    else:
+        queue_snapshot_digests.add(actual_sha256)
 
 
 def _lookup_field(payload: Mapping[str, Any], field_path: str) -> Tuple[bool, Any]:
@@ -272,6 +837,273 @@ def _audit_artifact_reference(
             path=expected_path,
             detail=f"{artifact_name} 的 SHA-256 与 evidence bundle 不一致",
         )
+
+
+def _audit_case_study_payload(
+    *,
+    artifact_path: Path,
+    row: Mapping[str, str],
+    matrix_root: Path,
+    scope: str,
+    issues: List[Dict[str, str]],
+) -> bool:
+    issue_count_before = len(issues)
+    try:
+        payload = _read_json(artifact_path)
+    except PublicationAuditError as exc:
+        _issue(
+            issues,
+            code="invalid_case_study_payload",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail=str(exc),
+        )
+        return False
+
+    sample_id = row.get("sample_id", "")
+    if payload.get("sample_id") != sample_id:
+        _issue(
+            issues,
+            code="case_study_identity_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail=(
+                f"case study sample_id={payload.get('sample_id')!r}，"
+                f"索引为 {sample_id!r}"
+            ),
+        )
+    if payload.get("selection_reason") != row.get("selection_reason"):
+        _issue(
+            issues,
+            code="case_study_selection_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail="case study selection_reason 与索引不一致",
+        )
+    automated_summary = payload.get("automated_summary")
+    if (
+        not isinstance(automated_summary, Mapping)
+        or automated_summary.get("semantic_outcome") != row.get("semantic_outcome")
+    ):
+        _issue(
+            issues,
+            code="case_study_outcome_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail="case study automated_summary.semantic_outcome 与索引不一致",
+        )
+    if not _is_nonempty_text(payload.get("replay_command")):
+        _issue(
+            issues,
+            code="missing_case_study_replay_command",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail="case study 缺少一键 replay_command",
+        )
+
+    raw_evidence = payload.get("raw_evidence")
+    resolver_context = (
+        raw_evidence.get("resolver_context")
+        if isinstance(raw_evidence, Mapping)
+        else None
+    )
+    primary = (
+        resolver_context.get("primary")
+        if isinstance(resolver_context, Mapping)
+        else None
+    )
+    secondary = (
+        resolver_context.get("secondary")
+        if isinstance(resolver_context, Mapping)
+        else None
+    )
+    paths = raw_evidence.get("paths") if isinstance(raw_evidence, Mapping) else None
+    if (
+        not _is_nonempty_text(primary)
+        or not _is_nonempty_text(secondary)
+        or primary == secondary
+        or not isinstance(paths, Mapping)
+    ):
+        _issue(
+            issues,
+            code="incomplete_case_study_raw_evidence",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail="raw_evidence 缺少 resolver_context 或 paths",
+        )
+        primary = "bind9"
+        secondary = "secondary"
+        paths = {}
+
+    required_paths = (
+        "sample_bin_path",
+        "oracle_path",
+        f"{primary}_stderr_path",
+        f"{secondary}_stderr_path",
+        f"{primary}_before_cache_path",
+        f"{primary}_after_cache_path",
+        f"{secondary}_before_cache_path",
+        f"{secondary}_after_cache_path",
+    )
+    resolved_paths: Dict[str, Path] = {}
+    for field in required_paths:
+        evidence_path = _resolve_path(paths.get(field), base_dir=artifact_path.parent)
+        if evidence_path is None or not evidence_path.is_file():
+            _issue(
+                issues,
+                code="missing_case_study_artifact",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=evidence_path or artifact_path,
+                detail=f"case study 缺少原始证据文件: {field}",
+            )
+            continue
+        resolved_paths[field] = evidence_path
+
+    sample_path = resolved_paths.get("sample_bin_path")
+    if sample_path is not None:
+        if sample_path.stat().st_size < 1:
+            _issue(
+                issues,
+                code="empty_case_study_transcript",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=sample_path,
+                detail="case study 原始 transcript 为空",
+            )
+        sample_dir = sample_path.parent.resolve()
+        for field, evidence_path in resolved_paths.items():
+            try:
+                evidence_path.relative_to(sample_dir)
+            except ValueError:
+                _issue(
+                    issues,
+                    code="case_study_artifact_path_escape",
+                    matrix_root=matrix_root,
+                    scope=scope,
+                    path=evidence_path,
+                    detail=f"{field} 不在 transcript 所属样本目录内",
+                )
+
+    oracle_path = resolved_paths.get("oracle_path")
+    if oracle_path is not None:
+        try:
+            oracle_payload = _read_json(oracle_path)
+            embedded_oracle = (
+                raw_evidence.get("oracle")
+                if isinstance(raw_evidence, Mapping)
+                else None
+            )
+            if not oracle_payload or embedded_oracle != oracle_payload:
+                _issue(
+                    issues,
+                    code="invalid_case_study_oracle",
+                    matrix_root=matrix_root,
+                    scope=scope,
+                    path=oracle_path,
+                    detail="oracle 必须非空且与 case study 内嵌证据一致",
+                )
+        except PublicationAuditError as exc:
+            _issue(
+                issues,
+                code="invalid_case_study_oracle",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=oracle_path,
+                detail=str(exc),
+            )
+
+    stderr_evidence = (
+        raw_evidence.get("stderr") if isinstance(raw_evidence, Mapping) else None
+    )
+    for resolver in (primary, secondary):
+        resolver_stderr = (
+            stderr_evidence.get(resolver)
+            if isinstance(stderr_evidence, Mapping)
+            else None
+        )
+        expected_stderr_path = resolved_paths.get(f"{resolver}_stderr_path")
+        recorded_stderr_path = (
+            _resolve_path(resolver_stderr.get("path"), base_dir=artifact_path.parent)
+            if isinstance(resolver_stderr, Mapping)
+            else None
+        )
+        if (
+            not isinstance(resolver_stderr, Mapping)
+            or resolver_stderr.get("exists") is not True
+            or recorded_stderr_path != expected_stderr_path
+        ):
+            _issue(
+                issues,
+                code="invalid_case_study_log_evidence",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=expected_stderr_path or artifact_path,
+                detail=f"raw_evidence.stderr.{resolver} 未引用完整日志",
+            )
+
+    manual_truth = payload.get("manual_truth")
+    manual_truth_status = (
+        manual_truth.get("status") if isinstance(manual_truth, Mapping) else None
+    )
+    missing_manual_fields = [
+        field
+        for field in REQUIRED_MANUAL_TRUTH_FIELDS
+        if not isinstance(manual_truth, Mapping)
+        or not _is_nonempty_text(manual_truth.get(field))
+    ]
+    if (
+        not isinstance(manual_truth, Mapping)
+        or manual_truth_status not in JUDGED_MANUAL_TRUTH_STATUSES
+        or missing_manual_fields
+    ):
+        _issue(
+            issues,
+            code="unadjudicated_case_study",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail=(
+                f"manual_truth 必须已裁决；status={manual_truth_status!r}，"
+                f"缺少={missing_manual_fields!r}"
+            ),
+        )
+    elif len(
+        {
+            manual_truth["reviewer_primary"],
+            manual_truth["reviewer_secondary"],
+            manual_truth["adjudicator"],
+        }
+    ) != 3:
+        _issue(
+            issues,
+            code="invalid_case_study_manual_reviewers",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail="manual_truth 的双评人员与裁决人必须互不相同",
+        )
+
+    evidence_path_values = list(resolved_paths.values())
+    if len(set(evidence_path_values)) != len(evidence_path_values):
+        _issue(
+            issues,
+            code="duplicate_case_study_artifact_path",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail=(
+                "transcript、日志、cache before/after 与 oracle 必须引用不同文件"
+            ),
+        )
+
+    return len(issues) == issue_count_before
 
 
 def _audit_evidence_bundle(
@@ -630,7 +1462,14 @@ def _audit_evidence_bundle(
                 detail=f"case study 重复 sample_id: {sample_id}",
             )
             continue
-        case_study_ids.add(sample_id)
+        if _audit_case_study_payload(
+            artifact_path=artifact_path,
+            row=row,
+            matrix_root=matrix_root,
+            scope=scope,
+            issues=issues,
+        ):
+            case_study_ids.add(sample_id)
     return case_study_ids
 
 
@@ -877,6 +1716,19 @@ def _audit_matrix_root(
                 f"当前要求 {CONTRACT_VERSION}"
             ),
         )
+    for field, expected_value in (
+        ("producer_profile", PUBLICATION_PRODUCER_PROFILE),
+        ("input_model", PUBLICATION_INPUT_MODEL),
+    ):
+        if manifest.get(field) != expected_value:
+            _issue(
+                issues,
+                code="invalid_publication_matrix_semantics",
+                matrix_root=root,
+                scope="matrix",
+                path=manifest_path,
+                detail=f"{field}={manifest.get(field)!r}，要求 {expected_value!r}",
+            )
 
     statistics = manifest.get("statistics")
     expected_statistics = statistics_contract()
@@ -941,9 +1793,28 @@ def _audit_matrix_root(
         )
     total_runs = 0
     case_study_ids: Set[str] = set()
+    producer_run_ids: Set[str] = set()
+    producer_random_seeds: Set[str] = set()
+    queue_snapshot_ids: Set[str] = set()
+    queue_snapshot_digests: Set[str] = set()
     for variant in variants:
         variant_name = str(variant.get("variant_name", ""))
+        expected_env = EXPECTED_VARIANT_ENVS.get(variant_name, {})
+        raw_variant_env = variant.get("env")
+        if not isinstance(raw_variant_env, Mapping) or dict(raw_variant_env) != dict(
+            expected_env
+        ):
+            _issue(
+                issues,
+                code="invalid_variant_execution_env",
+                matrix_root=root,
+                scope=f"variant:{variant_name or '<unknown>'}",
+                path=manifest_path,
+                detail=f"variant env={raw_variant_env!r}，要求 {dict(expected_env)!r}",
+            )
         row = rows_by_variant.get(variant_name)
+        row_aggregation_key: Optional[Dict[str, Any]] = None
+        row_baseline_key: Optional[Dict[str, Any]] = None
         if row is None:
             _issue(
                 issues,
@@ -960,6 +1831,17 @@ def _audit_matrix_root(
                 matrix_root=root,
                 summary_path=variant_summary_path,
                 minimum_runs=minimum_runs,
+                issues=issues,
+            )
+            row_aggregation_key, row_baseline_key = _audit_comparability_key_pair(
+                aggregation_value=row.get("aggregation_key"),
+                baseline_value=row.get("baseline_compare_key"),
+                variant_name=variant_name,
+                expected_env=expected_env,
+                manifest=manifest,
+                matrix_root=root,
+                scope=f"variant:{variant_name}",
+                path=variant_summary_path,
                 issues=issues,
             )
 
@@ -1034,6 +1916,20 @@ def _audit_matrix_root(
                     path=run_dir or root,
                     detail=f"run_dir 必须指向 {expected_run_dir}",
                 )
+            _audit_producer_execution_manifest(
+                run=run,
+                expected_run_dir=expected_run_dir,
+                variant_name=variant_name,
+                repeat_index=index,
+                expected_env=expected_env,
+                matrix_root=root,
+                scope=run_scope,
+                issues=issues,
+                producer_run_ids=producer_run_ids,
+                random_seeds=producer_random_seeds,
+                queue_snapshot_ids=queue_snapshot_ids,
+                queue_snapshot_digests=queue_snapshot_digests,
+            )
             report_dir = _resolve_path(run.get("report_dir"), base_dir=root)
             if report_dir is None or not report_dir.is_dir():
                 _issue(
@@ -1104,6 +2000,48 @@ def _audit_matrix_root(
                             scope=run_scope,
                             path=summary_path,
                             detail="run summary 的 comparability.status 不是 comparable",
+                        )
+                    run_aggregation_key, run_baseline_key = (
+                        _audit_comparability_key_pair(
+                            aggregation_value=(
+                                comparability.get("aggregation_key")
+                                if isinstance(comparability, Mapping)
+                                else None
+                            ),
+                            baseline_value=(
+                                comparability.get("baseline_compare_key")
+                                if isinstance(comparability, Mapping)
+                                else None
+                            ),
+                            variant_name=variant_name,
+                            expected_env=expected_env,
+                            manifest=manifest,
+                            matrix_root=root,
+                            scope=run_scope,
+                            path=summary_path,
+                            issues=issues,
+                        )
+                    )
+                    if (
+                        row_aggregation_key is not None
+                        and run_aggregation_key != row_aggregation_key
+                    ):
+                        _issue(
+                            issues,
+                            code="aggregation_key_summary_mismatch",
+                            matrix_root=root,
+                            scope=run_scope,
+                            path=summary_path,
+                            detail="run aggregation_key 与 variant_summary.tsv 不一致",
+                        )
+                    if row_baseline_key is not None and run_baseline_key != row_baseline_key:
+                        _issue(
+                            issues,
+                            code="baseline_key_summary_mismatch",
+                            matrix_root=root,
+                            scope=run_scope,
+                            path=summary_path,
+                            detail="run baseline_compare_key 与 variant_summary.tsv 不一致",
                         )
                 except PublicationAuditError as exc:
                     _issue(
@@ -1270,15 +2208,20 @@ def run_publication_audit(
     *,
     matrix_roots: Sequence[Path],
     output_dir: Optional[Path] = None,
-    minimum_runs: int = 5,
-    minimum_case_studies: int = 2,
+    minimum_runs: int = MINIMUM_PUBLICATION_RUNS,
+    minimum_case_studies: int = MINIMUM_PUBLICATION_CASE_STUDIES,
 ) -> int:
     if not matrix_roots:
         raise PublicationAuditError("至少提供一个 --matrix-root")
-    if minimum_runs < 2:
-        raise PublicationAuditError("--minimum-runs 必须大于等于 2")
-    if minimum_case_studies < 0:
-        raise PublicationAuditError("--minimum-case-studies 必须大于等于 0")
+    if minimum_runs < MINIMUM_PUBLICATION_RUNS:
+        raise PublicationAuditError(
+            f"--minimum-runs 不得低于论文硬门槛 {MINIMUM_PUBLICATION_RUNS}"
+        )
+    if minimum_case_studies < MINIMUM_PUBLICATION_CASE_STUDIES:
+        raise PublicationAuditError(
+            "--minimum-case-studies 不得低于论文硬门槛 "
+            f"{MINIMUM_PUBLICATION_CASE_STUDIES}"
+        )
 
     resolved_roots = [Path(path).expanduser().resolve() for path in matrix_roots]
     if output_dir is None:
@@ -1330,4 +2273,9 @@ def run_publication_audit(
     return 0
 
 
-__all__ = ["PublicationAuditError", "run_publication_audit"]
+__all__ = [
+    "MINIMUM_PUBLICATION_CASE_STUDIES",
+    "MINIMUM_PUBLICATION_RUNS",
+    "PublicationAuditError",
+    "run_publication_audit",
+]

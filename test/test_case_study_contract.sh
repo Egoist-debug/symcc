@@ -253,6 +253,9 @@ def write_sample(
         sample_dir / "unbound.stderr",
         f"===== unbound.after =====\nORACLE_SUMMARY sample={sample_id} parse_ok=1\n",
     )
+    for resolver in ("bind9", "unbound"):
+        write_text(sample_dir / f"{resolver}.before.cache.txt", "before\n")
+        write_text(sample_dir / f"{resolver}.after.cache.txt", "after\n")
 
 
 write_sample(
@@ -762,6 +765,9 @@ write_json(
 (sample_dir / "transcript").write_bytes(b"hello-world")
 (sample_dir / "bind9.stderr").write_text("bind9 stderr\n", encoding="utf-8")
 (sample_dir / "unbound.stderr").write_text("unbound stderr\n", encoding="utf-8")
+for resolver in ("bind9", "unbound"):
+    (sample_dir / f"{resolver}.before.cache.txt").write_text("before\n", encoding="utf-8")
+    (sample_dir / f"{resolver}.after.cache.txt").write_text("after\n", encoding="utf-8")
 PY
 }
 
@@ -832,6 +838,10 @@ expected_path_suffix = {
     "sample_bin_path": "sample.bin",
     "bind9_stderr_path": "bind9.stderr",
     "unbound_stderr_path": "unbound.stderr",
+    "bind9_before_cache_path": "bind9.before.cache.txt",
+    "bind9_after_cache_path": "bind9.after.cache.txt",
+    "unbound_before_cache_path": "unbound.before.cache.txt",
+    "unbound_after_cache_path": "unbound.after.cache.txt",
 }
 
 for row in rows:
@@ -848,6 +858,7 @@ for row in rows:
     required_keys = {
         "sample_id",
         "selection_reason",
+        "replay_command",
         "raw_evidence",
         "automated_summary",
         "manual_truth",
@@ -867,6 +878,8 @@ for row in rows:
         raise SystemExit(
             f"ASSERT FAIL: {sample_id}.selection_reason 与 index.tsv 不一致"
         )
+    if not isinstance(payload.get("replay_command"), str) or not payload["replay_command"]:
+        raise SystemExit(f"ASSERT FAIL: {sample_id}.replay_command 应为非空字符串")
     if sample_id == "sample-005":
         if "次优先级" not in payload["selection_reason"]:
             raise SystemExit(f"ASSERT FAIL: {sample_id} 应为次优先级选择理由")

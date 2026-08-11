@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "../include/FormatAwareGenerator.h"
+#include "../include/DST1Mutator.h"
 #include "../include/DST1Transcript.h"
 
 #include <algorithm>
@@ -350,9 +351,24 @@ bool appendTranscriptVariant(
     return false;
   }
 
-  return addUniquePacket(Results, Seen,
-                         buildStatefulTranscriptBlob(Query, Responses, PostCheckQuery),
-                         Cb);
+  std::vector<std::vector<uint8_t>> NormalizedResponses;
+  NormalizedResponses.reserve(Responses.size());
+  for (const auto &Response : Responses) {
+    auto Normalized =
+        DST1Mutator::normalizeResponseForQuery(Response, Query);
+    if (!Normalized) {
+      return false;
+    }
+    NormalizedResponses.push_back(std::move(*Normalized));
+  }
+
+  auto Transcript =
+      buildStatefulTranscriptBlob(Query, NormalizedResponses, PostCheckQuery);
+  if (!DST1Mutator::validatePoisonEligible(Transcript).ok()) {
+    return false;
+  }
+
+  return addUniquePacket(Results, Seen, std::move(Transcript), Cb);
 }
 
 void setDnsU16(std::vector<uint8_t> &Packet, size_t Offset, uint16_t Value) {
@@ -1426,7 +1442,8 @@ DNSPacketBuilder::buildResponseFromQuery(const std::vector<uint8_t> &Query,
   uint16_t QCLASS = (static_cast<uint16_t>(Query[Pos + 2]) << 8) | Query[Pos + 3];
   Pos += 4;
 
-  std::vector<uint8_t> QNameBytes(Query.begin() + QNameStart, Query.begin() + Pos);
+  std::vector<uint8_t> QNameBytes(Query.begin() + QNameStart,
+                                  Query.begin() + Pos - 4);
 
   std::vector<uint8_t> Response;
   Response.reserve(512);
@@ -1794,7 +1811,12 @@ std::vector<std::vector<uint8_t>> StatefulDNSGenerator::generateStatefulTranscri
     Queries.push_back(DNSPacketBuilder::buildQuery("www.example.com", 1));
   }
 
+  std::vector<std::vector<std::vector<uint8_t>>> CandidatesByQuery;
+  CandidatesByQuery.reserve(Queries.size());
+
   for (const auto &Query : Queries) {
+    std::vector<std::vector<uint8_t>> Candidates;
+    std::set<std::vector<uint8_t>> CandidateSeen;
     std::vector<std::vector<uint8_t>> Responses = ResponseSeeds_;
     auto Question = parseDnsQuestionSpec(Query);
     std::vector<std::vector<uint8_t>> TemplateResponses;
@@ -1817,11 +1839,11 @@ std::vector<std::vector<uint8_t>> StatefulDNSGenerator::generateStatefulTranscri
     }
 
     for (const auto &Response : Responses) {
-      if (Results.size() >= Config_.MaxTranscripts) {
-        return Results;
+      if (Candidates.size() >= Config_.MaxTranscripts) {
+        break;
       }
-      appendTranscriptVariant(Results, Seen, Query, {Response}, PostCheckQuery,
-                              Config_.MaxTranscripts, InputCb_);
+      appendTranscriptVariant(Candidates, CandidateSeen, Query, {Response},
+                              PostCheckQuery, Config_.MaxTranscripts, {});
     }
 
     if (Config_.GenerateResponseRaces && Config_.MaxResponsesPerTranscript > 1 &&
@@ -1833,43 +1855,64 @@ std::vector<std::vector<uint8_t>> StatefulDNSGenerator::generateStatefulTranscri
       for (size_t Index = 0; Index < PoisonLimit; ++Index) {
         const auto &Poison = PoisonResponses[Index];
 
-        if (Results.size() >= Config_.MaxTranscripts ||
+        if (Candidates.size() >= Config_.MaxTranscripts ||
             Permutations >= Config_.MaxRacePermutations) {
           break;
         }
-        appendTranscriptVariant(Results, Seen, Query, {Poison, BenignResponse},
-                                PostCheckQuery, Config_.MaxTranscripts, InputCb_);
+        appendTranscriptVariant(Candidates, CandidateSeen, Query,
+                                {Poison, BenignResponse}, PostCheckQuery,
+                                Config_.MaxTranscripts, {});
         ++Permutations;
 
-        if (Results.size() >= Config_.MaxTranscripts ||
+        if (Candidates.size() >= Config_.MaxTranscripts ||
             Permutations >= Config_.MaxRacePermutations) {
           break;
         }
-        appendTranscriptVariant(Results, Seen, Query, {BenignResponse, Poison},
-                                PostCheckQuery, Config_.MaxTranscripts, InputCb_);
+        appendTranscriptVariant(Candidates, CandidateSeen, Query,
+                                {BenignResponse, Poison}, PostCheckQuery,
+                                Config_.MaxTranscripts, {});
         ++Permutations;
 
         if (Config_.MaxResponsesPerTranscript > 2 && PoisonLimit > 1 &&
-            Results.size() < Config_.MaxTranscripts &&
+            Candidates.size() < Config_.MaxTranscripts &&
             Permutations < Config_.MaxRacePermutations) {
           const auto &NextPoison = PoisonResponses[(Index + 1) % PoisonLimit];
-          appendTranscriptVariant(Results, Seen, Query,
+          appendTranscriptVariant(Candidates, CandidateSeen, Query,
                                   {Poison, BenignResponse, NextPoison},
-                                  PostCheckQuery, Config_.MaxTranscripts, InputCb_);
+                                  PostCheckQuery, Config_.MaxTranscripts, {});
           ++Permutations;
         }
       }
     }
 
     if (Config_.MaxResponsesPerTranscript > 1 && Responses.size() >= 2 &&
-        Results.size() < Config_.MaxTranscripts) {
+        Candidates.size() < Config_.MaxTranscripts) {
       std::vector<std::vector<uint8_t>> Sequence;
       const size_t Limit =
           std::min(Config_.MaxResponsesPerTranscript, Responses.size());
 
       Sequence.insert(Sequence.end(), Responses.begin(), Responses.begin() + Limit);
-      appendTranscriptVariant(Results, Seen, Query, Sequence, PostCheckQuery,
-                              Config_.MaxTranscripts, InputCb_);
+      appendTranscriptVariant(Candidates, CandidateSeen, Query, Sequence,
+                              PostCheckQuery, Config_.MaxTranscripts, {});
+    }
+
+    CandidatesByQuery.push_back(std::move(Candidates));
+  }
+
+  for (size_t Round = 0; Results.size() < Config_.MaxTranscripts; ++Round) {
+    bool FoundCandidate = false;
+    for (const auto &Candidates : CandidatesByQuery) {
+      if (Round >= Candidates.size()) {
+        continue;
+      }
+      FoundCandidate = true;
+      addUniquePacket(Results, Seen, Candidates[Round], InputCb_);
+      if (Results.size() >= Config_.MaxTranscripts) {
+        break;
+      }
+    }
+    if (!FoundCandidate) {
+      break;
     }
   }
 

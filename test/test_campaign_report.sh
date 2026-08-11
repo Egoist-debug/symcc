@@ -431,9 +431,12 @@ EMPTY_REPORT_DIR="$(get_latest_report_dir "$EMPTY_ROOT/campaign_reports")"
 assert_file_exists "$EMPTY_REPORT_DIR/summary.json"
 assert_file_exists "$EMPTY_REPORT_DIR/ablation_matrix.tsv"
 assert_file_exists "$EMPTY_REPORT_DIR/cluster_counts.tsv"
+assert_file_exists "$EMPTY_REPORT_DIR/cluster.tsv"
 assert_file_exists "$EMPTY_REPORT_DIR/repro_rate.tsv"
 assert_file_exists "$EMPTY_REPORT_DIR/oracle_audit.tsv"
 assert_file_exists "$EMPTY_REPORT_DIR/oracle_reliability.json"
+assert_file_exists "$EMPTY_REPORT_DIR/evidence_bundle.json"
+assert_file_exists "$EMPTY_REPORT_DIR/case_studies/index.tsv"
 assert_summary_contract "$EMPTY_REPORT_DIR/summary.json" 0 0 0 0 0 0.0 0 0
 assert_summary_metadata_contract "$EMPTY_REPORT_DIR/summary.json" empty
 assert_oracle_audit_header "$EMPTY_REPORT_DIR/oracle_audit.tsv"
@@ -444,6 +447,7 @@ assert_file_contains "$EMPTY_REPORT_DIR/repro_rate.tsv" $'reproduced_count\t0'
 assert_file_contains "$EMPTY_REPORT_DIR/repro_rate.tsv" $'repro_rate\t0.0000'
 assert_file_contains "$EMPTY_REPORT_DIR/cluster_counts.tsv" $'cluster_key\tcount'
 assert_file_contains "$EMPTY_REPORT_DIR/cluster_counts.tsv" $'_\t0'
+assert_file_contains "$EMPTY_REPORT_DIR/cluster.tsv" $'cluster_key\tsample_count\tsample_ids'
 assert_file_contains "$EMPTY_REPORT_DIR/ablation_matrix.tsv" $'module\tstatus'
 assert_file_contains "$EMPTY_REPORT_DIR/ablation_matrix.tsv" $'cache-delta\ton'
 assert_file_contains "$EMPTY_REPORT_DIR/ablation_matrix.tsv" $'mutator\toff'
@@ -622,9 +626,12 @@ NONEMPTY_REPORT_DIR="$(get_latest_report_dir "$NONEMPTY_ROOT/campaign_reports")"
 assert_file_exists "$NONEMPTY_REPORT_DIR/summary.json"
 assert_file_exists "$NONEMPTY_REPORT_DIR/ablation_matrix.tsv"
 assert_file_exists "$NONEMPTY_REPORT_DIR/cluster_counts.tsv"
+assert_file_exists "$NONEMPTY_REPORT_DIR/cluster.tsv"
 assert_file_exists "$NONEMPTY_REPORT_DIR/repro_rate.tsv"
 assert_file_exists "$NONEMPTY_REPORT_DIR/oracle_audit.tsv"
 assert_file_exists "$NONEMPTY_REPORT_DIR/oracle_reliability.json"
+assert_file_exists "$NONEMPTY_REPORT_DIR/evidence_bundle.json"
+assert_file_exists "$NONEMPTY_REPORT_DIR/case_studies/index.tsv"
 assert_summary_contract "$NONEMPTY_REPORT_DIR/summary.json" 2 1 2 1 1 1.0 0 0
 assert_summary_metadata_contract "$NONEMPTY_REPORT_DIR/summary.json" comparable
 assert_oracle_audit_header "$NONEMPTY_REPORT_DIR/oracle_audit.tsv"
@@ -637,6 +644,7 @@ assert_file_contains "$NONEMPTY_REPORT_DIR/repro_rate.tsv" $'repro_rate\t1.0000'
 assert_file_contains "$NONEMPTY_REPORT_DIR/cluster_counts.tsv" $'cluster_key\tcount'
 assert_file_contains "$NONEMPTY_REPORT_DIR/cluster_counts.tsv" $'non-manifest-cluster\t1'
 assert_file_contains "$NONEMPTY_REPORT_DIR/cluster_counts.tsv" $'review-cluster\t1'
+assert_file_contains "$NONEMPTY_REPORT_DIR/cluster.tsv" $'cluster_key\tsample_count\tsample_ids'
 assert_file_contains "$NONEMPTY_REPORT_DIR/ablation_matrix.tsv" $'module\tstatus'
 assert_file_contains "$NONEMPTY_REPORT_DIR/ablation_matrix.tsv" $'cache-delta\ton'
 assert_file_contains "$NONEMPTY_REPORT_DIR/ablation_matrix.tsv" $'mutator\toff'

@@ -54,6 +54,7 @@ QUERY_GEN_LOG="$WORK_DIR/query_gen.log"
 RESPONSE_GEN_LOG="$WORK_DIR/response_gen.log"
 TRANSCRIPT_GEN_LOG="$WORK_DIR/transcript_gen.log"
 SEED_PROVENANCE_FILE="$WORK_DIR/producer_seed_provenance.json"
+EXECUTION_MANIFEST_FILE="$WORK_DIR/producer_execution_manifest.json"
 
 MASTER_LOG="$LOG_DIR/afl_master_persistent.log"
 SECONDARY_LOG="$LOG_DIR/afl_secondary_persistent.log"
@@ -70,6 +71,9 @@ AFL_TIMEOUT_MS="${AFL_TIMEOUT_MS:-}"
 SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-15}"
 ENABLE_SECONDARY="${ENABLE_SECONDARY:-}"
 ENABLE_DST1_MUTATOR="${ENABLE_DST1_MUTATOR:-}"
+ENABLE_SYMCC="${ENABLE_SYMCC:-}"
+ENABLE_CACHE_DELTA="${ENABLE_CACHE_DELTA:-1}"
+ENABLE_TRIAGE="${ENABLE_TRIAGE:-1}"
 DST1_MUTATOR_ONLY="${DST1_MUTATOR_ONLY:-}"
 SYMCC_FRONTIER_RELOAD_SEC="${SYMCC_FRONTIER_RELOAD_SEC:-}"
 SYMCC_FRONTIER_RETRY_LIMIT="${SYMCC_FRONTIER_RETRY_LIMIT:-}"
@@ -99,6 +103,13 @@ HELPER_SESSION="${HELPER_SESSION:-named_symcc_helper}"
 QUERY_CORPUS_GENERATED_THIS_RUN=0
 RESPONSE_CORPUS_GENERATED_THIS_RUN=0
 TRANSCRIPT_CORPUS_GENERATED_THIS_RUN=0
+PRODUCER_RUN_ID="${PRODUCER_RUN_ID:-}"
+PRODUCER_RANDOM_SEED="${PRODUCER_RANDOM_SEED:-}"
+PRODUCER_VARIANT_NAME="${PRODUCER_VARIANT_NAME:-${VARIANT_NAME:-}}"
+PRODUCER_REPEAT_INDEX="${PRODUCER_REPEAT_INDEX:-${REPEAT_INDEX:-}}"
+AFL_MASTER_STARTED=""
+AFL_SECONDARY_STARTED=""
+SYMCC_HELPER_STARTED=""
 if [ ! -r "$DEFAULT_SYMCC_HIGH_VALUE_MANIFEST" ]; then
 	DEFAULT_SYMCC_HIGH_VALUE_MANIFEST="$UNBOUND_REPORT_HIGH_VALUE_MANIFEST"
 fi
@@ -141,6 +152,7 @@ usage() {
   RESET_OUTPUT=1
   SHOW_AFL_UI=1
   ENABLE_DST1_MUTATOR=1 (poison-stateful 默认)
+  ENABLE_SYMCC=1
   DST1_MUTATOR_LIBRARY=build/linux/x86_64/release/libafl_dst1_mutator.so
   DST1_MUTATOR_ONLY=1
   NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS=100000
@@ -153,7 +165,7 @@ usage() {
   TRANSCRIPT_FORMAT_VERSION=2
   TRANSCRIPT_MAX_RESPONSES=3
   RESPONSE_PRESERVE=20
-  TRANSCRIPT_GEN_TARGET=/bin/true
+  TRANSCRIPT_GEN_TARGET=<AFL_TREE>/bin/named/.libs/named
   RUN_DURATION_SEC=180
   MUTATOR_ADDR=127.0.0.1:55300
   TARGET_ADDR=127.0.0.1:55301
@@ -296,6 +308,18 @@ apply_profile_semantic_defaults() {
 	NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS="${NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS:-100000}"
 }
 
+validate_component_switches() {
+	local name=""
+	local value=""
+	for name in ENABLE_SECONDARY ENABLE_DST1_MUTATOR DST1_MUTATOR_ONLY ENABLE_SYMCC ENABLE_CACHE_DELTA ENABLE_TRIAGE; do
+		value="${!name}"
+		case "$value" in
+		0|1) ;;
+		*) die "$name 仅允许 0 或 1（当前: ${value:-<空>}）" ;;
+		esac
+	done
+}
+
 show_semantic_config_summary() {
 	local semantic_manifest="${SYMCC_SEMANTIC_FRONTIER_MANIFEST:-<unset>}"
 	local frontier_reload_sec="${SYMCC_FRONTIER_RELOAD_SEC:-<unset>}"
@@ -305,6 +329,7 @@ show_semantic_config_summary() {
 	printf '  %-14s %s\n' "high_value" "$SYMCC_HIGH_VALUE_MANIFEST"
 	printf '  %-14s %s\n' "semantic_json" "$semantic_manifest"
 	printf '  %-14s %s\n' "dst1_mutator" "$ENABLE_DST1_MUTATOR"
+	printf '  %-14s %s\n' "symcc" "$ENABLE_SYMCC"
 	printf '  %-14s %s\n' "mutator_only" "$DST1_MUTATOR_ONLY"
 	printf '  %-14s %s\n' "reload_sec" "$frontier_reload_sec"
 	printf '  %-14s %s\n' "retry_limit" "$frontier_retry_limit"
@@ -447,6 +472,260 @@ print(f"  {'response_preserve':28s} {payload.get('response_preserve')}")
 PY
 }
 
+initialize_execution_identity() {
+	local identity=""
+	identity="$(python3 - <<'PY'
+import secrets
+import uuid
+
+print(uuid.uuid4().hex, secrets.randbelow(2**31 - 1) + 1)
+PY
+)"
+	read -r PRODUCER_RUN_ID PRODUCER_RANDOM_SEED <<<"$identity"
+	AFL_MASTER_STARTED=0
+	AFL_SECONDARY_STARTED=0
+	SYMCC_HELPER_STARTED=0
+	rm -f "$EXECUTION_MANIFEST_FILE"
+}
+
+component_pid() {
+	local pidfile="$1"
+	local session="$2"
+	if tmux_session_alive "$session"; then
+		tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -n 1
+	elif pid_is_alive "$pidfile"; then
+		cat "$pidfile"
+	fi
+}
+
+write_execution_manifest() {
+	local status="$1"
+	local exit_code="${2:-}"
+	local queue_dir="$AFL_OUT_DIR/master/queue"
+	local master_pid=""
+	local secondary_pid=""
+	local symcc_pid=""
+
+	mkdir -p "$(dirname "$EXECUTION_MANIFEST_FILE")"
+	master_pid="$(component_pid "$MASTER_PID" "$MASTER_SESSION" || true)"
+	secondary_pid="$(component_pid "$SECONDARY_PID" "$SECONDARY_SESSION" || true)"
+	symcc_pid="$(component_pid "$HELPER_PID" "$HELPER_SESSION" || true)"
+
+	env \
+		EXECUTION_MANIFEST_OUT="$EXECUTION_MANIFEST_FILE" \
+		EXECUTION_MANIFEST_STATUS="$status" \
+		EXECUTION_MANIFEST_EXIT_CODE="$exit_code" \
+		EXECUTION_MANIFEST_WORK_DIR="$WORK_DIR" \
+		EXECUTION_MANIFEST_QUEUE_DIR="$queue_dir" \
+		EXECUTION_MANIFEST_PROFILE="$FUZZ_PROFILE" \
+		EXECUTION_MANIFEST_VARIANT="$PRODUCER_VARIANT_NAME" \
+		EXECUTION_MANIFEST_REPEAT_INDEX="$PRODUCER_REPEAT_INDEX" \
+		EXECUTION_MANIFEST_RUN_ID="$PRODUCER_RUN_ID" \
+		EXECUTION_MANIFEST_RANDOM_SEED="$PRODUCER_RANDOM_SEED" \
+		EXECUTION_MANIFEST_ENABLE_SECONDARY="$ENABLE_SECONDARY" \
+		EXECUTION_MANIFEST_ENABLE_DST1_MUTATOR="$ENABLE_DST1_MUTATOR" \
+		EXECUTION_MANIFEST_ENABLE_CACHE_DELTA="$ENABLE_CACHE_DELTA" \
+		EXECUTION_MANIFEST_ENABLE_TRIAGE="$ENABLE_TRIAGE" \
+		EXECUTION_MANIFEST_ENABLE_SYMCC="$ENABLE_SYMCC" \
+		EXECUTION_MANIFEST_MASTER_STARTED="$AFL_MASTER_STARTED" \
+		EXECUTION_MANIFEST_SECONDARY_STARTED="$AFL_SECONDARY_STARTED" \
+		EXECUTION_MANIFEST_SYMCC_STARTED="$SYMCC_HELPER_STARTED" \
+		EXECUTION_MANIFEST_MASTER_PID="$master_pid" \
+		EXECUTION_MANIFEST_SECONDARY_PID="$secondary_pid" \
+		EXECUTION_MANIFEST_SYMCC_PID="$symcc_pid" \
+		EXECUTION_MANIFEST_MASTER_COMMAND="$AFL_FUZZ_BIN -M master" \
+		EXECUTION_MANIFEST_SECONDARY_COMMAND="$AFL_FUZZ_BIN -S secondary" \
+		EXECUTION_MANIFEST_SYMCC_COMMAND="$HELPER_BIN -a master" \
+		python3 - <<'PY'
+import datetime
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+
+def now_utc() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def env_bool(name: str) -> bool:
+    return os.environ.get(name, "0") == "1"
+
+
+def env_int(name: str):
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
+
+
+def queue_snapshot(queue_dir: Path) -> dict:
+    digest = hashlib.sha256()
+    file_count = 0
+    size_bytes = 0
+    if queue_dir.is_dir():
+        files = sorted(path for path in queue_dir.rglob("*") if path.is_file())
+    else:
+        files = []
+    for path in files:
+        relative_path = path.relative_to(queue_dir).as_posix()
+        size = path.stat().st_size
+        file_count += 1
+        size_bytes += size
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(size).encode("ascii"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        digest.update(b"\0")
+    sha256 = digest.hexdigest()
+    return {
+        "path": str(queue_dir.resolve()),
+        "snapshot_id": sha256,
+        "algorithm": "sha256-relative-path-size-content-v1",
+        "file_count": file_count,
+        "size_bytes": size_bytes,
+        "sha256": sha256,
+    }
+
+
+def inferred_variant(toggles: dict) -> str:
+    configured = os.environ.get("EXECUTION_MANIFEST_VARIANT", "").strip()
+    if configured:
+        return configured
+    signature = tuple(toggles[name] for name in (
+        "ENABLE_DST1_MUTATOR", "ENABLE_CACHE_DELTA", "ENABLE_TRIAGE", "ENABLE_SYMCC"
+    ))
+    return {
+        ("1", "1", "1", "1"): "full_stack",
+        ("1", "1", "1", "0"): "afl_only",
+        ("0", "1", "1", "1"): "no_mutator",
+        ("1", "0", "1", "1"): "no_cache_delta",
+    }.get(signature, "custom")
+
+
+def inferred_repeat_index(work_dir: Path) -> int:
+    configured = env_int("EXECUTION_MANIFEST_REPEAT_INDEX")
+    if configured is not None:
+        return configured
+    match = re.fullmatch(r"run-(\d+)", work_dir.name)
+    return int(match.group(1)) if match else 1
+
+
+def component(existing: dict, *, enabled: bool, started_env: str, pid_env: str, command: str, status: str, exit_code):
+    started_value = os.environ.get(started_env, "").strip()
+    started = started_value == "1" if started_value else bool(existing.get("started", False))
+    pid_value = env_int(pid_env)
+    pid = pid_value if pid_value is not None else existing.get("pid")
+    if not enabled:
+        started = False
+        pid = None
+    if status == "running":
+        component_exit_status = None
+    elif started:
+        component_exit_status = exit_code
+    else:
+        component_exit_status = None
+    return {
+        "enabled": enabled,
+        "started": started,
+        "pid": pid,
+        "exit_status": component_exit_status,
+        "command_summary": command if enabled else None,
+    }
+
+
+output_path = Path(os.environ["EXECUTION_MANIFEST_OUT"])
+work_dir = Path(os.environ["EXECUTION_MANIFEST_WORK_DIR"]).resolve()
+queue_dir = Path(os.environ["EXECUTION_MANIFEST_QUEUE_DIR"])
+status = os.environ["EXECUTION_MANIFEST_STATUS"]
+exit_code = env_int("EXECUTION_MANIFEST_EXIT_CODE")
+existing = {}
+if output_path.is_file():
+    try:
+        existing = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+
+new_toggles = {
+    "ENABLE_DST1_MUTATOR": os.environ["EXECUTION_MANIFEST_ENABLE_DST1_MUTATOR"],
+    "ENABLE_CACHE_DELTA": os.environ["EXECUTION_MANIFEST_ENABLE_CACHE_DELTA"],
+    "ENABLE_TRIAGE": os.environ["EXECUTION_MANIFEST_ENABLE_TRIAGE"],
+    "ENABLE_SYMCC": os.environ["EXECUTION_MANIFEST_ENABLE_SYMCC"],
+}
+toggles = existing.get("toggles", new_toggles) if status != "running" else new_toggles
+run_id = os.environ.get("EXECUTION_MANIFEST_RUN_ID", "").strip() or existing.get("producer_run_id")
+random_seed = env_int("EXECUTION_MANIFEST_RANDOM_SEED")
+if random_seed is None:
+    random_seed = existing.get("random_seed")
+variant_name = existing.get("variant_name") if status != "running" else None
+repeat_index = existing.get("repeat_index") if status != "running" else None
+variant_name = variant_name or inferred_variant(toggles)
+repeat_index = repeat_index or inferred_repeat_index(work_dir)
+started_at = existing.get("started_at") or now_utc()
+components_existing = existing.get("components", {}) if isinstance(existing.get("components"), dict) else {}
+
+payload = {
+    "contract_name": "rq3_producer_execution_manifest",
+    "contract_version": 1,
+    "status": status,
+    "exit_code": exit_code,
+    "producer_run_id": run_id,
+    "random_seed": random_seed,
+    "variant_name": variant_name,
+    "repeat_index": repeat_index,
+    "producer_profile": os.environ["EXECUTION_MANIFEST_PROFILE"],
+    "run_dir": str(work_dir),
+    "started_at": started_at,
+    "finished_at": None if status == "running" else now_utc(),
+    "toggles": toggles,
+    "queue_snapshot": queue_snapshot(queue_dir),
+    "components": {
+        "afl_master": component(
+            components_existing.get("afl_master", {}), enabled=True,
+            started_env="EXECUTION_MANIFEST_MASTER_STARTED", pid_env="EXECUTION_MANIFEST_MASTER_PID",
+            command=os.environ["EXECUTION_MANIFEST_MASTER_COMMAND"], status=status, exit_code=exit_code,
+        ),
+        "afl_secondary": component(
+            components_existing.get("afl_secondary", {}),
+            enabled=env_bool("EXECUTION_MANIFEST_ENABLE_SECONDARY"),
+            started_env="EXECUTION_MANIFEST_SECONDARY_STARTED", pid_env="EXECUTION_MANIFEST_SECONDARY_PID",
+            command=os.environ["EXECUTION_MANIFEST_SECONDARY_COMMAND"], status=status, exit_code=exit_code,
+        ),
+        "symcc": component(
+            components_existing.get("symcc", {}), enabled=env_bool("EXECUTION_MANIFEST_ENABLE_SYMCC"),
+            started_env="EXECUTION_MANIFEST_SYMCC_STARTED", pid_env="EXECUTION_MANIFEST_SYMCC_PID",
+            command=os.environ["EXECUTION_MANIFEST_SYMCC_COMMAND"], status=status, exit_code=exit_code,
+        ),
+    },
+}
+output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+execution_manifest_is_running() {
+	[ -f "$EXECUTION_MANIFEST_FILE" ] || return 1
+	python3 - "$EXECUTION_MANIFEST_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+raise SystemExit(0 if payload.get("status") == "running" else 1)
+PY
+}
+
+finish_execution_manifest() {
+	local status="$1"
+	local exit_code="$2"
+	execution_manifest_is_running || return 0
+	write_execution_manifest "$status" "$exit_code"
+}
+
 validate_transcript_seed_v2_two_part() {
 	local sample="$1"
 
@@ -572,12 +851,15 @@ load_profile() {
 	: "${REPLY_TIMEOUT_MS:=50}"
 	: "${AFL_TIMEOUT_MS:=3000+}"
 	: "${ENABLE_SECONDARY:=1}"
+	: "${ENABLE_SYMCC:=1}"
 	: "${QUERY_MAX_ITER:=40}"
 	: "${RESPONSE_MAX_ITER:=4}"
 	: "${RESPONSE_QUERY_SEEDS:=8}"
 	: "${TRANSCRIPT_MAX_ITER:=4}"
 	: "${TRANSCRIPT_RESPONSE_SEEDS:=24}"
-	: "${TRANSCRIPT_GEN_TARGET:=/bin/true}"
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ] && [ -z "$TRANSCRIPT_GEN_TARGET" ]; then
+		TRANSCRIPT_GEN_TARGET="$AFL_TREE/bin/named/.libs/named"
+	fi
 	apply_profile_semantic_defaults
 	if [ "$TRANSCRIPT_FORMAT_VERSION" != "2" ]; then
 		die "仅支持两段式 transcript 格式版本：TRANSCRIPT_FORMAT_VERSION 必须为 2（当前: $TRANSCRIPT_FORMAT_VERSION）"
@@ -876,23 +1158,18 @@ sync_patch() {
 
 build_helper_and_gen_input() {
 	require_cmd xmake
-	case "$ENABLE_DST1_MUTATOR" in
-	0|1) ;;
-	*) die "ENABLE_DST1_MUTATOR 仅允许 0 或 1" ;;
-	esac
-	case "$DST1_MUTATOR_ONLY" in
-	0|1) ;;
-	*) die "DST1_MUTATOR_ONLY 仅允许 0 或 1" ;;
-	esac
-	log "构建 helper 与 gen_input"
+	validate_component_switches
+	log "构建 gen_input 与 SymCC 编译工具链"
 	(
 		cd "$ROOT_DIR"
 		HOME="$ROOT_DIR/.xmake-home" \
 		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
 		xmake f -c --backend=qsym -m release >/dev/null
-		HOME="$ROOT_DIR/.xmake-home" \
-		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
-		xmake b symcc_fuzzing_helper
+		if [ "$ENABLE_SYMCC" = "1" ]; then
+			HOME="$ROOT_DIR/.xmake-home" \
+			XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
+			xmake b symcc_fuzzing_helper
+		fi
 		HOME="$ROOT_DIR/.xmake-home" \
 		XMAKE_GLOBALDIR="$ROOT_DIR/.xmake-global" \
 		xmake b gen_input
@@ -906,7 +1183,9 @@ build_helper_and_gen_input() {
 			xmake b afl_dst1_mutator
 		fi
 	)
-	require_file "$HELPER_BIN"
+	if [ "$ENABLE_SYMCC" = "1" ]; then
+		require_file "$HELPER_BIN"
+	fi
 	require_file "$GEN_INPUT_BIN"
 	require_file "$SYMCC_CC_BIN"
 	require_file "$SYMCC_CXX_BIN"
@@ -1132,6 +1411,9 @@ generate_seeds() {
 			[ -z "$(find "$TRANSCRIPT_CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null)" ]; }
 	then
 		TRANSCRIPT_CORPUS_GENERATED_THIS_RUN=1
+		if [ "$TRANSCRIPT_GEN_TARGET" = "$AFL_TREE/bin/named/.libs/named" ]; then
+			build_afl_named
+		fi
 		require_file "$TRANSCRIPT_GEN_TARGET"
 		rm -rf "$TRANSCRIPT_CORPUS_DIR"
 		mkdir -p "$TRANSCRIPT_CORPUS_DIR"
@@ -1182,13 +1464,63 @@ sample_is_stable() {
 
 sample_is_stateful_stable() {
 	local sample="$1"
+	local stderr_file=""
+	local ld_path=""
 	require_file "$DNSLABCTL_BIN"
+	require_file "$AFL_TREE/bin/named/.libs/named"
 
-	if "$DNSLABCTL_BIN" transcript-summary --input "$sample" >/dev/null 2>&1; then
-		return 0
+	if ! "$DNSLABCTL_BIN" transcript-summary --input "$sample" >/dev/null 2>&1; then
+		return 1
 	fi
 
-	return 1
+	stderr_file="$(mktemp "$LOG_DIR/stateful-filter.XXXXXX.stderr")"
+	ld_path="$(afl_ld_library_path)"
+	if ! env \
+		LD_LIBRARY_PATH="$ld_path" \
+		NAMED_RESOLVER_AFL_SYMCC_TARGET="$TARGET_ADDR" \
+		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS" \
+		timeout -k 5 "$SEED_TIMEOUT_SEC" \
+		"$AFL_TREE/bin/named/.libs/named" \
+		-g \
+		-c "$NAMED_CONF" \
+		-A "resolver-afl-symcc:${MUTATOR_ADDR},input=$sample" \
+		>/dev/null 2>"$stderr_file"
+	then
+		warn "stateful stable harness 异常退出，拒绝样本: $sample"
+		rm -f "$stderr_file"
+		return 1
+	fi
+
+	local counter=""
+	for counter in \
+		'Transcript cases' \
+		'Oracle parse_ok' \
+		'Oracle resolver_fetch_started' \
+		'Oracle response_accepted' \
+		'Oracle second_query_hit'
+	do
+		if ! grep -Eq "^[[:space:]]*${counter}: 1[[:space:]]*$" "$stderr_file"; then
+			warn "stateful stable harness 缺少 ${counter}=1，拒绝样本: $sample"
+			rm -f "$stderr_file"
+			return 1
+		fi
+	done
+
+	rm -f "$stderr_file"
+	return 0
+}
+
+validate_stateful_stable_corpus_or_die() {
+	local dir_path="$1"
+	local context_tag="$2"
+	local sample=""
+
+	for sample in "$dir_path"/*; do
+		[ -f "$sample" ] || continue
+		if ! sample_is_stateful_stable "$sample"; then
+			die "$context_tag 的已有 stateful corpus 未通过真实 named 五计数器门槛: $sample。请设置 REFILTER_QUERIES=1 重新筛选。"
+		fi
+	done
 }
 
 filter_seeds() {
@@ -1200,14 +1532,21 @@ filter_seeds() {
 
 	source_dir="$(sample_source_dir)"
 	target_dir="$(active_input_corpus_dir)"
+	ensure_dirs
 	[ -d "$source_dir" ] || die "输入语料目录不存在: $source_dir"
 	[ -d "$RESPONSE_CORPUS_DIR" ] || die "response 语料目录不存在: $RESPONSE_CORPUS_DIR"
+	# 先验证输入协议，避免旧格式在依赖构建前被吞成无关的工具缺失错误。
+	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
+		validate_transcript_corpus_dir_or_die "$source_dir" "filter_seeds(source)"
+	fi
+	build_afl_named
 
 	if [ "$REFILTER_QUERIES" -eq 0 ] && [ -d "$target_dir" ] && \
 		[ -n "$(find "$target_dir" -maxdepth 1 -type f 2>/dev/null)" ]
 	then
 		if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
 			validate_transcript_corpus_dir_or_die "$target_dir" "filter_seeds(reuse)"
+			validate_stateful_stable_corpus_or_die "$target_dir" "filter_seeds(reuse)"
 		fi
 		write_seed_provenance_sidecar \
 			0 \
@@ -1218,12 +1557,6 @@ filter_seeds() {
 		return 0
 	fi
 
-	if [ "$FUZZ_PROFILE" = "poison-stateful" ]; then
-		validate_transcript_corpus_dir_or_die "$source_dir" "filter_seeds(source)"
-	fi
-
-	build_afl_named
-	ensure_dirs
 	tmp_dir="$(mktemp -d "$WORK_DIR/.stable_query_tmp.XXXXXX")"
 
 	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
@@ -1265,7 +1598,9 @@ prepare_all() {
 	sync_patch
 	build_helper_and_gen_input
 	build_afl_named
-	build_symcc_named
+	if [ "$ENABLE_SYMCC" = "1" ]; then
+		build_symcc_named
+	fi
 	generate_seeds
 	filter_seeds
 }
@@ -1320,11 +1655,15 @@ stop_pidfile() {
 
 stop_all() {
 	if tmux_enabled; then
-		tmux kill-session -t "$HELPER_SESSION" 2>/dev/null || true
+		if [ "$ENABLE_SYMCC" = "1" ]; then
+			tmux kill-session -t "$HELPER_SESSION" 2>/dev/null || true
+		fi
 		tmux kill-session -t "$SECONDARY_SESSION" 2>/dev/null || true
 		tmux kill-session -t "$MASTER_SESSION" 2>/dev/null || true
 	fi
-	stop_pidfile "$HELPER_PID" "helper"
+	if [ "$ENABLE_SYMCC" = "1" ]; then
+		stop_pidfile "$HELPER_PID" "helper"
+	fi
 	stop_pidfile "$SECONDARY_PID" "afl-secondary"
 	stop_pidfile "$MASTER_PID" "afl-master"
 	pkill -f "$AFL_TREE/bin/named/.libs/named -g -c $NAMED_CONF -A resolver-afl-symcc:${MUTATOR_ADDR}" \
@@ -1421,6 +1760,7 @@ start_all() {
 	local ld_path
 	local helper_target_csv
 	local -a master_no_ui=()
+	local -a master_seed_args=()
 	local -a afl_env=()
 	local -a helper_env=()
 	local -a helper_extra=()
@@ -1429,6 +1769,9 @@ start_all() {
 	prepare_all
 	stop_all
 	cleanup_output
+	initialize_execution_identity
+	write_execution_manifest "running" ""
+	master_seed_args=(-s "$PRODUCER_RANDOM_SEED")
 	ld_path="$(afl_ld_library_path)"
 	input_dir="$(active_input_corpus_dir)"
 	helper_target_csv="${AFL_TREE}/bin/named/.libs/named,-g,-c,${NAMED_CONF},-A,resolver-afl-symcc:${MUTATOR_ADDR}"
@@ -1458,6 +1801,8 @@ start_all() {
 			-r "$RESPONSE_CORPUS_DIR"
 			-e NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL
 		)
+	else
+		helper_extra=(--require-poison-eligible)
 	fi
 	helper_env=(
 		LD_LIBRARY_PATH="$ld_path"
@@ -1492,6 +1837,7 @@ start_all() {
 			"${master_no_ui[@]}" \
 			"$AFL_FUZZ_BIN" \
 			-M master \
+			"${master_seed_args[@]}" \
 			-i "$input_dir" \
 			-o "$AFL_OUT_DIR" \
 			-m none \
@@ -1510,6 +1856,7 @@ start_all() {
 			"${master_no_ui[@]}" \
 			"$AFL_FUZZ_BIN" \
 			-M master \
+			"${master_seed_args[@]}" \
 			-i "$input_dir" \
 			-o "$AFL_OUT_DIR" \
 			-m none \
@@ -1520,6 +1867,7 @@ start_all() {
 			-c "$NAMED_CONF" \
 			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
 	fi
+	AFL_MASTER_STARTED=1
 
 	if [ "$ENABLE_SECONDARY" -eq 1 ]; then
 		log "启动 AFL secondary（持久模式）"
@@ -1560,6 +1908,7 @@ start_all() {
 				-c "$NAMED_CONF" \
 				-A "resolver-afl-symcc:${MUTATOR_ADDR}"
 		fi
+		AFL_SECONDARY_STARTED=1
 	fi
 
 	if [ -d "$AFL_OUT_DIR/$HELPER_NAME" ]; then
@@ -1569,32 +1918,38 @@ start_all() {
 		rm -rf "$HELPER_RUN_ROOT/$HELPER_RUN_NAME/${HELPER_RUN_NAME}_symcc"
 	fi
 
-	log "启动 SymCC helper"
-	if tmux_enabled; then
-		launch_shell_in_tmux \
-			"$HELPER_SESSION" \
-			"$HELPER_LOG" \
-			"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env "${helper_env[@]}" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}" -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
+	if [ "$ENABLE_SYMCC" = "1" ]; then
+		log "启动 SymCC helper"
+		if tmux_enabled; then
+			launch_shell_in_tmux \
+				"$HELPER_SESSION" \
+				"$HELPER_LOG" \
+				"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env "${helper_env[@]}" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}" -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
+		else
+			wait_for_master_queue
+			launch_in_background \
+				"$HELPER_LOG" \
+				"$HELPER_PID" \
+				env \
+				"${helper_env[@]}" \
+				"$HELPER_BIN" \
+				-o "$HELPER_RUN_ROOT" \
+				-n "$HELPER_RUN_NAME" \
+				-a master \
+				-v \
+				"${helper_extra[@]}" \
+				-t "$helper_target_csv" \
+				-- \
+				"$SYMCC_TREE/bin/named/named" \
+				-g \
+				-c "$NAMED_CONF" \
+				-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+		fi
+		SYMCC_HELPER_STARTED=1
 	else
-		wait_for_master_queue
-		launch_in_background \
-			"$HELPER_LOG" \
-			"$HELPER_PID" \
-			env \
-			"${helper_env[@]}" \
-			"$HELPER_BIN" \
-			-o "$HELPER_RUN_ROOT" \
-			-n "$HELPER_RUN_NAME" \
-			-a master \
-			-v \
-			"${helper_extra[@]}" \
-			-t "$helper_target_csv" \
-			-- \
-			"$SYMCC_TREE/bin/named/named" \
-			-g \
-			-c "$NAMED_CONF" \
-			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+		log "ENABLE_SYMCC=0，跳过 SymCC helper 构建/启动"
 	fi
+	write_execution_manifest "running" ""
 
 	log "实验已启动"
 	status_all
@@ -1645,7 +2000,11 @@ status_all() {
 	printf '  %-14s %s\n' "profile" "$FUZZ_PROFILE"
 	show_pid_status "afl-master" "$MASTER_PID"
 	show_pid_status "afl-secondary" "$SECONDARY_PID"
-	show_pid_status "helper" "$HELPER_PID"
+	if [ "$ENABLE_SYMCC" = "1" ]; then
+		show_pid_status "helper" "$HELPER_PID"
+	else
+		printf '  %-14s disabled (ENABLE_SYMCC=0)\n' "helper"
+	fi
 
 	printf '\nAFL 统计:\n'
 	show_fuzzer_stats "$AFL_OUT_DIR/master/fuzzer_stats"
@@ -1744,10 +2103,13 @@ run_for_duration() {
 	[ "$duration" -gt 0 ] || die "run 持续时间必须大于 0: $duration"
 
 	cleanup_run_for_duration() {
+		local rc="$?"
 		stop_all >/dev/null 2>&1 || true
+		finish_execution_manifest "failed" "$rc" >/dev/null 2>&1 || true
 	}
 
-	trap cleanup_run_for_duration EXIT INT TERM
+	trap cleanup_run_for_duration EXIT
+	trap 'exit 130' INT TERM
 
 	start_all
 	log "开始定时运行: ${duration}s"
@@ -1757,6 +2119,17 @@ run_for_duration() {
 
 	trap - EXIT INT TERM
 	stop_all
+	finish_execution_manifest "success" 0
+}
+
+handle_execution_error() {
+	local rc="$1"
+	trap - ERR
+	if execution_manifest_is_running; then
+		stop_all >/dev/null 2>&1 || true
+		finish_execution_manifest "failed" "$rc" >/dev/null 2>&1 || true
+	fi
+	return "$rc"
 }
 
 main() {
@@ -1772,7 +2145,9 @@ main() {
 		sync_patch
 		build_helper_and_gen_input
 		build_afl_named
-		build_symcc_named
+		if [ "$ENABLE_SYMCC" = "1" ]; then
+			build_symcc_named
+		fi
 		;;
 	gen-seeds)
 		generate_seeds
@@ -1794,6 +2169,7 @@ main() {
 		;;
 	stop)
 		stop_all
+		finish_execution_manifest "success" 0
 		;;
 	status)
 		status_all
@@ -1820,10 +2196,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	require_file "$NAMED_CONF_TEMPLATE"
 	resolve_bind9_tree_layout_defaults
 	load_profile
+	validate_component_switches
 	export -n AFL_TREE 2>/dev/null || true
 	export -n AFL_CC_BIN 2>/dev/null || true
 	export -n AFL_FUZZ_BIN 2>/dev/null || true
 	export -n AFL_TIMEOUT_MS 2>/dev/null || true
 
+	trap 'handle_execution_error "$?"' ERR
 	main "$@"
+	trap - ERR
 fi

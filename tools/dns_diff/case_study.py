@@ -1,3 +1,4 @@
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,6 +336,18 @@ def _build_raw_evidence(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     secondary_stderr_path = _resolve_sample_artifact(
         sample_dir, resolver_context.secondary_stderr_name
     )
+    primary_before_cache_path = _resolve_sample_artifact(
+        sample_dir, resolver_context.primary_before_cache_name
+    )
+    primary_after_cache_path = _resolve_sample_artifact(
+        sample_dir, resolver_context.primary_after_cache_name
+    )
+    secondary_before_cache_path = _resolve_sample_artifact(
+        sample_dir, resolver_context.secondary_before_cache_name
+    )
+    secondary_after_cache_path = _resolve_sample_artifact(
+        sample_dir, resolver_context.secondary_after_cache_name
+    )
 
     return {
         "resolver_context": {
@@ -349,6 +362,14 @@ def _build_raw_evidence(candidate: CaseStudyCandidate) -> Dict[str, Any]:
             "sample_bin_path": str(sample_bin_path),
             "bind9_stderr_path": str(bind9_stderr_path),
             f"{resolver_context.secondary}_stderr_path": str(secondary_stderr_path),
+            "bind9_before_cache_path": str(primary_before_cache_path),
+            "bind9_after_cache_path": str(primary_after_cache_path),
+            f"{resolver_context.secondary}_before_cache_path": str(
+                secondary_before_cache_path
+            ),
+            f"{resolver_context.secondary}_after_cache_path": str(
+                secondary_after_cache_path
+            ),
         },
         "sample_meta": sample_meta_payload,
         "oracle": oracle_payload,
@@ -369,6 +390,7 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     cache_diff_payload = raw_evidence["cache_diff"]
     resolver_context = _resolver_context(raw_evidence["sample_meta"], oracle_payload)
     sample_input_name = Path(raw_evidence["paths"]["sample_bin_path"]).name
+    replay_sample_path = raw_evidence["paths"]["sample_bin_path"]
 
     automated_summary = _build_automated_summary(
         semantic_outcome=candidate.semantic_outcome,
@@ -381,6 +403,9 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
     return {
         "sample_id": candidate.sample_id,
         "selection_reason": candidate.selection_reason,
+        "replay_command": (
+            "dnslabctl sync-replay --sample " + shlex.quote(replay_sample_path)
+        ),
         "raw_evidence": raw_evidence,
         "automated_summary": automated_summary,
         "manual_truth": {
@@ -394,7 +419,7 @@ def _build_case_study_payload(candidate: CaseStudyCandidate) -> Dict[str, Any]:
         },
         "claim_scope": [
             "选样仅消费 triage.json 中已冻结的 analysis_state 与 semantic_outcome，不重算 publication 语义。",
-            f"原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、{sample_input_name}、bind9.stderr、{resolver_context.secondary}.stderr。",
+            f"原始证据路径严格限定在当前 sample_dir 的 sample.meta.json、oracle.json、cache_diff.json、triage.json、{sample_input_name}、bind9.stderr、{resolver_context.secondary}.stderr 及两端 before/after cache。",
         ],
         "limitations": [
             "manual_truth 仅为 not_started scaffold，当前尚无人工双评或 adjudication 结论。",
