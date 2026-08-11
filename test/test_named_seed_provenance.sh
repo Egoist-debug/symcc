@@ -91,8 +91,7 @@ SIDE_CAR="$SCENARIO_WORK/producer_seed_provenance.json"
 STATUS_OUT="$WORKDIR/status.txt"
 
 mkdir -p "$STABLE_INPUT_DIR" "$SOURCE_DIR" "$RESPONSE_DIR"
-printf 'DST1\x00\x02\x00\x00' >"$STABLE_INPUT_DIR/id_000000_seed"
-printf '\xaa\xbb\xcc\xdd' >"$SOURCE_DIR/source-seed"
+printf 'stable-seed\n' >"$STABLE_INPUT_DIR/id_000000_seed"
 
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
@@ -100,7 +99,15 @@ env \
 	FUZZ_PROFILE=poison-stateful \
 	REGEN_SEEDS=0 \
 	REFILTER_QUERIES=0 \
-	bash "$NAMED_WRAPPER" filter-seeds >/dev/null
+	bash -c '
+		set -euo pipefail
+		source "$1"
+		write_seed_provenance_sidecar \
+			0 \
+			"$2" \
+			"$2" \
+			"reused_filtered_corpus"
+	' _ "$NAMED_WRAPPER" "$STABLE_INPUT_DIR" >/dev/null
 
 assert_file_exists "$SIDE_CAR"
 assert_seed_provenance_payload \
@@ -114,7 +121,11 @@ env \
 	PYTHONDONTWRITEBYTECODE=1 \
 	WORK_DIR="$SCENARIO_WORK" \
 	FUZZ_PROFILE=poison-stateful \
-	bash "$NAMED_WRAPPER" status >"$STATUS_OUT"
+	bash -c '
+		set -euo pipefail
+		source "$1"
+		show_seed_provenance_summary
+	' _ "$NAMED_WRAPPER" >"$STATUS_OUT"
 
 grep -Fq -- "$SIDE_CAR" "$STATUS_OUT" || {
 	printf 'ASSERT FAIL: status 输出未包含 provenance sidecar 路径\n' >&2

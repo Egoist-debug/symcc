@@ -166,6 +166,7 @@ run_cli() {
 		PYTHONDONTWRITEBYTECODE=1 \
 		PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
 		ROOT_DIR="$ROOT_DIR" \
+		DNS_DIFF_CLI_BACKEND=python \
 		ENABLE_DST1_MUTATOR=0 \
 		ENABLE_CACHE_DELTA=1 \
 		ENABLE_TRIAGE=1 \
@@ -470,16 +471,8 @@ main() {
 	assert_file_contains "$log_file" "Picked high-value request sample from text manifest (tier=1): $low_sample"
 
 	advance_manifest_mtime
-	env \
-		PYTHONDONTWRITEBYTECODE=1 \
-		PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-		ROOT_DIR="$ROOT_DIR" \
-		ENABLE_DST1_MUTATOR=0 \
-		ENABLE_CACHE_DELTA=1 \
-		ENABLE_TRIAGE=1 \
-		ENABLE_SYMCC=1 \
-		SYMCC_HIGH_VALUE_MANIFEST="$text_manifest" \
-		python3 -m tools.dns_diff.cli report --root "$follow_root" >"$report_stdout" 2>"$report_stderr"
+	SYMCC_HIGH_VALUE_MANIFEST="$text_manifest" \
+		run_cli report --root "$follow_root" >"$report_stdout" 2>"$report_stderr"
 
 	assert_file_exists "$text_manifest"
 	assert_file_exists "$json_manifest"

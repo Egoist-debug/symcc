@@ -48,7 +48,8 @@ local function configure_test_target(name, source_file, deps, include_dirs)
         if include_dirs then
             add_includedirs(table.unpack(include_dirs))
         end
-        add_cxxflags("-Wall", "-Wextra", "-Wpedantic", "-UNDEBUG")
+        add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+        add_undefines("NDEBUG")
 end
 
 configure_test_target(

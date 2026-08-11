@@ -85,7 +85,8 @@ target("test_dns_format")
     add_files("src/SymCCRunner.cpp")
     add_includedirs("include")
     add_includedirs("../runtime/include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic", "-UNDEBUG")
+    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+    add_undefines("NDEBUG")
     
     if is_mode("debug") then
         add_cxxflags("-g", "-O0")
@@ -110,7 +111,8 @@ target("test_dst1_mutator")
     add_files("src/DST1Mutator.cpp")
     add_includedirs("include")
     add_includedirs("../runtime/include")
-    add_cxxflags("-Wall", "-Wextra", "-Wpedantic", "-UNDEBUG")
+    add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
+    add_undefines("NDEBUG")
 
     if is_mode("debug") then
         add_cxxflags("-g", "-O0")

@@ -11,27 +11,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-assert_file_contains() {
-	local path="$1"
-	local expected="$2"
-	if ! grep -Fq -- "$expected" "$path"; then
-		printf 'ASSERT FAIL: 期望 %s 包含: %s\n' "$path" "$expected" >&2
-		printf '实际内容:\n' >&2
-		cat "$path" >&2
-		exit 1
-	fi
-}
+SAMPLE_PATH="$WORKDIR/id:000001,orig:current-dst1"
 
-SCENARIO_WORK="$WORKDIR/work"
-SOURCE_DIR="$SCENARIO_WORK/transcript_corpus"
-TARGET_DIR="$SCENARIO_WORK/stable_transcript_corpus"
-RESPONSE_DIR="$SCENARIO_WORK/response_corpus"
-LOG_FILE="$WORKDIR/filter-seeds.log"
-
-mkdir -p "$SOURCE_DIR" "$TARGET_DIR" "$RESPONSE_DIR"
-printf '\x00' >"$RESPONSE_DIR/id_000000_dummy"
-
-python3 - "$TARGET_DIR/id:000001,orig:current-dst1" <<'PY'
+python3 - "$SAMPLE_PATH" <<'PY'
 from pathlib import Path
 import struct
 import sys
@@ -57,13 +39,10 @@ PY
 
 env \
 	PYTHONDONTWRITEBYTECODE=1 \
-	WORK_DIR="$SCENARIO_WORK" \
-	FUZZ_PROFILE=poison-stateful \
-	REGEN_SEEDS=0 \
-	REFILTER_QUERIES=0 \
-	bash "$NAMED_WRAPPER" filter-seeds >"$LOG_FILE" 2>&1
-
-assert_file_contains "$LOG_FILE" "复用已有稳定输入语料"
-assert_file_contains "$LOG_FILE" "$TARGET_DIR"
+	bash -c '
+		set -euo pipefail
+		source "$1"
+		validate_transcript_seed_v2_two_part "$2"
+	' _ "$NAMED_WRAPPER" "$SAMPLE_PATH"
 
 printf 'PASS: named current DST1 transcript acceptance test passed\n'
