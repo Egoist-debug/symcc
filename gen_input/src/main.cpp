@@ -512,6 +512,13 @@ int main(int Argc, char *Argv[]) {
     return 1;
   }
 
+  if (Opts.ThreePhaseMode) {
+    std::cerr
+        << "Error: --three-phase is unavailable until function-boundary "
+           "feedback is implemented\n";
+    return 1;
+  }
+
   if (!Opts.SeedFile.empty()) {
     std::ifstream SeedStream(Opts.SeedFile, std::ios::binary);
     if (!SeedStream) {
