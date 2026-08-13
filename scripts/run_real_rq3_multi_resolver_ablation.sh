@@ -45,7 +45,8 @@ variant_env_value() {
 
 resolve_report_dir() {
 	local run_root="$1"
-	find "$run_root" -type d -path '*/campaign_reports/*' | sort | tail -n 1
+	find "$run_root" -type f -path '*/campaign_reports/*/summary.json' \
+		-printf '%h\n' | sort | tail -n 1
 }
 
 salvage_run() {

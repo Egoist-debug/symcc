@@ -79,17 +79,26 @@ queue_dir = root / "afl_out" / "master" / "queue"
 queue_dir.mkdir(parents=True, exist_ok=True)
 
 queue_limit = int(os.environ.get("QUEUE_LIMIT", "0"))
-producer_queue_dir = Path(os.environ.get("PRODUCER_QUEUE_DIR", "")).expanduser()
-transcript_source_dir = Path(os.environ.get("TRANSCRIPT_SOURCE_DIR", "")).expanduser()
+producer_queue_dir_raw = os.environ.get("PRODUCER_QUEUE_DIR", "").strip()
+transcript_source_dir_raw = os.environ.get("TRANSCRIPT_SOURCE_DIR", "").strip()
 provenance_path = Path(os.environ.get("PRODUCER_PROVENANCE_FILE", "")).expanduser()
 copied = 0
 
+def _valid_source_dir(raw: str) -> Path | None:
+    """空字符串的 Path('') 会解析为 '.'（cwd），必须显式拒绝。"""
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    return candidate if candidate.is_dir() else None
+
 def iter_source_files() -> list[Path]:
-    if producer_queue_dir.is_dir():
-        files = sorted(path for path in producer_queue_dir.iterdir() if path.is_file())
+    producer_dir = _valid_source_dir(producer_queue_dir_raw)
+    if producer_dir is not None:
+        files = sorted(path for path in producer_dir.iterdir() if path.is_file())
         return files[:queue_limit] if queue_limit > 0 else files
-    if transcript_source_dir.is_dir():
-        files = sorted(path for path in transcript_source_dir.iterdir() if path.is_file())
+    transcript_dir = _valid_source_dir(transcript_source_dir_raw)
+    if transcript_dir is not None:
+        files = sorted(path for path in transcript_dir.iterdir() if path.is_file())
         return files[:queue_limit] if queue_limit > 0 else files
     return []
 

@@ -239,13 +239,20 @@ target_provenance.parent.mkdir(parents=True, exist_ok=True)
 copied = 0
 if source_queue.is_dir():
     for source_file in sorted(source_queue.iterdir()):
-        if not source_file.is_file():
+        # AFL 持久模式写队列先落 <name>.tmp 再原子 rename；把 .tmp
+        # 当作源会导致拷贝中途源被 rename 而 FileNotFoundError，
+        # 并让 .tmp 残留进 live queue。只同步最终名文件。
+        if not source_file.is_file() or source_file.name.endswith(".tmp"):
             continue
         target_file = target_queue / source_file.name
         if target_file.exists():
             continue
         tmp_file = target_file.with_name(target_file.name + ".tmp")
-        shutil.copy2(source_file, tmp_file)
+        try:
+            shutil.copy2(source_file, tmp_file)
+        except FileNotFoundError:
+            # AFL 在拷贝期间原子替换了源文件，下轮同步再取
+            continue
         tmp_file.replace(target_file)
         copied += 1
 
@@ -565,8 +572,16 @@ run_all() {
 	producer_pid="$!"
 	cleanup_all() {
 		if [ -n "$producer_pid" ] && kill -0 "$producer_pid" 2>/dev/null; then
+			pkill -TERM -P "$producer_pid" 2>/dev/null || true
 			kill "$producer_pid" 2>/dev/null || true
 			wait "$producer_pid" 2>/dev/null || true
+		fi
+		# producer_pid 只是 run_producer 的子 shell；run 脚本、AFL、
+		# named、SymCC helper 可能在异常路径下脱离其进程树成为孤儿，
+		# 按 producer work 目录精确兜底清理，避免残留进程与下次运行
+		# 抢占资源（曾导致 prepare 编译被 kill）。
+		if [ -n "$PRODUCER_WORK_DIR" ]; then
+			pkill -TERM -f "$PRODUCER_WORK_DIR" 2>/dev/null || true
 		fi
 	}
 	trap cleanup_all EXIT INT TERM
