@@ -3,7 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAMP="$(date -u +%Y%m%d_%H%M%S)"
-OUT_DIR="/home/ubuntu/tmp/rq1_input_model_snapshot/$STAMP"
+# 默认路径保持 CI 宿主机布局；本地/其他环境用 env 覆盖。
+OUT_BASE="${REAL_RQ1_OUT_BASE:-/home/ubuntu/tmp/rq1_input_model_snapshot}"
+BIND9_TREE="${REAL_RQ1_BIND9_TREE:-/home/ubuntu/symcc/bind-9.18.46-afl}"
+OUT_DIR="$OUT_BASE/$STAMP"
 RESP_DIR="$OUT_DIR/legacy_responses"
 mkdir -p "$RESP_DIR"
 
@@ -31,7 +34,7 @@ PY
 
 python3 -m tools.dns_diff.cli input-model-eval \
   --output-dir "$OUT_DIR/out" \
-  --bind9-tree /home/ubuntu/symcc/bind-9.18.46-afl \
+  --bind9-tree "$BIND9_TREE" \
   --named-conf-template "$ROOT_DIR/named_experiment/runtime/named.conf" \
   --dst1-input "$OUT_DIR/dst1.bin" \
   --query-only-input "$OUT_DIR/query.bin" \

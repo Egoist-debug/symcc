@@ -2,7 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ROOT_BASE="/home/ubuntu/tmp"
+# 默认路径保持 CI 宿主机布局（/home/ubuntu/symcc）；本地/其他环境用 env 覆盖。
+RUN_ROOT_BASE="${REAL_FOLLOW_DIFF_RUN_ROOT_BASE:-/home/ubuntu/tmp}"
+UNBOUND_AFL_TREE="${UNBOUND_AFL_TREE_OVERRIDE:-/home/ubuntu/symcc/unbound-1.24.2-afl}"
+UNBOUND_SRC_TREE="${UNBOUND_SRC_TREE_OVERRIDE:-/home/ubuntu/symcc/unbound-1.24.2}"
+BIND9_AFL_TREE="${BIND9_AFL_TREE_OVERRIDE:-/home/ubuntu/symcc/bind-9.18.46-afl}"
+BIND9_SRC_TREE="${BIND9_SRC_TREE_OVERRIDE:-/home/ubuntu/symcc/bind-9.18.46-afl}"
+RESPONSE_CORPUS_DIR="${RESPONSE_CORPUS_DIR_OVERRIDE:-$ROOT_DIR/unbound_experiment/work_stateful/response_corpus}"
 WORKDIR="$(mktemp -d "$RUN_ROOT_BASE/follow-diff-dnslabctl-real.XXXXXX")"
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -63,8 +69,8 @@ run_probe() {
 
 	case "$resolver" in
 		unbound)
-			secondary_build="/home/ubuntu/symcc/unbound-1.24.2-afl"
-			secondary_src="/home/ubuntu/symcc/unbound-1.24.2"
+			secondary_build="$UNBOUND_AFL_TREE"
+			secondary_src="$UNBOUND_SRC_TREE"
 			;;
 		dnsmasq)
 			secondary_build="$ROOT_DIR/experiments/subjects/dnsmasq/v2.92-build"
@@ -96,10 +102,10 @@ run_probe() {
 		BIND9_WORK_DIR="$work_root/bind9-work" \
 		DNS_DIFF_SECONDARY_RESOLVER="$resolver" \
 		DNS_DIFF_REPLAY_BACKEND=dnslabctl \
-		BIND9_AFL_TREE="/home/ubuntu/symcc/bind-9.18.46-afl" \
-		BIND9_SRC_TREE="/home/ubuntu/symcc/bind-9.18.46-afl" \
+		BIND9_AFL_TREE="$BIND9_AFL_TREE" \
+		BIND9_SRC_TREE="$BIND9_SRC_TREE" \
 		BIND9_NAMED_CONF_TEMPLATE="$ROOT_DIR/named_experiment/runtime/named.conf" \
-		RESPONSE_CORPUS_DIR="$ROOT_DIR/unbound_experiment/work_stateful/response_corpus" \
+		RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
 		UNBOUND_SRC_TREE="$secondary_src" \
 		DNSMASQ_SRC_TREE="$secondary_src" \
 		SMARTDNS_SRC_TREE="$secondary_src" \

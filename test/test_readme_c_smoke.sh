@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="${1:-/tmp/symcc-readme-c-smoke}"
 ROUNDS="${2:-4}"
+SYMCC_BIN="${SYMCC_BIN:-$ROOT_DIR/build/linux/x86_64/release/symcc}"
+
+[ -x "$SYMCC_BIN" ] || {
+	printf 'ASSERT FAIL: 缺少 symcc 可执行: %s\n' "$SYMCC_BIN" >&2
+	exit 127
+}
 
 mkdir -p "$WORKDIR/results"
 cd "$WORKDIR"
@@ -32,7 +39,7 @@ int main(int argc, char* argv[]) {
 }
 EOF
 
-symcc -O2 test.c -o test
+"$SYMCC_BIN" -O2 test.c -o test
 export SYMCC_OUTPUT_DIR="$WORKDIR/results"
 
 # Seed input from README.

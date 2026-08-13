@@ -108,6 +108,7 @@ DNSMASQ_BUILD="$WORKDIR/dnsmasq-build"
 DNSMASQ_BIN="$DNSMASQ_BUILD/dnsmasq"
 DNSMASQ_HARNESS="$WORKDIR/dnsmasq-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
+RESPONSE_CORPUS_DIR="$WORKDIR/response_corpus"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
 
 mkdir -p "$QUEUE_DIR"
@@ -115,6 +116,8 @@ write_fake_bind9_binary "$BIND9_BIN"
 write_fake_dnsmasq_binary "$DNSMASQ_BIN"
 write_fake_dnsmasq_harness "$DNSMASQ_HARNESS"
 printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
+mkdir -p "$RESPONSE_CORPUS_DIR"
+printf 'seed\n' >"$RESPONSE_CORPUS_DIR/seed.txt"
 printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
 
 env \
@@ -129,6 +132,7 @@ env \
 	DNSMASQ_BUILD_TREE="$DNSMASQ_BUILD" \
 	DNSMASQ_HARNESS_SCRIPT="$DNSMASQ_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
+	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
 	python3 -m tools.dns_diff.cli follow-diff-window --budget-sec 5 >/dev/null
 
 env \

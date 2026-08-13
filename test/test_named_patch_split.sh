@@ -72,7 +72,8 @@ assert_diff_variant_tree() {
 	assert_same_file "$PATCH_ROOT/cache/bind9/lib/dns/dispatch.c" "$tree/lib/dns/dispatch.c"
 	assert_same_file "$PATCH_ROOT/cache/bind9/lib/dns/include/dns/dispatch.h" "$tree/lib/dns/include/dns/dispatch.h"
 	assert_same_file "$PATCH_ROOT/cache/bind9/lib/isc/managers.c" "$tree/lib/isc/managers.c"
-	assert_file_contains_text "$tree/lib/ns/client.c" "baseline client"
+	# client.c 自 sendcb 拦截修复后由两个 variant 共同覆盖
+	assert_same_file "$PATCH_ROOT/cache/bind9/lib/ns/client.c" "$tree/lib/ns/client.c"
 	assert_file_contains_text "$tree/bin/named/fuzz.c" "baseline fuzz"
 }
 
@@ -87,8 +88,9 @@ assert_fuzz_variant_tree() {
 	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/dns/dispatch.c" "$tree/lib/dns/dispatch.c"
 	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/dns/include/dns/dispatch.h" "$tree/lib/dns/include/dns/dispatch.h"
 	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/isc/managers.c" "$tree/lib/isc/managers.c"
+	# client.c 自 sendcb 拦截修复后由两个 variant 共同覆盖
+	assert_same_file "$PATCH_ROOT/fuzz/bind9/lib/ns/client.c" "$tree/lib/ns/client.c"
 	assert_file_contains_text "$tree/bin/named/fuzz.c" "baseline fuzz"
-	assert_file_contains_text "$tree/lib/ns/client.c" "baseline client"
 }
 
 run_variant_case() {
@@ -129,7 +131,7 @@ Path(sys.argv[1]).write_text(
     "overwritten=cache/bind9/lib/dns/dispatch.c\n"
     "overwritten=cache/bind9/lib/dns/include/dns/dispatch.h\n"
     "overwritten=cache/bind9/lib/isc/managers.c\n"
-    "retained=lib/ns/client.c\n"
+    "overwritten=cache/bind9/lib/ns/client.c\n"
     "retained=bin/named/fuzz.c\n",
     encoding="utf-8",
 )
@@ -156,8 +158,8 @@ Path(sys.argv[1]).write_text(
     "overwritten=fuzz/bind9/lib/dns/dispatch.c\n"
     "overwritten=fuzz/bind9/lib/dns/include/dns/dispatch.h\n"
     "overwritten=fuzz/bind9/lib/isc/managers.c\n"
-    "retained=bin/named/fuzz.c\n"
-    "retained=lib/ns/client.c\n",
+    "overwritten=fuzz/bind9/lib/ns/client.c\n"
+    "retained=bin/named/fuzz.c\n",
     encoding="utf-8",
 )
 PY

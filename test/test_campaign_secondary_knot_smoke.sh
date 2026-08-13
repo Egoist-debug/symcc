@@ -107,6 +107,7 @@ KNOT_BUILD="$WORKDIR/knot-build"
 KNOT_BIN="$KNOT_BUILD/knot-build/daemon/kresd"
 KNOT_HARNESS="$WORKDIR/knot-harness.py"
 NAMED_CONF_TEMPLATE="$WORKDIR/named.conf.template"
+RESPONSE_CORPUS_DIR="$WORKDIR/response_corpus"
 SAMPLE_FILE="$QUEUE_DIR/id:000001,orig:seed"
 
 mkdir -p "$QUEUE_DIR"
@@ -114,6 +115,8 @@ write_fake_bind9_binary "$BIND9_BIN"
 write_fake_knot_binary "$KNOT_BIN"
 write_fake_knot_harness "$KNOT_HARNESS"
 printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
+mkdir -p "$RESPONSE_CORPUS_DIR"
+printf 'seed\n' >"$RESPONSE_CORPUS_DIR/seed.txt"
 printf '\x01\x02\x03\x04' >"$SAMPLE_FILE"
 
 env \
@@ -128,6 +131,7 @@ env \
 	KNOT_RESOLVER_BUILD_TREE="$KNOT_BUILD" \
 	KNOT_RESOLVER_HARNESS_SCRIPT="$KNOT_HARNESS" \
 	BIND9_NAMED_CONF_TEMPLATE="$NAMED_CONF_TEMPLATE" \
+	RESPONSE_CORPUS_DIR="$RESPONSE_CORPUS_DIR" \
 	python3 -m tools.dns_diff.cli follow-diff-window --budget-sec 5 >/dev/null
 
 env \
