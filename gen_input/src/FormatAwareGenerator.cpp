@@ -1811,6 +1811,44 @@ std::vector<std::vector<uint8_t>> StatefulDNSGenerator::generateStatefulTranscri
     Queries.push_back(DNSPacketBuilder::buildQuery("www.example.com", 1));
   }
 
+  /*
+   * stateful transcript 的 client_query 必须模拟真实递归客户端的 IN 类
+   * A 记录查询，否则实验链路断裂：
+   *  - RD 位未置 1（通用 dns 语料随机生成）→ named 视为非递归请求，
+   *    直接返回 root hints referral，不进 resolver/fetch，hook 与缓存
+   *    oracle 全部失效；
+   *  - qclass 非 IN（如 CH/HS）→ named 拒绝递归（REFUSED）；
+   *  - qtype 非 A 而伪造响应模板固定为 A 记录 → 响应与查询不匹配，
+   *    resolver 不缓存，post-check 命中判定失败；
+   *  - flags 含保留 opcode（如 0x7fff）→ named 拒绝查询。
+   * 此处统一规范化/过滤：保留合法 IN 查询，强制 RD=1、opcode=0、
+   * qtype=A、qclass=IN，与响应模板语义一致。
+   */
+  {
+    std::vector<std::vector<uint8_t>> NormalizedQueries;
+    for (auto &Query : Queries) {
+      auto Question = parseDnsQuestionSpec(Query);
+      if (!Question || Question->DnsClass != 1) {
+        continue;
+      }
+      auto NameEnd = getQuestionSectionEnd(Query);
+      if (!NameEnd || *NameEnd < 17 || Query.size() < *NameEnd) {
+        continue;
+      }
+      Query[2] = 0x01;
+      Query[3] = 0x00;
+      Query[*NameEnd - 4] = 0;
+      Query[*NameEnd - 3] = 1;
+      Query[*NameEnd - 2] = 0;
+      Query[*NameEnd - 1] = 1;
+      NormalizedQueries.push_back(std::move(Query));
+    }
+    Queries = std::move(NormalizedQueries);
+  }
+  if (Queries.empty()) {
+    Queries.push_back(DNSPacketBuilder::buildQuery("www.example.com", 1));
+  }
+
   std::vector<std::vector<std::vector<uint8_t>>> CandidatesByQuery;
   CandidatesByQuery.reserve(Queries.size());
 

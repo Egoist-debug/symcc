@@ -957,6 +957,7 @@ patch_variant_mappings() {
 			"include/named/resolver_afl_symcc_orchestrator.h:bin/named/include/named/resolver_afl_symcc_orchestrator.h" \
 			"include/named/resolver_afl_symcc_mutator_server.h:bin/named/include/named/resolver_afl_symcc_mutator_server.h" \
 			"lib/isc/managers.c:lib/isc/managers.c" \
+			"lib/ns/client.c:lib/ns/client.c" \
 			"lib/dns/dispatch.c:lib/dns/dispatch.c" \
 			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h"
 		;;
@@ -969,6 +970,7 @@ patch_variant_mappings() {
 			"include/named/resolver_afl_symcc_orchestrator.h:bin/named/include/named/resolver_afl_symcc_orchestrator.h" \
 			"include/named/resolver_afl_symcc_mutator_server.h:bin/named/include/named/resolver_afl_symcc_mutator_server.h" \
 			"lib/isc/managers.c:lib/isc/managers.c" \
+			"lib/ns/client.c:lib/ns/client.c" \
 			"lib/dns/dispatch.c:lib/dns/dispatch.c" \
 			"lib/dns/include/dns/dispatch.h:lib/dns/include/dns/dispatch.h"
 		;;
@@ -996,7 +998,6 @@ apply_bind9_tree_compat_fixes() {
 	local baseline_root="$tree/.symcc_patch_baseline/files"
 	local full_restore_files=(
 		"bin/named/fuzz.c"
-		"lib/ns/client.c"
 	)
 	local legacy_print_include_files=(
 		"$tree/lib/dns/dispatch.c"
@@ -1274,6 +1275,11 @@ build_afl_named() {
 		reconfigure=1
 	fi
 
+	if [ "$reconfigure" -eq 0 ] && [ ! -f "$AFL_TREE/.named_afl_build_ok" ]; then
+		log "检测到上次 AFL named 构建未成功（缺少成功标记），强制重配 + 全量编译"
+		reconfigure=1
+	fi
+
 	if [ "$reconfigure" -eq 1 ]; then
 		log "配置 AFL named（开启持久模式）"
 		(
@@ -1298,6 +1304,7 @@ build_afl_named() {
 		make -C bin/named -j"$JOBS" named
 	)
 	require_file "$AFL_TREE/bin/named/.libs/named"
+	touch "$AFL_TREE/.named_afl_build_ok"
 }
 
 build_symcc_named() {
@@ -1319,6 +1326,11 @@ build_symcc_named() {
 	if [ ! -f "$SYMCC_TREE/config.status" ]; then
 		reconfigure=1
 	elif ! grep -q -- '-DENABLE_AFL' "$SYMCC_TREE/config.status"; then
+		reconfigure=1
+	fi
+
+	if [ "$reconfigure" -eq 0 ] && [ ! -f "$SYMCC_TREE/.named_symcc_build_ok" ]; then
+		log "检测到上次 SymCC named 构建未成功（缺少成功标记），强制重配 + 全量编译"
 		reconfigure=1
 	fi
 
@@ -1354,6 +1366,7 @@ build_symcc_named() {
 		make -C bin/named -j"$JOBS" named
 	)
 	require_file "$SYMCC_TREE/bin/named/named"
+	touch "$SYMCC_TREE/.named_symcc_build_ok"
 }
 
 generate_seeds() {
