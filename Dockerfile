@@ -40,6 +40,10 @@ ENV PATH=/usr/local/cargo/bin:$PATH
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 && chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
+# xmake 构建系统（仓库自 a6bd596 起移除 CMake 布局）
+RUN curl -fsSL https://xmake.io/shget.text | bash
+ENV PATH=/root/.local/bin:$PATH
+
 WORKDIR /
 
 # Build AFL.
@@ -79,13 +83,10 @@ RUN git submodule update --init --recursive
 # Build SymCC with the simple backend
 #
 FROM builder AS builder_simple
-WORKDIR /symcc_build_simple
-RUN cmake -G Ninja \
-        -DSYMCC_RT_BACKEND=simple \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DZ3_TRUST_SYSTEM_VERSION=on \
-        /symcc_source \
-    && ninja check
+WORKDIR /symcc_source
+RUN xmake f -c -y -o /symcc_build_simple --backend=simple -m release \
+    && xmake b SymCC \
+    && xmake run check
 
 #
 # Build libc++ with SymCC using the simple backend
@@ -101,8 +102,8 @@ RUN export SYMCC_REGULAR_LIBCXX=yes SYMCC_NO_SYMBOLIC_INPUT=yes \
   -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;cxx-headers" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/libcxx_symcc_install \
-  -DCMAKE_C_COMPILER=/symcc_build_simple/symcc \
-  -DCMAKE_CXX_COMPILER=/symcc_build_simple/sym++ \
+  -DCMAKE_C_COMPILER=/symcc_build_simple/linux/x86_64/release/symcc \
+  -DCMAKE_CXX_COMPILER=/symcc_build_simple/linux/x86_64/release/sym++ \
   && ninja distribution \
   && ninja install-distribution
 
@@ -111,13 +112,10 @@ RUN export SYMCC_REGULAR_LIBCXX=yes SYMCC_NO_SYMBOLIC_INPUT=yes \
 # Build SymCC with the Qsym backend
 #
 FROM builder_libcxx AS builder_qsym
-WORKDIR /symcc_build
-RUN cmake -G Ninja \
-        -DSYMCC_RT_BACKEND=qsym \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DZ3_TRUST_SYSTEM_VERSION=on \
-        /symcc_source \
-    && ninja check \
+WORKDIR /symcc_source
+RUN xmake f -c -y -o /symcc_build --backend=qsym -m release \
+    && xmake b SymCC \
+    && xmake run check \
     && cargo install --path /symcc_source/util/symcc_fuzzing_helper
 
 
@@ -160,8 +158,8 @@ COPY --from=builder_qsym /afl /afl
 
 # fix permissions
 RUN chmod -R og+rX /symcc_build
+ENV PATH=/symcc_build/linux/x86_64/release:$PATH
 
-ENV PATH=/symcc_build:$PATH
 ENV AFL_PATH=/afl
 ENV AFL_CC=clang-$LLVM_VERSION
 ENV AFL_CXX=clang++-$LLVM_VERSION
