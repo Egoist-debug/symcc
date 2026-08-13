@@ -55,8 +55,12 @@ build_command_for() {
 
 	normalized="$(resolver_normalize_name "$1")"
 	source_root="$(resolver_src_root "$normalized")"
+	# adapter-build 的 --build-root 是构建根：unbound 适配器在其下
+	# 挂 unbound-afl/ 目标树（与 unbound_afl_tree() 一致）。传
+	# unbound_afl_tree() 会导致 unbound-afl/unbound-afl 双重嵌套，
+	# 产物路径与 registry/tests 期望不符。
 	if [ "$normalized" = "unbound" ]; then
-		build_root="$(unbound_afl_tree)"
+		build_root="$(resolver_build_root "$normalized")"
 	else
 		build_root="$(resolver_build_root "$normalized")"
 	fi

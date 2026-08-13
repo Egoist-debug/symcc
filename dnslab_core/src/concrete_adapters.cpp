@@ -208,15 +208,30 @@ void ensureUnboundFuzzmeMakefile(const std::filesystem::path &TargetRoot) {
     throw std::runtime_error("无法定位 unbound Makefile.in 的 daemon 链接段");
   }
 
-  if (!replaceOnce(MakefileIn,
-                   "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
-                   "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) $(LIBS)\n\n",
-                   "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
-                   "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) "
-                   "$(LIBS)\n\n"
-                   "unbound-fuzzme$(EXEEXT):\t$(FUZZME_OBJ_LINK) libunbound.la\n"
-                   "\t$(LINK) -o $@ $(FUZZME_OBJ_LINK) libunbound.la "
-                   "$(EXTRALINK) $(SSLLIB) $(LIBS)\n\n")) {
+  /*
+   * unbound 1.24.2 起 daemon 链接行追加了 $(DYNLIBMOD_EXTRALIBS)，
+   * 旧版无此变量。两种布局都尝试，兼容性优先。
+   */
+  const std::string UnboundFuzzmeLinkRule =
+      "unbound-fuzzme$(EXEEXT):\t$(FUZZME_OBJ_LINK) libunbound.la\n"
+      "\t$(LINK) -o $@ $(FUZZME_OBJ_LINK) libunbound.la "
+      "$(EXTRALINK) $(SSLLIB) $(LIBS)\n\n";
+  if (!(replaceOnce(MakefileIn,
+                    "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
+                    "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) "
+                    "$(LIBS) $(DYNLIBMOD_EXTRALIBS)\n",
+                    "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
+                    "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) "
+                    "$(LIBS) $(DYNLIBMOD_EXTRALIBS)\n\n" +
+                        UnboundFuzzmeLinkRule) ||
+        replaceOnce(MakefileIn,
+                    "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
+                    "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) "
+                    "$(LIBS)\n",
+                    "unbound$(EXEEXT):\t$(DAEMON_OBJ_LINK) libunbound.la\n"
+                    "\t$(LINK) -o $@ $(DAEMON_OBJ_LINK) $(EXTRALINK) $(SSLLIB) "
+                    "$(LIBS)\n\n" +
+                        UnboundFuzzmeLinkRule))) {
     throw std::runtime_error("无法定位 unbound Makefile.in 的 daemon 链接规则");
   }
 

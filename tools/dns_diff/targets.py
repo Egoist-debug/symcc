@@ -598,7 +598,7 @@ def _dump_unbound_cache(sample: Optional[str], output_path: Optional[str]) -> in
             "--source-root",
             str(_resolve_unbound_src_tree(root_dir)),
             "--build-root",
-            str(unbound_afl_tree),
+            str(unbound_afl_tree.parent),
         ]
         completed = _run_dnslabctl_command(root_dir, build_args)
         if completed.returncode != 0:
