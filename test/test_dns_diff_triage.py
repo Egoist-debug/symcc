@@ -1,8 +1,15 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.dns_diff.triage import TriageError, build_triage, rewrite_triage_payload, rewrite_triage_root
+from tools.dns_diff.triage import (
+    TRIAGE_REQUIRED_FIELDS,
+    TriageError,
+    build_triage,
+    rewrite_triage_payload,
+    rewrite_triage_root,
+)
 
 
 class DnsDiffTriageTest(unittest.TestCase):
@@ -96,7 +103,7 @@ class DnsDiffTriageTest(unittest.TestCase):
             self.assertIn("forwarding_path_seen", payload["filter_labels"])
             self.assertEqual("completed_no_diff", payload["status"])
 
-    def test_rewrite_triage_root_raises_when_triage_missing(self) -> None:
+    def test_rewrite_triage_root_creates_missing_triage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "follow_diff"
             sample_dir = root / "sample-missing-triage"
@@ -118,9 +125,17 @@ class DnsDiffTriageTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(TriageError) as ctx:
-                rewrite_triage_root(root)
-            self.assertIn("triage.json", str(ctx.exception))
+            self.assertEqual(0, rewrite_triage_root(root))
+
+            triage = (sample_dir / "triage.json").read_text(encoding="utf-8")
+            payload = json.loads(triage)
+            self.assertEqual("sample-missing-triage", payload["sample_id"])
+            self.assertEqual("completed_no_diff", payload["status"])
+            self.assertEqual("no_diff", payload["diff_class"])
+            self.assertTrue(
+                set(TRIAGE_REQUIRED_FIELDS).issubset(payload),
+                "生成的 triage.json 必须包含所有必需字段",
+            )
 
     def test_rewrite_triage_root_raises_when_oracle_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

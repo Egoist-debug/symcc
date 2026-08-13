@@ -4,6 +4,7 @@
 #include "FormatAwareGenerator.h"
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -12,13 +13,25 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <spawn.h>
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef DNS_PARSER_PATH
+#error DNS_PARSER_PATH must be provided by the build system
+#endif
+
+#ifndef DNS_RESPONSE_PARSER_PATH
+#error DNS_RESPONSE_PARSER_PATH must be provided by the build system
+#endif
 
 using namespace geninput;
 
 #include "../src/DST1Mutator.cpp"
+
+extern char **environ;
 
 std::string hexDump(const std::vector<uint8_t> &data) {
   std::ostringstream oss;
@@ -55,6 +68,78 @@ std::string createTempDirectory() {
   char *dirPath = mkdtemp(pathTemplate);
   assert(dirPath != nullptr);
   return dirPath;
+}
+
+int runParser(const char *parserPath, const std::vector<uint8_t> &input) {
+  if (access(parserPath, X_OK) != 0) {
+    std::cerr << "Parser is not executable: " << parserPath << std::endl;
+    std::abort();
+  }
+
+  int inputPipe[2];
+  if (pipe(inputPipe) != 0) {
+    std::cerr << "Failed to create parser input pipe: " << std::strerror(errno)
+              << std::endl;
+    std::abort();
+  }
+
+  posix_spawn_file_actions_t actions;
+  if (posix_spawn_file_actions_init(&actions) != 0 ||
+      posix_spawn_file_actions_adddup2(&actions, inputPipe[0], STDIN_FILENO) !=
+          0 ||
+      posix_spawn_file_actions_addclose(&actions, inputPipe[0]) != 0 ||
+      posix_spawn_file_actions_addclose(&actions, inputPipe[1]) != 0) {
+    close(inputPipe[0]);
+    close(inputPipe[1]);
+    std::cerr << "Failed to prepare parser process: " << parserPath << std::endl;
+    std::abort();
+  }
+
+  pid_t pid = -1;
+  char *const argv[] = {const_cast<char *>(parserPath), nullptr};
+  const int spawnError =
+      posix_spawn(&pid, parserPath, &actions, nullptr, argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  close(inputPipe[0]);
+  if (spawnError != 0) {
+    close(inputPipe[1]);
+    std::cerr << "Failed to execute parser: " << parserPath << ": "
+              << std::strerror(spawnError) << std::endl;
+    std::abort();
+  }
+
+  size_t written = 0;
+  while (written < input.size()) {
+    const ssize_t result =
+        write(inputPipe[1], input.data() + written, input.size() - written);
+    if (result > 0) {
+      written += static_cast<size_t>(result);
+    } else if (result < 0 && errno == EINTR) {
+      continue;
+    } else {
+      close(inputPipe[1]);
+      std::cerr << "Failed to write parser input: " << parserPath << std::endl;
+      std::abort();
+    }
+  }
+  if (close(inputPipe[1]) != 0) {
+    std::cerr << "Failed to close parser input: " << parserPath << std::endl;
+    std::abort();
+  }
+
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    std::cerr << "Failed to wait for parser: " << parserPath << std::endl;
+    std::abort();
+  }
+  if (!WIFEXITED(status)) {
+    std::cerr << "Parser did not exit normally: " << parserPath << std::endl;
+    std::abort();
+  }
+  return WEXITSTATUS(status);
 }
 
 void testDNSNameCodec() {
@@ -139,24 +224,12 @@ void testDNSParserValidation() {
   auto query = DNSPacketBuilder::buildQuery("test.example.com", 1);
   std::cout << "Generated query (" << query.size() << " bytes)" << std::endl;
 
-  FILE *pipe = popen("/tmp/dns_parser", "w");
-  if (!pipe) {
-    std::cerr << "Failed to open pipe to dns_parser" << std::endl;
-    return;
-  }
-
-  fwrite(query.data(), 1, query.size(), pipe);
-  int status = pclose(pipe);
-  int exit_code = WEXITSTATUS(status);
+  const int exit_code = runParser(DNS_PARSER_PATH, query);
 
   std::cout << "DNS parser exit code: " << exit_code << std::endl;
 
-  if (exit_code == 0) {
-    std::cout << "DNS Parser validation PASSED" << std::endl;
-  } else {
-    std::cout << "DNS Parser validation FAILED (expected 0, got " << exit_code
-              << ")" << std::endl;
-  }
+  assert(exit_code == 0);
+  std::cout << "DNS Parser validation PASSED" << std::endl;
   std::cout << std::endl;
 }
 
@@ -164,10 +237,7 @@ void testInvalidDNSPackets() {
   std::cout << "=== Testing Invalid DNS Packets ===" << std::endl;
 
   std::vector<uint8_t> tooShort = {0x00, 0x01, 0x00, 0x00};
-  FILE *pipe = popen("/tmp/dns_parser", "w");
-  fwrite(tooShort.data(), 1, tooShort.size(), pipe);
-  int status = pclose(pipe);
-  int exit_code = WEXITSTATUS(status);
+  int exit_code = runParser(DNS_PARSER_PATH, tooShort);
   std::cout << "Too short packet: exit=" << exit_code << " (expected non-zero)"
             << std::endl;
   assert(exit_code != 0);
@@ -177,10 +247,7 @@ void testInvalidDNSPackets() {
                       .asResponse()
                       .addQuestion("example.com", 1, 1)
                       .build();
-  pipe = popen("/tmp/dns_parser", "w");
-  fwrite(response.data(), 1, response.size(), pipe);
-  status = pclose(pipe);
-  exit_code = WEXITSTATUS(status);
+  exit_code = runParser(DNS_PARSER_PATH, response);
   std::cout << "Response packet (QR=1): exit=" << exit_code
             << " (expected non-zero)" << std::endl;
   assert(exit_code != 0);
@@ -359,24 +426,12 @@ void testDNSResponseParserValidation() {
 
   std::cout << "Generated response (" << response.size() << " bytes)" << std::endl;
 
-  FILE *pipe = popen("/tmp/dns_response_parser", "w");
-  if (!pipe) {
-    std::cerr << "Failed to open pipe to dns_response_parser (try building it first)" << std::endl;
-    return;
-  }
-
-  fwrite(response.data(), 1, response.size(), pipe);
-  int status = pclose(pipe);
-  int exit_code = WEXITSTATUS(status);
+  const int exit_code = runParser(DNS_RESPONSE_PARSER_PATH, response);
 
   std::cout << "DNS response parser exit code: " << exit_code << std::endl;
 
-  if (exit_code == 0) {
-    std::cout << "DNS Response Parser validation PASSED" << std::endl;
-  } else {
-    std::cout << "DNS Response Parser validation FAILED (expected 0, got " << exit_code
-              << ")" << std::endl;
-  }
+  assert(exit_code == 0);
+  std::cout << "DNS Response Parser validation PASSED" << std::endl;
   std::cout << std::endl;
 }
 
@@ -385,14 +440,7 @@ void testInvalidDNSResponse() {
 
   // Query packet should be rejected by response parser
   auto query = DNSPacketBuilder::buildQuery("example.com", 1);
-  FILE *pipe = popen("/tmp/dns_response_parser", "w");
-  if (!pipe) {
-    std::cerr << "Skipping (dns_response_parser not available)" << std::endl;
-    return;
-  }
-  fwrite(query.data(), 1, query.size(), pipe);
-  int status = pclose(pipe);
-  int exit_code = WEXITSTATUS(status);
+  const int exit_code = runParser(DNS_RESPONSE_PARSER_PATH, query);
   std::cout << "Query packet to response parser: exit=" << exit_code
             << " (expected non-zero)" << std::endl;
   assert(exit_code != 0);

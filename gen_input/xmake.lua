@@ -79,6 +79,7 @@ target("test_dns_format")
     set_kind("binary")
     set_languages("c++17")
     set_default(false)
+    add_deps("dns_parser", "dns_response_parser")
     add_files("test/test_dns_format.cpp")
     add_files("src/BinaryFormat.cpp")
     add_files("src/FormatAwareGenerator.cpp")
@@ -91,6 +92,15 @@ target("test_dns_format")
     if is_mode("debug") then
         add_cxxflags("-g", "-O0")
     end
+
+    after_load(function (target)
+        local dns_parser = target:dep("dns_parser")
+        local dns_response_parser = target:dep("dns_response_parser")
+        target:add("defines",
+            'DNS_PARSER_PATH="' .. path.absolute(dns_parser:targetfile()) .. '"',
+            'DNS_RESPONSE_PARSER_PATH="' .. path.absolute(dns_response_parser:targetfile()) .. '"'
+        )
+    end)
 
     after_build(function (target)
         local mirrored = target:targetfile():gsub("/gen_input/build/", "/build/")

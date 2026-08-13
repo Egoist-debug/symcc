@@ -549,7 +549,11 @@ def rewrite_triage_payload(
     resolved_existing_triage = (
         dict(existing_triage)
         if existing_triage is not None
-        else _load_json_artifact(sample_dir / "triage.json")
+        else (
+            _load_json_artifact(sample_dir / "triage.json")
+            if (sample_dir / "triage.json").exists()
+            else {}
+        )
     )
 
     sample_id = _resolve_sample_id(

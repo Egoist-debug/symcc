@@ -21,28 +21,7 @@ local function has_llvm_compilers(prefix, find_program)
            find_program(path.join(bindir, "clang++")) ~= nil
 end
 
-local function detect_default_symcc_llvm(find_program)
-    local candidates = {}
-    for _, prefix in ipairs(os.dirs("/usr/lib/llvm-*")) do
-        local major = llvm_major_from_prefix(prefix)
-        if major then
-            table.insert(candidates, {prefix = prefix, major = tonumber(major)})
-        end
-    end
-    table.sort(candidates, function (left, right)
-        return left.major > right.major
-    end)
-
-    for _, candidate in ipairs(candidates) do
-        if has_llvm_compilers(candidate.prefix, find_program) then
-            return candidate.prefix, tostring(candidate.major)
-        end
-    end
-
-    return nil, nil
-end
-
-local function llvm_prefix_validation_error(prefix, find_program)
+local function llvm_prefix_validation_error(prefix, major, find_program, find_library)
     if not nonempty(prefix) then
         return "No usable versioned LLVM installation was found under /usr/lib. " ..
                "Set --symcc_llvm_prefix and --symcc_llvm_major (or " ..
@@ -55,13 +34,55 @@ local function llvm_prefix_validation_error(prefix, find_program)
         return string.format("Invalid SymCC LLVM prefix '%s': expected executable " ..
                              "compiler files at '%s' and '%s'.", prefix, clang, clangxx)
     end
+
+    local plugin_header = path.join(prefix, "include", "llvm", "Passes", "PassPlugin.h")
+    if not os.isfile(plugin_header) then
+        return string.format("Invalid SymCC LLVM prefix '%s': required SymCC " ..
+                             "development header '%s' was not found.",
+                             prefix, plugin_header)
+    end
+
+    local major_number = nonempty(major) and tonumber(major) or nil
+    if major_number and major_number >= 1 and major_number % 1 == 0 then
+        local libdir = path.join(prefix, "lib")
+        local link_name = "LLVM-" .. tostring(major_number)
+        if not find_library(link_name, {libdir}) then
+            return string.format("Invalid SymCC LLVM prefix '%s': expected a linkable " ..
+                                 "LLVM %s library under '%s' (link name '%s').",
+                                 prefix, tostring(major), libdir, link_name)
+        end
+    end
     return nil
+end
+
+local function detect_default_symcc_llvm(find_program, find_library)
+    local candidates = {}
+    for _, prefix in ipairs(os.dirs("/usr/lib/llvm-*")) do
+        local major = llvm_major_from_prefix(prefix)
+        if major then
+            table.insert(candidates, {prefix = prefix, major = tonumber(major)})
+        end
+    end
+    table.sort(candidates, function (left, right)
+        return left.major > right.major
+    end)
+
+    for _, candidate in ipairs(candidates) do
+        local major = tostring(candidate.major)
+        if not llvm_prefix_validation_error(candidate.prefix, major,
+                                            find_program, find_library) then
+            return candidate.prefix, major
+        end
+    end
+
+    return nil, nil
 end
 
 option("symcc_llvm_prefix")
     set_description("LLVM installation prefix for SymCC build/runtime alignment.")
     on_check(function (option)
         local find_program = import("lib.detect.find_program")
+        local find_library = import("lib.detect.find_library")
         local value = option:value()
         if not nonempty(value) then
             local env_prefix = os.getenv("SYMCC_LLVM_PREFIX")
@@ -74,11 +95,19 @@ option("symcc_llvm_prefix")
             elseif nonempty(env_major) then
                 value = path.join("/usr/lib", "llvm-" .. env_major)
             else
-                value = detect_default_symcc_llvm(find_program)
+                value = detect_default_symcc_llvm(find_program, find_library)
             end
             option:set_value(value)
         end
-        local validation_error = llvm_prefix_validation_error(value, find_program)
+        local validation_major = get_config("symcc_llvm_major")
+        if not nonempty(validation_major) then
+            validation_major = os.getenv("SYMCC_LLVM_MAJOR")
+        end
+        if not nonempty(validation_major) then
+            validation_major = llvm_major_from_prefix(value) or "18"
+        end
+        local validation_error = llvm_prefix_validation_error(value, validation_major,
+                                                                find_program, find_library)
         if validation_error then
             raise(validation_error)
         end
@@ -365,6 +394,13 @@ target("check")
         -- PATH that does not include ~/.local/bin, even though an interactive
         -- terminal does. Be tolerant and try common locations.
         local function _find_lit_program()
+            -- Use lit shipped with the selected LLVM installation first so the
+            -- test runner and compiler tools always come from the same version.
+            local llvm_lit = path.join(symcc_llvm_bindir(), "lit")
+            if os.isexec(llvm_lit) then
+                return llvm_lit, {}
+            end
+
             local lit = find_tool("lit")
             if lit and lit.program then
                 return lit.program, {}
