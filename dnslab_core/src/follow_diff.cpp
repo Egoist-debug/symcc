@@ -59,6 +59,7 @@ struct FollowDiffConfig {
   double IntervalSec = 1.0;
   int IdleRounds = 1;
   int SeedTimeoutSec = 5;
+  int RepeatCount = 1;
 };
 
 struct BatchSummary {
@@ -602,6 +603,33 @@ resolveSecondarySourceRoot(const std::string &Resolver,
   }
   return normalizePath(BuildRoot);
 }
+namespace {
+
+// 对齐 Python `_iter_seed_provenance_sidecar_candidates`：WorkDir 优先，
+// 然后从 SourceDir 自身向上 4 级父目录查找 producer_seed_provenance.json。
+std::filesystem::path resolveSeedProvenancePath(
+    const std::filesystem::path &WorkDir,
+    const std::filesystem::path &SourceDir) {
+  std::vector<std::filesystem::path> CandidateRoots{WorkDir};
+  auto Parent = SourceDir;
+  for (int Depth = 0; Depth < 4; ++Depth) {
+    CandidateRoots.push_back(Parent);
+    const auto Next = Parent.parent_path();
+    if (Next == Parent) {
+      break;
+    }
+    Parent = Next;
+  }
+  for (const auto &Root : CandidateRoots) {
+    const auto Candidate = Root / "producer_seed_provenance.json";
+    if (std::filesystem::is_regular_file(Candidate)) {
+      return Candidate;
+    }
+  }
+  return WorkDir / "producer_seed_provenance.json";
+}
+
+} // namespace
 
 FollowDiffConfig collectConfig() {
   FollowDiffConfig Config;
@@ -614,7 +642,8 @@ FollowDiffConfig collectConfig() {
   Config.WindowSummaryPath = Config.WorkDir / kFollowDiffWindowSummaryFileName;
   Config.CampaignCloseSummaryPath =
       Config.WorkDir / kCampaignCloseSummaryFileName;
-  Config.SeedProvenancePath = Config.WorkDir / "producer_seed_provenance.json";
+  Config.SeedProvenancePath =
+      resolveSeedProvenancePath(Config.WorkDir, Config.SourceDir);
   Config.SelfExecutable = resolveSelfExecutable();
   Config.SecondaryResolver = resolveSecondaryResolver();
   Config.Bind9BuildRoot = resolveBind9BuildRoot(Config.RootDir);
@@ -629,6 +658,7 @@ FollowDiffConfig collectConfig() {
   Config.IdleRounds =
       resolvePositiveIntEnv("FOLLOW_DIFF_WINDOW_IDLE_ROUNDS", 1);
   Config.SeedTimeoutSec = resolveSeedTimeoutSec();
+  Config.RepeatCount = resolveRepeatCount();
   return Config;
 }
 
@@ -679,8 +709,7 @@ BaselineCompareKey buildBaselineCompareKey(const FollowDiffConfig &Config,
   Output.InputModel = "DST1 transcript";
   Output.SourceQueueDir = Config.SourceDir.string();
   Output.BudgetSec = static_cast<int>(std::max(1.0, std::floor(BudgetSec)));
-  Output.SeedTimeoutSec = Config.SeedTimeoutSec;
-  Output.RepeatCount = 1;
+  Output.RepeatCount = Config.RepeatCount;
   Output.ContractVersion = kContractVersion;
   return Output;
 }
@@ -719,7 +748,7 @@ json::Value::Object buildBaselineCompareKeyPayload(const FollowDiffConfig &Confi
   Output["budget_sec"] = budgetJsonValue(BudgetSec);
   Output["seed_timeout_sec"] =
       static_cast<std::int64_t>(Config.SeedTimeoutSec);
-  Output["repeat_count"] = static_cast<std::int64_t>(1);
+  Output["repeat_count"] = static_cast<std::int64_t>(Config.RepeatCount);
   Output["contract_version"] = static_cast<std::int64_t>(kContractVersion);
   return Output;
 }

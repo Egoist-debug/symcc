@@ -155,6 +155,7 @@ def run_comparable_scenario() -> None:
         work_root = pathlib.Path(tmp)
         queue_dir = work_root / "afl_out" / "master" / "queue"
         queue_dir.mkdir(parents=True, exist_ok=True)
+        (queue_dir / "id:000001,orig:seed-a").write_bytes(b"DST1 seed payload")
         invocation_log = work_root / "invocations.log"
 
         totals = {
@@ -178,6 +179,15 @@ def run_comparable_scenario() -> None:
 
         def fake_close(*, budget_sec: float) -> int:
             env = dict(os.environ)
+            assert_true(
+                env.get("SEED_TIMEOUT_SEC") == "1",
+                f"matrix 未注入 SEED_TIMEOUT_SEC: {env.get('SEED_TIMEOUT_SEC')!r}",
+            )
+            assert_true(
+                env.get("FOLLOW_DIFF_REPEAT_COUNT") == "2",
+                "matrix 未注入 FOLLOW_DIFF_REPEAT_COUNT="
+                f"{env.get('FOLLOW_DIFF_REPEAT_COUNT')!r}",
+            )
             variant_name = detect_variant(env)
             work_dir = pathlib.Path(env["WORK_DIR"])
             repeat_index = repeat_index_from_work_dir(work_dir)
@@ -226,6 +236,48 @@ def run_comparable_scenario() -> None:
                 ]
             )
         assert_true(exit_code == 0, f"可比场景 exit_code={exit_code!r} != 0")
+
+        manifest_path = (
+            work_root
+            / "matrix_runs"
+            / "full_stack"
+            / "run-01"
+            / "producer_execution_manifest.json"
+        )
+        assert_true(manifest_path.is_file(), f"缺少 producer manifest: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert_true(
+            manifest.get("contract_name") == "rq3_producer_execution_manifest",
+            f"manifest contract_name 非预期: {manifest.get('contract_name')!r}",
+        )
+        assert_true(
+            manifest.get("status") == "success" and manifest.get("exit_code") == 0,
+            f"manifest 状态非预期: status={manifest.get('status')!r}",
+        )
+        assert_true(
+            manifest.get("variant_name") == "full_stack"
+            and manifest.get("repeat_index") == 1,
+            "manifest 身份字段非预期",
+        )
+        assert_true(
+            manifest.get("toggles") == EXPECTED_ENV["full_stack"],
+            f"manifest toggles 非预期: {manifest.get('toggles')!r}",
+        )
+        snapshot = manifest.get("queue_snapshot")
+        assert_true(isinstance(snapshot, dict), "manifest 缺少 queue_snapshot")
+        assert_true(
+            snapshot.get("algorithm") == "sha256-relative-path-size-content-v1",
+            f"queue_snapshot 算法非预期: {snapshot.get('algorithm')!r}",
+        )
+        assert_true(
+            snapshot.get("file_count") == 2 and snapshot.get("size_bytes") > 0,
+            f"queue_snapshot 计数非预期: {snapshot!r}",
+        )
+        snapshot_dir = work_root / "matrix_runs" / "full_stack" / "run-01" / "queue_snapshot"
+        assert_true(
+            snapshot_dir.is_dir() and len(list(snapshot_dir.iterdir())) == 2,
+            "queue_snapshot 目录内容非预期（期望样本 + run 元数据）",
+        )
 
         summary_root = work_root / "_summary"
         manifest_path = summary_root / "matrix_manifest.json"

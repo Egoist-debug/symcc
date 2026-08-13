@@ -2,7 +2,31 @@
 
 ## 更新时间
 
+- `2026-08-13`（本轮）
 - `2026-08-10`
+
+## 2026-08-13 本轮更新
+
+数据补齐与缺陷修复（Trellis 任务 `08-13-symcc-full-experiment-paper-data`）：
+
+- **RQ1 多样本对照重跑**：`experiments/results/rq1_input_model_multi_sample/20260813_114524/out/summary.tsv`。
+  `dst1_transcript` 4/4 全链路命中（parse/fetch/response_accepted/second_query_hit 均为 1.0），
+  对照组（query_only/random_packet/legacy_response_tail）全部 0——对比历史 RQ1 表（仅 parse_ok=1.0、fetch=0），
+  本轮输入模型链路已真实推进到缓存路径。
+- **RQ2 同步 replay repeat=5**：`experiments/results/rq2_sync_replay_repeat/20260813_114601`（5×4 样本，20/20 replay 成功、comparability=comparable）。
+  带指纹版重跑：`20260813_122829`。
+- **RQ3 gate 对照**：见 [RQ3GateContrast20260813.md](./RQ3GateContrast20260813.md)。
+  gate-on（manifest 匹配修复后）helper high_value_processed=6、corpus_found=28；gate-off 为 0/22。
+- **RQ4 指纹链路修复**：见 [RQ4Fingerprint20260813.md](./RQ4Fingerprint20260813.md)。
+  修复前 40 样本 = 1 cluster（全 null 指纹）；修复后 8 样本 = 2 clusters。
+- **代码修复**（均带回归）：
+  - matrix 链注入 `SEED_TIMEOUT_SEC`/`FOLLOW_DIFF_REPEAT_COUNT`，写入 `producer_execution_manifest.json` + 带 run 元数据的 queue snapshot。
+  - C++ `resolveRepeatCount()`；C++ seed provenance sidecar 父链候选；C++ 指纹从 cache 记录提取真实信号；C++ 缓存文件提升到样本顶层。
+  - orchestrator 每 testcase 前 mainloop 异步 flush 视图 cache（producer stability 10.69% → 18-34%，dry run crash 消除）。
+  - helper 高价值 manifest 路径规范（相对路径双重拼接缺陷，需绝对路径）。
+- **audit-ready 矩阵**：`experiments/results/audit_ready_matrix/20260813_124516/unbound`（4 变体 × repeat=5）。
+  审计问题从 2925（基线批次）收敛到 81；剩余 80 个 `unadjudicated_case_study` + 1 个 `insufficient_case_studies`
+  为人工双评裁决缺口（reviewer_primary/reviewer_secondary/adjudicator 三人裁决待补）。
 
 ## 论文就绪状态
 

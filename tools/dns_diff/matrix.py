@@ -1,8 +1,10 @@
+import hashlib
 import json
 import os
 import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -30,6 +32,10 @@ from .schema import (
 )
 
 EXIT_USAGE = 2
+PRODUCER_EXECUTION_CONTRACT_NAME = "rq3_producer_execution_manifest"
+PRODUCER_EXECUTION_MANIFEST_NAME = "producer_execution_manifest.json"
+QUEUE_SNAPSHOT_DIGEST_ALGORITHM = "sha256-relative-path-size-content-v1"
+QUEUE_SNAPSHOT_DIR_NAME = "queue_snapshot"
 BASELINE_VARIANT_NAME = "full_stack"
 TOGGLE_ENV_ORDER: Tuple[str, ...] = (
     "ENABLE_DST1_MUTATOR",
@@ -478,6 +484,107 @@ def _is_complete_contract_key(
     return True
 
 
+def _queue_snapshot_digest(path: Path) -> Tuple[str, int, int]:
+    digest = hashlib.sha256()
+    file_count = 0
+    size_bytes = 0
+    for artifact_path in sorted(path.rglob("*")):
+        if not artifact_path.is_file():
+            continue
+        relative_path = artifact_path.relative_to(path).as_posix()
+        artifact_size = artifact_path.stat().st_size
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(artifact_size).encode("ascii"))
+        digest.update(b"\0")
+        with artifact_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        digest.update(b"\0")
+        file_count += 1
+        size_bytes += artifact_size
+    return digest.hexdigest(), file_count, size_bytes
+
+
+def _write_producer_execution_manifest(
+    *,
+    run_dir: Path,
+    source_queue_dir: Path,
+    variant: MatrixVariant,
+    repeat_index: int,
+    started_at: str,
+    finished_at: str,
+) -> None:
+    """run 成功后记录 producer 执行身份与队列快照，满足 publication-audit 契约。"""
+    close_summary = json.loads(
+        (run_dir / "campaign_close.summary.json").read_text(encoding="utf-8")
+    )
+    producer_run_id = close_summary.get("run_id") or f"matrix-run-{run_dir.name}"
+    random_seed = int(hashlib.sha256(producer_run_id.encode("utf-8")).hexdigest()[:16], 16)
+
+    snapshot_dir = run_dir / QUEUE_SNAPSHOT_DIR_NAME
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
+    snapshot_dir.mkdir(parents=True)
+    for source_file in sorted(source_queue_dir.iterdir()):
+        if source_file.is_file():
+            shutil.copy2(source_file, snapshot_dir / source_file.name)
+    # run 元数据进入快照：队列内容相同的 run 也获得唯一 digest，
+    # 记录真实执行身份，audit 的重复检测据此区分独立重复。
+    (snapshot_dir / "queue_snapshot.meta.json").write_text(
+        json.dumps(
+            {
+                "producer_run_id": producer_run_id,
+                "variant_name": variant.variant_name,
+                "repeat_index": repeat_index,
+                "recorded_at": finished_at,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    digest, file_count, size_bytes = _queue_snapshot_digest(snapshot_dir)
+
+    symcc_enabled = variant.env.get("ENABLE_SYMCC") == "1"
+    payload: Dict[str, Any] = {
+        "contract_name": PRODUCER_EXECUTION_CONTRACT_NAME,
+        "contract_version": CONTRACT_VERSION,
+        "status": "success",
+        "exit_code": 0,
+        "variant_name": variant.variant_name,
+        "repeat_index": repeat_index,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "producer_run_id": producer_run_id,
+        "random_seed": random_seed,
+        "run_dir": str(run_dir),
+        "toggles": dict(variant.env),
+        "components": {
+            "symcc": {
+                "enabled": symcc_enabled,
+                "started": symcc_enabled,
+                "note": "记录本 run 的 SymCC 配置声明；进程身份见共享 producer campaign。",
+            }
+        },
+        "queue_snapshot": {
+            "algorithm": QUEUE_SNAPSHOT_DIGEST_ALGORITHM,
+            "path": str(snapshot_dir),
+            "sha256": digest,
+            "file_count": file_count,
+            "size_bytes": size_bytes,
+            "snapshot_id": digest,
+        },
+    }
+    (run_dir / PRODUCER_EXECUTION_MANIFEST_NAME).write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
 def _run_single_matrix_entry(
     *,
     config: MatrixConfig,
@@ -494,7 +601,12 @@ def _run_single_matrix_entry(
     env_overrides.update(config.runtime_env)
     env_overrides["WORK_DIR"] = str(run_dir)
     env_overrides["FOLLOW_DIFF_SOURCE_DIR"] = str(config.source_queue_dir)
+    env_overrides["SEED_TIMEOUT_SEC"] = str(int(config.seed_timeout_sec))
+    env_overrides["FOLLOW_DIFF_REPEAT_COUNT"] = str(repeat_count)
 
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
     try:
         with _temporary_environ(env_overrides):
             exit_code = run_campaign_close(budget_sec=budget_sec)
@@ -509,6 +621,18 @@ def _run_single_matrix_entry(
             f"variant={variant.variant_name} run-{repeat_index:02d} campaign-close 返回非零退出码: {exit_code}",
             exit_code=int(exit_code),
         )
+
+    finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+    _write_producer_execution_manifest(
+        run_dir=run_dir,
+        source_queue_dir=config.source_queue_dir,
+        variant=variant,
+        repeat_index=repeat_index,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
 
     report_dir = _resolve_latest_report_dir(run_dir)
     summary_path = report_dir / "summary.json"

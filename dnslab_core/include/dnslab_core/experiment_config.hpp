@@ -14,8 +14,8 @@ struct AblationConfig {
   std::string variantName() const;
   std::map<std::string, std::string> status() const;
 };
-
 int resolveSeedTimeoutSec();
+int resolveRepeatCount();
 AblationConfig resolveAblationConfig();
 
 } // namespace dnslab

@@ -62,6 +62,21 @@ int resolveSeedTimeoutSec() {
   throw std::runtime_error("SEED_TIMEOUT_SEC 必须是正整数");
 }
 
+int resolveRepeatCount() {
+  const char *Value = std::getenv("FOLLOW_DIFF_REPEAT_COUNT");
+  if (Value == nullptr || *Value == '\0') {
+    return 1;
+  }
+  try {
+    const int Parsed = std::stoi(Value);
+    if (Parsed > 0) {
+      return Parsed;
+    }
+  } catch (const std::exception &) {
+  }
+  throw std::runtime_error("FOLLOW_DIFF_REPEAT_COUNT 必须是正整数");
+}
+
 AblationConfig resolveAblationConfig() {
   AblationConfig Output;
   Output.Mutator = resolveToggle("ENABLE_DST1_MUTATOR", false);

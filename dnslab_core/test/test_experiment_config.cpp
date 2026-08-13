@@ -8,6 +8,7 @@ namespace {
 
 void clearEnvironment() {
   ::unsetenv("SEED_TIMEOUT_SEC");
+  ::unsetenv("FOLLOW_DIFF_REPEAT_COUNT");
   ::unsetenv("ENABLE_DST1_MUTATOR");
   ::unsetenv("ENABLE_CACHE_DELTA");
   ::unsetenv("ENABLE_TRIAGE");
@@ -64,6 +65,19 @@ int main() {
     InvalidTimeoutRejected = true;
   }
   require(InvalidTimeoutRejected, "invalid timeout was accepted");
+
+  require(dnslab::resolveRepeatCount() == 1, "default repeat count mismatch");
+  ::setenv("FOLLOW_DIFF_REPEAT_COUNT", "5", 1);
+  require(dnslab::resolveRepeatCount() == 5,
+          "configured repeat count mismatch");
+  ::setenv("FOLLOW_DIFF_REPEAT_COUNT", "0", 1);
+  bool InvalidRepeatRejected = false;
+  try {
+    (void)dnslab::resolveRepeatCount();
+  } catch (const std::runtime_error &) {
+    InvalidRepeatRejected = true;
+  }
+  require(InvalidRepeatRejected, "invalid repeat count was accepted");
 
   clearEnvironment();
   return 0;

@@ -1508,6 +1508,12 @@ def _run_dnslabctl_sync_replay(queue_file: Path, sample_dir: Path) -> None:
         secondary_resolver=secondary_resolver,
         payload=payload,
     )
+    artifact_dir = payload.get("artifact_dir")
+    if isinstance(artifact_dir, str) and artifact_dir:
+        fingerprint_src = Path(artifact_dir) / "state_fingerprint.json"
+        fingerprint_dst = sample_dir / "state_fingerprint.json"
+        if fingerprint_src.is_file() and fingerprint_src.resolve() != fingerprint_dst.resolve():
+            shutil.copy2(fingerprint_src, fingerprint_dst)
 
 
 def _process_one_sample(
@@ -1960,6 +1966,10 @@ def follow_diff_window(
     state_path = _follow_diff_state_path(config)
     state = _load_follow_diff_state(state_path)
     bounded_run_id = _new_bounded_run_id()
+    repeat_count = _parse_positive_int_env(
+        "FOLLOW_DIFF_REPEAT_COUNT",
+        FOLLOW_DIFF_REPEAT_COUNT,
+    )
     aggregation_key, baseline_compare_key = _build_follow_diff_comparability_keys(
         config,
         budget_sec=(
@@ -1967,6 +1977,7 @@ def follow_diff_window(
             if comparability_budget_sec is not None
             else budget_sec
         ),
+        repeat_count=repeat_count,
     )
     state.run_id = bounded_run_id
     state.retry_count = 0

@@ -162,6 +162,69 @@ maybe_dump_cache(void) {
 
 	fclose(fp);
 }
+static void
+flush_views_cache(void) {
+	dns_view_t *view = NULL;
+	bool flushed_shared_cache = false;
+
+	if (named_g_server == NULL) {
+		return;
+	}
+
+	for (view = ISC_LIST_HEAD(named_g_server->viewlist); view != NULL;
+	     view = ISC_LIST_NEXT(view, link))
+	{
+		if (view->cachedb == NULL) {
+			continue;
+		}
+		if (dns_view_iscacheshared(view)) {
+			if (flushed_shared_cache) {
+				continue;
+			}
+			flushed_shared_cache = true;
+		}
+		/*
+		 * 每个 testcase 从冷 cache 开始，避免 persistent 迭代间
+		 * cache 状态累积破坏 AFL 路径稳定性。
+		 */
+		(void)dns_view_flushcache(view, false);
+	}
+}
+static pthread_mutex_t g_flush_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_flush_cond = PTHREAD_COND_INITIALIZER;
+static bool g_flush_pending = false;
+
+static void
+flush_views_cache_async(void *arg) {
+	UNUSED(arg);
+	flush_views_cache();
+	pthread_mutex_lock(&g_flush_mutex);
+	g_flush_pending = false;
+	pthread_cond_signal(&g_flush_cond);
+	pthread_mutex_unlock(&g_flush_mutex);
+}
+
+/*
+ * named 的 cache 操作依赖 mainloop 已运行；persistent dry run 可能在
+ * isc_loopmgr_run 之前到达，直接把 flush 排到 mainloop 上与 query 注入
+ * 同线程执行，并同步等待完成。
+ */
+static void
+flush_views_cache_sync(void) {
+	pthread_mutex_lock(&g_flush_mutex);
+	g_flush_pending = true;
+	pthread_mutex_unlock(&g_flush_mutex);
+
+	isc_async_run(named_g_mainloop, flush_views_cache_async, NULL);
+
+
+	pthread_mutex_lock(&g_flush_mutex);
+	while (g_flush_pending) {
+		pthread_cond_wait(&g_flush_cond, &g_flush_mutex);
+	}
+	pthread_mutex_unlock(&g_flush_mutex);
+}
+
 
 static void
 install_dispatch_hook_if_ready(dns_dispatchmgr_t *mgr) {
@@ -1210,7 +1273,8 @@ request_injector_thread(void *arg) {
 				}
 				continue;
 			}
-
+			/* 每次 testcase 从冷 cache 开始，保证路径稳定性。 */
+			flush_views_cache_sync();
 			result = execute_input_case(orchestrator, afl_request,
 						    (size_t)length, timeout_ms);
 			if (persistent_debug_enabled()) {

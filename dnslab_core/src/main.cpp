@@ -486,8 +486,9 @@ ResolverExecutionMaps buildResolverExecutionMaps(
 dnslab::json::Value::Object buildSyncReplayOraclePayload(
     const std::map<std::string, dnslab::json::Value::Object> &OracleByResolver,
     const std::string &SecondaryResolverName);
-dnslab::StateFingerprint
-buildSyncReplayFingerprint(const dnslab::SampleIdentity &SampleIdentity);
+dnslab::StateFingerprint buildSyncReplayFingerprint(
+    const dnslab::SampleIdentity &SampleIdentity,
+    const ResolverExecutionMaps &ExecutionMaps);
 void copySyncReplaySampleArtifact(const std::filesystem::path &SamplePath,
                                   const std::filesystem::path &ArtifactRoot);
 double readSyncReplayBudgetSec();
@@ -865,7 +866,8 @@ SyncReplayResult executeSyncReplay(
         ExecutionMaps.OracleByResolver, SecondaryResolverName);
   }
 
-  const auto Fingerprint = buildSyncReplayFingerprint(SampleIdentity);
+  const auto Fingerprint =
+      buildSyncReplayFingerprint(SampleIdentity, ExecutionMaps);
   copySyncReplaySampleArtifact(SamplePath, ArtifactRoot);
 
   const auto Triage = dnslab::buildTriageRecord(
@@ -1167,12 +1169,54 @@ ResolverRunResult runSyncReplayResolver(
   return Result;
 }
 
-dnslab::StateFingerprint
-buildSyncReplayFingerprint(const dnslab::SampleIdentity &SampleIdentity) {
+dnslab::StateFingerprint buildSyncReplayFingerprint(
+    const dnslab::SampleIdentity &SampleIdentity,
+    const ResolverExecutionMaps &ExecutionMaps) {
   dnslab::StateFingerprint Fingerprint;
   Fingerprint.SchemaVersion = dnslab::kSchemaVersion;
   Fingerprint.GeneratedAt = dnslab::utcTimestampNow();
   Fingerprint.SampleId = SampleIdentity.SampleId;
+
+  // 从 replay 后的 cache 记录提取可观测缓存状态信号。
+  const auto FillSignals =
+      [](const std::vector<dnslab::CacheRecord> &Rows, bool &MsgSeen,
+         bool &RrsetSeen, bool &NegativeSeen) {
+        for (const auto &Row : Rows) {
+          if (Row.Section == "MSG") {
+            MsgSeen = true;
+          }
+          if (Row.CacheType == "rrset") {
+            RrsetSeen = true;
+          }
+          if (Row.CacheType == "negative" || Row.Section == "SERVFAIL" ||
+              Row.CacheType == "servfail" || Row.CacheType == "badcache") {
+            NegativeSeen = true;
+          }
+        }
+      };
+
+  bool Bind9Msg = false;
+  bool Bind9Rrset = false;
+  bool Bind9Neg = false;
+  if (const auto It = ExecutionMaps.AfterByResolver.find("bind9");
+      It != ExecutionMaps.AfterByResolver.end()) {
+    FillSignals(It->second, Bind9Msg, Bind9Rrset, Bind9Neg);
+    Fingerprint.Bind9MsgCacheSeen = Bind9Msg;
+    Fingerprint.Bind9RrsetCacheSeen = Bind9Rrset;
+    Fingerprint.Bind9NegativeCacheSeen = Bind9Neg;
+  }
+  bool UnboundMsg = false;
+  bool UnboundRrset = false;
+  bool UnboundNeg = false;
+  if (const auto It = ExecutionMaps.AfterByResolver.find("unbound");
+      It != ExecutionMaps.AfterByResolver.end()) {
+    FillSignals(It->second, UnboundMsg, UnboundRrset, UnboundNeg);
+    Fingerprint.UnboundMsgCacheSeen = UnboundMsg;
+    Fingerprint.UnboundRrsetCacheSeen = UnboundRrset;
+    Fingerprint.UnboundNegativeCacheSeen = UnboundNeg;
+  }
+  // forwarding_path / retry_seen：当前 resolver stderr 无稳定信号源，
+  // 保持未设置（null），由上层 triage 的 partial_fingerprint 标签显式区分。
   return Fingerprint;
 }
 
@@ -1193,6 +1237,24 @@ void writeSyncReplayArtifacts(
     const std::map<std::string, ResolverExecution> &ExecutedResolvers,
     const dnslab::json::Value::Object &OraclePayload, const dnslab::TriageRecord &Triage,
     const dnslab::SampleMeta &Meta, const dnslab::StateFingerprint &Fingerprint) {
+  std::error_code CopyError;
+  for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
+    // case study / audit 契约期望 <resolver>.before/after.cache.txt 位于
+    // 样本顶层；同时保留 resolver 子目录原始布局以兼容既有消费方。
+    if (std::filesystem::is_regular_file(Execution.Run.BeforeCache)) {
+      std::filesystem::copy_file(
+          Execution.Run.BeforeCache,
+          ArtifactRoot / (ResolverName + ".before.cache.txt"),
+          std::filesystem::copy_options::overwrite_existing, CopyError);
+    }
+    if (std::filesystem::is_regular_file(Execution.Run.AfterCache)) {
+      std::filesystem::copy_file(
+          Execution.Run.AfterCache,
+          ArtifactRoot / (ResolverName + ".after.cache.txt"),
+          std::filesystem::copy_options::overwrite_existing, CopyError);
+    }
+  }
+
   if (!Meta.Failure.has_value()) {
     dnslab::json::Value::Object OracleDocument = OraclePayload;
     appendSyncReplayContractFields(
