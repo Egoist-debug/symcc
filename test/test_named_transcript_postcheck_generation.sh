@@ -33,13 +33,13 @@ if [ "$#" -gt 0 ]; then
 	if [ "$#" -eq 2 ] && [ "$1" = "--case" ]; then
 		CASE="$2"
 	else
-		printf '用法: %s [--case happy|short-query]\n' "$0" >&2
+		printf '用法: %s [--case happy|empty-postcheck]\n' "$0" >&2
 		exit 1
 	fi
 fi
 
 case "$CASE" in
-	happy|short-query)
+	happy|empty-postcheck)
 		;;
 	*)
 		printf '不支持的 case: %s\n' "$CASE" >&2
@@ -56,20 +56,21 @@ source_path = pathlib.Path(sys.argv[1])
 harness_path = pathlib.Path(sys.argv[2])
 source = source_path.read_text(encoding="utf-8")
 
+# 现行 DST1 契约：10-byte header + 显式 post-check，reserved byte 不是版本字段。
 required_snippets = [
-    "NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION 2",
-    "build_second_query_from_client_query",
-    "if (transcript.client_query_len < 2)",
-    "result = execute_legacy_request(orchestrator, second_query,",
-    "input[5] != NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION",
+    "header_len = 10 + transcript->response_count * 2",
+    "transcript->post_check_query_len = read_u16le(input + 8)",
+    "transcript->post_check_query = input + cursor",
 ]
 for snippet in required_snippets:
     if snippet not in source:
-        raise SystemExit(f"ASSERT FAIL: orchestrator 缺少关键片段: {snippet}")
+        raise SystemExit(f"ASSERT FAIL: orchestrator 缺少显式 post-check 解析片段: {snippet}")
 
-for forbidden in ("post_check_query_len", "post_check_query"):
+# v2 迁移曾把 reserved byte 当版本字段并要求 ==2，且删除 wire post-check，
+# 与 producer 的 10-byte 显式 post-check 格式脱节，必须回归拒绝。
+for forbidden in ("NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION",):
     if forbidden in source:
-        raise SystemExit(f"ASSERT FAIL: orchestrator 仍残留旧字段: {forbidden}")
+        raise SystemExit(f"ASSERT FAIL: orchestrator 仍残留 v2 版本字段校验: {forbidden}")
 
 def extract_define(name: str) -> str:
     pattern = re.compile(rf"^#define\s+{re.escape(name)}\s+.+$", re.MULTILINE)
@@ -110,7 +111,6 @@ def extract_function(signature: str) -> str:
 
 defines = "\n".join([
     extract_define("NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAGIC"),
-    extract_define("NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION"),
     extract_define("NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES"),
 ])
 
@@ -121,7 +121,6 @@ transcript_struct = extract_block(
 
 functions = "\n\n".join([
     extract_function("static uint16_t\nread_u16le"),
-    extract_function("static bool\nbuild_second_query_from_client_query"),
     extract_function("static bool\nlooks_like_transcript"),
     extract_function("static bool\nparse_transcript_input"),
 ])
@@ -145,10 +144,6 @@ static void require_true(bool value, const char *message) {{
     }}
 }}
 
-static uint16_t read_u16be(const uint8_t *buffer) {{
-    return (uint16_t)(((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1]);
-}}
-
 static void print_hex_bytes(const uint8_t *bytes, size_t len) {{
     for (size_t index = 0; index < len; ++index) {{
         printf("%02x", bytes[index]);
@@ -158,80 +153,83 @@ static void print_hex_bytes(const uint8_t *bytes, size_t len) {{
 static void test_happy(void) {{
     static const uint8_t transcript_bytes[] = {{
         'D', 'S', 'T', '1',
-        2,
-        NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION,
+        1,
+        0,
         0x06, 0x00,
         0x03, 0x00,
         0x02, 0x00,
         0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd,
-        0x01, 0x02, 0x03,
-        0x04, 0x05,
+        0x56, 0x78,
+        0x9a, 0xbc, 0x01,
     }};
-    static const uint8_t expected_second_query[] = {{0x13, 0x35, 0xaa, 0xbb, 0xcc, 0xdd}};
+    static const uint8_t expected_client_query[] = {{0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd}};
+    static const uint8_t expected_response[] = {{0x56, 0x78}};
+    static const uint8_t expected_post_check[] = {{0x9a, 0xbc, 0x01}};
     named_resolver_afl_symcc_transcript_t transcript;
-    uint8_t second_query[sizeof(expected_second_query)];
 
     require_true(parse_transcript_input(transcript_bytes, sizeof(transcript_bytes), &transcript),
                  "happy transcript 应被成功解析");
-    require_true(transcript.response_count == 2, "response_count 应为 2");
-    require_true(transcript.client_query_len == sizeof(expected_second_query), "client_query 长度错误");
-    require_true(transcript.response_lens[0] == 3, "第一个 response 长度错误");
-    require_true(transcript.response_lens[1] == 2, "第二个 response 长度错误");
-    require_true(memcmp(transcript.client_query, expected_second_query, 2) != 0,
-                 "second query 必须修改 TxID");
-    require_true(build_second_query_from_client_query(transcript.client_query, transcript.client_query_len, second_query),
-                 "happy transcript 必须能生成 second query");
-    require_true(memcmp(second_query, expected_second_query, sizeof(expected_second_query)) == 0,
-                 "second query 字节结果不符合 +0x0101 语义");
-    require_true(memcmp(second_query + 2, transcript.client_query + 2, transcript.client_query_len - 2) == 0,
-                 "TxID 以外的 query 字节必须保持不变");
-    printf("EVIDENCE_T2 case=happy txid_delta=0x0101 original_txid=0x%04x derived_txid=0x%04x client_query_hex=",
-           (unsigned)read_u16be(transcript.client_query),
-           (unsigned)read_u16be(second_query));
-    print_hex_bytes(transcript.client_query, transcript.client_query_len);
-    printf(" second_query_hex=");
-    print_hex_bytes(second_query, sizeof(expected_second_query));
-    printf(" response_count=%u response_lens=%u,%u\\n",
+    require_true(transcript.response_count == 1, "response_count 应为 1");
+    require_true(transcript.client_query_len == sizeof(expected_client_query),
+                 "client_query 长度错误");
+    require_true(memcmp(transcript.client_query, expected_client_query, sizeof(expected_client_query)) == 0,
+                 "client_query 字节错误");
+    require_true(transcript.response_lens[0] == sizeof(expected_response),
+                 "第一个 response 长度错误");
+    require_true(memcmp(transcript.responses[0], expected_response, sizeof(expected_response)) == 0,
+                 "第一个 response 字节错误");
+    require_true(transcript.post_check_query_len == sizeof(expected_post_check),
+                 "post_check_query 长度错误");
+    require_true(transcript.post_check_query != NULL, "post_check_query 不应为 NULL");
+    require_true(memcmp(transcript.post_check_query, expected_post_check, sizeof(expected_post_check)) == 0,
+                 "post_check_query 字节错误");
+    printf("EVIDENCE_T2 case=happy response_count=%u client_query_len=%zu post_check_len=%zu client_query_hex=",
            (unsigned)transcript.response_count,
-           (unsigned)transcript.response_lens[0],
-           (unsigned)transcript.response_lens[1]);
-    puts("PASS: happy path 自动生成 second query 通过");
+           transcript.client_query_len,
+           transcript.post_check_query_len);
+    print_hex_bytes(transcript.client_query, transcript.client_query_len);
+    printf(" post_check_hex=");
+    print_hex_bytes(transcript.post_check_query, transcript.post_check_query_len);
+    putchar('\\n');
+    puts("PASS: happy path 显式 post-check 解析通过");
 }}
 
-static void test_short_query(void) {{
+static void test_empty_postcheck(void) {{
     static const uint8_t transcript_bytes[] = {{
         'D', 'S', 'T', '1',
+        1,
         0,
-        NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION,
+        0x02, 0x00,
+        0x00, 0x00,
         0x01, 0x00,
-        0x7a,
+        0xaa, 0xbb,
+        0xcc,
     }};
     named_resolver_afl_symcc_transcript_t transcript;
-    uint8_t second_query[1] = {{0}};
 
     require_true(parse_transcript_input(transcript_bytes, sizeof(transcript_bytes), &transcript),
-                 "short-query transcript 结构上应可解析");
-    require_true(transcript.client_query_len == 1, "short-query 长度应为 1");
-    require_true(!build_second_query_from_client_query(transcript.client_query, transcript.client_query_len, second_query),
-                 "short-query 必须被 second query helper 拒绝");
-    printf("EVIDENCE_T2 case=short-query client_query_len=%u helper_result=rejected client_query_hex=",
-           (unsigned)transcript.client_query_len);
-    print_hex_bytes(transcript.client_query, transcript.client_query_len);
-    putchar('\\n');
-    puts("PASS: short-query 被安全拒绝");
+                 "empty-postcheck transcript 结构上应可解析");
+    require_true(transcript.response_count == 1, "response_count 应为 1");
+    require_true(transcript.client_query_len == 2, "client_query 长度应为 2");
+    require_true(transcript.post_check_query_len == 0, "post_check_query 长度应为 0");
+    require_true(transcript.post_check_query == NULL, "空 post-check 时 post_check_query 应为 NULL");
+    require_true(transcript.response_lens[0] == 1, "第一个 response 长度错误");
+    printf("EVIDENCE_T2 case=empty-postcheck client_query_len=%zu post_check_len=%zu\\n",
+           transcript.client_query_len, transcript.post_check_query_len);
+    puts("PASS: empty-postcheck 被安全解析为无 post-check");
 }}
 
 int main(int argc, char **argv) {{
     if (argc != 2) {{
-        fprintf(stderr, "用法: %s <happy|short-query>\\n", argv[0]);
+        fprintf(stderr, "用法: %s <happy|empty-postcheck>\\n", argv[0]);
         return 1;
     }}
     if (strcmp(argv[1], "happy") == 0) {{
         test_happy();
         return 0;
     }}
-    if (strcmp(argv[1], "short-query") == 0) {{
-        test_short_query();
+    if (strcmp(argv[1], "empty-postcheck") == 0) {{
+        test_empty_postcheck();
         return 0;
     }}
     fprintf(stderr, "未知 case: %s\\n", argv[1]);
@@ -246,10 +244,8 @@ cc -std=c11 -Wall -Wextra -Werror "$WORKDIR/harness.c" -o "$WORKDIR/harness"
 
 "$WORKDIR/harness" "$CASE"
 
-assert_file_contains "$SOURCE_FILE" "NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION 2"
-assert_file_contains "$SOURCE_FILE" "build_second_query_from_client_query"
-assert_file_contains "$SOURCE_FILE" "result = execute_legacy_request(orchestrator, second_query,"
-assert_file_not_contains "$SOURCE_FILE" "post_check_query_len"
-assert_file_not_contains "$SOURCE_FILE" "post_check_query"
+assert_file_contains "$SOURCE_FILE" "header_len = 10 + transcript->response_count * 2"
+assert_file_contains "$SOURCE_FILE" "transcript->post_check_query_len = read_u16le(input + 8)"
+assert_file_not_contains "$SOURCE_FILE" "NAMED_RESOLVER_AFL_SYMCC_TRANSCRIPT_VERSION"
 
-printf 'PASS: named transcript postcheck generation regression test passed (%s)\n' "$CASE"
+printf 'PASS: named transcript explicit post-check format regression test passed (%s)\n' "$CASE"
