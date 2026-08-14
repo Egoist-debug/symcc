@@ -101,7 +101,7 @@ run_resolver() {
 				ENABLE_CACHE_DELTA="$(variant_env_value "$variant" ENABLE_CACHE_DELTA)" \
 				ENABLE_TRIAGE=1 \
 				ENABLE_SYMCC="$(variant_env_value "$variant" ENABLE_SYMCC)" \
-				BIND9_AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/v9.20.22-build/bind9-afl" \
+				BIND9_AFL_TREE="$ROOT_DIR/experiments/subjects/bind9/v9.20.22-afl" \
 					BIND9_SRC_TREE="$ROOT_DIR/experiments/subjects/bind9/v9.20.22" \
 					BIND9_NAMED_CONF_TEMPLATE="$ROOT_DIR/named_experiment/runtime/named.conf" \
 					RESPONSE_CORPUS_DIR="$ROOT_DIR/named_experiment/work/response_corpus" \

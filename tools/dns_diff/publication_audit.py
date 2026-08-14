@@ -2,10 +2,10 @@ import csv
 import hashlib
 import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
-
 from .aggregate import METRIC_NAMES, _extract_metrics
 from .artifact_digest import sha256_file
 from .io import atomic_write_json
@@ -38,6 +38,14 @@ REQUIRED_MANUAL_TRUTH_FIELDS: Tuple[str, ...] = (
     "adjudicator",
     "judgment",
     "decided_at",
+)
+PLACEHOLDER_REVIEWER_PATTERN = re.compile(
+    r"^(review|adjudicator|reviewer|judge|annotator)\d*$"
+)
+PLACEHOLDER_REVIEWER_FIELDS: Tuple[str, ...] = (
+    "reviewer_primary",
+    "reviewer_secondary",
+    "adjudicator",
 )
 REQUIRED_EVIDENCE_ARTIFACTS: Tuple[str, ...] = (
     "campaign_summary",
@@ -1089,6 +1097,23 @@ def _audit_case_study_payload(
             path=artifact_path,
             detail="manual_truth 的双评人员与裁决人必须互不相同",
         )
+    elif any(
+        PLACEHOLDER_REVIEWER_PATTERN.fullmatch(
+            str(manual_truth.get(field, "")).strip()
+        )
+        for field in PLACEHOLDER_REVIEWER_FIELDS
+    ):
+        _issue(
+            issues,
+            code="placeholder_case_study_reviewer",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=artifact_path,
+            detail=(
+                "manual_truth 评审人标识疑似占位（如 review1/review2/adjudicator1）；"
+                "投稿证据必须使用真实评审人标识"
+            ),
+        )
 
     evidence_path_values = list(resolved_paths.values())
     if len(set(evidence_path_values)) != len(evidence_path_values):
@@ -1113,6 +1138,7 @@ def _audit_evidence_bundle(
     scope: str,
     issues: List[Dict[str, str]],
     run_summary: Optional[Mapping[str, Any]],
+    audited_payload_ids: Optional[Set[str]] = None,
 ) -> Set[str]:
     bundle_path = report_dir / "evidence_bundle.json"
     if not bundle_path.is_file():
@@ -1462,13 +1488,21 @@ def _audit_evidence_bundle(
                 detail=f"case study 重复 sample_id: {sample_id}",
             )
             continue
-        if _audit_case_study_payload(
-            artifact_path=artifact_path,
-            row=row,
-            matrix_root=matrix_root,
-            scope=scope,
-            issues=issues,
-        ):
+        already_audited = (
+            audited_payload_ids is not None and sample_id in audited_payload_ids
+        )
+        if not already_audited:
+            if _audit_case_study_payload(
+                artifact_path=artifact_path,
+                row=row,
+                matrix_root=matrix_root,
+                scope=scope,
+                issues=issues,
+            ):
+                case_study_ids.add(sample_id)
+            if audited_payload_ids is not None:
+                audited_payload_ids.add(sample_id)
+        else:
             case_study_ids.add(sample_id)
     return case_study_ids
 
@@ -1793,6 +1827,7 @@ def _audit_matrix_root(
         )
     total_runs = 0
     case_study_ids: Set[str] = set()
+    audited_payload_ids: Set[str] = set()
     producer_run_ids: Set[str] = set()
     producer_random_seeds: Set[str] = set()
     queue_snapshot_ids: Set[str] = set()
@@ -2155,6 +2190,7 @@ def _audit_matrix_root(
                     scope=run_scope,
                     issues=issues,
                     run_summary=run_summary,
+                    audited_payload_ids=audited_payload_ids,
                 )
             )
 

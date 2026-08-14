@@ -1787,6 +1787,10 @@ start_all() {
 	master_seed_args=(-s "$PRODUCER_RANDOM_SEED")
 	ld_path="$(afl_ld_library_path)"
 	input_dir="$(active_input_corpus_dir)"
+	local -a named_cpu_args=()
+	if [ -n "${NAMED_CPU_COUNT:-}" ]; then
+		named_cpu_args=(-n "$NAMED_CPU_COUNT")
+	fi
 	helper_target_csv="${AFL_TREE}/bin/named/.libs/named,-g,-c,${NAMED_CONF},-A,resolver-afl-symcc:${MUTATOR_ADDR}"
 	afl_env=(
 		LD_LIBRARY_PATH="$ld_path"
@@ -1857,6 +1861,7 @@ start_all() {
 			-t "$AFL_TIMEOUT_MS" \
 			-- \
 			"$AFL_TREE/bin/named/.libs/named" \
+			"${named_cpu_args[@]}" \
 			-g \
 			-c "$NAMED_CONF" \
 			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
@@ -1876,6 +1881,7 @@ start_all() {
 			-t "$AFL_TIMEOUT_MS" \
 			-- \
 			"$AFL_TREE/bin/named/.libs/named" \
+			"${named_cpu_args[@]}" \
 			-g \
 			-c "$NAMED_CONF" \
 			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
@@ -1899,6 +1905,7 @@ start_all() {
 				-t "$AFL_TIMEOUT_MS" \
 				-- \
 				"$AFL_TREE/bin/named/.libs/named" \
+				"${named_cpu_args[@]}" \
 				-g \
 				-c "$NAMED_CONF" \
 				-A "resolver-afl-symcc:${MUTATOR_ADDR}"
@@ -1917,6 +1924,7 @@ start_all() {
 				-t "$AFL_TIMEOUT_MS" \
 				-- \
 				"$AFL_TREE/bin/named/.libs/named" \
+				"${named_cpu_args[@]}" \
 				-g \
 				-c "$NAMED_CONF" \
 				-A "resolver-afl-symcc:${MUTATOR_ADDR}"

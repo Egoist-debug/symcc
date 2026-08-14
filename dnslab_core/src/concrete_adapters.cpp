@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -12,6 +13,9 @@
 namespace dnslab {
 
 namespace {
+
+// 防止 harness 从 stdin 读取阻塞（PTY 环境 stdin 永不 EOF）。
+const std::filesystem::path kDevNullStdin = "/dev/null";
 
 std::filesystem::path normalizePath(const std::filesystem::path &InputPath) {
   std::error_code Error;
@@ -461,6 +465,23 @@ std::filesystem::path resolveEnvPathOrDefault(
   return DefaultPath;
 }
 
+std::filesystem::path knotLibraryDir(const std::filesystem::path &WorkspaceRoot) {
+  return resolveEnvPathOrDefault(
+      "DNSLAB_KNOT_LIBRARY_DIR",
+      WorkspaceRoot / "experiments" / "subjects" / "knot-resolver" /
+          "knot-local" / "lib");
+}
+
+std::string knotLibraryEnv(const std::filesystem::path &WorkspaceRoot) {
+  std::string Value = knotLibraryDir(WorkspaceRoot).string();
+  if (const char *Existing = std::getenv("LD_LIBRARY_PATH");
+      Existing != nullptr && *Existing != '\0') {
+    Value += ':';
+    Value += Existing;
+  }
+  return Value;
+}
+
 void appendRelativeCandidates(
     std::vector<std::filesystem::path> &Candidates,
     const std::filesystem::path &Root,
@@ -475,16 +496,15 @@ void appendRelativeCandidates(
 
 OracleArtifact makeOracleArtifact(const OracleSnapshot &Snapshot);
 
-CommandResult runResolverHarness(const std::string &ResolverName,
-                                 const std::vector<std::string> &HarnessArgs,
-                                 const std::filesystem::path &RunRoot) {
+CommandResult runResolverHarness(
+    const std::string &ResolverName, const std::vector<std::string> &HarnessArgs,
+    const std::filesystem::path &RunRoot,
+    const std::map<std::string, std::string> &Environment = {}) {
   std::filesystem::create_directories(RunRoot);
-  CommandResult Result =
-      runProcess({HarnessArgs, std::nullopt, {}, std::nullopt});
+  CommandResult Result = runProcess({HarnessArgs, std::nullopt, Environment, kDevNullStdin});
   std::ofstream(RunRoot / (ResolverName + ".stderr")) << Result.StdoutText;
   return Result;
 }
-
 CommandResult runScriptedResolverMode(
     const std::string &ResolverName, const std::filesystem::path &BinaryPath,
     const std::string &MissingBinaryMessage,
@@ -494,7 +514,8 @@ CommandResult runScriptedResolverMode(
     const std::string &NativeOutputArgName,
     const std::filesystem::path &NativeOutputPath,
     const std::filesystem::path &RunRoot,
-    const std::optional<std::filesystem::path> &TranscriptPath = std::nullopt) {
+    const std::optional<std::filesystem::path> &TranscriptPath = std::nullopt,
+    const std::map<std::string, std::string> &Environment = {}) {
   const auto Binary = requireExecutable(BinaryPath, MissingBinaryMessage);
   const auto Harness = requireExisting(HarnessPath, MissingHarnessMessage);
   std::vector<std::string> HarnessArgs = {"python3", Harness.string(),
@@ -508,7 +529,7 @@ CommandResult runScriptedResolverMode(
   HarnessArgs.push_back(CacheDumpPath.string());
   HarnessArgs.push_back(NativeOutputArgName);
   HarnessArgs.push_back(NativeOutputPath.string());
-  return runResolverHarness(ResolverName, HarnessArgs, RunRoot);
+  return runResolverHarness(ResolverName, HarnessArgs, RunRoot, Environment);
 }
 
 std::filesystem::path prepareMirroredBuildTree(
@@ -909,7 +930,7 @@ Bind9ResolverAdapter::runSample(const RunSampleRequest &Request) const {
            (Request.RunRoot / "bind9.after.cache.txt").string()},
           {"NAMED_RESOLVER_AFL_SYMCC_LOG", "1"},
       },
-      std::nullopt,
+      kDevNullStdin,
   });
   std::ofstream(Request.RunRoot / "bind9.stderr") << Result.StderrText;
   return Result;
@@ -947,7 +968,7 @@ Bind9ResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
           {"NAMED_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH", OutputFile.string()},
           {"NAMED_RESOLVER_AFL_SYMCC_LOG", "1"},
       },
-      std::nullopt,
+      kDevNullStdin,
   });
   std::ofstream(RunRoot / "bind9.stderr") << Result.StderrText;
   return Result;
@@ -1108,7 +1129,7 @@ UnboundResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
           {"UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH", OutputFile.string()},
           {"UNBOUND_RESOLVER_AFL_SYMCC_LOG", "1"},
       },
-      std::nullopt,
+      kDevNullStdin,
   });
   std::ofstream(RunRoot / "unbound.stderr") << Result.StderrText;
   return Result;
@@ -1479,7 +1500,8 @@ KnotResolverAdapter::runSample(const RunSampleRequest &Request) const {
       "缺少 knot-resolver 可执行文件", Config_.HarnessScriptPath,
       "缺少 knot-resolver replay harness", "--kresd-bin", "run",
       CacheDumpPath, "--kresd-log-path", NativeLogPath, Request.RunRoot,
-      Request.TranscriptPath);
+      Request.TranscriptPath,
+      {{"LD_LIBRARY_PATH", knotLibraryEnv(Config_.WorkspaceRoot)}});
 }
 
 CommandResult
@@ -1490,7 +1512,8 @@ KnotResolverAdapter::dumpCache(const std::filesystem::path &RunRoot,
       "knot-resolver", knotResolverBinaryPath(Config_, RunRoot),
       "缺少 knot-resolver 可执行文件", Config_.HarnessScriptPath,
       "缺少 knot-resolver replay harness", "--kresd-bin", "dump", OutputFile,
-      "--kresd-log-path", NativeLogPath, RunRoot);
+      "--kresd-log-path", NativeLogPath, RunRoot, std::nullopt,
+      {{"LD_LIBRARY_PATH", knotLibraryEnv(Config_.WorkspaceRoot)}});
 }
 
 CommandResult
@@ -1533,8 +1556,7 @@ makeDefaultResolverRegistry(const std::filesystem::path &WorkspaceRoot) {
   UnboundConfig.WorkspaceRoot = WorkspaceRoot;
   UnboundConfig.ResponseCorpusDir = resolveEnvPathOrDefault(
       "RESPONSE_CORPUS_DIR",
-      WorkspaceRoot / "unbound_experiment" / "work_stateful" /
-          "response_corpus");
+      WorkspaceRoot / "named_experiment" / "work" / "response_corpus");
   UnboundConfig.SeedTimeoutSec = resolveSeedTimeoutSec();
   UnboundConfig.SourceFallbackPath = std::nullopt;
   UnboundConfig.BinaryPathOverride = std::nullopt;

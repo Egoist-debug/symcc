@@ -463,6 +463,15 @@ std::filesystem::path resolvePathEnv(const char *Name,
   return normalizePath(std::filesystem::path(Value));
 }
 
+std::optional<std::filesystem::path>
+resolvePathEnvOptional(const char *Name) {
+  const char *Value = std::getenv(Name);
+  if (Value == nullptr || *Value == '\0') {
+    return std::nullopt;
+  }
+  return normalizePath(std::filesystem::path(Value));
+}
+
 std::string resolveTextEnv(const char *Name, const std::string &Fallback) {
   const char *Value = std::getenv(Name);
   if (Value == nullptr || *Value == '\0') {
@@ -539,7 +548,19 @@ std::string resolveSecondaryResolver() {
 }
 
 std::filesystem::path resolveBind9BuildRoot(const std::filesystem::path &RootDir) {
-  return resolvePathEnv("BIND9_AFL_TREE", RootDir / "bind-9.18.46-afl");
+  if (const auto EnvValue = resolvePathEnvOptional("BIND9_AFL_TREE")) {
+    return *EnvValue;
+  }
+  const std::vector<std::filesystem::path> Candidates = {
+      RootDir / "experiments" / "subjects" / "bind9" / "v9.20.22-afl",
+      RootDir / "bind-9.18.46-afl",
+  };
+  for (const auto &Candidate : Candidates) {
+    if (std::filesystem::is_directory(Candidate)) {
+      return Candidate;
+    }
+  }
+  return Candidates.front();
 }
 
 std::filesystem::path
@@ -551,7 +572,10 @@ std::filesystem::path
 resolveSecondaryBuildRoot(const std::filesystem::path &RootDir,
                           const std::string &Resolver) {
   if (Resolver == "unbound") {
-    return resolvePathEnv("AFL_TREE", RootDir / "unbound-1.24.2-afl");
+    return resolvePathEnv(
+        "AFL_TREE",
+        RootDir / "experiments" / "subjects" / "unbound" / "release-1.24.2-build" /
+            "unbound-afl");
   }
   if (Resolver == "dnsmasq") {
     return resolvePathEnv("DNSMASQ_BUILD_TREE",

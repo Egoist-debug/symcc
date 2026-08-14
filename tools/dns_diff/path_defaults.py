@@ -463,3 +463,14 @@ def resolve_knot_resolver_binary(build_root: Path) -> Path:
     return (
         Path(build_root).expanduser().resolve() / "knot-build" / "daemon" / "kresd"
     ).resolve()
+
+def resolve_knot_library_dir(
+    root_dir: Path, *, environ: Optional[Mapping[str, str]] = None
+) -> Path:
+    """knot-resolver 依赖的 libknot 库目录（subjects 内 knot-local/lib，可 env 覆盖）。"""
+    env_path = _expand_env_path("KNOT_LIBRARY_DIR", environ=environ)
+    if env_path is not None:
+        return env_path
+    return (
+        root_dir / "experiments" / "subjects" / "knot-resolver" / "knot-local" / "lib"
+    ).resolve()

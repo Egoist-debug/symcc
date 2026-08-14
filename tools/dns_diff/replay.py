@@ -12,6 +12,7 @@ from .path_defaults import (
     resolve_bind9_afl_tree,
     resolve_dnsmasq_binary,
     resolve_dnsmasq_build_tree,
+    resolve_knot_library_dir,
     resolve_knot_resolver_binary,
     resolve_knot_resolver_build_tree,
     resolve_maradns_binary,
@@ -424,6 +425,7 @@ def _run_secondary_harness_stage(
     cache_dump_path: Path,
     native_log_path: Path,
     stderr_path: Path,
+    knot_library_dir: Optional[Path] = None,
 ) -> None:
     command = ["python3", str(harness)]
     if resolver == "dnsmasq":
@@ -488,6 +490,12 @@ def _run_secondary_harness_stage(
         )
     if transcript is not None:
         command.extend(["--transcript", str(transcript)])
+    harness_env = dict(os.environ)
+    if knot_library_dir is not None and resolver == "knot-resolver":
+        existing = harness_env.get("LD_LIBRARY_PATH", "")
+        harness_env["LD_LIBRARY_PATH"] = (
+            f"{knot_library_dir}{os.pathsep}{existing}" if existing else str(knot_library_dir)
+        )
     try:
         completed = subprocess.run(
             command,
@@ -495,7 +503,7 @@ def _run_secondary_harness_stage(
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            env=dict(os.environ),
+            env=harness_env,
         )
     except FileNotFoundError as exc:
         raise ReplayError(
@@ -646,11 +654,13 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
             message=f"缺少 {secondary_resolver} replay harness: {paths.secondary_harness}",
             exit_code=EXIT_DEPENDENCY,
         )
-
     bind9_ld = _collect_dot_libs(paths.bind9_afl_tree)
     unbound_ld: Optional[str] = None
     if paths.unbound_afl_tree is not None:
         unbound_ld = _collect_dot_libs(paths.unbound_afl_tree)
+    knot_library_dir: Optional[Path] = None
+    if secondary_resolver == "knot-resolver":
+        knot_library_dir = resolve_knot_library_dir(paths.root_dir)
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(paths.sample_src, paths.sample_bin)
@@ -696,6 +706,7 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
                 prefix=secondary_prefix,
             ),
             stderr_path=paths.secondary_stderr,
+            knot_library_dir=knot_library_dir,
         )
     _ensure_nonempty_file(
         paths.secondary_before_cache,
@@ -758,6 +769,7 @@ def replay_diff_cache(sample: str, output_dir: Optional[str] = None) -> int:
                 prefix=secondary_prefix,
             ),
             stderr_path=paths.secondary_stderr,
+            knot_library_dir=knot_library_dir,
         )
     _ensure_nonempty_file(
         paths.secondary_after_cache,

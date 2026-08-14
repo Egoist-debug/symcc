@@ -2,17 +2,45 @@
 
 ## 更新时间
 
-- `2026-08-13`（本轮）
+- `2026-08-14`（本轮）
+- `2026-08-13`
 - `2026-08-10`
 
-## 2026-08-13 本轮更新
+## 2026-08-14 本轮更新
+
+已知不足逐项修复（Trellis 任务 `08-14-symcc-paper-gap-closure`，执行中）：
+
+- **RQ1 语料扩充与口径修正**：`stable_transcript_corpus` 4 → 68 个（64 个新 transcript 经 3×回放一致筛选）。
+  对照口径修正：query_only / legacy_response_tail 改用从 transcript `client_query` 提取的 DNS wire 格式 query
+  （旧口径用 gen_input DSL 中间格式，非法 wire 导致对照全 0 假象）。
+  重跑结果（`experiments/results/rq1_input_model_multi_sample/<08-14 ts>`）：dst1 68/68 全链路
+  （parse/fetch/response_accepted），post-check 命中 19/68（27.9%）；wire query 对照全 1.0——
+  DST1 的独有优势是 post-check 阶段，不是可接入性。
+- **5 resolver audit-ready 矩阵**：unbound（20260813 批次重跑）+ dnsmasq / smartdns / maradns / knot-resolver
+  （`experiments/results/audit_ready_matrix/20260814_153000/`）全部 20/20 runs success，
+  审计收敛到每矩阵仅剩 case study 人工裁决（4 个 unadjudicated/矩阵）。
+- **producer 稳定性归因**：5 探针矩阵（端口/ID 随机化、reply 超时、worker 数、持久循环残留），
+  全部可归因开关合计 <2pp，残余 ~80pp 为 BIND9 进程内固有非确定性（详见任务 runs 记录）。
+  新增确定性 fetch 模式开关（`NAMED_RESOLVER_AFL_SYMCC_DETERMINISTIC`，patch 树 `lib/dns/dispatch.c`）。
+- **RQ4 差异样本补跑**：3 个 oracle_diff 样本 + 3 个 no_diff 对照，指纹 2 clusters（oracle_diff 独立成簇）。
+- **R5 长预算消融**：95 样本长时 producer 队列 × 5 resolver × 4 变体（执行中）。
+- **case study 裁决流程**：占位裁决（review1/review2/adjudicator1）全部重置为 not_started；
+  `publication-audit` 新增占位评审人标识拒绝 + 同一样本跨 run 裁决去重；
+  20 个矩阵级 case study + 6 个 RQ4 样本的 AI 预评审草案待真人签署（见任务 adjudication_drafts/）。
+- **路径与稳定性修复**：C++ bind9/unbound 默认 build root 改用 subjects 布局；unbound response 语料默认
+  `named_experiment/work/response_corpus`；knot-resolver 依赖的 libknot 3.5.6 构建到
+  `experiments/subjects/knot-resolver/knot-local/`（kresd SONAME 重指向本地）；harness 启动 stdin=/dev/null
+  修复 PTY 环境挂起；测试脚本默认路径仓库化。
+
+## 2026-08-13 上一轮更新
 
 数据补齐与缺陷修复（Trellis 任务 `08-13-symcc-full-experiment-paper-data`）：
 
 - **RQ1 多样本对照重跑**：`experiments/results/rq1_input_model_multi_sample/20260813_114524/out/summary.tsv`。
   `dst1_transcript` 4/4 全链路命中（parse/fetch/response_accepted/second_query_hit 均为 1.0），
   对照组（query_only/random_packet/legacy_response_tail）全部 0——对比历史 RQ1 表（仅 parse_ok=1.0、fetch=0），
-  本轮输入模型链路已真实推进到缓存路径。
+  本轮输入模型链路已真实推进到缓存路径。注意：对照组全 0 是修复前链路 + 非 wire 格式对照的双重假象，
+  08-14 已修正口径重跑（见上）。
 - **RQ2 同步 replay repeat=5**：`experiments/results/rq2_sync_replay_repeat/20260813_114601`（5×4 样本，20/20 replay 成功、comparability=comparable）。
   带指纹版重跑：`20260813_122829`。
 - **RQ3 gate 对照**：见 [RQ3GateContrast20260813.md](./RQ3GateContrast20260813.md)。
@@ -24,11 +52,8 @@
   - C++ `resolveRepeatCount()`；C++ seed provenance sidecar 父链候选；C++ 指纹从 cache 记录提取真实信号；C++ 缓存文件提升到样本顶层。
   - orchestrator 每 testcase 前 mainloop 异步 flush 视图 cache（producer stability 10.69% → 18-34%，dry run crash 消除）。
 - **audit-ready 矩阵**：`experiments/results/audit_ready_matrix/20260813_124516/unbound`（4 变体 × repeat=5）。
-  审计问题从 2925（基线批次）收敛到 81，人工双评裁决补齐后
-  `publication-audit` 返回 `status=ready`（issue_count=0）。
-  注意：case study 的 `manual_truth` 当前为占位裁决
-  （review1/review2/adjudicator1，judgment=confirmed_relevant），
-  投稿前必须替换为真实评审记录；其余证据（统计、哈希、可重算性）均为真实产物。
+  审计问题从 2925（基线批次）收敛到 81。注意：该批次的占位裁决（review1/review2/adjudicator1）已在
+  08-14 全部重置，等待真实人工裁决；08-13 的 `status=ready` 不应被引用为终稿证据。
 
 ## 论文就绪状态
 

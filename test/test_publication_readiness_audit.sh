@@ -15,6 +15,7 @@ INCONSISTENT_KEY_OUT="$WORKDIR/inconsistent-key"
 EMPTY_CASE_OUT="$WORKDIR/empty-case"
 FIXED_QUEUE_OUT="$WORKDIR/fixed-queue"
 MISSING_PRODUCER_OUT="$WORKDIR/missing-producer"
+PLACEHOLDER_REVIEWER_OUT="$WORKDIR/placeholder-reviewer"
 HIGHER_THRESHOLD_OUT="$WORKDIR/higher-threshold"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -702,6 +703,30 @@ if matrix.get("case_study_count") != 1:
         f"ASSERT FAIL: 空壳案例不应计数，实际 {matrix.get('case_study_count')!r}"
     )
 PY
+cp "$WORKDIR/case-study-a.original.json" "$CASE_STUDY_A_PATH"
+
+# 占位评审人标识（review1/review2/adjudicator1）应被门禁拒绝
+python3 - "$CASE_STUDY_A_PATH" <<'PY'
+import json
+import pathlib
+import sys
+
+case_path = pathlib.Path(sys.argv[1])
+payload = json.loads(case_path.read_text(encoding="utf-8"))
+payload["manual_truth"]["reviewer_primary"] = "review1"
+payload["manual_truth"]["reviewer_secondary"] = "review2"
+payload["manual_truth"]["adjudicator"] = "adjudicator1"
+case_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+PY
+if python3 -m tools.dns_diff.cli publication-audit \
+	--matrix-root "$MATRIX_ROOT" \
+	--output-dir "$PLACEHOLDER_REVIEWER_OUT" >/dev/null 2>"$WORKDIR/placeholder.stderr"; then
+	printf 'ASSERT FAIL: 占位评审人标识应使 publication-audit 返回非零\n' >&2
+	exit 1
+fi
+assert_audit_issue \
+	"$PLACEHOLDER_REVIEWER_OUT/publication_readiness.json" \
+	"placeholder_case_study_reviewer"
 cp "$WORKDIR/case-study-a.original.json" "$CASE_STUDY_A_PATH"
 
 mv "$PRODUCER_MANIFEST_PATH" "$WORKDIR/producer-manifest.original.json"

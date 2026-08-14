@@ -192,6 +192,30 @@ ISC_REFCOUNT_DECL(dns_dispentry);
 #endif
 
 /*
+ * Resolver AFL/SymCC harness: 确定性 fetch 模式（仅稳定性归因探针使用）。
+ * 默认关闭；NAMED_RESOLVER_AFL_SYMCC_DETERMINISTIC=1 时端口与 message ID
+ * 由 fetch 序列号派生，用于把 BIND9 协议随机性与 harness 逻辑噪声分离。
+ */
+static bool
+resolver_afl_symcc_deterministic(void) {
+	static int cached = -1;
+	if (cached < 0) {
+		cached = (getenv("NAMED_RESOLVER_AFL_SYMCC_DETERMINISTIC") != NULL &&
+			  strcmp(getenv("NAMED_RESOLVER_AFL_SYMCC_DETERMINISTIC"),
+				 "0") != 0)
+				 ? 1
+				 : 0;
+	}
+	return cached == 1;
+}
+
+static uint32_t
+resolver_afl_symcc_fetch_seq(void) {
+	static uint32_t seq = 0;
+	return __sync_fetch_and_add(&seq, 1U);
+}
+
+/*
  * Statics.
  */
 static void
@@ -410,7 +434,11 @@ setup_socket(dns_dispatch_t *disp, dns_dispentry_t *resp,
 	resp->peer = *dest;
 
 	if (port == 0) {
-		port = ports[isc_random_uniform(nports)];
+		if (resolver_afl_symcc_deterministic()) {
+			port = ports[resolver_afl_symcc_fetch_seq() % nports];
+		} else {
+			port = ports[isc_random_uniform(nports)];
+		}
 		isc_sockaddr_setport(&resp->local, port);
 		*portp = port;
 	}
@@ -1552,6 +1580,9 @@ dns_dispatch_add(dns_dispatch_t *disp, isc_loop_t *loop,
 	 */
 	if ((options & DNS_DISPATCHOPT_FIXEDID) != 0) {
 		id = *idp;
+	} else if (resolver_afl_symcc_deterministic()) {
+		id = (dns_messageid_t)(0x1000U +
+				       (resolver_afl_symcc_fetch_seq() & 0x0fffU));
 	} else {
 		id = (dns_messageid_t)isc_random16();
 	}

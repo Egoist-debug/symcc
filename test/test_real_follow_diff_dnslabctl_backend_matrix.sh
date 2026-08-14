@@ -2,15 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 默认路径保持 CI 宿主机布局（/home/ubuntu/symcc）；本地/其他环境用 env 覆盖。
-RUN_ROOT_BASE="${REAL_FOLLOW_DIFF_RUN_ROOT_BASE:-/home/ubuntu/tmp}"
-UNBOUND_AFL_TREE="${UNBOUND_AFL_TREE_OVERRIDE:-/home/ubuntu/symcc/unbound-1.24.2-afl}"
-UNBOUND_SRC_TREE="${UNBOUND_SRC_TREE_OVERRIDE:-/home/ubuntu/symcc/unbound-1.24.2}"
-BIND9_AFL_TREE="${BIND9_AFL_TREE_OVERRIDE:-/home/ubuntu/symcc/bind-9.18.46-afl}"
-BIND9_SRC_TREE="${BIND9_SRC_TREE_OVERRIDE:-/home/ubuntu/symcc/bind-9.18.46-afl}"
-RESPONSE_CORPUS_DIR="${RESPONSE_CORPUS_DIR_OVERRIDE:-$ROOT_DIR/unbound_experiment/work_stateful/response_corpus}"
+# 默认路径使用本仓库 subjects 布局（可 env 覆盖）；RUN_ROOT_BASE 默认系统临时目录。
+RUN_ROOT_BASE="${REAL_FOLLOW_DIFF_RUN_ROOT_BASE:-${TMPDIR:-/tmp}}"
+UNBOUND_AFL_TREE="${UNBOUND_AFL_TREE_OVERRIDE:-$ROOT_DIR/experiments/subjects/unbound/release-1.24.2-build}"
+UNBOUND_SRC_TREE="${UNBOUND_SRC_TREE_OVERRIDE:-$ROOT_DIR/experiments/subjects/unbound/release-1.24.2}"
+BIND9_AFL_TREE="${BIND9_AFL_TREE_OVERRIDE:-$ROOT_DIR/experiments/subjects/bind9/v9.20.22-afl}"
+BIND9_SRC_TREE="${BIND9_SRC_TREE_OVERRIDE:-$ROOT_DIR/experiments/subjects/bind9/v9.20.22}"
+RESPONSE_CORPUS_DIR="${RESPONSE_CORPUS_DIR_OVERRIDE:-$ROOT_DIR/named_experiment/work/response_corpus}"
 WORKDIR="$(mktemp -d "$RUN_ROOT_BASE/follow-diff-dnslabctl-real.XXXXXX")"
 export PYTHONDONTWRITEBYTECODE=1
+export SEED_TIMEOUT_SEC="${SEED_TIMEOUT_SEC:-15}"
 
 cleanup() {
 	if [ "${KEEP_WORKDIR:-0}" = "1" ]; then
