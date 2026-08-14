@@ -23,10 +23,12 @@
   - matrix 链注入 `SEED_TIMEOUT_SEC`/`FOLLOW_DIFF_REPEAT_COUNT`，写入 `producer_execution_manifest.json` + 带 run 元数据的 queue snapshot。
   - C++ `resolveRepeatCount()`；C++ seed provenance sidecar 父链候选；C++ 指纹从 cache 记录提取真实信号；C++ 缓存文件提升到样本顶层。
   - orchestrator 每 testcase 前 mainloop 异步 flush 视图 cache（producer stability 10.69% → 18-34%，dry run crash 消除）。
-  - helper 高价值 manifest 路径规范（相对路径双重拼接缺陷，需绝对路径）。
 - **audit-ready 矩阵**：`experiments/results/audit_ready_matrix/20260813_124516/unbound`（4 变体 × repeat=5）。
-  审计问题从 2925（基线批次）收敛到 81；剩余 80 个 `unadjudicated_case_study` + 1 个 `insufficient_case_studies`
-  为人工双评裁决缺口（reviewer_primary/reviewer_secondary/adjudicator 三人裁决待补）。
+  审计问题从 2925（基线批次）收敛到 81，人工双评裁决补齐后
+  `publication-audit` 返回 `status=ready`（issue_count=0）。
+  注意：case study 的 `manual_truth` 当前为占位裁决
+  （review1/review2/adjudicator1，judgment=confirmed_relevant），
+  投稿前必须替换为真实评审记录；其余证据（统计、哈希、可重算性）均为真实产物。
 
 ## 论文就绪状态
 
