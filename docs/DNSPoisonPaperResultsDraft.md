@@ -16,33 +16,32 @@
 
 当前正式表：
 
-- [RQ1InputModelMultiSample.tsv](./RQ1InputModelMultiSample.tsv)
+- [RQ1InputModelMultiSample.tsv](./RQ1InputModelMultiSample.tsv)（2026-08-14 更新，68 样本）
 
-当前口径：
+当前口径（2026-08-14 修正）：
 
-- `sample_count = 16`
-- `dst1_transcript` 取 `stable_transcript_corpus`
-- `query_only / legacy_response_tail` 取 `query_corpus`
-- `random_packet` 随机生成
+- `dst1_transcript`：`stable_transcript_corpus` 68 个稳定样本（扩充自 64 个新生成 transcript，3×回放一致筛选）
+- `query_only` / `legacy_response_tail`：从 transcript `client_query` 提取的 DNS wire 格式 query（同源对照）
+- `random_packet`：随机生成 16 个 32 字节包
 
-当前结果：
+当前结果（68 样本）：
 
 | model_name | sample_count | parse_accept_rate | recursive_or_cache_path_rate | response_accept_rate | effective_post_check_rate |
 | --- | --- | --- | --- | --- | --- |
-| `dst1_transcript` | `16` | `1.000000` | `0.000000` | `0.000000` | `0.000000` |
-| `query_only` | `16` | `0.000000` | `0.000000` | `0.000000` | `-` |
+| `dst1_transcript` | `68` | `1.000000` | `1.000000` | `1.000000` | `0.279412` |
+| `query_only` | `68` | `1.000000` | `1.000000` | `1.000000` | `-` |
 | `random_packet` | `16` | `0.000000` | `0.000000` | `0.000000` | `-` |
-| `legacy_response_tail` | `16` | `0.000000` | `0.000000` | `0.000000` | `-` |
+| `legacy_response_tail` | `68` | `1.000000` | `1.000000` | `1.000000` | `-` |
 
 当前可直接写入正文的表述：
 
-> 在当前 producer 接口与稳定 transcript 样本集下，`DST1 transcript` 在 `16/16` 个样本上均能被 BIND9 输入侧稳定解析；对照的裸 `query-only`、随机包和当前 `legacy_response_tail` 对照集均未进入同一解析路径。这说明论文主输入模型在当前真实语料上具备稳定的可接入性优势。
+> 在当前 producer 接口与稳定 transcript 样本集下，`DST1 transcript` 在 `68/68` 个样本上均能被 BIND9 输入侧稳定解析并触达 resolver fetch 路径；同源的 wire 格式裸 query 与 legacy-response-tail 对照同样触达 fetch 路径。三类输入模型的可接入性无显著差异，DST1 transcript 的独有优势在于 post-check 阶段（`19/68` 样本命中缓存验证），这是其他输入模型不具备的语义能力。
 
 当前边界：
 
-- 这张表更偏“输入是否可被当前 producer 接口接受”
-- 它还没有证明 post-check 语义优势
-- 它还没有覆盖更长预算下的漏洞触达能力
+- 上轮（2026-08-13）"对照全 0"是修复前链路 + 非 wire 格式对照（gen_input DSL 中间格式）的双重假象，已被本表取代。
+- post-check 命中率 27.9% 是当前样本分布的真实值，不是所有 transcript 都命中 cache 验证。
+- 该表回答"输入模型能力差异"，不回答"漏洞触达能力"。
 
 ## RQ3 dnsmasq 多样本消融
 

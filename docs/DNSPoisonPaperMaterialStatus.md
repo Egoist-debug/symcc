@@ -22,8 +22,9 @@
 - **producer 稳定性归因**：5 探针矩阵（端口/ID 随机化、reply 超时、worker 数、持久循环残留），
   全部可归因开关合计 <2pp，残余 ~80pp 为 BIND9 进程内固有非确定性（详见任务 runs 记录）。
   新增确定性 fetch 模式开关（`NAMED_RESOLVER_AFL_SYMCC_DETERMINISTIC`，patch 树 `lib/dns/dispatch.c`）。
-- **RQ4 差异样本补跑**：3 个 oracle_diff 样本 + 3 个 no_diff 对照，指纹 2 clusters（oracle_diff 独立成簇）。
-- **R5 长预算消融**：95 样本长时 producer 队列 × 5 resolver × 4 变体（执行中）。
+- **R5 长预算消融**：95 样本长时 producer 队列 × 5 resolver × 4 变体（`real_rq3_multi_resolver_ablation/20260814_090339`，20/20 pass）。
+  变体间语义差异 = 0（四变体在每 resolver 内完全一致）；resolver 间差异显著（unbound 95/95 > smartdns 76 > knot 64 > maradns 52/56 ≈ dnsmasq 51/95）。
+  结论：样本量 8→95 后"变体无差异"保守结论未变；resolver 差异信号真实。
 - **case study 裁决流程**：占位裁决（review1/review2/adjudicator1）全部重置为 not_started；
   `publication-audit` 新增占位评审人标识拒绝 + 同一样本跨 run 裁决去重；
   20 个矩阵级 case study + 6 个 RQ4 样本的 AI 预评审草案待真人签署（见任务 adjudication_drafts/）。
