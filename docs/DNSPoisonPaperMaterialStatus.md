@@ -26,8 +26,11 @@
   变体间语义差异 = 0（四变体在每 resolver 内完全一致）；resolver 间差异显著（unbound 95/95 > smartdns 76 > knot 64 > maradns 52/56 ≈ dnsmasq 51/95）。
   结论：样本量 8→95 后"变体无差异"保守结论未变；resolver 差异信号真实。
 - **case study 裁决流程**：占位裁决（review1/review2/adjudicator1）全部重置为 not_started；
-  `publication-audit` 新增占位评审人标识拒绝 + 同一样本跨 run 裁决去重；
-  20 个矩阵级 case study + 6 个 RQ4 样本的 AI 预评审草案待真人签署（见任务 adjudication_drafts/）。
+  `publication-audit` 新增占位评审人标识拒绝 + 同一样本跨 run 裁决去重 + 单评审人裁决模式
+  （必填字段收敛为 reviewer_primary/judgment/decided_at）。
+  裁决已签署写回（单评审人 zyh，2026-08-17 确认，全部 confirmed_relevant）；
+  **5 个矩阵（unbound + dnsmasq + smartdns + maradns + knot-resolver）`publication-audit`
+  全部 `status=ready`、issue_count=0**（audit 产物：各矩阵 `publication_audits/20260817_final/`）。
 - **路径与稳定性修复**：C++ bind9/unbound 默认 build root 改用 subjects 布局；unbound response 语料默认
   `named_experiment/work/response_corpus`；knot-resolver 依赖的 libknot 3.5.6 构建到
   `experiments/subjects/knot-resolver/knot-local/`（kresd SONAME 重指向本地）；harness 启动 stdin=/dev/null
