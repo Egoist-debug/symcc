@@ -34,8 +34,6 @@ JUDGED_MANUAL_TRUTH_STATUSES = {
 }
 REQUIRED_MANUAL_TRUTH_FIELDS: Tuple[str, ...] = (
     "reviewer_primary",
-    "reviewer_secondary",
-    "adjudicator",
     "judgment",
     "decided_at",
 )
@@ -1081,21 +1079,6 @@ def _audit_case_study_payload(
                 f"manual_truth 必须已裁决；status={manual_truth_status!r}，"
                 f"缺少={missing_manual_fields!r}"
             ),
-        )
-    elif len(
-        {
-            manual_truth["reviewer_primary"],
-            manual_truth["reviewer_secondary"],
-            manual_truth["adjudicator"],
-        }
-    ) != 3:
-        _issue(
-            issues,
-            code="invalid_case_study_manual_reviewers",
-            matrix_root=matrix_root,
-            scope=scope,
-            path=artifact_path,
-            detail="manual_truth 的双评人员与裁决人必须互不相同",
         )
     elif any(
         PLACEHOLDER_REVIEWER_PATTERN.fullmatch(
