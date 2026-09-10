@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAMP="$(date -u +%Y%m%d_%H%M%S)"
 # 默认路径保持 CI 宿主机布局；本地/其他环境用 env 覆盖。
-OUT_BASE="${REAL_RQ1_OUT_BASE:-/home/ubuntu/tmp/rq1_input_model_snapshot}"
-BIND9_TREE="${REAL_RQ1_BIND9_TREE:-/home/ubuntu/symcc/bind-9.18.46-afl}"
+OUT_BASE="${REAL_RQ1_OUT_BASE:-${TMPDIR:-/tmp}/rq1_input_model_snapshot}"
+BIND9_TREE="${REAL_RQ1_BIND9_TREE:-$ROOT_DIR/experiments/subjects/bind9/v9.20.22-afl}"
 OUT_DIR="$OUT_BASE/$STAMP"
 RESP_DIR="$OUT_DIR/legacy_responses"
 mkdir -p "$RESP_DIR"

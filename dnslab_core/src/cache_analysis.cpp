@@ -940,22 +940,59 @@ resolverPairOracleDiffFields(
   return oracleDiffFields(Combined, LeftResolver, RightResolver);
 }
 
+static std::string normalizeDomainForComparison(std::string Name) {
+  std::transform(Name.begin(), Name.end(), Name.begin(), ::tolower);
+  while (!Name.empty() && Name.back() == '.') {
+    Name.pop_back();
+  }
+  if (!Name.empty()) {
+    Name.push_back('.');
+  }
+  return Name;
+}
+
+static json::Value toSemanticJson(const CacheDeltaItem &Item) {
+  json::Value::Object Output;
+  Output["kind"] = Item.Kind;
+  Output["delta"] = Item.Delta;
+  json::Value::Object Fields;
+  Fields["qname"] = normalizeDomainForComparison(Item.Fields.QName);
+  Fields["qtype"] = Item.Fields.QType;
+  Fields["rrtype"] = Item.Fields.RRType;
+  Fields["cache_type"] = Item.Fields.CacheType;
+  std::string RData = Item.Fields.RDataNorm;
+  std::transform(RData.begin(), RData.end(), RData.begin(), ::tolower);
+  Fields["rdata_norm"] = RData;
+  Fields["flags"] = Item.Fields.Flags;
+  Output["fields"] = Fields;
+  return Output;
+}
+
 std::vector<std::string> cacheDiffMismatchFields(const ResolverCacheDiff &Left,
                                                  const ResolverCacheDiff &Right) {
   std::vector<std::string> Output;
-  if (Left.EntriesBefore != Right.EntriesBefore) {
-    Output.push_back("entries_before");
-  }
-  if (Left.EntriesAfter != Right.EntriesAfter) {
-    Output.push_back("entries_after");
-  }
   if (Left.HasCacheDiff != Right.HasCacheDiff) {
     Output.push_back("has_cache_diff");
   }
   if (Left.InterestingDeltaCount != Right.InterestingDeltaCount) {
     Output.push_back("interesting_delta_count");
   }
-  if (stableJsonText(toJson(Left)) != stableJsonText(toJson(Right))) {
+
+  std::vector<std::string> LeftSemanticItems;
+  LeftSemanticItems.reserve(Left.DeltaItems.size());
+  for (const auto &Item : Left.DeltaItems) {
+    LeftSemanticItems.push_back(stableJsonText(toSemanticJson(Item)));
+  }
+  std::sort(LeftSemanticItems.begin(), LeftSemanticItems.end());
+
+  std::vector<std::string> RightSemanticItems;
+  RightSemanticItems.reserve(Right.DeltaItems.size());
+  for (const auto &Item : Right.DeltaItems) {
+    RightSemanticItems.push_back(stableJsonText(toSemanticJson(Item)));
+  }
+  std::sort(RightSemanticItems.begin(), RightSemanticItems.end());
+
+  if (LeftSemanticItems != RightSemanticItems) {
     Output.push_back("delta_items");
   }
   if (!Output.empty()) {
@@ -966,10 +1003,7 @@ std::vector<std::string> cacheDiffMismatchFields(const ResolverCacheDiff &Left,
 }
 
 bool cacheHasDiff(const CacheDiffResult &Input) {
-  if (!Input.ResolverDifferences.empty()) {
-    return true;
-  }
-  return Input.Bind9.HasCacheDiff || Input.Unbound.HasCacheDiff;
+  return !Input.ResolverDifferences.empty();
 }
 
 int interestingDeltaCount(const CacheDiffResult &Input) {

@@ -221,13 +221,19 @@ def main():
         cli.sendto(client_query, ("127.0.0.1", listen_port))
         response = cli.recv(4096)
         resolver_fetch_started = len(matching_queries) > 0
-        response_accepted = acceptable_response(response)
+        fake_reply_dispatched = resolver_fetch_started and len(responses) > 0
+        response_accepted = bool(
+            resolver_fetch_started
+            and fake_reply_dispatched
+            and acceptable_response(response)
+        )
         upstream_after_first = len(matching_queries)
         if post_check_query:
             cli.sendto(post_check_query, ("127.0.0.1", listen_port))
             post_response = cli.recv(4096)
-            second_query_hit = (
-                acceptable_response(post_response)
+            second_query_hit = bool(
+                response_accepted
+                and acceptable_response(post_response)
                 and len(matching_queries) == upstream_after_first
             )
         cache_entry_created = second_query_hit or (response_accepted and not post_check_query)

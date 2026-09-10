@@ -32,6 +32,8 @@ typedef struct {
 	uint16_t arcount;
 } unbound_afl_symcc_dns_header_t;
 
+#define UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES 16
+
 typedef struct unbound_afl_symcc_mutator_server {
 	pthread_t thread_id;
 	bool thread_started;
@@ -42,6 +44,9 @@ typedef struct unbound_afl_symcc_mutator_server {
 	uint64_t received;
 	uint64_t replied;
 	uint64_t parse_errors;
+	const uint8_t *memory_responses[UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES];
+	size_t memory_response_lens[UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES];
+	size_t memory_response_count;
 } unbound_afl_symcc_mutator_server_t;
 
 static pthread_mutex_t g_server_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -349,12 +354,34 @@ load_response_sections(unbound_afl_symcc_mutator_server_t *server,
 	*tail_flags_hi = 0;
 	*tail_flags_lo = 0;
 
-	if (!pick_response_tail_path(server, path, sizeof(path))) {
-		return 0;
-	}
+	bool has_memory_resp = false;
+	const uint8_t *resp_data = NULL;
+	size_t resp_len = 0;
 
-	if (!load_file_bytes(path, packet, sizeof(packet), &packet_len)) {
-		return -1;
+	pthread_mutex_lock(&g_server_lock);
+	if (server != NULL && server->memory_response_count > 0) {
+		uint64_t wanted_index = server->tail_pick_count % server->memory_response_count;
+		server->tail_pick_count++;
+		resp_len = server->memory_response_lens[wanted_index];
+		resp_data = server->memory_responses[wanted_index];
+		has_memory_resp = true;
+	}
+	pthread_mutex_unlock(&g_server_lock);
+
+	if (has_memory_resp) {
+		if (resp_len > sizeof(packet)) {
+			return -1;
+		}
+		memcpy(packet, resp_data, resp_len);
+		packet_len = resp_len;
+	} else {
+		if (!pick_response_tail_path(server, path, sizeof(path))) {
+			return 0;
+		}
+
+		if (!load_file_bytes(path, packet, sizeof(packet), &packet_len)) {
+			return -1;
+		}
 	}
 
 	if (parse_dns_header(packet, packet_len, tail_hdr) != 0) {
@@ -473,20 +500,14 @@ build_dns_response(unbound_afl_symcc_mutator_server_t *server,
 
 		memcpy(response + question_end, sections, sections_len);
 		response[2] = (uint8_t)((query[2] & 0x79) | 0x80 |
-			(tail_flags_hi & 0x04));
-		response[3] = (uint8_t)(tail_flags_lo | 0x80);
+			(tail_flags_hi & 0x06));
+		response[3] = tail_flags_lo;
 		response[6] = (uint8_t)((tail_hdr.ancount >> 8) & 0xff);
 		response[7] = (uint8_t)(tail_hdr.ancount & 0xff);
 		response[8] = (uint8_t)((tail_hdr.nscount >> 8) & 0xff);
 		response[9] = (uint8_t)(tail_hdr.nscount & 0xff);
 		response[10] = (uint8_t)((tail_hdr.arcount >> 8) & 0xff);
 		response[11] = (uint8_t)(tail_hdr.arcount & 0xff);
-		if (tail_hdr.ancount == 0 && tail_hdr.nscount == 0 &&
-			tail_hdr.arcount == 0 && (response[3] & 0x0f) == 0)
-		{
-			/* 空 NOERROR 回复容易触发重试，转为 NXDOMAIN */
-			response[3] = (uint8_t)((response[3] & 0xf0) | 0x03);
-		}
 		return (int)(question_end + sections_len);
 	}
 
@@ -649,3 +670,49 @@ unbound_afl_symcc_mutator_server_stop(void)
 	}
 	free(server);
 }
+
+void
+unbound_afl_symcc_mutator_server_set_responses(
+	const uint8_t *const *responses, const size_t *response_lens,
+	size_t response_count)
+{
+	size_t i;
+
+	pthread_mutex_lock(&g_server_lock);
+	if (g_server != NULL) {
+		if (responses == NULL || response_lens == NULL || response_count == 0) {
+			g_server->memory_response_count = 0;
+		} else {
+			if (response_count > UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES) {
+				response_count = UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES;
+			}
+			for (i = 0; i < response_count; i++) {
+				g_server->memory_responses[i] = responses[i];
+				g_server->memory_response_lens[i] = response_lens[i];
+			}
+			g_server->memory_response_count = response_count;
+		}
+	}
+	pthread_mutex_unlock(&g_server_lock);
+}
+
+void
+unbound_afl_symcc_mutator_server_clear_responses(void)
+{
+	pthread_mutex_lock(&g_server_lock);
+	if (g_server != NULL) {
+		g_server->memory_response_count = 0;
+	}
+	pthread_mutex_unlock(&g_server_lock);
+}
+
+void
+unbound_afl_symcc_mutator_server_reset_response_sequence(void)
+{
+	pthread_mutex_lock(&g_server_lock);
+	if (g_server != NULL) {
+		g_server->tail_pick_count = 0;
+	}
+	pthread_mutex_unlock(&g_server_lock);
+}
+

@@ -192,13 +192,85 @@ std::optional<RRInfo> parseRRAt(const std::vector<uint8_t> &Packet,
     return std::nullopt;
   }
 
+  // Validate compression pointers and domain names inside RDATA for domain-bearing types
+  if (Info.Type == 2 || Info.Type == 5 || Info.Type == 12) { // NS, CNAME, PTR
+    auto Target = parseDnsName(Packet, RDataOffset);
+    if (!Target.Name || Target.Name->WireEnd > RDataOffset + RdLength) {
+      if (InvalidCompressionPointer != nullptr) {
+        *InvalidCompressionPointer = Target.InvalidCompressionPointer;
+      }
+      return std::nullopt;
+    }
+  } else if (Info.Type == 15) { // MX
+    if (RdLength < 3) {
+      return std::nullopt;
+    }
+    auto Target = parseDnsName(Packet, RDataOffset + 2);
+    if (!Target.Name || Target.Name->WireEnd > RDataOffset + RdLength) {
+      if (InvalidCompressionPointer != nullptr) {
+        *InvalidCompressionPointer = Target.InvalidCompressionPointer;
+      }
+      return std::nullopt;
+    }
+  } else if (Info.Type == 6) { // SOA
+    auto MName = parseDnsName(Packet, RDataOffset);
+    if (!MName.Name || MName.Name->WireEnd > RDataOffset + RdLength) {
+      if (InvalidCompressionPointer != nullptr) {
+        *InvalidCompressionPointer = MName.InvalidCompressionPointer;
+      }
+      return std::nullopt;
+    }
+    auto RName = parseDnsName(Packet, MName.Name->WireEnd);
+    if (!RName.Name || RName.Name->WireEnd + 20 > RDataOffset + RdLength) {
+      if (InvalidCompressionPointer != nullptr) {
+        *InvalidCompressionPointer = RName.InvalidCompressionPointer;
+      }
+      return std::nullopt;
+    }
+  }
+
   Info.EndOffset = RDataOffset + RdLength;
   return Info;
 }
 
 bool isRRBlobWellFormed(const std::vector<uint8_t> &RRBlob) {
   auto Parsed = parseRRAt(RRBlob, 0);
-  return Parsed.has_value() && Parsed->EndOffset == RRBlob.size();
+  if (Parsed.has_value() && Parsed->EndOffset == RRBlob.size()) {
+    return true;
+  }
+
+  // Check if RRBlob is a valid RR slice whose compression pointers point into
+  // the enclosing DNS message context (e.g. pointer target >= 12).
+  size_t Pos = 0;
+  while (Pos < RRBlob.size()) {
+    const uint8_t Len = RRBlob[Pos];
+    if ((Len & 0xC0) == 0xC0) {
+      if (Pos + 1 >= RRBlob.size()) {
+        return false;
+      }
+      const uint16_t Ptr =
+          (static_cast<uint16_t>(Len & 0x3F) << 8) | RRBlob[Pos + 1];
+      if (Ptr < 12) {
+        return false;
+      }
+      Pos += 2;
+      break;
+    }
+    if (Len == 0) {
+      Pos += 1;
+      break;
+    }
+    if (Len > 63 || Pos + 1 + Len > RRBlob.size()) {
+      return false;
+    }
+    Pos += 1 + Len;
+  }
+  if (Pos + 10 > RRBlob.size()) {
+    return false;
+  }
+  const uint16_t RdLength =
+      (static_cast<uint16_t>(RRBlob[Pos + 8]) << 8) | RRBlob[Pos + 9];
+  return (Pos + 10 + RdLength == RRBlob.size());
 }
 
 bool haveMatchingQuestionIdentity(const ParsedQuestionInfo &Left,
@@ -318,6 +390,279 @@ ensureTranscriptMutation(DST1Mutator::MutationRequest &Request) {
   return *Request.Transcript;
 }
 
+struct DecodedRR {
+  std::string OwnerName;
+  uint16_t Type = 0;
+  uint16_t DnsClass = 0;
+  uint32_t TTL = 0;
+  std::vector<uint8_t> RawRData;
+  std::string TargetDomain1;
+  std::string TargetDomain2;
+  uint16_t MxPreference = 0;
+  std::vector<uint8_t> SoaParams;
+  bool HasDomain1 = false;
+  bool HasDomain2 = false;
+  size_t WireStart = 0;
+  size_t WireEnd = 0;
+};
+
+std::optional<DecodedRR> decodeRRFromPacket(const std::vector<uint8_t> &Packet,
+                                            size_t Offset) {
+  auto ParsedName = parseDnsName(Packet, Offset);
+  if (!ParsedName.Name || ParsedName.Name->WireEnd + 10 > Packet.size()) {
+    return std::nullopt;
+  }
+
+  DecodedRR RR;
+  RR.WireStart = Offset;
+  RR.OwnerName = ParsedName.Name->CanonicalName;
+  const size_t HeaderEnd = ParsedName.Name->WireEnd;
+  RR.Type = readBe16(Packet, HeaderEnd);
+  RR.DnsClass = readBe16(Packet, HeaderEnd + 2);
+  RR.TTL = readBe32(Packet, HeaderEnd + 4);
+  const uint16_t RdLength = readBe16(Packet, HeaderEnd + 8);
+  const size_t RDataOffset = HeaderEnd + 10;
+  if (RDataOffset + RdLength > Packet.size()) {
+    return std::nullopt;
+  }
+  RR.WireEnd = RDataOffset + RdLength;
+  RR.RawRData.assign(Packet.begin() + RDataOffset,
+                     Packet.begin() + RDataOffset + RdLength);
+
+  if (RR.Type == 2 || RR.Type == 5 || RR.Type == 12) { // NS, CNAME, PTR
+    auto Target = parseDnsName(Packet, RDataOffset);
+    if (Target.Name && Target.Name->WireEnd <= RDataOffset + RdLength) {
+      RR.TargetDomain1 = Target.Name->CanonicalName;
+      RR.HasDomain1 = true;
+    }
+  } else if (RR.Type == 15) { // MX
+    if (RdLength >= 3) {
+      RR.MxPreference = readBe16(Packet, RDataOffset);
+      auto Target = parseDnsName(Packet, RDataOffset + 2);
+      if (Target.Name && Target.Name->WireEnd <= RDataOffset + RdLength) {
+        RR.TargetDomain1 = Target.Name->CanonicalName;
+        RR.HasDomain1 = true;
+      }
+    }
+  } else if (RR.Type == 6) { // SOA
+    auto MName = parseDnsName(Packet, RDataOffset);
+    if (MName.Name) {
+      auto RName = parseDnsName(Packet, MName.Name->WireEnd);
+      if (RName.Name && RName.Name->WireEnd + 20 <= RDataOffset + RdLength) {
+        RR.TargetDomain1 = MName.Name->CanonicalName;
+        RR.TargetDomain2 = RName.Name->CanonicalName;
+        RR.HasDomain1 = true;
+        RR.HasDomain2 = true;
+        RR.SoaParams.assign(Packet.begin() + RName.Name->WireEnd,
+                            Packet.begin() + RName.Name->WireEnd + 20);
+      }
+    }
+  }
+
+  return RR;
+}
+
+struct QuestionSuffix {
+  std::string Name;
+  uint16_t Offset = 0;
+};
+
+std::vector<QuestionSuffix>
+getQuestionSuffixes(const std::vector<uint8_t> &QuestionBytes) {
+  std::vector<QuestionSuffix> Suffixes;
+  if (QuestionBytes.size() < 5) {
+    return Suffixes;
+  }
+  size_t Pos = 0;
+  while (Pos < QuestionBytes.size()) {
+    const uint8_t Len = QuestionBytes[Pos];
+    if (Len == 0) {
+      Suffixes.push_back({"", static_cast<uint16_t>(12 + Pos)});
+      break;
+    }
+    if ((Len & 0xC0) != 0 || Pos + 1 + Len > QuestionBytes.size()) {
+      break;
+    }
+    std::string SuffixName;
+    size_t Scan = Pos;
+    while (Scan < QuestionBytes.size()) {
+      const uint8_t L = QuestionBytes[Scan];
+      if (L == 0) {
+        break;
+      }
+      if ((L & 0xC0) != 0 || Scan + 1 + L > QuestionBytes.size()) {
+        break;
+      }
+      if (!SuffixName.empty()) {
+        SuffixName.push_back('.');
+      }
+      for (size_t I = 0; I < L; ++I) {
+        SuffixName.push_back(
+            static_cast<char>(std::tolower(QuestionBytes[Scan + 1 + I])));
+      }
+      Scan += 1 + L;
+    }
+    if (!SuffixName.empty()) {
+      Suffixes.push_back({SuffixName, static_cast<uint16_t>(12 + Pos)});
+    }
+    Pos += 1 + Len;
+  }
+  return Suffixes;
+}
+
+std::vector<uint8_t>
+encodeDomainWithSuffixes(const std::string &Domain,
+                        const std::vector<QuestionSuffix> &Suffixes) {
+  for (const auto &S : Suffixes) {
+    if (!S.Name.empty() && S.Name == Domain) {
+      return {static_cast<uint8_t>(0xC0 | (S.Offset >> 8)),
+              static_cast<uint8_t>(S.Offset & 0xFF)};
+    }
+  }
+  for (const auto &S : Suffixes) {
+    if (S.Name.empty()) {
+      continue;
+    }
+    if (Domain.size() > S.Name.size() &&
+        Domain[Domain.size() - S.Name.size() - 1] == '.' &&
+        Domain.compare(Domain.size() - S.Name.size(), S.Name.size(), S.Name) ==
+            0) {
+      std::string Prefix =
+          Domain.substr(0, Domain.size() - S.Name.size() - 1);
+      auto EncPrefix = DNSNameCodec::encode(Prefix);
+      if (!EncPrefix.empty()) {
+        EncPrefix.pop_back(); // Drop trailing root 0x00
+        EncPrefix.push_back(static_cast<uint8_t>(0xC0 | (S.Offset >> 8)));
+        EncPrefix.push_back(static_cast<uint8_t>(S.Offset & 0xFF));
+        return EncPrefix;
+      }
+    }
+  }
+  return DNSNameCodec::encode(Domain);
+}
+
+std::vector<uint8_t> encodeRRBlob(const DecodedRR &RR,
+                                  const std::vector<QuestionSuffix> &Suffixes) {
+  std::vector<uint8_t> Blob;
+  auto EncOwner = encodeDomainWithSuffixes(RR.OwnerName, Suffixes);
+  Blob.insert(Blob.end(), EncOwner.begin(), EncOwner.end());
+
+  Blob.push_back(static_cast<uint8_t>((RR.Type >> 8) & 0xFF));
+  Blob.push_back(static_cast<uint8_t>(RR.Type & 0xFF));
+  Blob.push_back(static_cast<uint8_t>((RR.DnsClass >> 8) & 0xFF));
+  Blob.push_back(static_cast<uint8_t>(RR.DnsClass & 0xFF));
+  Blob.push_back(static_cast<uint8_t>((RR.TTL >> 24) & 0xFF));
+  Blob.push_back(static_cast<uint8_t>((RR.TTL >> 16) & 0xFF));
+  Blob.push_back(static_cast<uint8_t>((RR.TTL >> 8) & 0xFF));
+  Blob.push_back(static_cast<uint8_t>(RR.TTL & 0xFF));
+
+  std::vector<uint8_t> RData;
+  if (RR.HasDomain1) {
+    if (RR.Type == 2 || RR.Type == 5 || RR.Type == 12) { // NS, CNAME, PTR
+      RData = encodeDomainWithSuffixes(RR.TargetDomain1, Suffixes);
+    } else if (RR.Type == 15) { // MX
+      RData.push_back(static_cast<uint8_t>((RR.MxPreference >> 8) & 0xFF));
+      RData.push_back(static_cast<uint8_t>(RR.MxPreference & 0xFF));
+      auto EncTarget = encodeDomainWithSuffixes(RR.TargetDomain1, Suffixes);
+      RData.insert(RData.end(), EncTarget.begin(), EncTarget.end());
+    } else if (RR.Type == 6 && RR.HasDomain2 && RR.SoaParams.size() == 20) { // SOA
+      auto EncMName = encodeDomainWithSuffixes(RR.TargetDomain1, Suffixes);
+      auto EncRName = encodeDomainWithSuffixes(RR.TargetDomain2, Suffixes);
+      RData.insert(RData.end(), EncMName.begin(), EncMName.end());
+      RData.insert(RData.end(), EncRName.begin(), EncRName.end());
+      RData.insert(RData.end(), RR.SoaParams.begin(), RR.SoaParams.end());
+    } else {
+      RData = RR.RawRData;
+    }
+  } else {
+    RData = RR.RawRData;
+  }
+
+  const uint16_t RdLength = static_cast<uint16_t>(RData.size());
+  Blob.push_back(static_cast<uint8_t>((RdLength >> 8) & 0xFF));
+  Blob.push_back(static_cast<uint8_t>(RdLength & 0xFF));
+  Blob.insert(Blob.end(), RData.begin(), RData.end());
+
+  return Blob;
+}
+
+void relocatePointersInRR(
+    std::vector<uint8_t> &RR,
+    const std::function<uint16_t(uint16_t)> &remapPointer) {
+  size_t Pos = 0;
+  while (Pos < RR.size()) {
+    const uint8_t Len = RR[Pos];
+    if ((Len & 0xC0) == 0xC0) {
+      if (Pos + 1 < RR.size()) {
+        uint16_t OldPtr =
+            (static_cast<uint16_t>(Len & 0x3F) << 8) | RR[Pos + 1];
+        uint16_t NewPtr = remapPointer(OldPtr);
+        RR[Pos] = static_cast<uint8_t>(0xC0 | ((NewPtr >> 8) & 0x3F));
+        RR[Pos + 1] = static_cast<uint8_t>(NewPtr & 0xFF);
+      }
+      Pos += 2;
+      break;
+    }
+    if (Len == 0) {
+      Pos += 1;
+      break;
+    }
+    if (Len > 63 || Pos + 1 + Len > RR.size()) {
+      return;
+    }
+    Pos += 1 + Len;
+  }
+
+  if (Pos + 10 > RR.size()) {
+    return;
+  }
+
+  uint16_t Type = readBe16(RR, Pos);
+  uint16_t RdLength = readBe16(RR, Pos + 8);
+  size_t RDataPos = Pos + 10;
+  if (RDataPos + RdLength > RR.size()) {
+    return;
+  }
+
+  auto remapDomainAt = [&](size_t Start) -> size_t {
+    size_t DPos = Start;
+    while (DPos < RDataPos + RdLength) {
+      const uint8_t L = RR[DPos];
+      if ((L & 0xC0) == 0xC0) {
+        if (DPos + 1 < RDataPos + RdLength) {
+          uint16_t OldPtr =
+              (static_cast<uint16_t>(L & 0x3F) << 8) | RR[DPos + 1];
+          uint16_t NewPtr = remapPointer(OldPtr);
+          RR[DPos] = static_cast<uint8_t>(0xC0 | ((NewPtr >> 8) & 0x3F));
+          RR[DPos + 1] = static_cast<uint8_t>(NewPtr & 0xFF);
+        }
+        return DPos + 2;
+      }
+      if (L == 0) {
+        return DPos + 1;
+      }
+      if (L > 63 || DPos + 1 + L > RDataPos + RdLength) {
+        return DPos;
+      }
+      DPos += 1 + L;
+    }
+    return DPos;
+  };
+
+  if (Type == 2 || Type == 5 || Type == 12) { // NS, CNAME, PTR
+    remapDomainAt(RDataPos);
+  } else if (Type == 15) { // MX
+    if (RdLength >= 3) {
+      remapDomainAt(RDataPos + 2);
+    }
+  } else if (Type == 6) { // SOA
+    size_t Next = remapDomainAt(RDataPos);
+    if (Next < RDataPos + RdLength) {
+      remapDomainAt(Next);
+    }
+  }
+}
+
 bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
                               const DST1Mutator::Transcript &Donor,
                               DST1Mutator::MutationRequest &Request) {
@@ -351,13 +696,50 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
 
     const auto &Candidate = Donor.Responses[Request.ResponseIndex];
     auto Layout = parseResponseLayout(Candidate);
-    if (!Layout) {
+    if (!Layout || Layout->AuthorityRRs.empty()) {
       return false;
     }
 
+    if (packetsHaveMatchingQuestionIdentity(Candidate, Target.ClientQuery)) {
+      auto &Mutation = ensureResponseMutation(Request);
+      Mutation.AuthorityRRs = Layout->AuthorityRRs;
+      Mutation.NSCOUNT = static_cast<uint16_t>(Layout->AuthorityRRs.size());
+      return true;
+    }
+
+    auto DonorQuestion = parseSingleQuestion(Candidate);
+    auto TargetQuestion = parseSingleQuestion(Target.ClientQuery);
+    if (!DonorQuestion || !TargetQuestion) {
+      return false;
+    }
+
+    std::vector<uint8_t> TargetQuestionBytes(
+        Target.ClientQuery.begin() + TargetQuestion->NameStart,
+        Target.ClientQuery.begin() + TargetQuestion->EndOffset);
+    auto Suffixes = getQuestionSuffixes(TargetQuestionBytes);
+
+    size_t Cursor = DonorQuestion->EndOffset;
+    for (size_t I = 0; I < Layout->AnswerRRs.size(); ++I) {
+      auto RR = parseRRAt(Candidate, Cursor);
+      if (!RR) {
+        return false;
+      }
+      Cursor = RR->EndOffset;
+    }
+
+    std::vector<std::vector<uint8_t>> ReencodedAuth;
+    for (size_t I = 0; I < Layout->AuthorityRRs.size(); ++I) {
+      auto Decoded = decodeRRFromPacket(Candidate, Cursor);
+      if (!Decoded) {
+        return false;
+      }
+      Cursor = Decoded->WireEnd;
+      ReencodedAuth.push_back(encodeRRBlob(*Decoded, Suffixes));
+    }
+
     auto &Mutation = ensureResponseMutation(Request);
-    Mutation.AuthorityRRs = Layout->AuthorityRRs;
-    Mutation.NSCOUNT = static_cast<uint16_t>(Layout->AuthorityRRs.size());
+    Mutation.AuthorityRRs = std::move(ReencodedAuth);
+    Mutation.NSCOUNT = static_cast<uint16_t>(Mutation.AuthorityRRs->size());
     return true;
   }
 
@@ -369,14 +751,59 @@ bool applyDonorMutationFamily(const DST1Mutator::Transcript &Target,
 
     const auto &Candidate = Donor.Responses[Request.ResponseIndex];
     auto Layout = parseResponseLayout(Candidate);
-    if (!Layout) {
+    if (!Layout || Layout->AdditionalRRs.empty()) {
       return false;
     }
 
+    if (packetsHaveMatchingQuestionIdentity(Candidate, Target.ClientQuery)) {
+      auto &Mutation = ensureResponseMutation(Request);
+      Mutation.AdditionalRRs = Layout->AdditionalRRs;
+      Mutation.GlueRRs.reset();
+      Mutation.ARCOUNT = static_cast<uint16_t>(Layout->AdditionalRRs.size());
+      return true;
+    }
+
+    auto DonorQuestion = parseSingleQuestion(Candidate);
+    auto TargetQuestion = parseSingleQuestion(Target.ClientQuery);
+    if (!DonorQuestion || !TargetQuestion) {
+      return false;
+    }
+
+    std::vector<uint8_t> TargetQuestionBytes(
+        Target.ClientQuery.begin() + TargetQuestion->NameStart,
+        Target.ClientQuery.begin() + TargetQuestion->EndOffset);
+    auto Suffixes = getQuestionSuffixes(TargetQuestionBytes);
+
+    size_t Cursor = DonorQuestion->EndOffset;
+    for (size_t I = 0; I < Layout->AnswerRRs.size(); ++I) {
+      auto RR = parseRRAt(Candidate, Cursor);
+      if (!RR) {
+        return false;
+      }
+      Cursor = RR->EndOffset;
+    }
+    for (size_t I = 0; I < Layout->AuthorityRRs.size(); ++I) {
+      auto RR = parseRRAt(Candidate, Cursor);
+      if (!RR) {
+        return false;
+      }
+      Cursor = RR->EndOffset;
+    }
+
+    std::vector<std::vector<uint8_t>> ReencodedAdd;
+    for (size_t I = 0; I < Layout->AdditionalRRs.size(); ++I) {
+      auto Decoded = decodeRRFromPacket(Candidate, Cursor);
+      if (!Decoded) {
+        return false;
+      }
+      Cursor = Decoded->WireEnd;
+      ReencodedAdd.push_back(encodeRRBlob(*Decoded, Suffixes));
+    }
+
     auto &Mutation = ensureResponseMutation(Request);
-    Mutation.AdditionalRRs = Layout->AdditionalRRs;
+    Mutation.AdditionalRRs = std::move(ReencodedAdd);
     Mutation.GlueRRs.reset();
-    Mutation.ARCOUNT = static_cast<uint16_t>(Layout->AdditionalRRs.size());
+    Mutation.ARCOUNT = static_cast<uint16_t>(Mutation.AdditionalRRs->size());
     return true;
   }
 
@@ -859,17 +1286,84 @@ std::optional<std::vector<uint8_t>> DST1Mutator::normalizeResponseForQuery(
     return std::nullopt;
   }
 
+  auto ResponseQuestion = parseSingleQuestion(Response);
   auto Layout = parseResponseLayout(Response);
-  if (!Layout) {
+  if (!ResponseQuestion || !Layout) {
     return std::nullopt;
   }
 
-  Layout->Header[0] = Query[0];
-  Layout->Header[1] = Query[1];
-  Layout->QuestionBytes.assign(Query.begin() + QueryQuestion.NameStart,
-                               Query.begin() + QueryQuestion.EndOffset);
+  const bool SameQuestion =
+      (ResponseQuestion->Name == QueryQuestion.Name &&
+       ResponseQuestion->Type == QueryQuestion.Type &&
+       ResponseQuestion->DnsClass == QueryQuestion.DnsClass);
 
-  auto Normalized = buildResponsePacket(*Layout);
+  if (SameQuestion) {
+    Layout->Header[0] = Query[0];
+    Layout->Header[1] = Query[1];
+    Layout->QuestionBytes.assign(Query.begin() + QueryQuestion.NameStart,
+                                 Query.begin() + QueryQuestion.EndOffset);
+
+    auto Normalized = buildResponsePacket(*Layout);
+    if (!Normalized || !responsePacketMatchesQuery(*Normalized, Query)) {
+      return std::nullopt;
+    }
+    return Normalized;
+  }
+
+  // QNAME changed! Relocate compression pointers.
+  std::vector<uint8_t> OldQuestionBytes(
+      Response.begin() + ResponseQuestion->NameStart,
+      Response.begin() + ResponseQuestion->EndOffset);
+  std::vector<uint8_t> NewQuestionBytes(
+      Query.begin() + QueryQuestion.NameStart,
+      Query.begin() + QueryQuestion.EndOffset);
+
+  const size_t OldQuestionEnd = ResponseQuestion->EndOffset;
+  const size_t NewQuestionEnd = QueryQuestion.EndOffset;
+  const int Delta =
+      static_cast<int>(NewQuestionEnd) - static_cast<int>(OldQuestionEnd);
+
+  auto OldSuffixes = getQuestionSuffixes(OldQuestionBytes);
+  auto NewSuffixes = getQuestionSuffixes(NewQuestionBytes);
+
+  auto remapPointer = [&](uint16_t OldPtr) -> uint16_t {
+    if (OldPtr == 12) {
+      return 12;
+    }
+    if (OldPtr < OldQuestionEnd) {
+      for (const auto &OldS : OldSuffixes) {
+        if (OldS.Offset == OldPtr) {
+          for (const auto &NewS : NewSuffixes) {
+            if (NewS.Name == OldS.Name) {
+              return NewS.Offset;
+            }
+          }
+          break;
+        }
+      }
+      int Shifted = static_cast<int>(OldPtr) + Delta;
+      return Shifted >= 12 ? static_cast<uint16_t>(Shifted) : 12;
+    }
+    int Shifted = static_cast<int>(OldPtr) + Delta;
+    return Shifted >= 12 ? static_cast<uint16_t>(Shifted) : 12;
+  };
+
+  ParsedResponseLayout NewLayout = *Layout;
+  NewLayout.Header[0] = Query[0];
+  NewLayout.Header[1] = Query[1];
+  NewLayout.QuestionBytes = std::move(NewQuestionBytes);
+
+  for (auto &RR : NewLayout.AnswerRRs) {
+    relocatePointersInRR(RR, remapPointer);
+  }
+  for (auto &RR : NewLayout.AuthorityRRs) {
+    relocatePointersInRR(RR, remapPointer);
+  }
+  for (auto &RR : NewLayout.AdditionalRRs) {
+    relocatePointersInRR(RR, remapPointer);
+  }
+
+  auto Normalized = buildResponsePacket(NewLayout);
   if (!Normalized || !responsePacketMatchesQuery(*Normalized, Query)) {
     return std::nullopt;
   }

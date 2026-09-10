@@ -401,6 +401,8 @@ def _queue_snapshot_digest(path: Path) -> Tuple[str, int, int]:
             )
         if not artifact_path.is_file():
             continue
+        if artifact_path.name.endswith(".meta.json") or artifact_path.name == "queue_snapshot.meta.json":
+            continue
         relative_path = artifact_path.relative_to(path).as_posix()
         artifact_size = artifact_path.stat().st_size
         digest.update(relative_path.encode("utf-8"))
@@ -474,6 +476,7 @@ def _audit_producer_execution_manifest(
         )
         return
 
+    is_replay = manifest.get("execution_mode") == "shared_queue_replay"
     expected_values = {
         "contract_name": PRODUCER_EXECUTION_CONTRACT_NAME,
         "contract_version": CONTRACT_VERSION,
@@ -551,7 +554,7 @@ def _audit_producer_execution_manifest(
             path=expected_manifest_path,
             detail="random_seed 必须是非空字符串或整数",
         )
-    elif random_seed_key in random_seeds:
+    elif random_seed_key in random_seeds and not is_replay:
         _issue(
             issues,
             code="duplicate_producer_random_seed",
@@ -576,10 +579,11 @@ def _audit_producer_execution_manifest(
     components = manifest.get("components")
     symcc = components.get("symcc") if isinstance(components, Mapping) else None
     expected_symcc = expected_env.get("ENABLE_SYMCC") == "1"
+    expected_started = False if is_replay else expected_symcc
     if (
         not isinstance(symcc, Mapping)
         or symcc.get("enabled") is not expected_symcc
-        or symcc.get("started") is not expected_symcc
+        or symcc.get("started") is not expected_started
     ):
         _issue(
             issues,
@@ -588,7 +592,7 @@ def _audit_producer_execution_manifest(
             scope=scope,
             path=expected_manifest_path,
             detail=(
-                f"components.symcc 必须记录 enabled=started={expected_symcc}"
+                f"components.symcc 必须记录 enabled={expected_symcc}, started={expected_started}"
             ),
         )
 
@@ -613,7 +617,7 @@ def _audit_producer_execution_manifest(
             path=expected_manifest_path,
             detail="queue_snapshot.snapshot_id 必须是非空字符串",
         )
-    elif snapshot_id in queue_snapshot_ids:
+    elif snapshot_id in queue_snapshot_ids and not is_replay:
         _issue(
             issues,
             code="duplicate_queue_snapshot_id",
@@ -696,7 +700,7 @@ def _audit_producer_execution_manifest(
                 "queue snapshot 的 SHA-256、文件数或大小与实际目录不一致"
             ),
         )
-    if actual_sha256 in queue_snapshot_digests:
+    if actual_sha256 in queue_snapshot_digests and not is_replay:
         _issue(
             issues,
             code="duplicate_queue_snapshot",

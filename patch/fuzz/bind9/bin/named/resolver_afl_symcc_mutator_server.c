@@ -39,11 +39,16 @@ typedef struct {
 	uint16_t arcount;
 } dns_header_t;
 
+#define NAMED_RESOLVER_AFL_SYMCC_MAX_MEMORY_RESPONSES 16
+
 typedef struct named_resolver_afl_symcc_mutator_server {
 	uint64_t tail_pick_count;
 	uint64_t received;
 	uint64_t replied;
 	uint64_t parse_errors;
+	const uint8_t *memory_responses[NAMED_RESOLVER_AFL_SYMCC_MAX_MEMORY_RESPONSES];
+	size_t memory_response_lens[NAMED_RESOLVER_AFL_SYMCC_MAX_MEMORY_RESPONSES];
+	size_t memory_response_count;
 } named_resolver_afl_symcc_mutator_server_t;
 
 static named_resolver_afl_symcc_mutator_server_t *g_server = NULL;
@@ -317,6 +322,21 @@ load_response_packet(named_resolver_afl_symcc_mutator_server_t *server,
 	size_t preserve = 0;
 	char path[PATH_MAX];
 
+	if (server != NULL && server->memory_response_count > 0) {
+		uint64_t wanted_index =
+			server->tail_pick_count % server->memory_response_count;
+		size_t resp_len = server->memory_response_lens[wanted_index];
+		const uint8_t *resp_data = server->memory_responses[wanted_index];
+
+		server->tail_pick_count++;
+		if (resp_len > packet_max) {
+			return -1;
+		}
+		memcpy(packet, resp_data, resp_len);
+		*packet_len = resp_len;
+		return 1;
+	}
+
 	if (!pick_response_tail_path(server, path, sizeof(path))) {
 		return 0;
 	}
@@ -584,3 +604,33 @@ named_resolver_afl_symcc_mutator_server_reset_response_sequence(void) {
 		g_server->tail_pick_count = 0;
 	}
 }
+
+void
+named_resolver_afl_symcc_mutator_server_set_responses(
+	const uint8_t *const *responses, const size_t *response_lens,
+	size_t response_count) {
+	size_t i;
+	if (g_server == NULL) {
+		return;
+	}
+	if (responses == NULL || response_lens == NULL || response_count == 0) {
+		g_server->memory_response_count = 0;
+		return;
+	}
+	if (response_count > NAMED_RESOLVER_AFL_SYMCC_MAX_MEMORY_RESPONSES) {
+		response_count = NAMED_RESOLVER_AFL_SYMCC_MAX_MEMORY_RESPONSES;
+	}
+	for (i = 0; i < response_count; i++) {
+		g_server->memory_responses[i] = responses[i];
+		g_server->memory_response_lens[i] = response_lens[i];
+	}
+	g_server->memory_response_count = response_count;
+}
+
+void
+named_resolver_afl_symcc_mutator_server_clear_responses(void) {
+	if (g_server != NULL) {
+		g_server->memory_response_count = 0;
+	}
+}
+

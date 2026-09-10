@@ -1629,7 +1629,7 @@ std::vector<std::vector<uint8_t>> HybridDNSGenerator::generate() {
 
   for (const auto &Seed : Seeds_) {
     auto Header = createHeaderFromSeed(Seed);
-    auto PayloadVariants = explorePayload(Header);
+    auto PayloadVariants = explorePayload(Header, Seed);
 
     for (auto &Variant : PayloadVariants) {
       Results.push_back(std::move(Variant));
@@ -1644,53 +1644,74 @@ std::vector<std::vector<uint8_t>> HybridDNSGenerator::generate() {
 
 std::vector<uint8_t>
 HybridDNSGenerator::createHeaderFromSeed(const std::vector<uint8_t> &Seed) {
-  size_t HeaderSize = std::min(Config_.PreserveHeaderBytes, Seed.size());
+  auto QuestionEnd = getQuestionSectionEnd(Seed);
+  size_t HeaderSize = QuestionEnd.value_or(12);
+  if (Config_.PreserveHeaderBytes > HeaderSize &&
+      Config_.PreserveHeaderBytes <= Seed.size()) {
+    HeaderSize = Config_.PreserveHeaderBytes;
+  }
+  if (HeaderSize > Seed.size()) {
+    HeaderSize = Seed.size();
+  }
   return std::vector<uint8_t>(Seed.begin(), Seed.begin() + HeaderSize);
 }
 
 std::vector<std::vector<uint8_t>>
 HybridDNSGenerator::explorePayload(const std::vector<uint8_t> &Header) {
+  return explorePayload(Header, Header);
+}
+
+std::vector<std::vector<uint8_t>>
+HybridDNSGenerator::explorePayload(const std::vector<uint8_t> &Header,
+                                   const std::vector<uint8_t> &Seed) {
   std::vector<std::vector<uint8_t>> Results;
 
-  if (!Runner_) {
-    return Results;
-  }
-
   std::vector<std::vector<uint8_t>> InitialPayloads;
-  if (Config_.IsResponse) {
-    auto buildPayloadWithRDataLen = [](size_t RDataLength) {
+  if (Seed.size() > Header.size()) {
+    std::vector<uint8_t> BasePayload(Seed.begin() + Header.size(), Seed.end());
+    InitialPayloads.push_back(BasePayload);
+    if (Config_.IsResponse && BasePayload.size() >= 4) {
+      auto Variant1 = BasePayload;
+      Variant1.back() ^= 0x01;
+      InitialPayloads.push_back(std::move(Variant1));
+      auto Variant2 = BasePayload;
+      Variant2.back() ^= 0x02;
+      InitialPayloads.push_back(std::move(Variant2));
+      auto Variant3 = BasePayload;
+      Variant3.back() ^= 0x03;
+      InitialPayloads.push_back(std::move(Variant3));
+    }
+  } else if (Config_.IsResponse) {
+    auto Question = parseDnsQuestionSpec(Seed);
+    if (Question) {
+      auto EncodedName = DNSNameCodec::encode(Question->Name);
       std::vector<uint8_t> Payload;
-      auto EncodedName = DNSNameCodec::encode("a");
-
       Payload.insert(Payload.end(), EncodedName.begin(), EncodedName.end());
-      Payload.push_back(0x00);
-      Payload.push_back(0x01);
-      Payload.push_back(0x00);
-      Payload.push_back(0x01);
-
-      Payload.insert(Payload.end(), EncodedName.begin(), EncodedName.end());
-      Payload.push_back(0x00);
-      Payload.push_back(0x01);
-      Payload.push_back(0x00);
-      Payload.push_back(0x01);
+      Payload.push_back(static_cast<uint8_t>((Question->Type >> 8) & 0xFF));
+      Payload.push_back(static_cast<uint8_t>(Question->Type & 0xFF));
+      Payload.push_back(static_cast<uint8_t>((Question->DnsClass >> 8) & 0xFF));
+      Payload.push_back(static_cast<uint8_t>(Question->DnsClass & 0xFF));
       Payload.push_back(0x00);
       Payload.push_back(0x00);
       Payload.push_back(0x01);
       Payload.push_back(0x2C);
-      const uint16_t DeclaredLength = static_cast<uint16_t>(std::min<size_t>(RDataLength, 0xFFFF));
-      Payload.push_back(static_cast<uint8_t>((DeclaredLength >> 8) & 0xFF));
-      Payload.push_back(static_cast<uint8_t>(DeclaredLength & 0xFF));
-
-      for (size_t Index = 0; Index < RDataLength; ++Index) {
-        Payload.push_back(static_cast<uint8_t>((Index * 31) & 0xFF));
+      if (Question->Type == 28) {
+        Payload.push_back(0x00);
+        Payload.push_back(0x10);
+        Payload.insert(Payload.end(), 16, 0);
+        Payload.back() = 1;
+      } else {
+        Payload.push_back(0x00);
+        Payload.push_back(0x04);
+        Payload.push_back(127);
+        Payload.push_back(0);
+        Payload.push_back(0);
+        Payload.push_back(1);
       }
-      return Payload;
-    };
-
-    InitialPayloads.push_back(buildPayloadWithRDataLen(0));
-    InitialPayloads.push_back(buildPayloadWithRDataLen(1));
-    InitialPayloads.push_back(buildPayloadWithRDataLen(4));
-    InitialPayloads.push_back(buildPayloadWithRDataLen(16));
+      InitialPayloads.push_back(Payload);
+    } else {
+      InitialPayloads.push_back({});
+    }
   } else {
     InitialPayloads.push_back({});
   }
@@ -1709,6 +1730,10 @@ HybridDNSGenerator::explorePayload(const std::vector<uint8_t> &Header) {
                            InitialPayload.end());
       Results.push_back(std::move(InitialPacket));
     }
+  }
+
+  if (!Runner_) {
+    return Results;
   }
 
   size_t Iterations = 0;

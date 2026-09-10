@@ -161,17 +161,23 @@ for resolver_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name no
             for key, value in payload.get('semantic_counts', {}).items():
                 semantic_totals[key] = semantic_totals.get(key, 0.0) + float(value)
         semantic_means = {key: round(value / len(report_dirs), 6) for key, value in sorted(semantic_totals.items())} if report_dirs else {}
+        variance_status = agg_summary.get('variance_status', '')
         aggregates = agg_summary.get('aggregates', {})
+        valid_stats = (variance_status == 'ok') and bool(aggregates)
         def mean_of(name: str) -> str:
-            return f"{float(aggregates.get(name, {}).get('mean', 0.0)):.6f}"
+            if not valid_stats or name not in aggregates or 'mean' not in aggregates[name]:
+                return 'NA'
+            return f"{float(aggregates[name]['mean']):.6f}"
         def std_of(name: str) -> str:
-            return f"{float(aggregates.get(name, {}).get('stddev', 0.0)):.6f}"
+            if not valid_stats or name not in aggregates or 'stddev' not in aggregates[name]:
+                return 'NA'
+            return f"{float(aggregates[name]['stddev']):.6f}"
         rows.append({
             'resolver': agg_summary.get('aggregation_key', {}).get('resolver_pair', '').replace('bind9_vs_', ''),
             'resolver_pair': agg_summary.get('aggregation_key', {}).get('resolver_pair', ''),
             'variant_name': variant,
             'run_count': str(int(agg_summary.get('run_count', 0))),
-            'variance_status': agg_summary.get('variance_status', ''),
+            'variance_status': variance_status,
             'queue_limit': queue_limit,
             'budget_sec': budget_sec,
             'total_samples_mean': mean_of('total_samples'),
@@ -184,12 +190,21 @@ for resolver_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name no
             'cluster_count_stddev': std_of('cluster_count'),
             'oracle_audit_candidate_count_mean': mean_of('oracle_audit_candidate_count'),
             'semantic_diff_count_mean': mean_of('semantic_diff_count'),
-            'semantic_counts_mean_json': json.dumps(semantic_means, ensure_ascii=False, sort_keys=True),
+            'semantic_counts_mean_json': json.dumps(semantic_means, ensure_ascii=False, sort_keys=True) if valid_stats else 'NA',
             'aggregate_dir': str(agg_dir),
         })
 summary_tsv = base / 'resolver_variant_summary.tsv'
+fieldnames = [
+    'resolver', 'resolver_pair', 'variant_name', 'run_count', 'variance_status',
+    'queue_limit', 'budget_sec',
+    'total_samples_mean', 'total_samples_stddev',
+    'unknown_samples_mean', 'unknown_samples_stddev',
+    'needs_review_count_mean', 'needs_review_count_stddev',
+    'cluster_count_mean', 'cluster_count_stddev',
+    'oracle_audit_candidate_count_mean', 'semantic_diff_count_mean',
+    'semantic_counts_mean_json', 'aggregate_dir'
+]
 with summary_tsv.open('w', encoding='utf-8', newline='') as fh:
-    fieldnames = list(rows[0].keys())
     writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter='\t')
     writer.writeheader()
     writer.writerows(rows)

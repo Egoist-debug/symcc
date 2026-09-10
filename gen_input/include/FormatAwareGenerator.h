@@ -404,6 +404,9 @@ private:
   std::vector<uint8_t> createHeaderFromSeed(const std::vector<uint8_t> &Seed);
   std::vector<std::vector<uint8_t>> explorePayload(
       const std::vector<uint8_t> &Header);
+  std::vector<std::vector<uint8_t>> explorePayload(
+      const std::vector<uint8_t> &Header,
+      const std::vector<uint8_t> &Seed);
 };
 
 /// Stateful DNS generator for poisoning-oriented responses and transcripts

@@ -45,7 +45,7 @@
   对照组（query_only/random_packet/legacy_response_tail）全部 0——对比历史 RQ1 表（仅 parse_ok=1.0、fetch=0），
   本轮输入模型链路已真实推进到缓存路径。注意：对照组全 0 是修复前链路 + 非 wire 格式对照的双重假象，
   08-14 已修正口径重跑（见上）。
-- **RQ2 同步 replay repeat=5**：`experiments/results/rq2_sync_replay_repeat/20260813_114601`（5×4 样本，20/20 replay 成功、comparability=comparable）。
+- **RQ2 同步 replay repeat=5**：`experiments/results/rq2_sync_replay_repeat/20260813_114601`（真实状态：0/20 completed，20/20 unbound.preflight failure (missing response_corpus)；纠正原记录误导）。
   带指纹版重跑：`20260813_122829`。
 - **RQ3 gate 对照**：见 [RQ3GateContrast20260813.md](./RQ3GateContrast20260813.md)。
   gate-on（manifest 匹配修复后）helper high_value_processed=6、corpus_found=28；gate-off 为 0/22。

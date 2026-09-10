@@ -42,3 +42,12 @@ named_resolver_afl_symcc_mutator_server_get_counters(
 
 void
 named_resolver_afl_symcc_mutator_server_reset_response_sequence(void);
+
+void
+named_resolver_afl_symcc_mutator_server_set_responses(
+	const uint8_t *const *responses, const size_t *response_lens,
+	size_t response_count);
+
+void
+named_resolver_afl_symcc_mutator_server_clear_responses(void);
+

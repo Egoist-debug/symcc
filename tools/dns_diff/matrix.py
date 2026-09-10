@@ -491,6 +491,8 @@ def _queue_snapshot_digest(path: Path) -> Tuple[str, int, int]:
     for artifact_path in sorted(path.rglob("*")):
         if not artifact_path.is_file():
             continue
+        if artifact_path.name.endswith(".meta.json") or artifact_path.name == "queue_snapshot.meta.json":
+            continue
         relative_path = artifact_path.relative_to(path).as_posix()
         artifact_size = artifact_path.stat().st_size
         digest.update(relative_path.encode("utf-8"))
@@ -517,6 +519,7 @@ def _write_producer_execution_manifest(
     repeat_index: int,
     started_at: str,
     finished_at: str,
+    is_replay: bool = True,
 ) -> None:
     """run 成功后记录 producer 执行身份与队列快照，满足 publication-audit 契约。"""
     close_summary = json.loads(
@@ -530,10 +533,9 @@ def _write_producer_execution_manifest(
         shutil.rmtree(snapshot_dir)
     snapshot_dir.mkdir(parents=True)
     for source_file in sorted(source_queue_dir.iterdir()):
-        if source_file.is_file():
+        if source_file.is_file() and not source_file.name.endswith(".meta.json"):
             shutil.copy2(source_file, snapshot_dir / source_file.name)
-    # run 元数据进入快照：队列内容相同的 run 也获得唯一 digest，
-    # 记录真实执行身份，audit 的重复检测据此区分独立重复。
+    # run 元数据单独记录，不参与队列纯内容哈希计算
     (snapshot_dir / "queue_snapshot.meta.json").write_text(
         json.dumps(
             {
@@ -556,6 +558,7 @@ def _write_producer_execution_manifest(
         "contract_version": CONTRACT_VERSION,
         "status": "success",
         "exit_code": 0,
+        "execution_mode": "shared_queue_replay" if is_replay else "independent_producer_generation",
         "variant_name": variant.variant_name,
         "repeat_index": repeat_index,
         "started_at": started_at,
@@ -567,8 +570,8 @@ def _write_producer_execution_manifest(
         "components": {
             "symcc": {
                 "enabled": symcc_enabled,
-                "started": symcc_enabled,
-                "note": "记录本 run 的 SymCC 配置声明；进程身份见共享 producer campaign。",
+                "started": False if is_replay else symcc_enabled,
+                "note": "共享队列回放，未独立启动 SymCC 生成器进程。" if is_replay else "独立启动 SymCC 生成器进程。",
             }
         },
         "queue_snapshot": {

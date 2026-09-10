@@ -145,6 +145,38 @@ int main() {
   require(!Diff.Unbound.HasCacheDiff, "Unbound cache diff 误报");
   require(Diff.DiffDetected, "pairwise cache diff 应识别为 resolver 差异");
 
+  // F1 回归验证: 三种成对场景
+  // 1. 相同 RR: bind9 与 unbound 各自添加完全相同的 RR (仅 resolver/view/section 不同)
+  std::vector<dnslab::CacheRecord> PairBindSame = {
+      {"bind9", "_default", "example.com.", "IN", "A", "answer", "positive", "300", "192.0.2.1", ""},
+  };
+  std::vector<dnslab::CacheRecord> PairUnboundSame = {
+      {"unbound", "", "example.com.", "IN", "A", "", "positive", "300", "192.0.2.1", ""},
+  };
+  const auto DiffSame = dnslab::buildCacheDiff(
+      "pair-same", {}, PairBindSame, {}, PairUnboundSame, true);
+  require(DiffSame.Bind9.HasCacheDiff, "Bind9 自身应有 cache 变更");
+  require(DiffSame.Unbound.HasCacheDiff, "Unbound 自身应有 cache 变更");
+  require(!DiffSame.DiffDetected, "相同 RR 不应被误报为跨 resolver 差异 (F1)");
+  require(DiffSame.ResolverDifferences.empty(), "相同 RR 不应产生 ResolverDifferences");
+
+  // 2. 仅 TTL 不同: TTL 差异不应升级为语义差异
+  std::vector<dnslab::CacheRecord> PairUnboundTTLDiff = {
+      {"unbound", "", "example.com.", "IN", "A", "", "positive", "60", "192.0.2.1", ""},
+  };
+  const auto DiffTTL = dnslab::buildCacheDiff(
+      "pair-ttl", {}, PairBindSame, {}, PairUnboundTTLDiff, true);
+  require(!DiffTTL.DiffDetected, "仅 TTL 不同不应判定为跨 resolver 差异");
+
+  // 3. 真实 RDATA 不同: 192.0.2.1 vs 192.0.2.2 必须判定为差异
+  std::vector<dnslab::CacheRecord> PairUnboundRDataDiff = {
+      {"unbound", "", "example.com.", "IN", "A", "", "positive", "300", "192.0.2.2", ""},
+  };
+  const auto DiffRData = dnslab::buildCacheDiff(
+      "pair-rdata", {}, PairBindSame, {}, PairUnboundRDataDiff, true);
+  require(DiffRData.DiffDetected, "真实 RDATA 不同必须识别为差异");
+  require(!DiffRData.ResolverDifferences.empty(), "真实 RDATA 不同必须记录 ResolverDifferences");
+
   std::map<std::string, std::vector<dnslab::CacheRecord>> MultiBefore = {
       {"bind9", BindRows},
       {"unbound", UnboundRows},

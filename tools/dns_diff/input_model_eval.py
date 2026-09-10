@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -123,12 +124,22 @@ def _run_single_sample(
 
     stderr_path.write_text(completed.stderr, encoding="utf-8")
     oracle = parse_oracle_summary(completed.stderr, "bind9")
-    return {
+    sample_bytes = sample_path.read_bytes()
+    meta = {
+        "sample_path": str(sample_path.resolve()),
+        "sha256": hashlib.sha256(sample_bytes).hexdigest(),
+        "byte_length": len(sample_bytes),
+        "command": [str(c) for c in command],
         "returncode": completed.returncode,
         "oracle": oracle,
         "stderr_path": str(stderr_path),
         "cache_dump_path": str(cache_dump),
     }
+    (work_root / "sample.meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return meta
 
 
 def _rate(numerator: int, denominator: int) -> Optional[float]:

@@ -1072,13 +1072,13 @@ execute_legacy_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 static isc_result_t
 execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 			const uint8_t *input, size_t input_len, long timeout_ms) {
-	named_resolver_afl_symcc_transcript_t transcript;
+	named_resolver_afl_symcc_transcript_t transcript = { 0 };
 	named_resolver_afl_symcc_transcript_oracle_t oracle = { 0 };
-	named_resolver_afl_symcc_mutator_counters_t counters_before;
-	named_resolver_afl_symcc_mutator_counters_t counters_after_first;
-	named_resolver_afl_symcc_mutator_counters_t counters_after_second;
+	named_resolver_afl_symcc_mutator_counters_t counters_before = { 0 };
+	named_resolver_afl_symcc_mutator_counters_t counters_after_first = { 0 };
+	named_resolver_afl_symcc_mutator_counters_t counters_after_second = { 0 };
 	isc_result_t result = ISC_R_FAILURE;
-	char response_dir[PATH_MAX];
+	char response_dir[PATH_MAX] = { 0 };
 	char *saved_tail = NULL;
 	char *saved_tail_dir = NULL;
 	const char *tail_env = getenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
@@ -1120,6 +1120,9 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 		unsetenv("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR");
 	}
 
+	named_resolver_afl_symcc_mutator_server_set_responses(
+		transcript.responses, transcript.response_lens,
+		transcript.response_count);
 	named_resolver_afl_symcc_mutator_server_reset_response_sequence();
 	named_resolver_afl_symcc_mutator_server_get_counters(&counters_before);
 
@@ -1178,11 +1181,15 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	}
 
 done:
+	named_resolver_afl_symcc_mutator_server_clear_responses();
 	update_transcript_oracle(orchestrator, &oracle);
 	restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL", saved_tail);
 	restore_env_var("NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
 			saved_tail_dir);
-	cleanup_transcript_responses(response_dir, transcript.response_count);
+	if (response_dir[0] != '\0' && transcript.response_count > 0) {
+		cleanup_transcript_responses(response_dir,
+					     transcript.response_count);
+	}
 	return result;
 }
 

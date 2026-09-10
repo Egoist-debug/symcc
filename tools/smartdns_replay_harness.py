@@ -73,6 +73,21 @@ def write_empty_cache(path: Path):
     path.write_bytes(payload)
 
 
+def is_acceptable_dns_response(packet: bytes, query: bytes = b"") -> bool:
+    if not packet or len(packet) < 12:
+        return False
+    if query and len(query) >= 2 and packet[0:2] != query[0:2]:
+        return False
+    flags = int.from_bytes(packet[2:4], "big")
+    qr = (flags >> 15) & 0x1
+    rcode = flags & 0xF
+    if qr != 1:
+        return False
+    if rcode not in (0, 3):
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smartdns-bin", required=True)
@@ -160,13 +175,20 @@ def main():
             cli.sendto(client_query, ("127.0.0.1", listen_port))
             response = cli.recv(4096)
             resolver_fetch_started = len(upstream_queries) > 0
-            response_accepted = bool(response)
+            fake_reply_dispatched = resolver_fetch_started and len(responses) > 0
+            response_accepted = bool(
+                resolver_fetch_started
+                and fake_reply_dispatched
+                and is_acceptable_dns_response(response, client_query)
+            )
             upstream_after_first = len(upstream_queries)
             if post_check_query:
                 cli.sendto(post_check_query, ("127.0.0.1", listen_port))
                 post_response = cli.recv(4096)
-                second_query_hit = (
-                    bool(post_response) and len(upstream_queries) == upstream_after_first
+                second_query_hit = bool(
+                    response_accepted
+                    and is_acceptable_dns_response(post_response, post_check_query)
+                    and len(upstream_queries) == upstream_after_first
                 )
                 cache_entry_created = second_query_hit
         proc.terminate()

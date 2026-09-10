@@ -208,6 +208,10 @@ parse_transcript_input(const uint8_t *input, size_t input_len,
 	size_t header_len = 0;
 	size_t index;
 
+	if (transcript != NULL) {
+		memset(transcript, 0, sizeof(*transcript));
+	}
+
 	if (input == NULL || transcript == NULL || input_len < 10 ||
 		input_len > UNBOUND_AFL_SYMCC_MAX_TRANSCRIPT_INPUT ||
 		!looks_like_transcript(input, input_len))
@@ -215,7 +219,6 @@ parse_transcript_input(const uint8_t *input, size_t input_len,
 		return false;
 	}
 
-	memset(transcript, 0, sizeof(*transcript));
 	transcript->response_count = input[4];
 	if (transcript->response_count >
 		UNBOUND_AFL_SYMCC_TRANSCRIPT_MAX_RESPONSES)
@@ -590,13 +593,13 @@ static int
 execute_transcript_case(const uint8_t *input, size_t input_len,
 	unbound_afl_symcc_oracle_t *oracle)
 {
-	unbound_afl_symcc_transcript_t transcript;
+	unbound_afl_symcc_transcript_t transcript = { 0 };
 	unbound_afl_symcc_mutator_stats_t counters_before = { 0 };
 	unbound_afl_symcc_mutator_stats_t counters_after_first = { 0 };
 	unbound_afl_symcc_mutator_stats_t counters_after_second = { 0 };
 	char forwarder[UNBOUND_AFL_SYMCC_FWD_STR_MAX];
 	struct ub_ctx *ctx = NULL;
-	char response_dir[PATH_MAX];
+	char response_dir[PATH_MAX] = { 0 };
 	char *saved_tail = NULL;
 	char *saved_tail_dir = NULL;
 	const char *tail_env = getenv("UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL");
@@ -646,6 +649,10 @@ execute_transcript_case(const uint8_t *input, size_t input_len,
 		log_stage_failure("mutator_start");
 		goto cleanup;
 	}
+	unbound_afl_symcc_mutator_server_set_responses(
+		transcript.responses, transcript.response_lens,
+		transcript.response_count);
+	unbound_afl_symcc_mutator_server_reset_response_sequence();
 	snprintf(forwarder, sizeof(forwarder), "127.0.0.1@%u", (unsigned)port);
 
 	ctx = ub_ctx_create();
@@ -718,12 +725,16 @@ execute_transcript_case(const uint8_t *input, size_t input_len,
 	rc = oracle->parse_ok ? 0 : 1;
 
 cleanup:
+	unbound_afl_symcc_mutator_server_clear_responses();
 	unbound_afl_symcc_oracle_clear_active();
 	unbound_afl_symcc_mutator_server_stop();
 	restore_env_var("UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL", saved_tail);
 	restore_env_var("UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR",
 		saved_tail_dir);
-	cleanup_transcript_responses(response_dir, transcript.response_count);
+	if (response_dir[0] != '\0' && transcript.response_count > 0) {
+		cleanup_transcript_responses(response_dir,
+			transcript.response_count);
+	}
 	if (ctx != NULL) {
 		maybe_dump_cache(ctx);
 		ub_ctx_delete(ctx);
