@@ -265,4 +265,39 @@ if not triage_report.get("root"):
     raise SystemExit("ASSERT FAIL: phase_context.triage_report.root 缺失")
 PY
 
+python3 - "$WORKDIR" "$DNSLABCTL_BIN" "$SAMPLE_FILE" "$SAMPLE_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, binary, source, completed = map(Path, sys.argv[1:])
+for cache_exists in (False, True):
+    work = root / f"repair-{cache_exists}"
+    sample = work / "follow_diff" / "legacy"
+    sample.mkdir(parents=True)
+    (sample / "sample.bin").write_bytes(source.read_bytes())
+    if cache_exists:
+        (sample / "cache_diff.json").write_bytes((completed / "cache_diff.json").read_bytes())
+    result = subprocess.run([str(binary), "follow-diff-once"], env={
+        **os.environ, "ROOT_DIR": str(root / "root"), "WORK_DIR": str(work),
+        "BIND9_WORK_DIR": str(work / "bind9"), "DNS_DIFF_SECONDARY_RESOLVER": "dnsmasq",
+    }, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    if not cache_exists:
+        cache = json.loads((sample / "cache_diff.json").read_text())
+        assert cache["cache_comparison_status"] == "unknown", cache
+        assert cache["bind9"]["cache_comparison_reason"] == "missing_snapshot", cache
+        assert cache["unbound"]["cache_comparison_reason"] == "missing_snapshot", cache
+        assert cache["executed_resolvers"] == [], cache
+        assert not cache["diff_detected"] and not cache["resolver_diffs"], cache
+    else:
+        assert (sample / "cache_diff.json").read_bytes() == (completed / "cache_diff.json").read_bytes()
+    triage = json.loads((sample / "triage.json").read_text())
+    assert triage["status"] == "failed_replay" and not triage["case_study_candidate"], triage
+    assert triage["executed_resolvers"] == [], triage
+print("PASS: C++ follow-diff 补缺不伪造空快照或执行证据")
+PY
+
 printf 'PASS: dnslabctl follow-diff/campaign-close smoke test passed\n'

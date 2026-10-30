@@ -97,6 +97,11 @@ OracleSnapshot parseOracleSummary(const std::optional<std::string> &StderrText,
   if (!AllOk) {
     Output.StderrParseStatus = "missing_summary";
   }
+  // 新发送观测不影响旧记录的完整性，也不从接纳结果反推。
+  const auto Dispatched = Tokens.find("fake_reply_dispatched");
+  if (Dispatched != Tokens.end()) {
+    Output.FakeReplyDispatched = parseBoolToken(Dispatched->second);
+  }
   return Output;
 }
 
@@ -112,6 +117,8 @@ json::Value toJson(const OracleSnapshot &Input) {
   json::setOptional(Output, Input.Resolver + ".cache_entry_created",
                     Input.CacheEntryCreated);
   json::setOptional(Output, Input.Resolver + ".timeout", Input.Timeout);
+  json::setOptional(Output, Input.Resolver + ".fake_reply_dispatched",
+                    Input.FakeReplyDispatched);
   Output[Input.Resolver + ".stderr_parse_status"] = Input.StderrParseStatus;
   return Output;
 }

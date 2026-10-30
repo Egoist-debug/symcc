@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .cache_diff import cache_has_diff
 from .io import JsonArtifactError, json_artifact_error_reason, load_required_json_object
 from .oracle import ORACLE_FIELDS
 
@@ -142,16 +143,8 @@ def _oracle_diff_fields(
     return tuple(fields)
 
 
-def _cache_diff_any(
-    cache_diff_payload: Mapping[str, Any], secondary_resolver: str
-) -> bool:
-    for resolver in ("bind9", secondary_resolver):
-        resolver_payload = cache_diff_payload.get(resolver)
-        if not isinstance(resolver_payload, Mapping):
-            continue
-        if bool(resolver_payload.get("has_cache_diff")):
-            return True
-    return False
+def _cache_diff_any(cache_diff_payload: Mapping[str, Any]) -> bool:
+    return cache_has_diff(cache_diff_payload)
 
 
 def _build_sample_record(sample_dir: Path) -> AuditSampleRecord:
@@ -214,7 +207,7 @@ def _build_sample_record(sample_dir: Path) -> AuditSampleRecord:
     )
     oracle_diff_any = len(oracle_diff_fields) > 0
     oracle_diff_plus_cache_diff = oracle_diff_any and _cache_diff_any(
-        cache_diff_payload, secondary_resolver
+        cache_diff_payload
     )
 
     return AuditSampleRecord(

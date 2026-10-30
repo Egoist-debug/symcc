@@ -180,3 +180,102 @@ python3 -m tools.dns_diff.cli publication-audit \
 7. 去重后的 case study 数量达到设定门槛，且每条索引都指向真实导出产物。
 
 审计失败仍会写出完整问题清单并返回非零状态，便于 CI 和批量实验驱动脚本直接阻止未就绪结果进入正式材料。
+
+## 9. 跨 resolver 缓存比较（`cache_comparison_version=1`）
+
+缓存比较的实现 owner 是 `tools/dns_diff/cache_diff.py` 与
+`dnslab_core/src/cache_analysis.cpp`；两端使用
+`test/fixtures/cache_semantics/cases.tsv` 的共同输入验收。
+本节版本独立于外层 `schema_version`，不重命名既有字段。
+
+### 比较对象与输出
+
+- 原始观察、TTL 和单端 before/after delta 继续保留。
+- 跨端比较先投影成类型感知的共同 RR 集合，再比较增删的语义 delta。
+  resolver 身份、dump 结构、计时/命中元数据、TTL 漂移不是该结构比较的依据。
+- 两端 before 的共同投影必须等价；初态不同则不可比较，即使终态相同也不能把不同 delta 当作缺陷。共同投影不证明 resolver 内部完整状态等价。
+- 域名型 RDATA 按 DNS 名称归一化；IP 地址按值比较；TXT 大小写、字节和字符串边界不得按域名规则折叠。
+- 当前共同正 RR 支持 A、AAAA、NS、CNAME、DNAME、PTR、TXT。MSG 只有名称、类型、class、QD、TC 等条件与共同 RRset 相符时才可作为冗余观察折叠；不完整或不匹配的 MSG 保守不可比较。特殊标签保留边界，但不支持的共同名称投影不得强行等价。
+- `cache_delta_triggered` 只控制明细，不决定是否存在语义差异。
+
+| 字段 | 语义 |
+| --- | --- |
+| `cache_comparison_version` | 当前为 `1` |
+| `cache_comparison_status` | `comparable`：可比较；`incomparable`：状态不在共同投影范围或共同初态不同；`unknown`：快照缺失或证据不足 |
+| `cache_comparison_reason` | 保留不能比较的原因；`initial_state_mismatch` 表示共同初态不同，`missing_snapshot` 表示必要快照缺失 |
+| `diff_detected` | 只有共同投影得到的跨端差异才可支持肯定判断；不能单独把 `false` 当作无差异证据 |
+| `resolver_diffs` | 具体跨端比较结果；单端 `has_cache_diff` 不能替代它 |
+
+例如，两端从空缓存插入相同 RR，虽然各自都有 delta，
+仍应得到 `cache_comparison_status=comparable`、`diff_detected=false`，
+不得升级为缓存语义缺陷候选。
+
+### 不完整证据与兼容
+
+- 旧 artifact 缺少新比较版本/状态时仍可读取，但不能自动认定 `no_diff`。
+- triage、审计组合指标与两种后端均须遵守相同的可比较门槛；`oracle_diff_plus_cache_diff` 不能回退使用单端 `has_cache_diff`，也不能凭 legacy 的 `diff_detected` 补足新版证据。
+- 缺失快照、不支持的 RR/负缓存状态及不能观察 RDATA 的后端，不得伪造成空缓存。
+- 无其他独立 oracle 差异证据时，不完整比较输出
+  `cache_comparison_incomplete`，`analysis_state=unknown`，不进入有效阴性或语义缺陷计数。
+- 当前沿用 `input_parse_failure` 分类桶并保留
+  `failure_bucket_detail=cache_comparison_incomplete`；它描述比较证据不完整，
+  不意味着目标收到的 DNS 输入一定畸形。
+- `maradns`、`knot-resolver` 当前 cache 观测缺少共同 RDATA 证据，不能用其缓存投影声称与 BIND9 等价；
+  独立可用的 oracle 观察不因此被抹除。
+
+语义规则改变后，旧 ready 报告和旧候选不能直接沿用为新结论。
+结构/哈希审计通过也不证明真实独立 producer、人工真值或安全漏洞成立。
+
+## 10. Unbound 响应注入的字节合同
+
+`patch/cache/unbound/smallapp/unbound_afl_symcc_mutator_server.c` 的生产 builder
+对内存响应和文件 fallback 使用同一规则：
+
+- 成功输出长度等于输入响应长度，仅将 `[0, 2)` 两个事务 ID 字节替换为实时 query 的 ID。
+- 不替换 Question，不修复 AN/NS/AR 计数，不截断 RR 或尾部字节，不重写 flags。
+  即使响应畸形，也不能先把它改好再交给目标。
+- 输入缺失、读取失败、响应不足 12 字节、超过输出容量或 IPv4 UDP 载荷上限
+  `65507` 字节时返回失败；线程记录 `parse_errors`，不构造替代的空回复。
+- 原始输入不变；不同 Question 或其中的压缩指针也原样保留，是否接受由目标决定。
+
+该合同修复 Unbound 单端静默改写，**不等于六端原始 wire 已完全等价**。
+BIND 当前仍存在 Question/部分 flags 的请求绑定行为；共同可比子集需要满足这些
+绑定不改变原响应语义的条件。Unbound 的 `ub_resolve` 入口也不能用于宣称
+原始 client-wire opcode、flags、EDNS 行为的公平比较。
+
+回归入口：`bash test/test_unbound_mutator_fidelity.sh`。
+用例必须在读取 Unbound `config.h` 后重新启用断言；仅输出 PASS 而断言被
+`NDEBUG` 禁用不算验证。runner 使用独立临时目录并优先加载受版本管理的 patch header。
+
+## 11. 响应接纳与发送事实
+
+四个 Python replay harness 复用 `tools/dns_replay_support.py`；BIND 的
+cache/fuzz patch 与 Unbound patch 使用各自实际注入和客户端完成路径。
+
+- `resolver_fetch_started` 表示观察到匹配 QNAME/QTYPE/QCLASS 的上游请求。
+- 可选 `fake_reply_dispatched` 表示匹配请求的成功注入：Python/Unbound 要求完整发送，
+  MaraDNS TCP 要求 `sendall` 成功；BIND 表示 hook 成功返回非空响应并交由既有 dispatch
+  同步投递，不是 socket 发送计数。
+- `response_accepted` 同时要求匹配 fetch、成功注入和合格的客户端完成结果。
+  错误 ID/Question、截断、TC、非 QUERY opcode、SERVFAIL/REFUSED/NOTIMP、
+  未 fetch 或发送失败都不能算接纳。
+- 正 A、NXDOMAIN、NOERROR/NODATA 均可接纳；负答案本身不代表投毒。
+  已支持 RDATA 检查不等于完整实现所有 RR 的语义验证，且不得反向改写注入字节。
+- Unbound `ub_resolve` 的完成报文按当前 `libworker_fg` 的映射 ID `0` 校验；
+  它不是原始客户端 wire 接口。升级锁定的 Unbound 版本时须重新核验此映射。
+
+只有显式 post-check 确实执行、首次已接纳、后续回答匹配且完整，并且期间没有新增
+上游请求，`second_query_hit` / `cache_entry_created` 才为 `1`。这两个字段仍是
+**proxy**，不证明真实 cache entry、新增缓存状态或投毒因果。没有 post-check 时的
+`0` 只表示缺少命中证据，不能解释为“实际执行过且结果为阴性”。
+
+`fake_reply_dispatched` 不加入原六个 `ORACLE_FIELDS` 的语义差异比较。
+Python/C++ 都保留旧日志的可读性：缺失或非法发送字段输出 `null`，
+不从 `response_accepted` 反推，也不单独改变 `stderr_parse_status`。
+历史 artifact 没有自动获得新接纳口径的可信等级。
+
+回归必须检查最终 oracle：
+`test/test_replay_harness_negative_control.py`、
+`test/test_native_replay_oracle.sh` 和 C++ `test_oracle.cpp`。
+native 测试直接编译当前 patch、使用锁定 headers/parser 库和事件替身；
+通过这些测试不等于真实 resolver 网络时序或缓存因果已验证。

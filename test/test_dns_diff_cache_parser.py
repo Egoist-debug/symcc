@@ -10,6 +10,16 @@ class DnsDiffCacheParserTest(unittest.TestCase):
     def _write_lines(self, path: Path, lines: list[str]) -> None:
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def test_tsv_preserves_txt_tab_without_adding_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dump_file = Path(tmpdir) / "bind.cache.txt"
+            self._write_lines(dump_file, ['txt.example. 300 IN TXT "Keep\tCase"'])
+            record, = parse_cache_dump("bind9", dump_file)
+            self.assertEqual('"Keep\tCase"', record.rdata_norm)
+            fields = record.to_tsv().split("\t")
+            self.assertEqual(10, len(fields))
+            self.assertEqual(r'"Keep\009Case"', fields[8])
+
     def test_parse_bind9_negative_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             dump_file = Path(tmpdir) / "bind.cache.txt"

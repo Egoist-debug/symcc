@@ -8,6 +8,11 @@ import threading
 import time
 from pathlib import Path
 
+if __package__:
+    from .dns_replay_support import ReplayUpstream, is_acceptable_dns_response
+else:
+    from dns_replay_support import ReplayUpstream, is_acceptable_dns_response
+
 
 def parse_transcript(path: Path):
     data = path.read_bytes()
@@ -111,14 +116,7 @@ def write_cache_dump(path: Path, entries):
     write_text(path, "\n".join(lines) + "\n")
 
 
-def acceptable_response(packet: bytes):
-    if len(packet) < 12:
-        return False
-    flags = int.from_bytes(packet[2:4], "big")
-    qr = (flags >> 15) & 0x1
-    rcode = flags & 0xF
-    ancount = int.from_bytes(packet[6:8], "big")
-    return qr == 1 and rcode == 0 and ancount > 0
+acceptable_response = is_acceptable_dns_response
 
 
 def main():
@@ -141,7 +139,7 @@ def main():
         write_text(kresd_log_path, "")
         print(
             "ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=0 "
-            "response_accepted=0 second_query_hit=0 cache_entry_created=0 timeout=0"
+            "fake_reply_dispatched=0 response_accepted=0 second_query_hit=0 cache_entry_created=0 timeout=0"
         )
         print(f"knot_resolver_native_log={kresd_log_path}")
         return 0
@@ -151,10 +149,11 @@ def main():
 
     client_query, responses, post_check_query = parse_transcript(Path(args.transcript))
     qname, qtype = parse_question(client_query)
-    target_signature = (qname, qtype)
     parse_ok = True
     resolver_fetch_started = False
     response_accepted = False
+    fake_reply_dispatched = False
+    response = b""
     second_query_hit = False
     cache_entry_created = False
     timeout_seen = False
@@ -176,25 +175,18 @@ def main():
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     upstream_sock.bind(("127.0.0.1", upstream_port))
     upstream_sock.settimeout(args.timeout_sec)
-    upstream_queries = []
-    matching_queries = []
+    upstream = ReplayUpstream(client_query, responses)
+    upstream_queries = upstream.queries
+    matching_queries = upstream.matching_queries
     stop_flag = {"stop": False}
 
     def upstream_loop():
         while not stop_flag["stop"]:
             try:
-                packet, addr = upstream_sock.recvfrom(4096)
+                packet, addr = upstream_sock.recvfrom(65535)
             except Exception:
                 continue
-            upstream_queries.append(packet)
-            if parse_question(packet) == target_signature:
-                matching_queries.append(packet)
-            if not responses:
-                continue
-            reply = bytearray(responses[min(len(upstream_queries) - 1, len(responses) - 1)])
-            if len(reply) >= 2 and len(packet) >= 2:
-                reply[0:2] = packet[0:2]
-            upstream_sock.sendto(reply, addr)
+            upstream.reply(packet, lambda reply: upstream_sock.sendto(reply, addr) == len(reply))
 
     threading.Thread(target=upstream_loop, daemon=True).start()
 
@@ -219,26 +211,26 @@ def main():
     raw_log = ""
     try:
         cli.sendto(client_query, ("127.0.0.1", listen_port))
-        response = cli.recv(4096)
-        resolver_fetch_started = len(matching_queries) > 0
-        fake_reply_dispatched = resolver_fetch_started and len(responses) > 0
+        response = cli.recv(65535)
+        upstream_after_first, resolver_fetch_started, fake_reply_dispatched = upstream.snapshot()
         response_accepted = bool(
             resolver_fetch_started
             and fake_reply_dispatched
-            and acceptable_response(response)
+            and acceptable_response(response, client_query)
         )
-        upstream_after_first = len(matching_queries)
         if post_check_query:
             cli.sendto(post_check_query, ("127.0.0.1", listen_port))
-            post_response = cli.recv(4096)
+            post_response = cli.recv(65535)
             second_query_hit = bool(
                 response_accepted
-                and acceptable_response(post_response)
-                and len(matching_queries) == upstream_after_first
+                and acceptable_response(post_response, post_check_query)
+                and upstream.snapshot()[0] == upstream_after_first
             )
-        cache_entry_created = second_query_hit or (response_accepted and not post_check_query)
+        cache_entry_created = second_query_hit
     except socket.timeout:
         timeout_seen = True
+        if not response:
+            _, resolver_fetch_started, fake_reply_dispatched = upstream.snapshot()
     finally:
         try:
             proc.send_signal(signal.SIGTERM)
@@ -271,6 +263,7 @@ def main():
         "ORACLE_SUMMARY "
         f"parse_ok={1 if parse_ok else 0} "
         f"resolver_fetch_started={1 if resolver_fetch_started else 0} "
+        f"fake_reply_dispatched={1 if fake_reply_dispatched else 0} "
         f"response_accepted={1 if response_accepted else 0} "
         f"second_query_hit={1 if second_query_hit else 0} "
         f"cache_entry_created={1 if cache_entry_created else 0} "

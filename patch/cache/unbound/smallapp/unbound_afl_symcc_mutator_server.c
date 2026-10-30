@@ -16,12 +16,12 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define UNBOUND_AFL_SYMCC_MAX_PACKET 65536
+/* 服务端只使用 IPv4 UDP，超过此载荷上限的输入必须拒绝而非截断。 */
+#define UNBOUND_AFL_SYMCC_MAX_PACKET 65507
 
 /*
- * 用 BIND9 legacy-response-tail 的策略拼 reply:
- * - 复制 query 的 header+question（保证 ID 与 question 匹配）
- * - 从 response-tail 样本中取出 question_end 之后的 section bytes 作为尾段
+ * 注入原始响应，仅用实时 query 的事务 ID 绑定请求。
+ * 不替换 Question 或修复 RR，避免改变压缩指针和无效报文的语义。
  */
 typedef struct {
 	uint16_t id;
@@ -47,6 +47,8 @@ typedef struct unbound_afl_symcc_mutator_server {
 	const uint8_t *memory_responses[UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES];
 	size_t memory_response_lens[UNBOUND_AFL_SYMCC_MAX_MEMORY_RESPONSES];
 	size_t memory_response_count;
+	unbound_afl_symcc_observer_t observer;
+	void *observer_arg;
 } unbound_afl_symcc_mutator_server_t;
 
 static pthread_mutex_t g_server_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -108,72 +110,6 @@ parse_dns_question_end(const uint8_t *packet, size_t packet_len,
 	}
 
 	*question_end = pos;
-	return 0;
-}
-
-static int
-parse_dns_name_end(const uint8_t *packet, size_t packet_len, size_t pos,
-	size_t *name_end)
-{
-	size_t cursor = pos;
-
-	while (cursor < packet_len) {
-		uint8_t label_len = packet[cursor];
-
-		if (label_len == 0) {
-			cursor++;
-			*name_end = cursor;
-			return 0;
-		}
-
-		if ((label_len & 0xC0) == 0xC0) {
-			if (cursor + 1 >= packet_len) {
-				return -1;
-			}
-			cursor += 2;
-			*name_end = cursor;
-			return 0;
-		}
-
-		if ((label_len & 0xC0) != 0) {
-			return -1;
-		}
-
-		if (label_len > 63 || cursor + 1 + label_len > packet_len) {
-			return -1;
-		}
-
-		cursor += 1 + label_len;
-	}
-
-	return -1;
-}
-
-static int
-parse_dns_rr_end(const uint8_t *packet, size_t packet_len, size_t pos,
-	size_t *rr_end)
-{
-	size_t name_end = 0;
-	size_t cursor = pos;
-	uint16_t rdlen;
-
-	if (parse_dns_name_end(packet, packet_len, cursor, &name_end) != 0) {
-		return -1;
-	}
-	cursor = name_end;
-
-	/* type(2) + class(2) + ttl(4) + rdlen(2) */
-	if (cursor + 10 > packet_len) {
-		return -1;
-	}
-	rdlen = (uint16_t)((packet[cursor + 8] << 8) | packet[cursor + 9]);
-	cursor += 10;
-	if (cursor + rdlen > packet_len) {
-		return -1;
-	}
-	cursor += rdlen;
-
-	*rr_end = cursor;
 	return 0;
 }
 
@@ -305,7 +241,7 @@ load_file_bytes(const char *path, uint8_t *buf, size_t buf_size, size_t *len)
 	}
 
 	bytes_read = fread(buf, 1, buf_size, fp);
-	if (ferror(fp) != 0) {
+	if (fgetc(fp) != EOF || ferror(fp) != 0) {
 		fclose(fp);
 		return false;
 	}
@@ -336,29 +272,18 @@ unbound_afl_symcc_mutator_server_get_stats(unbound_afl_symcc_mutator_stats_t *ou
 }
 
 static int
-load_response_sections(unbound_afl_symcc_mutator_server_t *server,
-	uint8_t *sections, size_t sections_max, size_t *sections_len,
-	unbound_afl_symcc_dns_header_t *tail_hdr, uint8_t *tail_flags_hi,
-	uint8_t *tail_flags_lo)
+load_response_packet(unbound_afl_symcc_mutator_server_t *server,
+	uint8_t *packet, size_t packet_max, size_t *packet_len)
 {
-	uint8_t packet[UNBOUND_AFL_SYMCC_MAX_PACKET];
-	size_t packet_len = 0;
-	size_t question_end = 0;
-	size_t safe_end = 0;
-	size_t cursor = 0;
-	uint16_t i;
 	char path[PATH_MAX];
 
-	*sections_len = 0;
-	memset(tail_hdr, 0, sizeof(*tail_hdr));
-	*tail_flags_hi = 0;
-	*tail_flags_lo = 0;
+	*packet_len = 0;
 
 	bool has_memory_resp = false;
 	const uint8_t *resp_data = NULL;
 	size_t resp_len = 0;
 
-	pthread_mutex_lock(&g_server_lock);
+	/* dispatch_query 已持有 g_server_lock，覆盖取样、复制及发送的生命周期。 */
 	if (server != NULL && server->memory_response_count > 0) {
 		uint64_t wanted_index = server->tail_pick_count % server->memory_response_count;
 		server->tail_pick_count++;
@@ -366,83 +291,22 @@ load_response_sections(unbound_afl_symcc_mutator_server_t *server,
 		resp_data = server->memory_responses[wanted_index];
 		has_memory_resp = true;
 	}
-	pthread_mutex_unlock(&g_server_lock);
-
 	if (has_memory_resp) {
-		if (resp_len > sizeof(packet)) {
+		if (resp_data == NULL || resp_len > packet_max) {
 			return -1;
 		}
 		memcpy(packet, resp_data, resp_len);
-		packet_len = resp_len;
+		*packet_len = resp_len;
 	} else {
 		if (!pick_response_tail_path(server, path, sizeof(path))) {
 			return 0;
 		}
 
-		if (!load_file_bytes(path, packet, sizeof(packet), &packet_len)) {
+		if (!load_file_bytes(path, packet, packet_max, packet_len)) {
 			return -1;
 		}
 	}
 
-	if (parse_dns_header(packet, packet_len, tail_hdr) != 0) {
-		return -1;
-	}
-
-	if (parse_dns_question_end(packet, packet_len, tail_hdr,
-		    &question_end) != 0)
-	{
-		return -1;
-	}
-
-	if (question_end > packet_len || packet_len - question_end > sections_max) {
-		return -1;
-	}
-
-	/*
-	 * 语料可能存在 header 计数与实际内容不一致的情况，这里按计数逐条解析 RR，
-	 * 截断到可解析边界并下调计数，避免 Unbound 因尾部脏字节而持续重试。
-	 */
-	cursor = question_end;
-	safe_end = question_end;
-	for (i = 0; i < tail_hdr->ancount; i++) {
-		size_t rr_end = 0;
-		if (parse_dns_rr_end(packet, packet_len, cursor, &rr_end) != 0) {
-			tail_hdr->ancount = i;
-			tail_hdr->nscount = 0;
-			tail_hdr->arcount = 0;
-			break;
-		}
-		cursor = rr_end;
-		safe_end = rr_end;
-	}
-	for (i = 0; i < tail_hdr->nscount; i++) {
-		size_t rr_end = 0;
-		if (parse_dns_rr_end(packet, packet_len, cursor, &rr_end) != 0) {
-			tail_hdr->nscount = i;
-			tail_hdr->arcount = 0;
-			break;
-		}
-		cursor = rr_end;
-		safe_end = rr_end;
-	}
-	for (i = 0; i < tail_hdr->arcount; i++) {
-		size_t rr_end = 0;
-		if (parse_dns_rr_end(packet, packet_len, cursor, &rr_end) != 0) {
-			tail_hdr->arcount = i;
-			break;
-		}
-		cursor = rr_end;
-		safe_end = rr_end;
-	}
-
-	if (safe_end < question_end || safe_end > packet_len) {
-		return -1;
-	}
-
-	memcpy(sections, packet + question_end, safe_end - question_end);
-	*sections_len = safe_end - question_end;
-	*tail_flags_hi = packet[2];
-	*tail_flags_lo = packet[3];
 	return 1;
 }
 
@@ -452,13 +316,8 @@ build_dns_response(unbound_afl_symcc_mutator_server_t *server,
 	size_t response_max)
 {
 	unbound_afl_symcc_dns_header_t query_hdr;
-	unbound_afl_symcc_dns_header_t tail_hdr;
-	uint8_t sections[UNBOUND_AFL_SYMCC_MAX_PACKET];
-	uint8_t tail_flags_hi = 0;
-	uint8_t tail_flags_lo = 0;
 	size_t question_end = 0;
-	size_t sections_len = 0;
-	int tail_status;
+	size_t response_len = 0;
 
 	if (parse_dns_header(query, query_len, &query_hdr) != 0) {
 		return -1;
@@ -470,48 +329,60 @@ build_dns_response(unbound_afl_symcc_mutator_server_t *server,
 		return -1;
 	}
 
-	if (question_end > response_max) {
+	if (response_max > UNBOUND_AFL_SYMCC_MAX_PACKET) {
+		response_max = UNBOUND_AFL_SYMCC_MAX_PACKET;
+	}
+
+	/* 缺失、读取失败或不完整的 header 不能变成新造的空回复。 */
+	if (load_response_packet(server, response, response_max, &response_len) !=
+		    1 || response_len < 12)
+	{
 		return -1;
 	}
 
-	memcpy(response, query, question_end);
-	/* QR=1，其它尽量沿用 query，避免不匹配；rcode 先置 0 */
-	response[2] = (uint8_t)((query[2] & 0x79) | 0x80);
-	/* forwarder 场景下通常会带 RA=1，便于 Unbound 快速收敛 */
-	response[3] = 0x80;
-	/* 先把 answer/ns/ar 计数清零，后续按 tail 覆盖 */
-	response[6] = 0;
-	response[7] = 0;
-	response[8] = 0;
-	response[9] = 0;
-	response[10] = 0;
-	response[11] = 0;
+	response[0] = query[0];
+	response[1] = query[1];
+	return (int)response_len;
+}
 
-	tail_status = load_response_sections(server, sections, sizeof(sections),
-		&sections_len, &tail_hdr, &tail_flags_hi, &tail_flags_lo);
-	if (tail_status < 0) {
-		return (int)question_end;
+static void
+dispatch_query(unbound_afl_symcc_mutator_server_t *server,
+	const uint8_t *query, size_t query_len, struct sockaddr *client,
+	socklen_t client_len)
+{
+	uint8_t response[UNBOUND_AFL_SYMCC_MAX_PACKET];
+	int resp_len;
+
+	pthread_mutex_lock(&g_server_lock);
+	server->received++;
+	if (server->observer != NULL) {
+		server->observer(query, query_len, false, server->observer_arg);
 	}
-
-	if (tail_status > 0) {
-		if (question_end + sections_len > response_max) {
-			return -1;
+	resp_len = build_dns_response(server, query, query_len, response,
+		sizeof(response));
+	if (resp_len < 0) {
+		server->parse_errors++;
+	} else if (sendto(server->sockfd, response, (size_t)resp_len, 0,
+		client, client_len) == resp_len)
+	{
+		server->replied++;
+		if (server->observer != NULL) {
+			server->observer(query, query_len, true, server->observer_arg);
 		}
-
-		memcpy(response + question_end, sections, sections_len);
-		response[2] = (uint8_t)((query[2] & 0x79) | 0x80 |
-			(tail_flags_hi & 0x06));
-		response[3] = tail_flags_lo;
-		response[6] = (uint8_t)((tail_hdr.ancount >> 8) & 0xff);
-		response[7] = (uint8_t)(tail_hdr.ancount & 0xff);
-		response[8] = (uint8_t)((tail_hdr.nscount >> 8) & 0xff);
-		response[9] = (uint8_t)(tail_hdr.nscount & 0xff);
-		response[10] = (uint8_t)((tail_hdr.arcount >> 8) & 0xff);
-		response[11] = (uint8_t)(tail_hdr.arcount & 0xff);
-		return (int)(question_end + sections_len);
 	}
+	pthread_mutex_unlock(&g_server_lock);
+}
 
-	return (int)question_end;
+void
+unbound_afl_symcc_mutator_server_set_observer(unbound_afl_symcc_observer_t observer,
+	void *arg)
+{
+	pthread_mutex_lock(&g_server_lock);
+	if (g_server != NULL) {
+		g_server->observer = observer;
+		g_server->observer_arg = arg;
+	}
+	pthread_mutex_unlock(&g_server_lock);
 }
 
 static void *
@@ -520,36 +391,26 @@ mutator_server_thread(void *arg)
 	unbound_afl_symcc_mutator_server_t *server =
 		(unbound_afl_symcc_mutator_server_t *)arg;
 	uint8_t query[UNBOUND_AFL_SYMCC_MAX_PACKET];
-	uint8_t response[UNBOUND_AFL_SYMCC_MAX_PACKET];
 
-	while (!server->stop_requested) {
+	while (true) {
 		struct sockaddr_storage client;
 		socklen_t client_len = (socklen_t)sizeof(client);
 		ssize_t n;
-		int resp_len;
+		bool stopped;
 
+		pthread_mutex_lock(&g_server_lock);
+		stopped = server->stop_requested;
+		pthread_mutex_unlock(&g_server_lock);
+		if (stopped) {
+			break;
+		}
 		n = recvfrom(server->sockfd, query, sizeof(query), 0,
 			(struct sockaddr *)&client, &client_len);
 		if (n < 0) {
-			if (server->stop_requested) {
-				break;
-			}
 			continue;
 		}
-
-		server->received++;
-		resp_len = build_dns_response(server, query, (size_t)n, response,
-			sizeof(response));
-		if (resp_len < 0) {
-			server->parse_errors++;
-			continue;
-		}
-
-		if (sendto(server->sockfd, response, (size_t)resp_len, 0,
-			(struct sockaddr *)&client, client_len) == resp_len)
-		{
-			server->replied++;
-		}
+		dispatch_query(server, query, (size_t)n, (struct sockaddr *)&client,
+			client_len);
 	}
 
 	return NULL;
@@ -653,13 +514,17 @@ unbound_afl_symcc_mutator_server_stop(void)
 	pthread_mutex_lock(&g_server_lock);
 	server = g_server;
 	g_server = NULL;
+	if (server != NULL) {
+		server->stop_requested = true;
+		server->observer = NULL;
+		server->observer_arg = NULL;
+	}
 	pthread_mutex_unlock(&g_server_lock);
 
 	if (server == NULL) {
 		return;
 	}
 
-	server->stop_requested = true;
 	if (server->thread_started) {
 		pthread_join(server->thread_id, NULL);
 		server->thread_started = false;

@@ -210,13 +210,25 @@ COMPLETED_DIR="$FOLLOW_ROOT/$SAMPLE_ID"
 mkdir -p "$COMPLETED_DIR"
 cp "$QUEUE_FILE" "$COMPLETED_DIR/sample.bin"
 
-python3 - "$COMPLETED_DIR" "$SAMPLE_ID" <<'PY'
+PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$COMPLETED_DIR" "$SAMPLE_ID" "$ROOT_DIR" <<'PY'
 import json
 import pathlib
 import sys
 
 sample_dir = pathlib.Path(sys.argv[1])
 sample_id = sys.argv[2]
+
+from tools.dns_diff.cache_diff import build_cache_diff
+from tools.dns_diff.cache_parser import parse_cache_dump
+
+# 完成样本必须带可复核的 before/after，不能靠旧布尔字段声称有效阴性。
+fixture_root = pathlib.Path(sys.argv[3]) / "test/fixtures/cache_semantics"
+rows = {}
+for resolver, filename in (("bind9", "bind.cache"), ("unbound", "unbound.cache")):
+    source = fixture_root / filename
+    rows[resolver] = parse_cache_dump(resolver, source)
+    for stage in ("before", "after"):
+        (sample_dir / f"{resolver}.{stage}.cache.txt").write_bytes(source.read_bytes())
 
 (sample_dir / "sample.meta.json").write_text(
     json.dumps(
@@ -278,19 +290,9 @@ sample_id = sys.argv[2]
 )
 
 (sample_dir / "cache_diff.json").write_text(
-    json.dumps(
-        {
-            "schema_version": 1,
-            "generated_at": "2026-03-23T00:00:00Z",
-            "sample_id": sample_id,
-            "cache_delta_triggered": False,
-            "bind9": {"has_cache_diff": False, "interesting_delta_count": 0},
-            "unbound": {"has_cache_diff": False, "interesting_delta_count": 0},
-        },
-        ensure_ascii=False,
-    )
-    + "\n",
-    encoding="utf-8",
+    json.dumps(build_cache_diff(
+        sample_id, rows["bind9"], rows["bind9"], rows["unbound"], rows["unbound"], False,
+    )) + "\n", encoding="utf-8",
 )
 
 (sample_dir / "state_fingerprint.json").write_text(

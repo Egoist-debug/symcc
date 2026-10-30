@@ -11,6 +11,7 @@ typedef struct unbound_afl_symcc_oracle {
 	bool second_query_hit;
 	bool cache_entry_created;
 	bool timeout;
+	bool fake_reply_dispatched;
 } unbound_afl_symcc_oracle_t;
 
 void

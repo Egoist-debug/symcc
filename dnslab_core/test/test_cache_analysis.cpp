@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <sstream>
 
 namespace {
 
@@ -30,6 +31,70 @@ void require(bool Condition, const char *Message) {
 } // namespace
 
 int main() {
+  const auto FixtureRoot = std::filesystem::path(__FILE__).parent_path()
+                               .parent_path().parent_path() /
+                           "test/fixtures/cache_semantics";
+  std::ifstream Cases(FixtureRoot / "cases.tsv");
+  require(Cases.good(), "共享缓存 fixture 不存在");
+  std::string Line;
+  while (std::getline(Cases, Line)) {
+    std::istringstream Stream(Line);
+    std::vector<std::string> Fields;
+    std::string Field;
+    while (std::getline(Stream, Field, '\t')) {
+      Fields.push_back(Field);
+    }
+    require(Fields.size() == 7, "共享缓存 fixture 列数错误");
+    auto Rows = [&](const std::string &Resolver, const std::string &File) {
+      return File == "-" ? std::vector<dnslab::CacheRecord>{}
+                         : dnslab::parseCacheDump(Resolver, FixtureRoot / File);
+    };
+    for (const bool Triggered : {false, true}) {
+      const auto Cache = dnslab::buildCacheDiff(
+          Fields[0],
+          {{"bind9", Rows("bind9", Fields[1])}, {Fields[3], Rows(Fields[3], Fields[4])}},
+          {{"bind9", Rows("bind9", Fields[2])}, {Fields[3], Rows(Fields[3], Fields[5])}},
+          Triggered, Fields[3]);
+      dnslab::json::Value::Object Oracle;
+      for (const auto &Resolver : {std::string("bind9"), Fields[3]}) {
+        Oracle[Resolver + ".stderr_parse_status"] = "ok";
+        Oracle[Resolver + ".timeout"] = false;
+      }
+      const auto Triage = dnslab::buildTriageRecord(
+          Fields[0], Oracle, Cache, {}, std::nullopt);
+      if (Fields[5].find("smartdns") == 0) {
+        require(Cache.Unbound.ObservationsAfter[0].TTL == "0",
+                "SmartDNS 原始 RR TTL=0 不能被 cache TTL 替换");
+      }
+      if (Fields[0] == "metadata-before-delta") {
+        require(Cache.Unbound.HasCacheDiff && Cache.Unbound.SemanticDelta.empty(),
+                "原始 metadata delta 应保留，但不能成为语义 delta");
+      }
+      if (Triage.DiffClass != Fields[6]) {
+        std::fprintf(stderr, "%s triggered=%d: expected=%s actual=%s\n",
+                     Fields[0].c_str(), Triggered, Fields[6].c_str(),
+                     Triage.DiffClass.c_str());
+        std::abort();
+      }
+      require(Triage.CaseStudyCandidate == (Fields[6] == "cache_diff_interesting"),
+              "共享 fixture 候选分类错误");
+      require(Triage.AnalysisState ==
+                  (Fields[6] == "cache_comparison_incomplete" ? "unknown" : "included"),
+              "共享 fixture 未保留未知状态");
+      if (Fields[0].find("initial-mismatch") == 0) {
+        require(Cache.CacheComparisonStatus == "incomparable" &&
+                    Cache.CacheComparisonReason == "initial_state_mismatch",
+                "不同初态必须保留明确不可比较原因");
+        require(!Cache.DiffDetected && Cache.ResolverDifferences.empty(),
+                "不同初态不能成为跨端差异");
+        require(Cache.Bind9.SemanticDelta.empty() &&
+                    Cache.Unbound.SemanticDelta.empty() ==
+                        (Fields[0] == "initial-mismatch-no-change"),
+                "不同初态仍须保留单端语义 delta");
+      }
+    }
+  }
+
   const auto BindPath = writeTempFile(
       "dnslab_bind_cache.txt",
       "; Cache dump of view '_default'\n"
@@ -143,15 +208,16 @@ int main() {
       dnslab::buildCacheDiff("sample-1", BindRows, {}, UnboundRows, UnboundRows, true);
   require(Diff.Bind9.HasCacheDiff, "Bind9 cache diff 未命中");
   require(!Diff.Unbound.HasCacheDiff, "Unbound cache diff 误报");
-  require(Diff.DiffDetected, "pairwise cache diff 应识别为 resolver 差异");
+  require(!Diff.DiffDetected && Diff.CacheComparisonStatus == "incomparable",
+          "SERVFAIL cache 无共同投影时不能升级跨端差异");
 
   // F1 回归验证: 三种成对场景
   // 1. 相同 RR: bind9 与 unbound 各自添加完全相同的 RR (仅 resolver/view/section 不同)
   std::vector<dnslab::CacheRecord> PairBindSame = {
-      {"bind9", "_default", "example.com.", "IN", "A", "answer", "positive", "300", "192.0.2.1", ""},
+      {"bind9", "_default", "example.com.", "A", "A", "answer", "positive", "300", "192.0.2.1", "class=IN"},
   };
   std::vector<dnslab::CacheRecord> PairUnboundSame = {
-      {"unbound", "", "example.com.", "IN", "A", "", "positive", "300", "192.0.2.1", ""},
+      {"unbound", "", "example.com.", "A", "A", "", "positive", "300", "192.0.2.1", "class=IN"},
   };
   const auto DiffSame = dnslab::buildCacheDiff(
       "pair-same", {}, PairBindSame, {}, PairUnboundSame, true);
@@ -162,7 +228,7 @@ int main() {
 
   // 2. 仅 TTL 不同: TTL 差异不应升级为语义差异
   std::vector<dnslab::CacheRecord> PairUnboundTTLDiff = {
-      {"unbound", "", "example.com.", "IN", "A", "", "positive", "60", "192.0.2.1", ""},
+      {"unbound", "", "example.com.", "A", "A", "", "positive", "60", "192.0.2.1", "class=IN"},
   };
   const auto DiffTTL = dnslab::buildCacheDiff(
       "pair-ttl", {}, PairBindSame, {}, PairUnboundTTLDiff, true);
@@ -170,7 +236,7 @@ int main() {
 
   // 3. 真实 RDATA 不同: 192.0.2.1 vs 192.0.2.2 必须判定为差异
   std::vector<dnslab::CacheRecord> PairUnboundRDataDiff = {
-      {"unbound", "", "example.com.", "IN", "A", "", "positive", "300", "192.0.2.2", ""},
+      {"unbound", "", "example.com.", "A", "A", "", "positive", "300", "192.0.2.2", "class=IN"},
   };
   const auto DiffRData = dnslab::buildCacheDiff(
       "pair-rdata", {}, PairBindSame, {}, PairUnboundRDataDiff, true);
@@ -178,13 +244,13 @@ int main() {
   require(!DiffRData.ResolverDifferences.empty(), "真实 RDATA 不同必须记录 ResolverDifferences");
 
   std::map<std::string, std::vector<dnslab::CacheRecord>> MultiBefore = {
-      {"bind9", BindRows},
-      {"unbound", UnboundRows},
-      {"dnsmasq", DnsmasqRows},
+      {"bind9", {}},
+      {"unbound", {}},
+      {"dnsmasq", {}},
   };
   std::map<std::string, std::vector<dnslab::CacheRecord>> MultiAfter = {
-      {"bind9", BindRows},
-      {"unbound", UnboundRows},
+      {"bind9", PairBindSame},
+      {"unbound", PairUnboundSame},
       {"dnsmasq", {}},
   };
   const auto MultiDiff = dnslab::buildCacheDiff("sample-2", MultiBefore, MultiAfter,
@@ -194,6 +260,24 @@ int main() {
   require(MultiDiff.DiffDetected, "multi resolver cache diff 未标记差异");
   require(!MultiDiff.ResolverDifferences.empty(),
           "multi resolver cache diff 未记录 pair 差异");
+
+  for (const bool MissingBefore : {false, true}) {
+    auto Incomplete = MultiBefore;
+    Incomplete.erase("unbound");
+    const auto Missing = dnslab::buildCacheDiff(
+        "missing-snapshot", MissingBefore ? Incomplete : MultiBefore,
+        MissingBefore ? MultiAfter : Incomplete, true, "unbound");
+    require(Missing.CacheComparisonStatus == "unknown" &&
+                Missing.Unbound.CacheComparisonReason == "missing_snapshot" &&
+                !Missing.DiffDetected && Missing.ResolverDifferences.empty(),
+            "缺失任一快照不能被当作空缓存，也不能用其他 pair 补足证据");
+  }
+  const auto Absent = dnslab::buildCacheDiff("absent", {}, {}, false, "unbound");
+  require(Absent.CacheComparisonStatus == "unknown" &&
+              Absent.Bind9.CacheComparisonReason == "missing_snapshot" &&
+              Absent.Unbound.CacheComparisonReason == "missing_snapshot" &&
+              Absent.ExecutedResolvers.empty(),
+          "全部快照缺失不能伪造执行或空缓存比较");
 
   dnslab::json::Value::Object Oracle;
   Oracle["bind9.stderr_parse_status"] = "ok";

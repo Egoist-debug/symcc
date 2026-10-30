@@ -21,10 +21,12 @@ assert_file_exists() {
 }
 
 write_fixture_root() {
-	python3 - "$FOLLOW_ROOT" <<'PY'
+	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$FOLLOW_ROOT" <<'PY'
 import json
 import pathlib
 import sys
+
+from tools.dns_diff.cache_diff import build_cache_diff
 
 follow_root = pathlib.Path(sys.argv[1])
 follow_root.mkdir(parents=True, exist_ok=True)
@@ -80,69 +82,13 @@ def stale_triage_payload(sample_id: str) -> dict:
 
 
 def cache_diff_empty(sample_id: str) -> dict:
-    payload = shared_meta(sample_id)
-    payload.update(
-        {
-            "cache_delta_triggered": False,
-            "bind9": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-            "unbound": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-        }
-    )
-    return payload
+    return build_cache_diff(sample_id, [], [], [], [], False)
 
 
 def cache_diff_interesting(sample_id: str) -> dict:
-    payload = shared_meta(sample_id)
-    payload.update(
-        {
-            "cache_delta_triggered": True,
-            "bind9": {
-                "entries_before": 0,
-                "entries_after": 1,
-                "has_cache_diff": True,
-                "interesting_delta_count": 1,
-                "delta_items": [
-                    {
-                        "kind": "added",
-                        "count_before": 0,
-                        "count_after": 1,
-                        "delta": 1,
-                        "fields": {
-                            "resolver": "bind9",
-                            "view": "_default",
-                            "qname": "www.example.",
-                            "qtype": "A",
-                            "rrtype": "A",
-                            "section": "answer",
-                            "cache_type": "rrset",
-                            "rdata_norm": "192.0.2.1",
-                            "flags": "-",
-                        },
-                    }
-                ],
-            },
-            "unbound": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-        }
-    )
-    return payload
+    rows = [("bind9", "_default", "www.example.", "A", "A", "answer",
+             "rrset", "300", "192.0.2.1", "class=IN")]
+    return build_cache_diff(sample_id, [], rows, [], [], True)
 
 
 fixtures = {

@@ -919,20 +919,13 @@ void backfillExistingSampleContracts(const FollowDiffConfig &Config,
 
     CacheDiffResult CacheDiff;
     if (!std::filesystem::is_regular_file(SampleDir / "cache_diff.json")) {
-      std::map<std::string, std::vector<CacheRecord>> BeforeByResolver = {
-          {"bind9", {}}, {Config.SecondaryResolver, {}}};
-      const auto AfterByResolver = BeforeByResolver;
-      CacheDiff = buildCacheDiff(SampleId, BeforeByResolver, AfterByResolver,
-                                 false, Config.SecondaryResolver);
+      CacheDiff = buildCacheDiff(SampleId, {}, {}, false, Config.SecondaryResolver);
       writeJsonFile(SampleDir / "cache_diff.json", toJson(CacheDiff));
     }
 
     if (!std::filesystem::is_regular_file(SampleDir / "triage.json")) {
       if (CacheDiff.SampleId.empty()) {
-        std::map<std::string, std::vector<CacheRecord>> EmptyByResolver = {
-            {"bind9", {}}, {Config.SecondaryResolver, {}}};
-        CacheDiff = buildCacheDiff(SampleId, EmptyByResolver, EmptyByResolver,
-                                   false, Config.SecondaryResolver);
+        CacheDiff = buildCacheDiff(SampleId, {}, {}, false, Config.SecondaryResolver);
       }
       StateFingerprint Fingerprint;
       Fingerprint.GeneratedAt = utcTimestampNow();

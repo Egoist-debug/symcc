@@ -45,13 +45,14 @@ PY
 write_fake_binary() {
 	local path="$1"
 	local mode="$2"
-	python3 - "$path" "$mode" <<'PY'
+	python3 - "$path" "$mode" "$ROOT_DIR" <<'PY'
 import pathlib
 import stat
 import sys
 
 path = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
+fixtures = pathlib.Path(sys.argv[3]) / "test" / "fixtures" / "cache_semantics"
 path.parent.mkdir(parents=True, exist_ok=True)
 
 scripts = {
@@ -74,7 +75,9 @@ dump_path = os.environ.get(\"UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH\") or os
 if dump_path:
     dump_file = pathlib.Path(dump_path)
     dump_file.parent.mkdir(parents=True, exist_ok=True)
-    dump_file.write_text(\"cache-entry\\n\", encoding=\"utf-8\")
+    # 成功场景必须提供共同语义可比较的真实格式快照。
+    fixture = "unbound.cache" if os.environ.get("UNBOUND_RESOLVER_AFL_SYMCC_CACHE_DUMP_PATH") else "bind.cache"
+    dump_file.write_bytes((pathlib.Path({str(fixtures)!r}) / fixture).read_bytes())
 sys.stderr.write(\"ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=1 response_accepted=1 second_query_hit=0 cache_entry_created=0 timeout=0\\n\")
 sys.exit(0)
 """,

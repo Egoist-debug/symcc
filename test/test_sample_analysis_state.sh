@@ -12,10 +12,12 @@ cleanup() {
 trap cleanup EXIT
 
 write_fixture_root() {
-	python3 - "$FOLLOW_ROOT" <<'PY'
+	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$FOLLOW_ROOT" <<'PY'
 import json
 import pathlib
 import sys
+
+from tools.dns_diff.cache_diff import build_cache_diff
 
 follow_root = pathlib.Path(sys.argv[1])
 follow_root.mkdir(parents=True, exist_ok=True)
@@ -77,51 +79,13 @@ def stale_triage_payload(sample_id: str) -> dict:
 
 
 def cache_diff_empty(sample_id: str) -> dict:
-    payload = shared_meta(sample_id)
-    payload.update(
-        {
-            "cache_delta_triggered": False,
-            "bind9": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-            "unbound": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-        }
-    )
-    return payload
+    return build_cache_diff(sample_id, [], [], [], [], False)
 
 
-def cache_diff_present(sample_id: str, *, interesting: bool, has_diff: bool = True) -> dict:
-    payload = shared_meta(sample_id)
-    payload.update(
-        {
-            "cache_delta_triggered": bool(interesting),
-            "bind9": {
-                "entries_before": 0,
-                "entries_after": 1 if has_diff else 0,
-                "has_cache_diff": bool(has_diff),
-                "interesting_delta_count": 1 if interesting else 0,
-                "delta_items": [{"kind": "added"}] if interesting else [],
-            },
-            "unbound": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-        }
-    )
-    return payload
+def cache_diff_present(sample_id: str, *, interesting: bool) -> dict:
+    rows = [("bind9", "_default", "example.com.", "A", "A", "RRSET",
+             "rrset", "300", "192.0.2.1", "class=IN")]
+    return build_cache_diff(sample_id, [], rows, [], [], interesting)
 
 
 def oracle_ok_same() -> dict:
@@ -171,12 +135,19 @@ fixtures = {
         "state_fingerprint.json": fingerprint_payload("cache_diff_interesting"),
         "triage.json": stale_triage_payload("cache_diff_interesting"),
     },
-    "cache_diff_benign": {
-        "sample.meta.json": {**shared_meta("cache_diff_benign"), "status": "completed"},
+    "cache_diff_without_details": {
+        "sample.meta.json": {**shared_meta("cache_diff_without_details"), "status": "completed"},
         "oracle.json": oracle_ok_same(),
-        "cache_diff.json": cache_diff_present("cache_diff_benign", interesting=False),
-        "state_fingerprint.json": fingerprint_payload("cache_diff_benign"),
-        "triage.json": stale_triage_payload("cache_diff_benign"),
+        "cache_diff.json": cache_diff_present("cache_diff_without_details", interesting=False),
+        "state_fingerprint.json": fingerprint_payload("cache_diff_without_details"),
+        "triage.json": stale_triage_payload("cache_diff_without_details"),
+    },
+    "legacy_cache": {
+        "sample.meta.json": {**shared_meta("legacy_cache"), "status": "completed"},
+        "oracle.json": oracle_ok_same(),
+        "cache_diff.json": {"bind9": {"has_cache_diff": True}},
+        "state_fingerprint.json": fingerprint_payload("legacy_cache"),
+        "triage.json": stale_triage_payload("legacy_cache"),
     },
     "completed_no_diff": {
         "sample.meta.json": {**shared_meta("completed_no_diff"), "status": "completed"},
@@ -304,18 +275,28 @@ expected = {
         "manual_truth_status": "not_started",
         "needs_manual_review": True,
     },
-    "cache_diff_benign": {
-        "status": "completed_cache_changed_but_benign",
-        "diff_class": "cache_diff_benign",
+    "cache_diff_without_details": {
+        "status": "completed_cache_changed_needs_review",
+        "diff_class": "cache_diff_interesting",
         "analysis_state": "included",
         "exclude_reason": None,
-        "semantic_outcome": "cache_diff_benign",
-        "failure_bucket_primary": "valid_negative",
-        "failure_bucket_detail": "cache_diff_benign",
+        "semantic_outcome": "cache_diff_interesting",
+        "failure_bucket_primary": "semantic_diff",
+        "failure_bucket_detail": "cache_diff_interesting",
+        "oracle_audit_candidate": True,
+        "case_study_candidate": True,
+        "manual_truth_status": "not_started",
+        "needs_manual_review": True,
+    },
+    "legacy_cache": {
+        "status": "incomplete_cache_comparison",
+        "diff_class": "cache_comparison_incomplete",
+        "analysis_state": "unknown",
+        "failure_bucket_primary": "input_parse_failure",
+        "failure_bucket_detail": "cache_comparison_incomplete",
         "oracle_audit_candidate": False,
         "case_study_candidate": False,
         "manual_truth_status": "not_applicable",
-        "needs_manual_review": False,
     },
     "completed_no_diff": {
         "status": "completed_no_diff",

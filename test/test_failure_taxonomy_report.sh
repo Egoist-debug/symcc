@@ -24,10 +24,12 @@ run_cli() {
 }
 
 write_fixtures() {
-	python3 - "$FOLLOW_ROOT" <<'PY'
+	PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$FOLLOW_ROOT" <<'PY'
 import json
 import pathlib
 import sys
+
+from tools.dns_diff.cache_diff import build_cache_diff
 
 follow_root = pathlib.Path(sys.argv[1])
 follow_root.mkdir(parents=True, exist_ok=True)
@@ -66,27 +68,7 @@ def fingerprint(sample_id: str) -> dict:
 
 
 def cache_empty(sample_id: str) -> dict:
-    payload = shared_meta(sample_id)
-    payload.update(
-        {
-            "cache_delta_triggered": False,
-            "bind9": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-            "unbound": {
-                "entries_before": 0,
-                "entries_after": 0,
-                "has_cache_diff": False,
-                "interesting_delta_count": 0,
-                "delta_items": [],
-            },
-        }
-    )
-    return payload
+    return build_cache_diff(sample_id, [], [], [], [], False)
 
 
 def cache_benign(sample_id: str) -> dict:
@@ -280,10 +262,10 @@ root = pathlib.Path(sys.argv[1])
 expected = {
     "completed_no_diff": ("included", "no_diff", "valid_negative", "no_diff", None),
     "completed_cache_changed_but_benign": (
-        "included",
-        "cache_diff_benign",
-        "valid_negative",
-        "cache_diff_benign",
+        "unknown",
+        "cache_comparison_incomplete",
+        "input_parse_failure",
+        "cache_comparison_incomplete",
         None,
     ),
     "failed_parse": (
@@ -360,7 +342,7 @@ if included + excluded + unknown != total:
         f"included({included})+excluded({excluded})+unknown({unknown}) != total({total})"
     )
 
-if (included, excluded, unknown, total) != (3, 2, 2, 7):
+if (included, excluded, unknown, total) != (2, 2, 3, 7):
     raise SystemExit(
         "ASSERT FAIL: metric_denominators.analysis_state 计数不符合 fixture 预期: "
         f"actual={(included, excluded, unknown, total)!r}"
@@ -375,7 +357,7 @@ counts = {
 }
 expected_counts = {
     ("valid_negative", "no_diff"): 1,
-    ("valid_negative", "cache_diff_benign"): 1,
+    ("input_parse_failure", "cache_comparison_incomplete"): 1,
     ("input_parse_failure", "oracle_parse_incomplete"): 1,
     ("infra_artifact_failure", "replay_missing_artifact"): 1,
     ("orchestrator_compat_failure", "replay_subprocess_launch_error"): 1,
@@ -407,8 +389,8 @@ exclusion_counts = {
 }
 expected_exclusion = {
     "semantic_diff": ("included", 1),
-    "valid_negative": ("included", 2),
-    "input_parse_failure": ("unknown", 1),
+    "valid_negative": ("included", 1),
+    "input_parse_failure": ("unknown", 2),
     "infra_artifact_failure": ("excluded", 1),
     "orchestrator_compat_failure": ("excluded", 1),
     "target_runtime_failure": ("unknown", 1),

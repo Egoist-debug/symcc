@@ -1506,6 +1506,7 @@ std::string coerceFailureBucketDetail(const json::Value *Value) {
       "cache_diff_interesting",
       "cache_diff_benign",
       "no_diff",
+      "cache_comparison_incomplete",
       "oracle_parse_incomplete",
       "replay_missing_artifact",
       "replay_missing_executable",
@@ -2026,27 +2027,14 @@ json::Value::Array collectResolverDiffs(
 }
 
 bool cacheDiffAny(const json::Value::Object &CacheDiffPayload) {
-  if (coerceBool(findObjectValue(CacheDiffPayload, "diff_detected"))) {
-    return true;
-  }
-  const auto ResolverDiffs =
-      coerceArrayOrEmpty(findObjectValue(CacheDiffPayload, "resolver_diffs"));
-  if (!ResolverDiffs.empty()) {
-    return true;
-  }
-  for (const auto &[ResolverName, ResolverValue] : CacheDiffPayload) {
-    if (ResolverName == "schema_version" || ResolverName == "generated_at" ||
-        ResolverName == "sample_id" || ResolverName == "cache_delta_triggered" ||
-        ResolverName == "compatibility_secondary_resolver" ||
-        ResolverName == "executed_resolvers" || ResolverName == "resolvers") {
-      continue;
-    }
-    const auto ResolverObject = coerceObjectOrEmpty(&ResolverValue);
-    if (coerceBool(findObjectValue(ResolverObject, "has_cache_diff"))) {
-      return true;
-    }
-  }
-  return false;
+  const auto *Version = findObjectValue(CacheDiffPayload, "cache_comparison_version");
+  return Version &&
+         std::holds_alternative<std::int64_t>(Version->storage()) &&
+         std::get<std::int64_t>(Version->storage()) == 1 &&
+         coerceText(findObjectValue(CacheDiffPayload, "cache_comparison_status"), "") ==
+             "comparable" &&
+         coerceBool(findObjectValue(CacheDiffPayload, "diff_detected")) &&
+         !coerceArrayOrEmpty(findObjectValue(CacheDiffPayload, "resolver_diffs")).empty();
 }
 
 CampaignAuditRecord buildCampaignAuditRecord(

@@ -101,7 +101,8 @@ class DnsDiffTriageTest(unittest.TestCase):
             )
             self.assertIn("partial_fingerprint", payload["filter_labels"])
             self.assertIn("forwarding_path_seen", payload["filter_labels"])
-            self.assertEqual("completed_no_diff", payload["status"])
+            self.assertEqual("incomplete_cache_comparison", payload["status"])
+            self.assertEqual("unknown", payload["analysis_state"])
 
     def test_rewrite_triage_root_creates_missing_triage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -130,8 +131,9 @@ class DnsDiffTriageTest(unittest.TestCase):
             triage = (sample_dir / "triage.json").read_text(encoding="utf-8")
             payload = json.loads(triage)
             self.assertEqual("sample-missing-triage", payload["sample_id"])
-            self.assertEqual("completed_no_diff", payload["status"])
-            self.assertEqual("no_diff", payload["diff_class"])
+            self.assertEqual("incomplete_cache_comparison", payload["status"])
+            self.assertEqual("cache_comparison_incomplete", payload["diff_class"])
+            self.assertEqual("unknown", payload["analysis_state"])
             self.assertTrue(
                 set(TRIAGE_REQUIRED_FIELDS).issubset(payload),
                 "生成的 triage.json 必须包含所有必需字段",

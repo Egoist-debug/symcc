@@ -17,6 +17,7 @@ FAILURE_BUCKET_DETAIL_ORDER: Sequence[str] = (
     "cache_diff_interesting",
     "cache_diff_benign",
     "no_diff",
+    "cache_comparison_incomplete",
     "oracle_parse_incomplete",
     "replay_missing_artifact",
     "replay_missing_executable",
@@ -31,6 +32,7 @@ _PRIMARY_BY_DETAIL: Dict[str, str] = {
     "cache_diff_interesting": "semantic_diff",
     "cache_diff_benign": "valid_negative",
     "no_diff": "valid_negative",
+    "cache_comparison_incomplete": "input_parse_failure",
     "oracle_parse_incomplete": "input_parse_failure",
     "replay_missing_artifact": "infra_artifact_failure",
     "replay_missing_executable": "infra_artifact_failure",
@@ -62,6 +64,7 @@ _PUBLICATION_SEMANTIC_OUTCOME_BY_DETAIL: Dict[str, str] = {
     "cache_diff_interesting": "cache_diff_interesting",
     "cache_diff_benign": "cache_diff_benign",
     "no_diff": "no_diff",
+    "cache_comparison_incomplete": "cache_comparison_incomplete",
     "oracle_parse_incomplete": "runtime_or_parse_failure",
     "replay_timeout": "runtime_or_parse_failure",
     "replay_subprocess_failed": "runtime_or_parse_failure",
@@ -102,6 +105,8 @@ def _detail_from_status(
     diff_class: Optional[str],
     replay_failure_reason: Optional[str],
 ) -> str:
+    if diff_class == "cache_comparison_incomplete":
+        return "cache_comparison_incomplete"
     if diff_class == "oracle_and_cache_diff":
         return "oracle_and_cache_diff"
     if status == "completed_oracle_diff" or diff_class == "oracle_diff":

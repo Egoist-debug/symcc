@@ -1,6 +1,7 @@
 #include "dnslab_core/cache_analysis.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -142,7 +143,16 @@ buildRrsetRecord(const std::string &Resolver, const std::string &View,
 
   const std::string Rrtype = Tokens[TypeIndex];
   const std::string Ttl = Tokens[*TtlIndex];
-  const std::string Rdata = joinTokens(Tokens, TypeIndex + 1);
+  std::istringstream RdataStream(PendingRrset);
+  std::string Rdata;
+  for (size_t Index = 0; Index <= TypeIndex; ++Index) {
+    RdataStream >> Rdata;
+  }
+  std::getline(RdataStream, Rdata);
+  Rdata = trim(Rdata);
+  if (Rdata.empty()) {
+    Rdata = "_";
+  }
   CacheRecord Record{
       Resolver,
       View,
@@ -162,7 +172,8 @@ buildRrsetRecord(const std::string &Resolver, const std::string &View,
 std::optional<CacheRecord> buildUnboundMsgRecord(const std::string &Line) {
   const auto Tokens = splitWhitespace(trim(Line));
   if (Tokens.size() < 12) {
-    return std::nullopt;
+    return CacheRecord{"unbound", "_", "_", "_", "_", "MSG", "message",
+                       "_", Line, "_"};
   }
   return CacheRecord{
       "unbound",
@@ -213,6 +224,8 @@ std::string smartdnsQtypeName(int Qtype) {
   switch (Qtype) {
   case 1:
     return "A";
+  case 2:
+    return "NS";
   case 5:
     return "CNAME";
   case 6:
@@ -225,6 +238,8 @@ std::string smartdnsQtypeName(int Qtype) {
     return "AAAA";
   case 33:
     return "SRV";
+  case 39:
+    return "DNAME";
   case 65:
     return "HTTPS";
   case 257:
@@ -273,11 +288,24 @@ decodeDnsName(const std::vector<std::uint8_t> &Packet, size_t Offset) {
       continue;
     }
     ++Cursor;
+    if (Length > 63) {
+      throw std::runtime_error("smartdns cache 标签长度非法");
+    }
     if (Cursor + Length > Packet.size()) {
       throw std::runtime_error("smartdns cache 标签截断");
     }
-    Labels.emplace_back(reinterpret_cast<const char *>(Packet.data() + Cursor),
-                        Length);
+    // 保留标签内的点和特殊字节，不能把它们误当作标签分隔符。
+    std::ostringstream Label;
+    for (size_t Index = 0; Index < Length; ++Index) {
+      const auto Byte = Packet[Cursor + Index];
+      if (Byte >= 33 && Byte <= 126 && Byte != '"' && Byte != '.' && Byte != '\\') {
+        Label << static_cast<char>(Byte);
+      } else {
+        Label << '\\' << std::setw(3) << std::setfill('0')
+              << static_cast<unsigned int>(Byte);
+      }
+    }
+    Labels.push_back(Label.str());
     Cursor += Length;
     if (!Jumped) {
       NextOffset = Cursor;
@@ -312,8 +340,35 @@ std::string smartdnsRdataText(const std::vector<std::uint8_t> &Packet,
     }
     return Stream.str();
   }
-  if (Rrtype == 5 || Rrtype == 12) {
-    return decodeDnsName(Packet, Offset).first;
+  const auto End = Offset + Rdlength;
+  if (Rrtype == 2 || Rrtype == 5 || Rrtype == 12 || Rrtype == 39) {
+    if (Offset >= End) {
+      throw std::runtime_error("smartdns cache RDATA 截断");
+    }
+    const auto Name = decodeDnsName(Packet, Offset);
+    if (Name.second != End) {
+      throw std::runtime_error("smartdns cache RDATA 长度非法");
+    }
+    return Name.first;
+  }
+  if (Rrtype == 16) {
+    std::vector<std::string> Tokens;
+    size_t Cursor = Offset;
+    while (Cursor < End) {
+      const auto Size = Packet[Cursor++];
+      if (Cursor + Size > End) {
+        throw std::runtime_error("smartdns cache TXT 截断");
+      }
+      std::ostringstream Text;
+      Text << '"';
+      for (size_t Index = 0; Index < Size; ++Index) {
+        Text << '\\' << std::setw(3) << std::setfill('0')
+             << static_cast<unsigned int>(Packet[Cursor++]);
+      }
+      Text << '"';
+      Tokens.push_back(Text.str());
+    }
+    return joinTokens(Tokens, 0);
   }
   std::ostringstream Stream;
   Stream << std::hex;
@@ -637,6 +692,9 @@ std::vector<CacheRecord> iterSmartdnsRecords(
       size_t Cursor = 12U;
       for (size_t QIndex = 0; QIndex < Qdcount; ++QIndex) {
         Cursor = decodeDnsName(Packet, Cursor).second + 4U;
+        if (Cursor > Packet.size()) {
+          throw std::runtime_error("smartdns cache question 截断");
+        }
       }
       for (size_t AIndex = 0; AIndex < Ancount; ++AIndex) {
         const auto [Name, NameEnd] = decodeDnsName(Packet, Cursor);
@@ -662,12 +720,12 @@ std::vector<CacheRecord> iterSmartdnsRecords(
         Records.push_back(CacheRecord{
             "smartdns",
             "_",
-            Name == "." ? Domain : Name,
+            Name,
             smartdnsQtypeName(Qtype),
             smartdnsQtypeName(Rrtype),
             "CACHE",
             "packet",
-            std::to_string(Rrttl > 0 ? Rrttl : Ttl),
+            std::to_string(Rrttl),
             Rdata,
             composeFlags({{"class", std::to_string(Rrclass)},
                           {"rcode", std::to_string(Rcode)},
@@ -820,6 +878,204 @@ StructuralKey structuralKey(const CacheRecord &Record) {
           Record.CacheType, Record.RDataNorm, Record.Flags};
 }
 
+std::uint64_t decimalValue(const std::string &Text) {
+  if (Text.empty() || !std::all_of(Text.begin(), Text.end(),
+                                  [](char Ch) { return Ch >= '0' && Ch <= '9'; })) {
+    throw std::invalid_argument("invalid_number");
+  }
+  return std::stoull(Text);
+}
+
+std::string semanticDomain(std::string Name) {
+  if (Name == ".") {
+    return Name;
+  }
+  if (!Name.empty() && Name.back() == '.') {
+    Name.pop_back();
+  }
+  if (Name.empty() || Name == "_") {
+    throw std::invalid_argument("unsupported_domain");
+  }
+  size_t LabelSize = 0;
+  for (char &Ch : Name) {
+    const auto Byte = static_cast<unsigned char>(Ch);
+    if (Byte > 127 || std::isspace(Byte) || Ch == '\\' || Ch == '"') {
+      throw std::invalid_argument("unsupported_domain");
+    }
+    if (Ch == '.') {
+      if (!LabelSize || LabelSize > 63) {
+        throw std::invalid_argument("unsupported_domain");
+      }
+      LabelSize = 0;
+    } else {
+      ++LabelSize;
+      Ch = static_cast<char>(std::tolower(Byte));
+    }
+  }
+  if (!LabelSize || LabelSize > 63) {
+    throw std::invalid_argument("unsupported_domain");
+  }
+  return Name + ".";
+}
+
+std::string hexBytes(const std::string &Bytes) {
+  std::ostringstream Stream;
+  Stream << std::hex << std::setfill('0');
+  for (const unsigned char Byte : Bytes) {
+    Stream << std::setw(2) << static_cast<unsigned int>(Byte);
+  }
+  return Stream.str();
+}
+
+std::string semanticTxt(const std::string &Text) {
+  std::string Wire;
+  size_t Cursor = 0;
+  while (Cursor < Text.size()) {
+    if (std::isspace(static_cast<unsigned char>(Text[Cursor]))) {
+      ++Cursor;
+      continue;
+    }
+    if (Text[Cursor++] != '"') {
+      throw std::invalid_argument("unsupported_txt");
+    }
+    std::string Chunk;
+    while (Cursor < Text.size() && Text[Cursor] != '"') {
+      auto Byte = static_cast<unsigned char>(Text[Cursor++]);
+      if (Byte == '\\') {
+        if (Cursor == Text.size()) {
+          throw std::invalid_argument("unsupported_txt");
+        }
+        const auto Digits = Text.substr(Cursor, 3);
+        if (Digits.size() == 3 && std::all_of(Digits.begin(), Digits.end(),
+                [](char Ch) { return Ch >= '0' && Ch <= '9'; })) {
+          const auto Value = decimalValue(Digits);
+          if (Value > 255) {
+            throw std::invalid_argument("unsupported_txt");
+          }
+          Chunk.push_back(static_cast<char>(Value));
+          Cursor += 3;
+          continue;
+        }
+        Byte = static_cast<unsigned char>(Text[Cursor++]);
+      }
+      if (Byte > 127) {
+        throw std::invalid_argument("unsupported_txt");
+      }
+      Chunk.push_back(static_cast<char>(Byte));
+    }
+    if (Cursor == Text.size() || Chunk.size() > 255) {
+      throw std::invalid_argument("unsupported_txt");
+    }
+    ++Cursor;
+    Wire.push_back(static_cast<char>(Chunk.size()));
+    Wire += Chunk;
+  }
+  if (Wire.empty()) {
+    throw std::invalid_argument("unsupported_txt");
+  }
+  return hexBytes(Wire);
+}
+
+std::string semanticRdata(const std::string &Type, const std::string &Text) {
+  if (Type == "A" || Type == "AAAA") {
+    char Bytes[16];
+    if (inet_pton(Type == "A" ? AF_INET : AF_INET6, Text.c_str(), Bytes) != 1) {
+      throw std::invalid_argument("invalid_address");
+    }
+    return hexBytes(std::string(Bytes, Type == "A" ? 4 : 16));
+  }
+  if (Type == "TXT") {
+    return semanticTxt(Text);
+  }
+  if (Type == "NS" || Type == "CNAME" || Type == "DNAME" || Type == "PTR") {
+    return semanticDomain(Text);
+  }
+  // shortcut: 只比较当前共享正 RR 类型；扩展时须同步两端解码和 fixture。
+  throw std::invalid_argument("unsupported_rdata");
+}
+
+using SemanticKey = std::tuple<std::string, std::string, std::string, std::string>;
+
+std::map<std::string, std::string> recordFlags(const CacheRecord &Row) {
+  std::map<std::string, std::string> Flags;
+  for (const auto &Token : splitWhitespace(Row.Flags)) {
+    const auto Equals = Token.find('=');
+    if (Equals != std::string::npos) {
+      Flags[Token.substr(0, Equals)] = Token.substr(Equals + 1);
+    }
+  }
+  return Flags;
+}
+
+std::string semanticClass(std::string Class, const std::string &Resolver) {
+  if (Class.empty() && (Resolver == "dnsmasq" || Resolver == "maradns" ||
+                        Resolver == "knot-resolver")) {
+    Class = "IN";
+  }
+  if (Class == "IN") Class = "1";
+  else if (Class == "CH") Class = "3";
+  else if (Class == "HS") Class = "4";
+  else if (Class.rfind("CLASS", 0) == 0) Class = Class.substr(5);
+  const auto ClassNumber = decimalValue(Class);
+  if (ClassNumber == 0 || ClassNumber > 65535) {
+    throw std::invalid_argument("unknown_class");
+  }
+  return std::to_string(ClassNumber);
+}
+
+std::set<SemanticKey> semanticSnapshot(const std::vector<CacheRecord> &Rows) {
+  std::set<SemanticKey> Output;
+  for (const auto &Row : Rows) {
+    auto Flags = recordFlags(Row);
+    if (Row.CacheType == "message") {
+      const bool Positive = Flags["flags"] == "NOERROR" ||
+                            (decimalValue(Flags["flags"]) & 0x20F) == 0;
+      if (Positive && Flags["qd"] == "1" && decimalValue(Flags["an"]) > 0 &&
+          std::any_of(Rows.begin(), Rows.end(), [&](const auto &Other) {
+            return Other.CacheType == "rrset" &&
+                   semanticDomain(Other.QName) == semanticDomain(Row.QName) &&
+                   Other.RRType == Row.QType &&
+                   semanticClass(recordFlags(Other)["class"], Other.Resolver) ==
+                       semanticClass(Flags["class"], Row.Resolver);
+          })) {
+        continue;
+      }
+      throw std::invalid_argument("unsupported_message_state");
+    }
+    if ((Row.CacheType != "rrset" && Row.CacheType != "packet" &&
+         Row.CacheType != "positive") ||
+        (Flags.count("rcode") && Flags["rcode"] != "0")) {
+      throw std::invalid_argument("unsupported_cache_state");
+    }
+    Output.emplace(semanticDomain(Row.QName), Row.RRType,
+                   semanticClass(Flags["class"], Row.Resolver),
+                   semanticRdata(Row.RRType, Row.RDataNorm));
+  }
+  return Output;
+}
+
+json::Value::Array semanticDelta(const std::vector<CacheRecord> &Before,
+                                 const std::vector<CacheRecord> &After) {
+  // 先投影为 RR 集合，避免展示或 metadata 变化污染单端语义 delta。
+  const auto Left = semanticSnapshot(Before);
+  const auto Right = semanticSnapshot(After);
+  json::Value::Array Output;
+  auto Append = [&](const auto &Rows, const auto &Other, const char *Kind) {
+    for (const auto &Key : Rows) {
+      if (!Other.count(Key)) {
+        Output.emplace_back(json::Value::Object{
+            {"kind", Kind},
+            {"fields", json::Value::Object{{"qname", std::get<0>(Key)},
+                {"rrtype", std::get<1>(Key)}, {"class", std::get<2>(Key)},
+                {"rdata_norm", std::get<3>(Key)}}}});
+      }
+    }
+  };
+  Append(Left, Right, "removed");
+  Append(Right, Left, "added");
+  return Output;
+}
+
 ResolverCacheDiff buildResolverCacheDiff(const std::vector<CacheRecord> &Before,
                                          const std::vector<CacheRecord> &After,
                                          bool IncludeDetails) {
@@ -836,6 +1092,15 @@ ResolverCacheDiff buildResolverCacheDiff(const std::vector<CacheRecord> &Before,
   Output.EntriesBefore = static_cast<int>(Before.size());
   Output.EntriesAfter = static_cast<int>(After.size());
   Output.HasCacheDiff = BeforeCounter != AfterCounter;
+  Output.ObservationsBefore = Before;
+  Output.ObservationsAfter = After;
+  try {
+    Output.SemanticDelta = semanticDelta(Before, After);
+    Output.CacheComparisonStatus = "comparable";
+  } catch (const std::logic_error &Error) {
+    Output.CacheComparisonStatus = "incomparable";
+    Output.CacheComparisonReason = Error.what();
+  }
   if (!IncludeDetails) {
     return Output;
   }
@@ -940,66 +1205,14 @@ resolverPairOracleDiffFields(
   return oracleDiffFields(Combined, LeftResolver, RightResolver);
 }
 
-static std::string normalizeDomainForComparison(std::string Name) {
-  std::transform(Name.begin(), Name.end(), Name.begin(), ::tolower);
-  while (!Name.empty() && Name.back() == '.') {
-    Name.pop_back();
-  }
-  if (!Name.empty()) {
-    Name.push_back('.');
-  }
-  return Name;
-}
-
-static json::Value toSemanticJson(const CacheDeltaItem &Item) {
-  json::Value::Object Output;
-  Output["kind"] = Item.Kind;
-  Output["delta"] = Item.Delta;
-  json::Value::Object Fields;
-  Fields["qname"] = normalizeDomainForComparison(Item.Fields.QName);
-  Fields["qtype"] = Item.Fields.QType;
-  Fields["rrtype"] = Item.Fields.RRType;
-  Fields["cache_type"] = Item.Fields.CacheType;
-  std::string RData = Item.Fields.RDataNorm;
-  std::transform(RData.begin(), RData.end(), RData.begin(), ::tolower);
-  Fields["rdata_norm"] = RData;
-  Fields["flags"] = Item.Fields.Flags;
-  Output["fields"] = Fields;
-  return Output;
-}
-
 std::vector<std::string> cacheDiffMismatchFields(const ResolverCacheDiff &Left,
                                                  const ResolverCacheDiff &Right) {
-  std::vector<std::string> Output;
-  if (Left.HasCacheDiff != Right.HasCacheDiff) {
-    Output.push_back("has_cache_diff");
+  if (Left.CacheComparisonStatus != "comparable" ||
+      Right.CacheComparisonStatus != "comparable") {
+    return {};
   }
-  if (Left.InterestingDeltaCount != Right.InterestingDeltaCount) {
-    Output.push_back("interesting_delta_count");
-  }
-
-  std::vector<std::string> LeftSemanticItems;
-  LeftSemanticItems.reserve(Left.DeltaItems.size());
-  for (const auto &Item : Left.DeltaItems) {
-    LeftSemanticItems.push_back(stableJsonText(toSemanticJson(Item)));
-  }
-  std::sort(LeftSemanticItems.begin(), LeftSemanticItems.end());
-
-  std::vector<std::string> RightSemanticItems;
-  RightSemanticItems.reserve(Right.DeltaItems.size());
-  for (const auto &Item : Right.DeltaItems) {
-    RightSemanticItems.push_back(stableJsonText(toSemanticJson(Item)));
-  }
-  std::sort(RightSemanticItems.begin(), RightSemanticItems.end());
-
-  if (LeftSemanticItems != RightSemanticItems) {
-    Output.push_back("delta_items");
-  }
-  if (!Output.empty()) {
-    std::sort(Output.begin(), Output.end());
-    Output.erase(std::unique(Output.begin(), Output.end()), Output.end());
-  }
-  return Output;
+  return stableJsonText(Left.SemanticDelta) != stableJsonText(Right.SemanticDelta)
+             ? std::vector<std::string>{"semantic_delta"} : std::vector<std::string>{};
 }
 
 bool cacheHasDiff(const CacheDiffResult &Input) {
@@ -1073,6 +1286,11 @@ TriageRecord projectionFromStatus(const std::string &Status,
     Output.AnalysisState = "included";
     Output.SemanticOutcome = DiffClass;
     Output.FailureBucketPrimary = "valid_negative";
+    Output.FailureBucketDetail = DiffClass;
+  } else if (DiffClass == "cache_comparison_incomplete") {
+    Output.AnalysisState = "unknown";
+    Output.SemanticOutcome = DiffClass;
+    Output.FailureBucketPrimary = "input_parse_failure";
     Output.FailureBucketDetail = DiffClass;
   } else if (DiffClass == "oracle_parse_incomplete") {
     Output.AnalysisState = "unknown";
@@ -1177,11 +1395,20 @@ std::vector<CacheRecord> parseCacheDump(const std::string &Resolver,
     Lines.push_back(Line);
   }
 
-  if (Canonical == "unbound") {
-    return iterUnboundRecords(Lines);
-  }
-  if (Canonical == "bind9") {
-    return iterBind9Records(Lines);
+  if (Canonical == "unbound" || Canonical == "bind9") {
+    auto Records = Canonical == "unbound" ? iterUnboundRecords(Lines)
+                                          : iterBind9Records(Lines);
+    const std::set<std::string> Markers = {
+        "START_RRSET_CACHE", "END_RRSET_CACHE", "START_MSG_CACHE", "END_MSG_CACHE", "EOF"};
+    if (Records.empty() && std::any_of(Lines.begin(), Lines.end(), [&](const auto &Text) {
+          return !trim(Text).empty() && Text.front() != ';' &&
+                 Text.rfind("$DATE", 0) != 0 && !Markers.count(trim(Text));
+        })) {
+      // 未识别的观测保留为不可比较记录，而非伪造已知空快照。
+      Records.push_back({Canonical, "_", "_", "_", "_", "_", "unparsed", "_",
+                         joinTokens(Lines, 0), "_"});
+    }
+    return Records;
   }
   if (Canonical == "maradns") {
     return iterMaradnsRecords(Lines);
@@ -1222,6 +1449,8 @@ CacheDiffResult buildCacheDiff(
   Output.SampleId = SampleId;
   Output.CacheDeltaTriggered = Triggered;
   Output.CompatibilitySecondaryResolver = CompatibilitySecondaryResolver;
+  Output.Bind9.CacheComparisonReason = "missing_snapshot";
+  Output.Unbound.CacheComparisonReason = "missing_snapshot";
 
   std::set<std::string> ResolverNames;
   for (const auto &[Resolver, Rows] : BeforeByResolver) {
@@ -1242,6 +1471,14 @@ CacheDiffResult buildCacheDiff(
     const auto &AfterRows =
         AfterFound == AfterByResolver.end() ? EmptyRows : AfterFound->second;
     auto Diff = buildResolverCacheDiff(BeforeRows, AfterRows, Triggered);
+    if (Resolver == "maradns" || Resolver == "knot-resolver") {
+      Diff.CacheComparisonStatus = "incomparable";
+      Diff.CacheComparisonReason = "rdata_not_observable";
+    }
+    if (BeforeFound == BeforeByResolver.end() || AfterFound == AfterByResolver.end()) {
+      Diff.CacheComparisonStatus = "unknown";
+      Diff.CacheComparisonReason = "missing_snapshot";
+    }
     if (Resolver == "bind9") {
       Output.Bind9 = Diff;
     }
@@ -1254,12 +1491,34 @@ CacheDiffResult buildCacheDiff(
 
   if (!Output.Resolvers.empty()) {
     Output.ExecutedResolvers = orderedExecutedResolvers(Output.Resolvers);
-    if (!Output.Resolvers.count("bind9")) {
-      Output.Bind9 = ResolverCacheDiff{};
-    }
     if (!Output.Resolvers.count(CompatibilitySecondaryResolver) &&
         Output.Resolvers.count("unbound")) {
       Output.Unbound = Output.Resolvers.at("unbound");
+    }
+  }
+  Output.CacheComparisonStatus =
+      Output.Resolvers.count("bind9") &&
+              Output.Resolvers.count(CompatibilitySecondaryResolver)
+          ? "comparable" : "unknown";
+  for (const auto &[Resolver, Diff] : Output.Resolvers) {
+    (void)Resolver;
+    if (Diff.CacheComparisonStatus == "unknown" ||
+        (Diff.CacheComparisonStatus == "incomparable" &&
+         Output.CacheComparisonStatus == "comparable")) {
+      Output.CacheComparisonStatus = Diff.CacheComparisonStatus;
+    }
+  }
+  if (Output.CacheComparisonStatus != "comparable") {
+    return Output;
+  }
+  const auto Initial = semanticSnapshot(Output.Resolvers.begin()->second.ObservationsBefore);
+  for (const auto &[Resolver, Diff] : Output.Resolvers) {
+    (void)Resolver;
+    if (semanticSnapshot(Diff.ObservationsBefore) != Initial) {
+      // 相对变化必须具有相同共同初态，不以最终快照替代语义 delta。
+      Output.CacheComparisonStatus = "incomparable";
+      Output.CacheComparisonReason = "initial_state_mismatch";
+      return Output;
     }
   }
 
@@ -1414,19 +1673,17 @@ TriageRecord buildTriageRecord(
     NeedsManualReview = true;
     Notes.push_back("oracle 字段存在 resolver 间差异");
   } else if (cacheHasDiff(CacheDiff)) {
-    if (CacheDiff.CacheDeltaTriggered && Output.InterestingDeltaCount > 0) {
-      Status = "completed_cache_changed_needs_review";
-      DiffClass = "cache_diff_interesting";
-      Labels.push_back("cache_diff_present");
-      Labels.push_back("cache_delta_review");
-      NeedsManualReview = true;
-      Notes.push_back("cache 结构差异已触发明细输出");
-    } else {
-      Status = "completed_cache_changed_but_benign";
-      DiffClass = "cache_diff_benign";
-      Labels.push_back("cache_diff_present");
-      Notes.push_back("cache 存在结构差异，但当前未命中需要人工复核的触发条件");
-    }
+    Status = "completed_cache_changed_needs_review";
+    DiffClass = "cache_diff_interesting";
+    Labels.push_back("cache_diff_present");
+    Labels.push_back("cache_delta_review");
+    NeedsManualReview = true;
+    Notes.push_back("共同 RRset 投影存在跨 resolver 语义 delta 差异");
+  } else if (CacheDiff.CacheComparisonStatus != "comparable") {
+    Status = "incomplete_cache_comparison";
+    DiffClass = "cache_comparison_incomplete";
+    Labels.push_back("cache_comparison_incomplete");
+    Notes.push_back("缓存快照缺失、不支持共同投影或来自旧比较合同");
   } else {
     Status = "completed_no_diff";
     DiffClass = "no_diff";
@@ -1524,6 +1781,24 @@ json::Value toJson(const ResolverCacheDiff &Input) {
     DeltaItems.emplace_back(toJson(Item));
   }
   Output["delta_items"] = DeltaItems;
+  Output["cache_comparison_status"] = Input.CacheComparisonStatus;
+  if (!Input.CacheComparisonReason.empty()) {
+    Output["cache_comparison_reason"] = Input.CacheComparisonReason;
+  }
+  Output["semantic_delta"] = Input.SemanticDelta;
+  auto Observations = [](const std::vector<CacheRecord> &Rows) {
+    json::Value::Array Values;
+    for (const auto &Row : Rows) {
+      Values.emplace_back(json::Value::Object{
+          {"resolver", Row.Resolver}, {"view", Row.View}, {"qname", Row.QName},
+          {"qtype", Row.QType}, {"rrtype", Row.RRType}, {"section", Row.Section},
+          {"cache_type", Row.CacheType}, {"ttl", Row.TTL},
+          {"rdata_norm", Row.RDataNorm}, {"flags", Row.Flags}});
+    }
+    return Values;
+  };
+  Output["observations_before"] = Observations(Input.ObservationsBefore);
+  Output["observations_after"] = Observations(Input.ObservationsAfter);
   return Output;
 }
 
@@ -1563,6 +1838,11 @@ json::Value toJson(const CacheDiffResult &Input) {
   Output["sample_id"] = Input.SampleId;
   Output["cache_delta_triggered"] = Input.CacheDeltaTriggered;
   Output["diff_detected"] = Input.DiffDetected;
+  Output["cache_comparison_version"] = 1;
+  Output["cache_comparison_status"] = Input.CacheComparisonStatus;
+  if (!Input.CacheComparisonReason.empty()) {
+    Output["cache_comparison_reason"] = Input.CacheComparisonReason;
+  }
   Output["compatibility_secondary_resolver"] =
       Input.CompatibilitySecondaryResolver;
   json::Value::Array ExecutedResolvers;

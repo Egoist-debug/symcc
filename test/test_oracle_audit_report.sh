@@ -60,10 +60,12 @@ print(dirs[-1])
 PY
 }
 
-python3 - "$FOLLOW_ROOT" <<'PY'
+PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$FOLLOW_ROOT" <<'PY'
 import json
 import pathlib
 import sys
+
+from tools.dns_diff.cache_diff import build_cache_diff
 
 root = pathlib.Path(sys.argv[1])
 root.mkdir(parents=True, exist_ok=True)
@@ -125,11 +127,13 @@ def oracle(
 
 
 def cache_diff(*, has_diff_bind9: bool, has_diff_unbound: bool) -> dict:
-    return {
-        "cache_delta_triggered": has_diff_bind9 or has_diff_unbound,
-        "bind9": {"has_cache_diff": has_diff_bind9},
-        "unbound": {"has_cache_diff": has_diff_unbound},
-    }
+    def rows(resolver, changed):
+        return [(resolver, "_", "example.com.", "A", "A", "RRSET",
+                 "rrset", "300", "192.0.2.1", "class=IN")] if changed else []
+    return build_cache_diff(
+        "audit", [], rows("bind9", has_diff_bind9),
+        [], rows("unbound", has_diff_unbound), True,
+    )
 
 
 fixtures = {
@@ -425,6 +429,69 @@ if payload != expected:
         "ASSERT FAIL: oracle_reliability.json 与预期不一致:\n"
         f"actual={payload!r}\nexpected={expected!r}"
     )
+PY
+
+PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$WORKDIR" "$DNSLABCTL_BIN" "$ROOT_DIR" <<'PY'
+import copy
+import json
+import pathlib
+import subprocess
+import sys
+
+from tools.dns_diff.audit import build_oracle_reliability, collect_audit_records
+from tools.dns_diff.cache_diff import build_cache_diff
+from tools.dns_diff.cache_parser import parse_cache_dump
+from tools.dns_diff.triage import build_triage
+
+workdir, binary, repo = map(pathlib.Path, sys.argv[1:])
+fixtures = repo / "test/fixtures/cache_semantics"
+left = parse_cache_dump("bind9", fixtures / "bind.cache")
+right = parse_cache_dump("unbound", fixtures / "unbound.cache")
+different = parse_cache_dump("bind9", fixtures / "bind-ip.cache")
+same = build_cache_diff("audit", [], left, [], right, True)
+positive = build_cache_diff("audit", [], different, [], right, False)
+cases = [
+    ("same-delta", same, 0),
+    ("real-difference", positive, 1),
+    ("different-before", build_cache_diff("audit", left, left, [], right, True), 0),
+    ("unchanged-before", build_cache_diff("audit", different, different, right, right, True), 0),
+    ("missing-snapshot", build_cache_diff("audit", None, left, [], right, True), 0),
+    ("legacy-single", {"bind9": {"has_cache_diff": True}}, 0),
+]
+for field in ("cache_comparison_version", "cache_comparison_status", "diff_detected", "resolver_diffs"):
+    partial = copy.deepcopy(positive)
+    del partial[field]
+    cases.append(("missing-" + field, partial, 0))
+for version in (0, 2, True, "1", 1.5):
+    partial = copy.deepcopy(positive)
+    partial["cache_comparison_version"] = version
+    cases.append(("version-" + str(version), partial, 0))
+for status in ("unknown", "incomparable"):
+    partial = copy.deepcopy(positive)
+    partial["cache_comparison_status"] = status
+    cases.append((status, partial, 0))
+oracle = {f"{resolver}.stderr_parse_status": "ok" for resolver in ("bind9", "unbound")}
+oracle.update({"bind9.response_accepted": True, "unbound.response_accepted": False})
+for name, cache, expected in cases:
+    root = workdir / "comparison-contract" / name
+    sample = root / "sample"
+    sample.mkdir(parents=True)
+    triage = build_triage(name, oracle, cache, {})
+    assert triage["diff_class"] == ("oracle_and_cache_diff" if expected else "oracle_diff"), name
+    for filename, payload in (
+        ("sample.meta.json", {"sample_id": name}),
+        ("triage.json", triage), ("oracle.json", oracle), ("cache_diff.json", cache),
+    ):
+        (sample / filename).write_text(json.dumps(payload) + "\n")
+    python = build_oracle_reliability(collect_audit_records([sample]))
+    subprocess.run([str(binary), "campaign-report", "--root", str(root)],
+                   check=True, stdout=subprocess.DEVNULL)
+    report = next((root / "campaign_reports").glob("*/oracle_reliability.json"))
+    cpp = json.loads(report.read_text())
+    for backend, payload in (("Python", python), ("C++", cpp)):
+        combo = payload["signal_combos"]["oracle_diff_plus_cache_diff"]
+        assert combo["eligible_count"] == expected, (name, backend, combo)
+print(f"PASS: {len(cases)} 组 Python/C++ 审计比较合同")
 PY
 
 printf 'PASS: oracle audit campaign report regression test passed\n'

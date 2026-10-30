@@ -59,12 +59,15 @@ class CacheRecord:
             _clean_field(self.section),
             _clean_field(self.cache_type),
             _clean_field(self.ttl),
-            _clean_field(self.rdata_norm),
+            self.rdata_norm,
             _clean_field(self.flags),
         )
 
     def to_tsv(self) -> str:
-        return "\t".join(self.to_fields())
+        fields = list(self.to_fields())
+        # TSV 分隔符采用 DNS 字节转义，原始观测和 TXT 内部空白不变。
+        fields[8] = fields[8].replace("\t", r"\009").replace("\r", r"\013").replace("\n", r"\010")
+        return "\t".join(fields)
 
 
 def _clean_field(value: object) -> str:
@@ -152,7 +155,8 @@ def _build_rrset_record(
 
     rrtype = tokens[type_index]
     ttl = tokens[ttl_index]
-    rdata_norm = _join_tokens(tokens, type_index + 1)
+    parts = _trim(pending_rrset).split(maxsplit=type_index + 1)
+    rdata_norm = parts[-1] if len(parts) > type_index + 1 else "_"
     cache_type = "negative" if rrtype.startswith(r"\-") else "rrset"
     record = CacheRecord(
         resolver=resolver,
@@ -174,7 +178,8 @@ def _build_rrset_record(
 def _build_unbound_msg_record(line: str) -> Optional[CacheRecord]:
     tokens = _trim(line).split()
     if len(tokens) < 12:
-        return None
+        return CacheRecord("unbound", "_", "_", "_", "_", "MSG", "message",
+                           "_", line, "_")
 
     reason_text = _join_tokens(tokens, 12)
     return CacheRecord(
@@ -551,12 +556,14 @@ def _iter_knot_resolver_records(lines: Iterable[str]) -> List[CacheRecord]:
 def _smartdns_qtype_name(qtype: int) -> str:
     mapping = {
         1: "A",
+        2: "NS",
         5: "CNAME",
         6: "SOA",
         12: "PTR",
         16: "TXT",
         28: "AAAA",
         33: "SRV",
+        39: "DNAME",
         65: "HTTPS",
         257: "CAA",
     }
@@ -588,10 +595,17 @@ def _decode_dns_name(data: bytes, offset: int) -> Tuple[str, int]:
             jumped = True
             continue
         current += 1
+        if length > 63:
+            raise CacheParseError("smartdns cache packet 标签长度非法")
         label_bytes = data[current : current + length]
         if len(label_bytes) != length:
             raise CacheParseError("smartdns cache packet 标签截断")
-        labels.append(label_bytes.decode("utf-8", errors="replace"))
+        # 保留标签内的点和特殊字节，不能把它们误当作标签分隔符。
+        labels.append("".join(
+            chr(byte) if 33 <= byte <= 126 and byte not in (34, 46, 92)
+            else f"\\{byte:03d}"
+            for byte in label_bytes
+        ))
         current += length
         if not jumped:
             next_offset = current
@@ -599,15 +613,33 @@ def _decode_dns_name(data: bytes, offset: int) -> Tuple[str, int]:
 
 
 def _smartdns_rdata_to_text(rrtype: int, packet: bytes, offset: int, length: int) -> str:
+    end = offset + length
+    if end > len(packet):
+        raise CacheParseError("smartdns cache RDATA 截断")
     rdata = packet[offset : offset + length]
     if rrtype == 1 and length == 4:
         return ".".join(str(part) for part in rdata)
     if rrtype == 28 and length == 16:
         groups = [f"{int.from_bytes(rdata[i:i+2], 'big'):x}" for i in range(0, 16, 2)]
         return ":".join(groups)
-    if rrtype in {5, 12}:
-        name, _ = _decode_dns_name(packet, offset)
+    if rrtype in {2, 5, 12, 39}:
+        if offset >= end:
+            raise CacheParseError("smartdns cache RDATA 截断")
+        name, cursor = _decode_dns_name(packet, offset)
+        if cursor != end:
+            raise CacheParseError("smartdns cache RDATA 长度非法")
         return name
+    if rrtype == 16:
+        tokens = []
+        cursor = offset
+        while cursor < end:
+            size = packet[cursor]
+            cursor += 1
+            if cursor + size > end:
+                raise CacheParseError("smartdns cache TXT 截断")
+            tokens.append('"' + "".join(f"\\{byte:03d}" for byte in packet[cursor:cursor + size]) + '"')
+            cursor += size
+        return " ".join(tokens)
     return rdata.hex() or "_"
 
 
@@ -661,8 +693,12 @@ def _iter_smartdns_records(raw_bytes: bytes) -> List[CacheRecord]:
             for _ in range(qdcount):
                 _, cursor = _decode_dns_name(packet, cursor)
                 cursor += 4
+                if cursor > len(packet):
+                    raise CacheParseError("smartdns cache question 截断")
             for _ in range(ancount):
                 name, cursor = _decode_dns_name(packet, cursor)
+                if cursor + 10 > len(packet):
+                    raise CacheParseError("smartdns cache answer 截断")
                 rrtype = int.from_bytes(packet[cursor : cursor + 2], "big")
                 cursor += 2
                 rrclass = int.from_bytes(packet[cursor : cursor + 2], "big")
@@ -677,12 +713,12 @@ def _iter_smartdns_records(raw_bytes: bytes) -> List[CacheRecord]:
                     CacheRecord(
                         resolver="smartdns",
                         view="_",
-                        qname=name.rstrip("."),
+                        qname=name,
                         qtype=qtype_name,
                         rrtype=_smartdns_qtype_name(rrtype),
                         section="CACHE",
                         cache_type="packet",
-                        ttl=str(rrttl if rrttl > 0 else ttl),
+                        ttl=str(rrttl),
                         rdata_norm=rdata_text,
                         flags=_compose_message_flags(
                             (
@@ -754,7 +790,7 @@ def parse_cache_dump(resolver: str, dump_file: Union[str, Path]) -> List[CacheRe
     if resolved_resolver == "unbound":
         with dump_path.open("r", encoding="utf-8", errors="replace") as handle:
             lines = list(handle)
-        return _iter_unbound_records(lines)
+        return _retain_unparsed_dump(resolved_resolver, _iter_unbound_records(lines), lines)
     if resolved_resolver == "dnsmasq":
         with dump_path.open("r", encoding="utf-8", errors="replace") as handle:
             lines = list(handle)
@@ -771,7 +807,23 @@ def parse_cache_dump(resolver: str, dump_file: Union[str, Path]) -> List[CacheRe
         return _iter_smartdns_records(dump_path.read_bytes())
     with dump_path.open("r", encoding="utf-8", errors="replace") as handle:
         lines = list(handle)
-    return _iter_bind9_records(lines)
+    return _retain_unparsed_dump(resolved_resolver, _iter_bind9_records(lines), lines)
+
+
+def _retain_unparsed_dump(
+    resolver: str, records: List[CacheRecord], lines: Sequence[str],
+) -> List[CacheRecord]:
+    if not records and any(
+        line.strip() and not line.startswith((";", "$DATE"))
+        and line.strip() not in {
+            "START_RRSET_CACHE", "END_RRSET_CACHE", "START_MSG_CACHE", "END_MSG_CACHE", "EOF",
+        }
+        for line in lines
+    ):
+        # 未识别的观测保留为不可比较记录，而非伪造已知空快照。
+        return [CacheRecord(resolver, "_", "_", "_", "_", "_", "unparsed", "_",
+                            "".join(lines), "_")]
+    return records
 
 
 def write_cache_tsv(

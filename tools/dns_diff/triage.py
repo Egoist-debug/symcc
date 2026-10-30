@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .cache_diff import cache_comparable as _cache_comparable, cache_has_diff as _cache_has_diff
 from .io import (
     JsonArtifactError,
     atomic_write_json,
@@ -80,13 +81,6 @@ def _interesting_delta_count(resolver_payload: Mapping[str, Any]) -> int:
     if isinstance(delta_items, list):
         return len(delta_items)
     return 0
-
-
-def _cache_has_diff(cache_diff: Mapping[str, Any]) -> bool:
-    return any(
-        bool(_resolver_payload(cache_diff, resolver).get("has_cache_diff"))
-        for resolver in (BASE_RESOLVER, DEFAULT_SECONDARY_RESOLVER)
-    )
 
 
 def _cache_interesting_delta_count(cache_diff: Mapping[str, Any]) -> int:
@@ -261,11 +255,9 @@ def _classify_triage_branch(
         return "oracle_diff"
 
     if _cache_has_diff(cache_diff):
-        cache_delta_triggered = bool(cache_diff.get("cache_delta_triggered"))
-        interesting_delta_count = _cache_interesting_delta_count(cache_diff)
-        if cache_delta_triggered and interesting_delta_count > 0:
-            return "cache_diff_interesting"
-        return "cache_diff_benign"
+        return "cache_diff_interesting"
+    if not _cache_comparable(cache_diff):
+        return "cache_comparison_incomplete"
 
     return "no_diff"
 
@@ -338,6 +330,8 @@ def _rewrite_filter_labels(
         _append_filter_label(labels, "cache_delta_review")
     elif triage_branch == "cache_diff_benign":
         _append_filter_label(labels, "cache_diff_present")
+    elif triage_branch == "cache_comparison_incomplete":
+        _append_filter_label(labels, "cache_comparison_incomplete")
 
     if cache_delta_triggered:
         _append_filter_label(labels, "cache_delta_triggered")
@@ -453,20 +447,16 @@ def build_triage(
             )
             needs_manual_review = True
         elif cache_has_diff:
-            if cache_delta_triggered and interesting_delta_count > 0:
-                status = "completed_cache_changed_needs_review"
-                diff_class = "cache_diff_interesting"
-                filter_labels.append("cache_diff_present")
-                filter_labels.append("cache_delta_review")
-                notes.append(
-                    f"cache 结构差异已触发明细输出，interesting_delta_count={interesting_delta_count}"
-                )
-                needs_manual_review = True
-            else:
-                status = "completed_cache_changed_but_benign"
-                diff_class = "cache_diff_benign"
-                filter_labels.append("cache_diff_present")
-                notes.append("cache 存在结构差异，但当前未命中需要人工复核的触发条件")
+            status = "completed_cache_changed_needs_review"
+            diff_class = "cache_diff_interesting"
+            filter_labels.extend(("cache_diff_present", "cache_delta_review"))
+            notes.append("共同 RRset 投影存在跨 resolver 语义 delta 差异")
+            needs_manual_review = True
+        elif not _cache_comparable(cache_diff):
+            status = "incomplete_cache_comparison"
+            diff_class = "cache_comparison_incomplete"
+            filter_labels.append("cache_comparison_incomplete")
+            notes.append("缓存快照缺失、不支持共同投影或来自旧比较合同")
         else:
             status = "completed_no_diff"
             diff_class = "no_diff"
@@ -487,6 +477,7 @@ def build_triage(
         {
             "status": status,
             "diff_class": diff_class,
+            "cache_comparison_status": cache_diff.get("cache_comparison_status", "unknown"),
             "filter_labels": filter_labels,
             "cluster_key": _build_cluster_key(
                 status=status,
@@ -591,6 +582,7 @@ def rewrite_triage_payload(
 
     payload["status"] = status
     payload["diff_class"] = diff_class
+    payload["cache_comparison_status"] = rebuilt_triage["cache_comparison_status"]
     payload["filter_labels"] = filter_labels
     payload["cluster_key"] = _build_cluster_key(
         status=status,

@@ -1,0 +1,5 @@
+; Cache dump of view '_default' (cache _default)
+Example.COM. 300 IN A 192.0.2.1
+v6.example. 300 IN AAAA 2001:db8::1
+alias.example. 300 IN CNAME Target.Example.
+txt.example. 300 IN TXT "Keep  Case"

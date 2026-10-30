@@ -19,6 +19,7 @@ def _empty_oracle(resolver: str, status: str) -> Dict[str, OracleValue]:
         f"{resolver}.{key}": None for key in ORACLE_FIELDS
     }
     payload[f"{resolver}.stderr_parse_status"] = status
+    payload[f"{resolver}.fake_reply_dispatched"] = None
     return payload
 
 
@@ -66,6 +67,10 @@ def parse_oracle_summary(
 
     if not all_ok:
         result[f"{resolver}.stderr_parse_status"] = "missing_summary"
+    # 旧产物没有发送观测字段，保持 unknown，不从 accepted 反推。
+    result[f"{resolver}.fake_reply_dispatched"] = _parse_bool_token(
+        tokens.get("fake_reply_dispatched", "")
+    )
     return result
 
 

@@ -9,6 +9,11 @@ import threading
 import time
 from pathlib import Path
 
+if __package__:
+    from .dns_replay_support import ReplayUpstream, is_acceptable_dns_response
+else:
+    from dns_replay_support import ReplayUpstream, is_acceptable_dns_response
+
 
 def parse_transcript(path: Path):
     data = path.read_bytes()
@@ -64,20 +69,6 @@ def write_text(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
 
-
-def is_acceptable_dns_response(packet: bytes, query: bytes = b"") -> bool:
-    if not packet or len(packet) < 12:
-        return False
-    if query and len(query) >= 2 and packet[0:2] != query[0:2]:
-        return False
-    flags = int.from_bytes(packet[2:4], "big")
-    qr = (flags >> 15) & 0x1
-    rcode = flags & 0xF
-    if qr != 1:
-        return False
-    if rcode not in (0, 3):
-        return False
-    return True
 
 
 def build_preload_shim(work_dir: Path) -> Path:
@@ -188,6 +179,8 @@ def main():
     parse_ok = False
     resolver_fetch_started = False
     response_accepted = False
+    fake_reply_dispatched = False
+    response = b""
     second_query_hit = False
     cache_entry_created = False
     timeout_seen = False
@@ -216,25 +209,16 @@ def main():
     upstream_tcp_sock.listen(4)
     upstream_tcp_sock.settimeout(0.5)
     stop_flag = {"stop": False}
-    upstream_queries = []
-
-    def build_reply(packet: bytes) -> bytes:
-        if not responses:
-            return packet
-        index = min(len(upstream_queries) - 1, len(responses) - 1)
-        reply = bytearray(responses[index])
-        if len(reply) >= 2 and len(packet) >= 2:
-            reply[0:2] = packet[0:2]
-        return bytes(reply)
+    upstream = ReplayUpstream(client_query, responses)
+    upstream_queries = upstream.queries
 
     def upstream_loop():
         while not stop_flag["stop"]:
             try:
-                packet, addr = upstream_sock.recvfrom(4096)
+                packet, addr = upstream_sock.recvfrom(65535)
             except Exception:
                 continue
-            upstream_queries.append(packet)
-            upstream_sock.sendto(build_reply(packet), addr)
+            upstream.reply(packet, lambda reply: upstream_sock.sendto(reply, addr) == len(reply))
 
     threading.Thread(target=upstream_loop, daemon=True).start()
 
@@ -261,10 +245,11 @@ def main():
                         packet.extend(chunk)
                     if len(packet) != length:
                         continue
-                    upstream_queries.append(bytes(packet))
-                    reply = build_reply(bytes(packet))
-                    conn.sendall(len(reply).to_bytes(2, "big") + reply)
-                except socket.timeout:
+                    def send_reply(reply):
+                        conn.sendall(len(reply).to_bytes(2, "big") + reply)
+                        return True
+                    upstream.reply(bytes(packet), send_reply)
+                except OSError:
                     continue
 
     threading.Thread(target=upstream_tcp_loop, daemon=True).start()
@@ -319,33 +304,33 @@ def main():
                 remaining = max(0.05, deadline - time.monotonic())
                 cli.settimeout(min(0.25, remaining))
                 try:
-                    response = cli.recv(4096)
+                    response = cli.recv(65535)
                     break
                 except socket.timeout:
                     continue
-            resolver_fetch_started = len(upstream_queries) > 0
-            fake_reply_dispatched = resolver_fetch_started and len(responses) > 0
+            upstream_after_first, resolver_fetch_started, fake_reply_dispatched = upstream.snapshot()
             response_accepted = bool(
                 resolver_fetch_started
                 and fake_reply_dispatched
                 and is_acceptable_dns_response(response, client_query)
             )
-            upstream_after_first = len(upstream_queries)
             if post_check_query:
                 cli.sendto(post_check_query, ("127.0.0.1", listen_port))
-                post_response = cli.recv(4096)
+                post_response = cli.recv(65535)
                 second_query_hit = bool(
                     response_accepted
                     and is_acceptable_dns_response(post_response, post_check_query)
-                    and len(upstream_queries) == upstream_after_first
+                    and upstream.snapshot()[0] == upstream_after_first
                 )
                 cache_entry_created = second_query_hit
-            if not response_accepted:
+            if not response:
                 timeout_seen = True
         os.kill(proc.pid, signal.SIGUSR1)
         time.sleep(0.3)
     except socket.timeout:
         timeout_seen = True
+        if not response:
+            _, resolver_fetch_started, fake_reply_dispatched = upstream.snapshot()
     finally:
         try:
             proc.terminate()
@@ -367,6 +352,7 @@ def main():
         "ORACLE_SUMMARY "
         f"parse_ok={1 if parse_ok else 0} "
         f"resolver_fetch_started={1 if resolver_fetch_started else 0} "
+        f"fake_reply_dispatched={1 if fake_reply_dispatched else 0} "
         f"response_accepted={1 if response_accepted else 0} "
         f"second_query_hit={1 if second_query_hit else 0} "
         f"cache_entry_created={1 if cache_entry_created else 0} "

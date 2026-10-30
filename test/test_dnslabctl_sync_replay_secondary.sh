@@ -37,6 +37,11 @@ if not dump_path:
     sys.stderr.write("missing dump path\\n")
     sys.exit(9)
 has_input = any("input=" in arg for arg in sys.argv[1:])
+stage = "after" if has_input else "before"
+if os.environ.get("FAKE_MISSING_CACHE_STAGE") == stage:
+    if os.environ.get("FAKE_MISSING_CACHE_MODE") == "zero-byte":
+        pathlib.Path(dump_path).write_bytes(b"")
+    sys.exit(0)
 ttl = "299" if has_input else "300"
 pathlib.Path(dump_path).write_text(
     "\\n".join([
@@ -294,6 +299,43 @@ for field in (
 ):
     if oracle.get(field) is not True:
         raise SystemExit(f"ASSERT FAIL: {field}={oracle.get(field)!r} != True")
+PY
+
+python3 - "$WORKDIR" "$DNSLABCTL_BIN" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, binary = map(Path, sys.argv[1:])
+for stage in ("before", "after"):
+    for mode in ("absent", "zero-byte"):
+        run = root / f"missing-{stage}-{mode}"
+        env = {
+            **os.environ,
+            "DNSMASQ_HARNESS_SCRIPT": str(root / "dnsmasq-harness.py"),
+            "RESPONSE_CORPUS_DIR": str(root / "response-corpus"),
+            "FAKE_MISSING_CACHE_STAGE": stage,
+            "FAKE_MISSING_CACHE_MODE": mode,
+        }
+        result = subprocess.run([
+            str(binary), "sync-replay", "--sample", str(root / "sample.bin"),
+            "--run-root", str(run), "--bind9-build-root", str(root / "bind9-afl"),
+            "--bind9-source-root", str(root / "bind9-source"),
+            "--secondary-resolver", "dnsmasq", "--secondary-build-root", str(root / "dnsmasq-build"),
+            "--secondary-source-root", str(root / "dnsmasq-source"), "--resolvers", "bind9,dnsmasq",
+        ], env=env, capture_output=True, text=True)
+        assert result.returncode == 5, (stage, mode, result.returncode, result.stderr)
+        cache = json.loads((run / "cache_diff.json").read_text())
+        triage = json.loads((run / "triage.json").read_text())
+        assert cache["cache_comparison_status"] == "unknown", (stage, mode, cache)
+        assert cache["bind9"]["cache_comparison_status"] == "unknown", (stage, mode, cache)
+        assert cache["bind9"]["cache_comparison_reason"] == "missing_snapshot", (stage, mode, cache)
+        assert not cache["diff_detected"] and not cache["resolver_diffs"], (stage, mode, cache)
+        assert triage["failure_bucket_detail"] == "replay_missing_artifact", triage
+        assert not triage["case_study_candidate"], triage
+print("PASS: C++ sync-replay before/after 缺失与零字节快照均保持 unknown")
 PY
 
 printf 'PASS: dnslabctl sync-replay secondary regression test passed\n'

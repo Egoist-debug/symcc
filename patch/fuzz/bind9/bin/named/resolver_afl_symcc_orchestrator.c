@@ -31,6 +31,9 @@
 #include <isc/util.h>
 
 #include <dns/cache.h>
+#include <dns/message.h>
+#include <dns/name.h>
+#include <dns/rdataset.h>
 #include <dns/dispatch.h>
 #include <dns/view.h>
 
@@ -76,6 +79,9 @@ typedef struct named_resolver_afl_symcc_request_context {
 	ns_client_t *client;
 	bool finished;
 	bool reply_sent;
+	bool client_result_valid;
+	bool matched_fetch;
+	bool fake_reply_dispatched;
 	bool timed_out;
 	isc_result_t result;
 } named_resolver_afl_symcc_request_context_t;
@@ -94,6 +100,8 @@ typedef struct named_resolver_afl_symcc_transcript_oracle {
 	bool parse_ok;
 	bool resolver_fetch_started;
 	bool response_accepted;
+	bool fake_reply_dispatched;
+	bool client_result_valid;
 	bool second_query_hit;
 	bool cache_entry_created;
 	bool timeout;
@@ -226,6 +234,11 @@ flush_views_cache_sync(void) {
 }
 
 
+static isc_result_t
+observed_dispatch_hook(dns_dispentry_t *resp, const isc_region_t *request,
+                       unsigned char *response_buf, size_t response_buf_size,
+                       isc_region_t *response, void *arg);
+
 static void
 install_dispatch_hook_if_ready(dns_dispatchmgr_t *mgr) {
 	if (!g_initialized || mgr == NULL) {
@@ -233,7 +246,7 @@ install_dispatch_hook_if_ready(dns_dispatchmgr_t *mgr) {
 	}
 
 	dns_dispatchmgr_setudpresphook(
-		mgr, named_resolver_afl_symcc_mutator_dispatch_hook, NULL);
+		mgr, observed_dispatch_hook, NULL);
 }
 
 static named_resolver_afl_symcc_request_context_t *
@@ -251,6 +264,84 @@ set_request_context(named_resolver_afl_symcc_request_context_t *ctx) {
 	pthread_mutex_lock(&g_request_context_lock);
 	g_request_context = ctx;
 	pthread_mutex_unlock(&g_request_context_lock);
+}
+
+static bool
+matching_dns_message(const uint8_t *query, size_t query_len,
+                     const uint8_t *packet, size_t packet_len, bool response) {
+	dns_message_t *messages[2] = { NULL, NULL };
+	const uint8_t *wire[2] = { query, packet };
+	size_t lengths[2] = { query_len, packet_len };
+	dns_name_t *names[2];
+	dns_rdataset_t *questions[2];
+	bool valid = false;
+
+	for (size_t i = 0; i < 2; i++) {
+		isc_buffer_t buffer;
+		if (wire[i] == NULL || lengths[i] < 12 || lengths[i] > 65535) {
+			goto done;
+		}
+		dns_message_create(named_g_mctx, NULL, NULL, DNS_MESSAGE_INTENTPARSE, &messages[i]);
+		isc_buffer_constinit(&buffer, wire[i], (unsigned int)lengths[i]);
+		isc_buffer_add(&buffer, (unsigned int)lengths[i]);
+		if (dns_message_parse(messages[i], &buffer, 0) != ISC_R_SUCCESS ||
+		    isc_buffer_remaininglength(&buffer) != 0 ||
+		    messages[i]->opcode != dns_opcode_query ||
+		    messages[i]->counts[DNS_SECTION_QUESTION] != 1)
+		{
+			goto done;
+		}
+		names[i] = ISC_LIST_HEAD(messages[i]->sections[DNS_SECTION_QUESTION]);
+		if (names[i] == NULL) {
+			goto done;
+		}
+		questions[i] = ISC_LIST_HEAD(names[i]->list);
+		if (questions[i] == NULL) {
+			goto done;
+		}
+	}
+	if ((messages[0]->flags & DNS_MESSAGEFLAG_QR) != 0 ||
+	    !dns_name_equal(names[0], names[1]) ||
+	    questions[0]->type != questions[1]->type ||
+	    questions[0]->rdclass != questions[1]->rdclass)
+	{
+		goto done;
+	}
+	if (response) {
+		valid = messages[0]->id == messages[1]->id &&
+			(messages[1]->flags & (DNS_MESSAGEFLAG_QR | DNS_MESSAGEFLAG_TC)) == DNS_MESSAGEFLAG_QR &&
+			(messages[1]->rcode == dns_rcode_noerror || messages[1]->rcode == dns_rcode_nxdomain);
+	} else {
+		valid = (messages[1]->flags & DNS_MESSAGEFLAG_QR) == 0;
+	}
+done:
+	for (size_t i = 0; i < 2; i++) {
+		if (messages[i] != NULL) {
+			dns_message_detach(&messages[i]);
+		}
+	}
+	return valid;
+}
+
+static isc_result_t
+observed_dispatch_hook(dns_dispentry_t *resp, const isc_region_t *request,
+                       unsigned char *response_buf, size_t response_buf_size,
+                       isc_region_t *response, void *arg) {
+	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
+	bool matched = ctx != NULL && request != NULL &&
+		matching_dns_message(ctx->request, ctx->request_len,
+			request->base, request->length, false);
+	isc_result_t result = named_resolver_afl_symcc_mutator_dispatch_hook(
+		resp, request, response_buf, response_buf_size, response, arg);
+	if (matched) {
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->matched_fetch = true;
+		/* dispatch 在 hook 成功后同步投递 response，无 socket 发送推断。 */
+		ctx->fake_reply_dispatched |= result == ISC_R_SUCCESS &&
+			response != NULL && response->base != NULL && response->length > 0;
+		pthread_mutex_unlock(&ctx->mutex);
+	}
+	return result;
 }
 
 static bool
@@ -646,7 +737,7 @@ cleanup_transcript_responses(const char *dir_path, size_t response_count) {
 
 static void
 emit_oracle_summary(bool parse_ok, bool resolver_fetch_started,
-		    bool response_accepted, bool second_query_hit,
+		    bool fake_reply_dispatched, bool response_accepted, bool second_query_hit,
 		    bool cache_entry_created, bool timeout) {
 	const char *log_env = getenv("NAMED_RESOLVER_AFL_SYMCC_LOG");
 
@@ -656,10 +747,11 @@ emit_oracle_summary(bool parse_ok, bool resolver_fetch_started,
 
 	fprintf(stderr,
 		"ORACLE_SUMMARY parse_ok=%u resolver_fetch_started=%u "
-		"response_accepted=%u second_query_hit=%u "
+		"fake_reply_dispatched=%u response_accepted=%u second_query_hit=%u "
 		"cache_entry_created=%u timeout=%u\n",
 		parse_ok ? 1U : 0U,
 		resolver_fetch_started ? 1U : 0U,
+		fake_reply_dispatched ? 1U : 0U,
 		response_accepted ? 1U : 0U,
 		second_query_hit ? 1U : 0U,
 		cache_entry_created ? 1U : 0U,
@@ -669,7 +761,7 @@ emit_oracle_summary(bool parse_ok, bool resolver_fetch_started,
 static void
 update_basic_oracle_counters(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 			     bool parse_ok, bool resolver_fetch_started,
-			     bool response_accepted, bool timeout) {
+			     bool fake_reply_dispatched, bool response_accepted, bool timeout) {
 	if (orchestrator == NULL) {
 		return;
 	}
@@ -687,7 +779,7 @@ update_basic_oracle_counters(named_resolver_afl_symcc_orchestrator_t *orchestrat
 		orchestrator->oracle_timeouts++;
 	}
 
-	emit_oracle_summary(parse_ok, resolver_fetch_started, response_accepted,
+	emit_oracle_summary(parse_ok, resolver_fetch_started, fake_reply_dispatched, response_accepted,
 			   false, false, timeout);
 
 	if (getenv("NAMED_RESOLVER_AFL_SYMCC_TRACE_ORACLE") != NULL) {
@@ -711,6 +803,7 @@ update_transcript_oracle(
 	orchestrator->transcript_cases++;
 	update_basic_oracle_counters(orchestrator, oracle->parse_ok,
 				     oracle->resolver_fetch_started,
+				     oracle->fake_reply_dispatched,
 				     oracle->response_accepted,
 				     oracle->timeout);
 	if (oracle->second_query_hit) {
@@ -721,6 +814,7 @@ update_transcript_oracle(
 	}
 
 	emit_oracle_summary(oracle->parse_ok, oracle->resolver_fetch_started,
+			   oracle->fake_reply_dispatched,
 			   oracle->response_accepted,
 			   oracle->second_query_hit,
 			   oracle->cache_entry_created, oracle->timeout);
@@ -820,7 +914,6 @@ resolver_afl_symcc_client_sendcb(isc_buffer_t *buffer) {
 	named_resolver_afl_symcc_request_context_t *ctx = get_request_context();
 	isc_region_t region;
 
-	UNUSED(buffer);
 
 	if (ctx == NULL) {
 		return;
@@ -850,6 +943,11 @@ resolver_afl_symcc_client_sendcb(isc_buffer_t *buffer) {
 
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->reply_sent = true;
+	if (buffer != NULL) {
+		isc_buffer_usedregion(buffer, &region);
+		ctx->client_result_valid = matching_dns_message(ctx->request,
+			ctx->request_len, region.base, region.length, true);
+	}
 	pthread_mutex_unlock(&ctx->mutex);
 	finish_request_context(ctx, ISC_R_SUCCESS);
 }
@@ -925,7 +1023,7 @@ resolver_afl_symcc_start_udpconnect(void *arg) {
 
 static isc_result_t
 inject_request_bytes(const uint8_t *request, size_t request_len,
-			 long timeout_ms) {
+			 long timeout_ms, named_resolver_afl_symcc_transcript_oracle_t *oracle) {
 	named_resolver_afl_symcc_request_context_t *ctx = NULL;
 	struct timespec deadline;
 	char host[64];
@@ -1003,6 +1101,11 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 		}
 	}
 	result = ctx->result;
+	oracle->resolver_fetch_started = ctx->matched_fetch;
+	oracle->fake_reply_dispatched = ctx->fake_reply_dispatched;
+	oracle->client_result_valid = ctx->client_result_valid;
+	oracle->response_accepted = result == ISC_R_SUCCESS &&
+		ctx->matched_fetch && ctx->fake_reply_dispatched && ctx->client_result_valid;
 	pthread_mutex_unlock(&ctx->mutex);
 
 	if (ctx->timed_out) {
@@ -1025,11 +1128,12 @@ inject_request_bytes(const uint8_t *request, size_t request_len,
 
 static isc_result_t
 execute_legacy_request(named_resolver_afl_symcc_orchestrator_t *orchestrator,
-		       const uint8_t *input, size_t input_len, long timeout_ms) {
+		       const uint8_t *input, size_t input_len, long timeout_ms,
+                       named_resolver_afl_symcc_transcript_oracle_t *oracle) {
 	isc_result_t result;
 
 	orchestrator->requests_sent++;
-	result = inject_request_bytes(input, input_len, timeout_ms);
+	result = inject_request_bytes(input, input_len, timeout_ms, oracle);
 	if (result == ISC_R_SUCCESS) {
 		orchestrator->replies_received++;
 	} else if (result == ISC_R_TIMEDOUT) {
@@ -1044,28 +1148,12 @@ execute_legacy_request(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 static isc_result_t
 execute_legacy_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 		    const uint8_t *input, size_t input_len, long timeout_ms) {
-	named_resolver_afl_symcc_mutator_counters_t counters_before;
-	named_resolver_afl_symcc_mutator_counters_t counters_after;
-	isc_result_t result;
-	bool parse_ok = false;
-	bool resolver_fetch_started = false;
-	bool response_accepted = false;
-	bool timeout = false;
-
-	named_resolver_afl_symcc_mutator_server_get_counters(&counters_before);
-	result = execute_legacy_request(orchestrator, input, input_len, timeout_ms);
-	named_resolver_afl_symcc_mutator_server_get_counters(&counters_after);
-
-	resolver_fetch_started =
-		counters_after.received > counters_before.received;
-	parse_ok = resolver_fetch_started;
-	response_accepted =
-		result == ISC_R_SUCCESS &&
-		counters_after.replied > counters_before.replied;
-	timeout = result == ISC_R_TIMEDOUT;
-	update_basic_oracle_counters(orchestrator, parse_ok,
-				     resolver_fetch_started,
-				     response_accepted, timeout);
+	named_resolver_afl_symcc_transcript_oracle_t oracle = { 0 };
+	isc_result_t result = execute_legacy_request(orchestrator, input, input_len,
+		timeout_ms, &oracle);
+	update_basic_oracle_counters(orchestrator, oracle.resolver_fetch_started,
+		oracle.resolver_fetch_started, oracle.fake_reply_dispatched,
+		oracle.response_accepted, result == ISC_R_TIMEDOUT);
 	return result;
 }
 
@@ -1127,14 +1215,9 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	named_resolver_afl_symcc_mutator_server_get_counters(&counters_before);
 
 	result = execute_legacy_request(orchestrator, transcript.client_query,
-					transcript.client_query_len, timeout_ms);
+					transcript.client_query_len, timeout_ms, &oracle);
 	named_resolver_afl_symcc_mutator_server_get_counters(
 		&counters_after_first);
-	oracle.resolver_fetch_started =
-		counters_after_first.received > counters_before.received;
-	oracle.response_accepted =
-		result == ISC_R_SUCCESS &&
-		counters_after_first.replied > counters_before.replied;
 	if (result != ISC_R_SUCCESS) {
 		if (result == ISC_R_TIMEDOUT) {
 			oracle.timeout = true;
@@ -1147,14 +1230,16 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 	    transcript.post_check_query_len > 0)
 	{
 		bool post_check_hit = false;
+		named_resolver_afl_symcc_transcript_oracle_t post_oracle = { 0 };
 
 		result = execute_legacy_request(orchestrator,
 						transcript.post_check_query,
 						transcript.post_check_query_len,
-						timeout_ms);
+						timeout_ms, &post_oracle);
 		named_resolver_afl_symcc_mutator_server_get_counters(
 			&counters_after_second);
 		post_check_hit =
+			oracle.response_accepted && post_oracle.client_result_valid &&
 			result == ISC_R_SUCCESS &&
 			counters_after_second.received ==
 				counters_after_first.received &&
@@ -1163,17 +1248,9 @@ execute_transcript_case(named_resolver_afl_symcc_orchestrator_t *orchestrator,
 			counters_after_second.parse_errors ==
 				counters_after_first.parse_errors;
 		if (post_check_hit) {
-			/*
-			 * second_query_hit 现在要求第一轮 query 至少发生过一次
-			 * 上游抓取，避免把“从未进入 fetch 路径”误标成
-			 * post-check 命中代理；cache_entry_created 则进一步要求
-			 * 第一轮已接受过伪造响应。
-			 */
-			oracle.second_query_hit =
-				oracle.resolver_fetch_started;
-			oracle.cache_entry_created =
-				oracle.second_query_hit &&
-				oracle.response_accepted;
+			/* 实际 post-check 的无上游代理指标，不证明真实缓存项或投毒。 */
+			oracle.second_query_hit = true;
+			oracle.cache_entry_created = true;
 		}
 		if (result == ISC_R_TIMEDOUT) {
 			oracle.timeout = true;

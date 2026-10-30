@@ -9,6 +9,7 @@
 #include "libunbound/unbound.h"
 #include "sldns/sbuffer.h"
 #include "sldns/wire2str.h"
+#include "util/data/dname.h"
 #include "util/data/msgparse.h"
 #include "util/regional.h"
 
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #define UNBOUND_AFL_SYMCC_FWD_STR_MAX 64
@@ -116,10 +118,11 @@ log_result(const unbound_afl_symcc_oracle_t *oracle)
 
 	fprintf(stderr,
 		"ORACLE_SUMMARY parse_ok=%u resolver_fetch_started=%u "
-		"response_accepted=%u second_query_hit=%u "
+		"fake_reply_dispatched=%u response_accepted=%u second_query_hit=%u "
 		"cache_entry_created=%u timeout=%u\n",
 		oracle->parse_ok ? 1U : 0U,
 		oracle->resolver_fetch_started ? 1U : 0U,
+		oracle->fake_reply_dispatched ? 1U : 0U,
 		oracle->response_accepted ? 1U : 0U,
 		oracle->second_query_hit ? 1U : 0U,
 		oracle->cache_entry_created ? 1U : 0U,
@@ -439,18 +442,88 @@ maybe_dump_cache(struct ub_ctx *ctx)
 }
 
 static bool
+complete_rdata(sldns_buffer *pkt, const struct rrset_parse *rrset,
+	const struct rr_parse *rr)
+{
+	size_t length = sldns_read_uint16(rr->ttl_data + 4);
+	size_t start = (size_t)(rr->ttl_data + 6 - sldns_buffer_begin(pkt));
+	size_t end = start + length;
+	const uint8_t *data = rr->ttl_data + 6;
+
+	/* msgparse 保留部分不完整的已知 RDATA；oracle 不能把它们当完整响应。 */
+	switch (rrset->type) {
+	case LDNS_RR_TYPE_A:
+		return length == 4;
+	case LDNS_RR_TYPE_AAAA:
+		return length == 16;
+	case LDNS_RR_TYPE_NS:
+	case LDNS_RR_TYPE_CNAME:
+	case LDNS_RR_TYPE_SOA:
+	case LDNS_RR_TYPE_PTR:
+	case LDNS_RR_TYPE_MX:
+	case LDNS_RR_TYPE_SRV:
+	case LDNS_RR_TYPE_DNAME:
+		start += rrset->type == LDNS_RR_TYPE_MX ? 2 :
+			(rrset->type == LDNS_RR_TYPE_SRV ? 6 : 0);
+		if (start >= end) {
+			return false;
+		}
+		sldns_buffer_set_position(pkt, start);
+		if (!pkt_dname_len(pkt)) {
+			return false;
+		}
+		if (rrset->type == LDNS_RR_TYPE_SOA) {
+			if (sldns_buffer_position(pkt) >= end || !pkt_dname_len(pkt)) {
+				return false;
+			}
+			return sldns_buffer_position(pkt) + 20 == end;
+		}
+		return sldns_buffer_position(pkt) == end;
+	case LDNS_RR_TYPE_TXT:
+		if (length == 0) {
+			return false;
+		}
+		for (size_t pos = 0; pos < length;) {
+			pos += 1 + data[pos];
+			if (pos > length) {
+				return false;
+			}
+		}
+		return true;
+	case LDNS_RR_TYPE_OPT:
+		if (rr->ttl_data[0] != 0) {
+			return false;
+		}
+		for (size_t pos = 0; pos < length;) {
+			if (length - pos < 4) {
+				return false;
+			}
+			pos += 4 + sldns_read_uint16(data + pos + 2);
+			if (pos > length) {
+				return false;
+			}
+		}
+		return true;
+	default:
+		return true;
+	}
+}
+
+static bool
 parse_query_packet(const uint8_t *input, size_t input_len,
 	const char *parse_stage, const char *qname_stage, char **qname_out,
-	uint16_t *qtype_out, uint16_t *qclass_out)
+	uint16_t *qtype_out, uint16_t *qclass_out, uint16_t *flags_out)
 {
-	uint8_t *input_copy = NULL;
 	sldns_buffer *pkt = NULL;
 	struct regional *region = NULL;
 	struct msg_parse msg;
 	char *qname = NULL;
 	bool ok = false;
+	size_t rr_count = 0;
 
-	if (qname_out == NULL || qtype_out == NULL || qclass_out == NULL) {
+	if (input == NULL || input_len < 12 || input_len > 65535 ||
+		qname_out == NULL || qtype_out == NULL || qclass_out == NULL)
+	{
 		return false;
 	}
 
@@ -459,26 +532,37 @@ parse_query_packet(const uint8_t *input, size_t input_len,
 	*qtype_out = 0;
 	*qclass_out = 0;
 
-	input_copy = malloc(input_len);
-	if (input_copy == NULL) {
-		log_stage_failure("malloc_input");
-		goto cleanup;
-	}
-	memcpy(input_copy, input, input_len);
-
 	pkt = sldns_buffer_new(input_len);
 	region = regional_create();
 	if (pkt == NULL || region == NULL) {
 		log_stage_failure("alloc_parse_state");
 		goto cleanup;
 	}
-	sldns_buffer_init_frm_data(pkt, input_copy, input_len);
+	memcpy(sldns_buffer_begin(pkt), input, input_len);
 	sldns_buffer_set_position(pkt, 0);
 	if (parse_packet(pkt, &msg, region) != LDNS_RCODE_NOERROR || msg.qdcount != 1 ||
-		msg.qname == NULL)
+		msg.qname == NULL || sldns_buffer_remaining(pkt) != 0)
 	{
 		log_stage_failure(parse_stage);
 		goto cleanup;
+	}
+
+	/* parse_packet 宽容缺失末尾 OPT；oracle 仍要求声明的 RR 全部存在。 */
+	for (struct rrset_parse *rrset = msg.rrset_first; rrset != NULL;
+	     rrset = rrset->rrset_all_next)
+	{
+		rr_count += rrset->rr_count + rrset->rrsig_count;
+		for (struct rr_parse *rr = rrset->rr_first; rr != NULL; rr = rr->next) {
+			if (!complete_rdata(pkt, rrset, rr)) {
+				goto cleanup;
+			}
+		}
+	}
+	if (rr_count != (size_t)msg.ancount + msg.nscount + msg.arcount) {
+		goto cleanup;
+	}
+	if (flags_out != NULL) {
+		*flags_out = msg.flags;
 	}
 
 	qname = sldns_wire2str_dname(msg.qname, msg.qname_len);
@@ -501,36 +585,106 @@ cleanup:
 	if (pkt != NULL) {
 		sldns_buffer_free(pkt);
 	}
-	free(input_copy);
 	return ok;
+}
+
+typedef struct query_observation {
+	const char *qname;
+	uint16_t qtype;
+	uint16_t qclass;
+	bool fetched;
+	bool dispatched;
+} query_observation_t;
+
+static void
+observe_query(const uint8_t *query, size_t query_len, bool dispatched, void *arg)
+{
+	query_observation_t *observation = arg;
+	char *qname = NULL;
+	uint16_t qtype, qclass, flags;
+	if (parse_query_packet(query, query_len, "parse_fetch", "fetch_qname",
+		&qname, &qtype, &qclass, &flags))
+	{
+		if ((flags & 0xf800) == 0 &&
+			strcasecmp(qname, observation->qname) == 0 &&
+			qtype == observation->qtype && qclass == observation->qclass)
+		{
+			observation->fetched = true;
+			observation->dispatched |= dispatched;
+		}
+	}
+	free(qname);
+}
+
+static bool
+acceptable_result(const struct ub_result *result, const char *qname,
+	uint16_t qtype, uint16_t qclass)
+{
+	char *answer_name = NULL;
+	uint16_t answer_type, answer_class, flags;
+	bool valid;
+	if (result == NULL || result->bogus || result->qname == NULL ||
+		strcasecmp(result->qname, qname) != 0 || result->qtype != qtype ||
+		result->qclass != qclass || result->answer_packet == NULL ||
+		result->answer_len < 12 ||
+		((const uint8_t *)result->answer_packet)[0] != 0 ||
+		((const uint8_t *)result->answer_packet)[1] != 0 ||
+		!((result->rcode == 0 && !result->nxdomain) ||
+		  (result->rcode == 3 && result->nxdomain && !result->havedata)) ||
+		(result->havedata && (result->data == NULL || result->data[0] == NULL)))
+	{
+		return false;
+	}
+	/* libworker_fg 固定 qid=0；核对 API 的映射 ID，而非 transcript 原始 ID。 */
+	if (!parse_query_packet(result->answer_packet, (size_t)result->answer_len,
+		"parse_answer", "answer_qname", &answer_name, &answer_type,
+		&answer_class, &flags))
+	{
+		return false;
+	}
+	valid = (flags & 0xfa00) == 0x8000 && (flags & 0xf) == result->rcode &&
+		strcasecmp(answer_name, qname) == 0 && answer_type == qtype && answer_class == qclass;
+	free(answer_name);
+	return valid;
 }
 
 static bool
 execute_query_packet(struct ub_ctx *ctx, const uint8_t *input, size_t input_len,
-	const char *parse_stage, const char *qname_stage, bool *answer_nonempty,
-	int *resolve_result_out)
+	const char *parse_stage, const char *qname_stage, bool *answer_valid,
+	int *resolve_result_out, bool *fetch_started, bool *dispatched)
 {
 	char *qname = NULL;
 	uint16_t qtype = 0;
 	uint16_t qclass = 0;
 	struct ub_result *result = NULL;
+	query_observation_t observation = { 0 };
 	bool ok = false;
 
-	if (ctx == NULL || answer_nonempty == NULL || resolve_result_out == NULL) {
+	if (ctx == NULL || answer_valid == NULL || resolve_result_out == NULL) {
 		return false;
 	}
 
-	*answer_nonempty = false;
+	*answer_valid = false;
+	*fetch_started = false;
+	*dispatched = false;
 	*resolve_result_out = UB_NOERROR;
 	if (!parse_query_packet(input, input_len, parse_stage, qname_stage, &qname,
-		&qtype, &qclass))
+		&qtype, &qclass, NULL))
 	{
 		return false;
 	}
 
+	observation.qname = qname;
+	observation.qtype = qtype;
+	observation.qclass = qclass;
+	unbound_afl_symcc_mutator_server_set_observer(observe_query, &observation);
 	*resolve_result_out = ub_resolve(ctx, qname, qtype, qclass, &result);
-	*answer_nonempty = *resolve_result_out == UB_NOERROR && result != NULL &&
-		result->answer_len > 0;
+	/* 注销会等待正在执行的回调，随后才可读取局部事实并释放 qname。 */
+	unbound_afl_symcc_mutator_server_set_observer(NULL, NULL);
+	*fetch_started = observation.fetched;
+	*dispatched = observation.dispatched;
+	*answer_valid = *resolve_result_out == UB_NOERROR &&
+		acceptable_result(result, qname, qtype, qclass);
 	ok = true;
 
 	if (result != NULL) {
@@ -547,7 +701,7 @@ execute_query_case(const uint8_t *input, size_t input_len,
 	char forwarder[UNBOUND_AFL_SYMCC_FWD_STR_MAX];
 	struct ub_ctx *ctx = NULL;
 	uint16_t port = 0;
-	bool answer_nonempty = false;
+	bool answer_valid = false;
 	int resolve_result = UB_NOERROR;
 	int rc = 1;
 
@@ -569,14 +723,15 @@ execute_query_case(const uint8_t *input, size_t input_len,
 
 	unbound_afl_symcc_oracle_set_active(oracle);
 	if (!execute_query_packet(ctx, input, input_len, "parse_query",
-		"wire2str_qname", &answer_nonempty, &resolve_result))
+		"wire2str_qname", &answer_valid, &resolve_result, &oracle->resolver_fetch_started,
+		&oracle->fake_reply_dispatched))
 	{
 		goto cleanup;
 	}
 
 	oracle->parse_ok = true;
 	oracle->response_accepted =
-		oracle->resolver_fetch_started && answer_nonempty;
+		oracle->resolver_fetch_started && oracle->fake_reply_dispatched && answer_valid;
 	rc = oracle->parse_ok ? 0 : 1;
 
 cleanup:
@@ -606,7 +761,7 @@ execute_transcript_case(const uint8_t *input, size_t input_len,
 	const char *tail_dir_env =
 		getenv("UNBOUND_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR");
 	uint16_t port = 0;
-	bool answer_nonempty = false;
+	bool answer_valid = false;
 	int resolve_result = UB_NOERROR;
 	int rc = 1;
 
@@ -672,7 +827,8 @@ execute_transcript_case(const uint8_t *input, size_t input_len,
 	}
 	if (!execute_query_packet(ctx, transcript.client_query,
 		transcript.client_query_len, "parse_query", "wire2str_qname",
-		&answer_nonempty, &resolve_result))
+		&answer_valid, &resolve_result, &oracle->resolver_fetch_started,
+		&oracle->fake_reply_dispatched))
 	{
 		goto cleanup;
 	}
@@ -681,23 +837,22 @@ execute_transcript_case(const uint8_t *input, size_t input_len,
 		log_stage_failure("get_stats_after_first");
 		goto cleanup;
 	}
-	oracle->resolver_fetch_started =
-		counters_after_first.received > counters_before.received;
 	oracle->response_accepted =
-		oracle->resolver_fetch_started &&
-		resolve_result == UB_NOERROR && answer_nonempty;
+		oracle->resolver_fetch_started && oracle->fake_reply_dispatched &&
+		resolve_result == UB_NOERROR && answer_valid;
 
 	counters_after_second = counters_after_first;
 	if (transcript.post_check_query != NULL &&
 		transcript.post_check_query_len > 0)
 	{
-		bool post_answer_nonempty = false;
+		bool post_answer_valid = false;
 		int post_resolve_result = UB_NOERROR;
+		bool post_fetch = false, post_dispatched = false;
 
 		if (execute_query_packet(ctx, transcript.post_check_query,
 			transcript.post_check_query_len, "parse_post_check_query",
-			"wire2str_post_check_qname", &post_answer_nonempty,
-			&post_resolve_result))
+			"wire2str_post_check_qname", &post_answer_valid,
+			&post_resolve_result, &post_fetch, &post_dispatched))
 		{
 			if (!unbound_afl_symcc_mutator_server_get_stats(
 					&counters_after_second))
@@ -705,22 +860,21 @@ execute_transcript_case(const uint8_t *input, size_t input_len,
 				log_stage_failure("get_stats_after_second");
 				goto cleanup;
 			}
-				if (post_resolve_result == UB_NOERROR &&
-					counters_after_second.received ==
-						counters_after_first.received &&
-					counters_after_second.replied ==
-						counters_after_first.replied &&
-					counters_after_second.parse_errors ==
-						counters_after_first.parse_errors)
-				{
-					oracle->second_query_hit =
-						oracle->resolver_fetch_started;
-					oracle->cache_entry_created =
-						oracle->second_query_hit &&
-						oracle->response_accepted;
-				}
+			if (oracle->response_accepted && post_answer_valid &&
+				post_resolve_result == UB_NOERROR &&
+				counters_after_second.received ==
+					counters_after_first.received &&
+				counters_after_second.replied ==
+					counters_after_first.replied &&
+				counters_after_second.parse_errors ==
+					counters_after_first.parse_errors)
+			{
+				/* 实际 post-check 的无上游代理指标，不证明真实缓存项或投毒。 */
+				oracle->second_query_hit = true;
+				oracle->cache_entry_created = true;
 			}
 		}
+	}
 
 	rc = oracle->parse_ok ? 0 : 1;
 
@@ -757,9 +911,7 @@ unbound_afl_symcc_oracle_clear_active(void)
 void
 unbound_afl_symcc_oracle_note_fetch_started(void)
 {
-	if (g_active_oracle != NULL) {
-		g_active_oracle->resolver_fetch_started = true;
-	}
+	/* libworker 的提交事件没有 Question；只由 observer 证明匹配的 fetch。 */
 }
 
 void

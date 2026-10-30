@@ -41,6 +41,11 @@ struct ResolverCacheDiff {
   bool HasCacheDiff = false;
   int InterestingDeltaCount = 0;
   std::vector<CacheDeltaItem> DeltaItems;
+  std::vector<CacheRecord> ObservationsBefore;
+  std::vector<CacheRecord> ObservationsAfter;
+  json::Value::Array SemanticDelta;
+  std::string CacheComparisonStatus = "unknown";
+  std::string CacheComparisonReason;
 };
 
 struct ResolverPairCacheDifference {
@@ -60,6 +65,8 @@ struct CacheDiffResult {
   std::string SampleId;
   bool CacheDeltaTriggered = false;
   bool DiffDetected = false;
+  std::string CacheComparisonStatus = "unknown";
+  std::string CacheComparisonReason;
   std::string CompatibilitySecondaryResolver = "unbound";
   std::vector<std::string> ExecutedResolvers;
   ResolverCacheDiff Bind9;

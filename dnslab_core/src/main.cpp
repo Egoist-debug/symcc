@@ -429,8 +429,8 @@ struct SyncReplayResult {
 
 struct ResolverExecution {
   ResolverRunResult Run;
-  std::vector<dnslab::CacheRecord> BeforeRows;
-  std::vector<dnslab::CacheRecord> AfterRows;
+  std::optional<std::vector<dnslab::CacheRecord>> BeforeRows;
+  std::optional<std::vector<dnslab::CacheRecord>> AfterRows;
   dnslab::json::Value::Object OracleFields;
 };
 
@@ -662,11 +662,12 @@ buildSyncReplayCliOutput(const SyncReplayResult &ReplayResult) {
   return Output;
 }
 
-std::vector<dnslab::CacheRecord>
+std::optional<std::vector<dnslab::CacheRecord>>
 parseCacheRowsIfPresent(const std::string &ResolverName,
                         const std::filesystem::path &DumpPath) {
-  if (!std::filesystem::is_regular_file(DumpPath)) {
-    return {};
+  if (!std::filesystem::is_regular_file(DumpPath) ||
+      std::filesystem::file_size(DumpPath) == 0) {
+    return std::nullopt;
   }
   return dnslab::parseCacheDump(ResolverName, DumpPath);
 }
@@ -894,8 +895,12 @@ ResolverExecutionMaps buildResolverExecutionMaps(
     const std::map<std::string, ResolverExecution> &ExecutedResolvers) {
   ResolverExecutionMaps Output;
   for (const auto &[ResolverName, Execution] : ExecutedResolvers) {
-    Output.BeforeByResolver[ResolverName] = Execution.BeforeRows;
-    Output.AfterByResolver[ResolverName] = Execution.AfterRows;
+    if (Execution.BeforeRows.has_value()) {
+      Output.BeforeByResolver[ResolverName] = *Execution.BeforeRows;
+    }
+    if (Execution.AfterRows.has_value()) {
+      Output.AfterByResolver[ResolverName] = *Execution.AfterRows;
+    }
     Output.OracleByResolver[ResolverName] = Execution.OracleFields;
   }
   return Output;

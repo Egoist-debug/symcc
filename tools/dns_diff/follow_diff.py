@@ -192,21 +192,6 @@ def _normalize_secondary_oracle_payload(
     return payload
 
 
-def _normalize_secondary_cache_rows(rows: List[Tuple[str, ...]]) -> List[Tuple[str, ...]]:
-    resolver = _secondary_resolver_name()
-    if resolver == "unbound":
-        return rows
-    normalized: List[Tuple[str, ...]] = []
-    for row in rows:
-        if len(row) != 10:
-            normalized.append(row)
-            continue
-        mutable = list(row)
-        mutable[0] = "unbound"
-        normalized.append(tuple(mutable))
-    return normalized
-
-
 @dataclass(frozen=True)
 class FollowDiffConfig:
     work_dir: Path
@@ -484,19 +469,21 @@ def _load_json_object(path: Path) -> Dict[str, Any]:
     return dict(load_state_file(path).data)
 
 
-def _parse_cache_rows(resolver: str, dump_path: Path) -> List[Tuple[str, ...]]:
+def _parse_cache_rows(resolver: str, dump_path: Path) -> Optional[List[Tuple[str, ...]]]:
     if not dump_path.is_file():
-        return []
+        return None
     try:
+        if dump_path.stat().st_size == 0:
+            return None
         return [
             tuple(record.to_fields())
             for record in parse_cache_dump(resolver, dump_path)
         ]
-    except CacheParseError as exc:
+    except (CacheParseError, OSError) as exc:
         sys.stderr.write(
-            f"dns-diff: cache dump 解析失败，按空集降级 {dump_path}: {exc}\n"
+            f"dns-diff: cache dump 解析失败，保留未知状态 {dump_path}: {exc}\n"
         )
-        return []
+        return None
 
 
 def _normalize_allowlist_tokens(raw: str) -> Set[str]:
@@ -570,13 +557,10 @@ def _write_cache_diff_artifact(
         sample_id,
         _parse_cache_rows("bind9", sample_dir / BIND9_BEFORE_CACHE_FILE),
         _parse_cache_rows("bind9", sample_dir / BIND9_AFTER_CACHE_FILE),
-        _normalize_secondary_cache_rows(
-            _parse_cache_rows(_secondary_resolver_name(), sample_dir / _secondary_before_cache_file())
-        ),
-        _normalize_secondary_cache_rows(
-            _parse_cache_rows(_secondary_resolver_name(), sample_dir / _secondary_after_cache_file())
-        ),
+        _parse_cache_rows(_secondary_resolver_name(), sample_dir / _secondary_before_cache_file()),
+        _parse_cache_rows(_secondary_resolver_name(), sample_dir / _secondary_after_cache_file()),
         triggered,
+        secondary_resolver=_secondary_resolver_name(),
     )
     return atomic_write_json(sample_dir / CACHE_DIFF_FILE, payload)
 

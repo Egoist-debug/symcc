@@ -16,6 +16,7 @@ struct OracleSnapshot {
   std::optional<bool> SecondQueryHit;
   std::optional<bool> CacheEntryCreated;
   std::optional<bool> Timeout;
+  std::optional<bool> FakeReplyDispatched;
 };
 
 OracleSnapshot emptyOracle(const std::string &Resolver,
