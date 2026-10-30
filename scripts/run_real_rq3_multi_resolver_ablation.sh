@@ -12,19 +12,43 @@ REPEAT_COUNT="${REPEAT_COUNT:-5}"
 BUDGET_SEC="${BUDGET_SEC:-12}"
 RESOLVERS="${RESOLVERS:-dnsmasq maradns knot}"
 STATUS_TSV="$BASE_DIR/status.tsv"
-mkdir -p "$BASE_DIR"
-printf 'resolver\tvariant\trepeat\tstatus\trun_root\treport_dir\n' >"$STATUS_TSV"
+mkdir -p "$(dirname "$BASE_DIR")"
+# 同秒重复启动也不能覆盖已有批次。
+mkdir "$BASE_DIR"
+printf 'resolver\tvariant\trepeat\tstatus\trun_root\treport_dir\texecution_mode\tgeneration_evidence\n' >"$STATUS_TSV"
 
 prepare_queue() {
 	local queue_dir="$1"
 	python3 - "$queue_dir" "$TRANSCRIPT_SOURCE_DIR" "$QUEUE_LIMIT" <<'PY'
 from pathlib import Path
+import datetime
 import json, shutil, sys
+from tools.dns_diff.matrix import _queue_snapshot_digest
+from tools.dns_diff.schema import QUEUE_SNAPSHOT_DIGEST_ALGORITHM
+
 queue_dir = Path(sys.argv[1]); src_dir = Path(sys.argv[2]); limit = int(sys.argv[3])
+if limit <= 0:
+    raise SystemExit("QUEUE_LIMIT 必须大于 0")
+sources = sorted(p for p in src_dir.iterdir() if p.is_file() and not p.name.endswith(".meta.json"))[:limit]
+if not sources:
+    raise SystemExit("共享 replay 来源目录没有 payload")
 queue_dir.mkdir(parents=True, exist_ok=True)
-for i, src in enumerate(sorted(p for p in src_dir.iterdir() if p.is_file())[:limit], start=1):
+for i, src in enumerate(sources, start=1):
     shutil.copyfile(src, queue_dir / f"id:{i:06d},orig:{src.name}")
-payload = {"cold_start": False, "seed_source_dir": str(queue_dir.resolve()), "seed_materialization_method": "reused_filtered_corpus", "seed_snapshot_id": f"rq3queue{limit:06d}", "regen_seeds": False, "refilter_queries": False, "stable_input_dir": str(queue_dir.resolve()), "recorded_at": "2026-05-22T08:00:00Z"}
+digest, _, _ = _queue_snapshot_digest(queue_dir)
+payload = {
+    "cold_start": False,
+    "seed_source_dir": str(src_dir.resolve()),
+    "seed_materialization_method": "copied_shared_queue",
+    "seed_snapshot_id": digest,
+    "seed_snapshot_algorithm": QUEUE_SNAPSHOT_DIGEST_ALGORITHM,
+    "regen_seeds": False,
+    "refilter_queries": False,
+    "stable_input_dir": str(queue_dir.resolve()),
+    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    "execution_mode": "shared_queue_replay",
+    "generation_evidence": False,
+}
 (queue_dir.parents[2] / "producer_seed_provenance.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -124,7 +148,7 @@ run_resolver() {
 			if [ -n "$report_dir" ]; then
 				ln -sfn "$report_dir" "$agg_root/run-$(printf '%02d' "$repeat")"
 			fi
-			printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$env_resolver" "$variant" "$repeat" "$run_status" "$run_root" "${report_dir:--}" >>"$STATUS_TSV"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\tshared_queue_replay\tfalse\n' "$env_resolver" "$variant" "$repeat" "$run_status" "$run_root" "${report_dir:--}" >>"$STATUS_TSV"
 			cleanup_run_root_artifacts "$run_root"
 		done
 		if find "$agg_root" -maxdepth 1 -mindepth 1 | grep -q .; then
@@ -192,6 +216,9 @@ for resolver_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name no
             'semantic_diff_count_mean': mean_of('semantic_diff_count'),
             'semantic_counts_mean_json': json.dumps(semantic_means, ensure_ascii=False, sort_keys=True) if valid_stats else 'NA',
             'aggregate_dir': str(agg_dir),
+            'execution_mode': 'shared_queue_replay',
+            'generation_evidence': False,
+            'source_queue_dir': str((resolver_dir / 'afl_out/master/queue').resolve()),
         })
 summary_tsv = base / 'resolver_variant_summary.tsv'
 fieldnames = [
@@ -202,16 +229,21 @@ fieldnames = [
     'needs_review_count_mean', 'needs_review_count_stddev',
     'cluster_count_mean', 'cluster_count_stddev',
     'oracle_audit_candidate_count_mean', 'semantic_diff_count_mean',
-    'semantic_counts_mean_json', 'aggregate_dir'
+    'semantic_counts_mean_json', 'aggregate_dir',
+    'execution_mode', 'generation_evidence', 'source_queue_dir',
 ]
 with summary_tsv.open('w', encoding='utf-8', newline='') as fh:
     writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter='\t')
     writer.writeheader()
-    writer.writerows(rows)
-(base / 'resolver_variant_summary.json').write_text(json.dumps({'rows': rows}, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    writer.writerows(dict(row, generation_evidence='false') for row in rows)
+(base / 'resolver_variant_summary.json').write_text(json.dumps({
+    'execution_mode': 'shared_queue_replay',
+    'generation_evidence': False,
+    'rows': rows,
+}, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 print(summary_tsv)
 PY
 
-printf 'PASS: real RQ3 multi-resolver ablation generated at %s\n' "$BASE_DIR"
+printf 'PASS: RQ3 shared_queue_replay 汇总已生成（非生成证据）: %s\n' "$BASE_DIR"
 
 cleanup_experiment_base "$BASE_DIR"

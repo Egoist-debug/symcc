@@ -284,4 +284,43 @@ assert_file_exists "$ONE_LATEST/comparability.tsv"
 assert_summary_status "$ONE_LATEST/summary.json" 1 "insufficient_runs"
 assert_file_contains "$ONE_LATEST/variance.tsv" $'__status__\tinsufficient_runs'
 
+UNKNOWN_ROOT="$WORKDIR/unknown/campaign_reports"
+mkdir -p "$(dirname "$UNKNOWN_ROOT")"
+cp -R "$OK_ROOT" "$UNKNOWN_ROOT"
+python3 - "$UNKNOWN_ROOT/run-1/summary.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+payload.pop("repro_rate")
+payload["cluster_count"] = -1
+payload["metric_denominators"]["analysis_state"].pop("unknown")
+path.write_text(json.dumps(payload))
+PY
+set +e
+run_cli campaign-aggregate --reports-root "$UNKNOWN_ROOT" --output-dir "$WORKDIR/unknown/out" \
+  >/dev/null 2>"$WORKDIR/unknown.stderr"
+status=$?
+set -e
+test "$status" -eq 2
+UNKNOWN_LATEST="$(get_latest_aggregate_dir "$WORKDIR/unknown/out/campaign_aggregates")"
+python3 - "$UNKNOWN_LATEST" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+summary = json.loads((root / "summary.json").read_text())
+assert summary["variance_status"] == "missing_metrics"
+assert summary["aggregates"] == {}
+assert set(summary["missing_metrics"]["run-1"]) == {"repro_rate", "cluster_count", "unknown_samples"}
+rows = list(csv.DictReader((root / "run_matrix.tsv").read_text().splitlines(), delimiter="\t"))
+for field in ("repro_rate", "cluster_count", "unknown_samples"):
+    assert rows[0][field] == "NA"
+assert rows[1]["repro_rate"] == "0.800000"
+PY
+
 printf 'PASS: multi-run aggregate regression test passed\n'

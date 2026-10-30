@@ -14,6 +14,7 @@ from .schema import (
     AGGREGATION_KEY_FIELDS,
     BASELINE_COMPARE_KEY_FIELDS,
     CONTRACT_VERSION,
+    QUEUE_SNAPSHOT_DIGEST_ALGORITHM,
     SEED_PROVENANCE_FIELDS,
 )
 from .statistics import compute_metric_statistics, statistics_contract
@@ -26,7 +27,6 @@ PUBLICATION_INPUT_MODEL = "DST1 transcript"
 PUBLICATION_EVIDENCE_CONTRACT_NAME = "publication_evidence_bundle"
 PRODUCER_EXECUTION_CONTRACT_NAME = "rq3_producer_execution_manifest"
 PRODUCER_EXECUTION_MANIFEST_NAME = "producer_execution_manifest.json"
-QUEUE_SNAPSHOT_DIGEST_ALGORITHM = "sha256-relative-path-size-content-v1"
 JUDGED_MANUAL_TRUTH_STATUSES = {
     "confirmed_relevant",
     "false_positive",
@@ -401,7 +401,7 @@ def _queue_snapshot_digest(path: Path) -> Tuple[str, int, int]:
             )
         if not artifact_path.is_file():
             continue
-        if artifact_path.name.endswith(".meta.json") or artifact_path.name == "queue_snapshot.meta.json":
+        if artifact_path.name.endswith(".meta.json"):
             continue
         relative_path = artifact_path.relative_to(path).as_posix()
         artifact_size = artifact_path.stat().st_size
@@ -433,8 +433,6 @@ def _audit_producer_execution_manifest(
     issues: List[Dict[str, str]],
     producer_run_ids: Set[str],
     random_seeds: Set[str],
-    queue_snapshot_ids: Set[str],
-    queue_snapshot_digests: Set[str],
 ) -> None:
     expected_manifest_path = expected_run_dir / PRODUCER_EXECUTION_MANIFEST_NAME
     raw_manifest_path = run.get("producer_execution_manifest_path")
@@ -476,7 +474,20 @@ def _audit_producer_execution_manifest(
         )
         return
 
-    is_replay = manifest.get("execution_mode") == "shared_queue_replay"
+    execution_mode = manifest.get("execution_mode")
+    is_replay = execution_mode == "shared_queue_replay"
+    if execution_mode != "independent_producer_generation":
+        _issue(
+            issues,
+            code="invalid_producer_execution_mode",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=(
+                "正式生成证据要求 execution_mode=independent_producer_generation，"
+                f"不能由缺失/未知模式或共享队列重放推断：{execution_mode!r}"
+            ),
+        )
     expected_values = {
         "contract_name": PRODUCER_EXECUTION_CONTRACT_NAME,
         "contract_version": CONTRACT_VERSION,
@@ -488,7 +499,7 @@ def _audit_producer_execution_manifest(
     mismatched_fields = sorted(
         field
         for field, expected_value in expected_values.items()
-        if manifest.get(field) != expected_value
+        if not _contract_values_equal(manifest.get(field), expected_value)
     )
     if mismatched_fields:
         _issue(
@@ -515,6 +526,35 @@ def _audit_producer_execution_manifest(
             scope=scope,
             path=expected_manifest_path,
             detail=f"producer manifest 缺少时间字段: {missing_time_fields!r}",
+        )
+    else:
+        try:
+            started_at = datetime.fromisoformat(manifest["started_at"])
+            finished_at = datetime.fromisoformat(manifest["finished_at"])
+            valid_time = (
+                started_at.tzinfo is not None
+                and finished_at.tzinfo is not None
+                and started_at <= finished_at
+            )
+        except ValueError:
+            valid_time = False
+        if not valid_time:
+            _issue(
+                issues,
+                code="invalid_producer_execution_time",
+                matrix_root=matrix_root,
+                scope=scope,
+                path=expected_manifest_path,
+                detail="producer 时间必须含时区且 started_at 不晚于 finished_at",
+            )
+    if _resolve_path(manifest.get("run_dir"), base_dir=matrix_root) != expected_run_dir.resolve():
+        _issue(
+            issues,
+            code="producer_run_directory_mismatch",
+            matrix_root=matrix_root,
+            scope=scope,
+            path=expected_manifest_path,
+            detail=f"producer manifest run_dir 必须指向 {expected_run_dir}",
         )
 
     producer_run_id = manifest.get("producer_run_id")
@@ -545,7 +585,7 @@ def _audit_producer_execution_manifest(
         if not isinstance(random_seed, bool) and isinstance(random_seed, (int, str))
         else ""
     )
-    if not random_seed_key:
+    if not random_seed_key.strip():
         _issue(
             issues,
             code="missing_producer_random_seed",
@@ -595,6 +635,37 @@ def _audit_producer_execution_manifest(
                 f"components.symcc 必须记录 enabled={expected_symcc}, started={expected_started}"
             ),
         )
+    if execution_mode == "independent_producer_generation":
+        for name in ("afl_master", "afl_secondary", "symcc"):
+            component = components.get(name) if isinstance(components, Mapping) else None
+            enabled = component.get("enabled") if isinstance(component, Mapping) else None
+            if (
+                not isinstance(enabled, bool)
+                or (name == "afl_master" and enabled is not True)
+                or component.get("started") is not enabled
+                or (not enabled and component.get("pid") is not None)
+            ):
+                _issue(
+                    issues,
+                    code="producer_component_state_mismatch",
+                    matrix_root=matrix_root,
+                    scope=scope,
+                    path=expected_manifest_path,
+                    detail=f"components.{name} 缺失或启用/启动状态矛盾",
+                )
+                continue
+            if enabled and (
+                _coerce_positive_int(component.get("pid")) is None
+                or not _is_nonempty_text(component.get("command_summary"))
+            ):
+                _issue(
+                    issues,
+                    code="incomplete_producer_component_evidence",
+                    matrix_root=matrix_root,
+                    scope=scope,
+                    path=expected_manifest_path,
+                    detail=f"components.{name} 已启动但缺少有效 pid 或 command_summary",
+                )
 
     queue_snapshot = manifest.get("queue_snapshot")
     if not isinstance(queue_snapshot, Mapping):
@@ -617,17 +688,6 @@ def _audit_producer_execution_manifest(
             path=expected_manifest_path,
             detail="queue_snapshot.snapshot_id 必须是非空字符串",
         )
-    elif snapshot_id in queue_snapshot_ids and not is_replay:
-        _issue(
-            issues,
-            code="duplicate_queue_snapshot_id",
-            matrix_root=matrix_root,
-            scope=scope,
-            path=expected_manifest_path,
-            detail=f"queue snapshot id 被多个 run 复用: {snapshot_id}",
-        )
-    else:
-        queue_snapshot_ids.add(snapshot_id)
 
     snapshot_path = _resolve_path(queue_snapshot.get("path"), base_dir=expected_run_dir)
     if snapshot_path is None or not snapshot_path.is_dir():
@@ -664,6 +724,7 @@ def _audit_producer_execution_manifest(
                 f"{QUEUE_SNAPSHOT_DIGEST_ALGORITHM}"
             ),
         )
+        return
     try:
         actual_sha256, actual_count, actual_size = _queue_snapshot_digest(snapshot_path)
     except (OSError, PublicationAuditError) as exc:
@@ -700,20 +761,6 @@ def _audit_producer_execution_manifest(
                 "queue snapshot 的 SHA-256、文件数或大小与实际目录不一致"
             ),
         )
-    if actual_sha256 in queue_snapshot_digests and not is_replay:
-        _issue(
-            issues,
-            code="duplicate_queue_snapshot",
-            matrix_root=matrix_root,
-            scope=scope,
-            path=snapshot_path,
-            detail=(
-                "多个正式 run 复用了内容完全相同的固定 "
-                "queue snapshot"
-            ),
-        )
-    else:
-        queue_snapshot_digests.add(actual_sha256)
 
 
 def _lookup_field(payload: Mapping[str, Any], field_path: str) -> Tuple[bool, Any]:
@@ -1817,8 +1864,6 @@ def _audit_matrix_root(
     audited_payload_ids: Set[str] = set()
     producer_run_ids: Set[str] = set()
     producer_random_seeds: Set[str] = set()
-    queue_snapshot_ids: Set[str] = set()
-    queue_snapshot_digests: Set[str] = set()
     for variant in variants:
         variant_name = str(variant.get("variant_name", ""))
         expected_env = EXPECTED_VARIANT_ENVS.get(variant_name, {})
@@ -1949,8 +1994,6 @@ def _audit_matrix_root(
                 issues=issues,
                 producer_run_ids=producer_run_ids,
                 random_seeds=producer_random_seeds,
-                queue_snapshot_ids=queue_snapshot_ids,
-                queue_snapshot_digests=queue_snapshot_digests,
             )
             report_dir = _resolve_path(run.get("report_dir"), base_dir=root)
             if report_dir is None or not report_dir.is_dir():

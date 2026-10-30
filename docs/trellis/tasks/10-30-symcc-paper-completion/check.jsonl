@@ -1,0 +1,8 @@
+{"file": "symcc/docs/trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "核查 DNS 跨层正负例、真实组件证据和可比性"}
+{"file": "symcc/docs/trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "核查共享语义与调用方是否完整同步，避免扩大重构"}
+{"file": "symcc/docs/trellis/spec/backend/dns-evidence.md", "reason": "核查首批缓存比较、发送事实、字节保真和跨语言回归边界"}
+{"file": "symcc/docs/DNSPoisonEvidenceContract.md", "reason": "核查正式状态、基线、失败分类、统计缺失及旧数据兼容"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/code-gaps.md", "reason": "复验当前根因，防止仅修旧案例或仅让原测试通过"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/experiment-gaps.md", "reason": "防止复制队列、ready、缺测填零和历史材料冒充实验结论"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/related-work.md", "reason": "核查论文论点未将已有工作或工程集成表述为原创"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/second-batch-symbolic.md", "reason": "区分真实solver/回流诊断、接口夹具与尚未验证的DNS端到端证据"}

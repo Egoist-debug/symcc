@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 CONFIDENCE_LEVEL = 0.95
 CONFIDENCE_INTERVAL_METHOD = "student_t_df_le_30_normal_asymptotic"
@@ -55,10 +55,13 @@ def _student_t_critical_95(degrees_of_freedom: int) -> float:
     return 1.96
 
 
-def compute_metric_statistics(values: Sequence[float]) -> Dict[str, float]:
+def compute_metric_statistics(values: Sequence[float]) -> Dict[str, Optional[float]]:
     if not values:
         raise StatisticsError("统计指标不能为空")
-    if any(not math.isfinite(value) for value in values):
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        or not math.isfinite(value) for value in values
+    ):
         raise StatisticsError("统计指标必须全部为有限数值")
 
     count = len(values)
@@ -67,10 +70,10 @@ def compute_metric_statistics(values: Sequence[float]) -> Dict[str, float]:
     population_stddev = math.sqrt(squared_deviations / count)
 
     if count == 1:
-        sample_stddev = 0.0
-        standard_error = 0.0
-        ci95_lower = mean
-        ci95_upper = mean
+        sample_stddev = None
+        standard_error = None
+        ci95_lower = None
+        ci95_upper = None
     else:
         sample_stddev = math.sqrt(squared_deviations / (count - 1))
         standard_error = sample_stddev / math.sqrt(count)

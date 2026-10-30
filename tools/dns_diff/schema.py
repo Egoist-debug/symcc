@@ -3,6 +3,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 SCHEMA_VERSION = 1
 CONTRACT_VERSION = SCHEMA_VERSION
+QUEUE_SNAPSHOT_DIGEST_ALGORITHM = "sha256-relative-path-size-content-v2"
 _LAST_FOLLOW_DIFF_RUN_ID: Optional[str] = None
 
 ANALYSIS_STATES = {"included", "excluded", "unknown"}

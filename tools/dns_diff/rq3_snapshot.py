@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
@@ -49,6 +50,8 @@ def run_rq3_snapshot(
         raise RQ3SnapshotError("未找到任何 RQ3 variant 行")
 
     output_root = Path(output_dir).expanduser().resolve()
+    if source_path == output_root / "rq3_hybrid_snapshot.tsv":
+        raise RQ3SnapshotError("输出路径不能覆盖输入 TSV，请使用新的报告目录")
     output_root.mkdir(parents=True, exist_ok=True)
 
     header = [
@@ -84,7 +87,27 @@ def run_rq3_snapshot(
     ]
     rows_out: List[Dict[str, str]] = []
     for row in filtered:
-        rows_out.append({column: row.get(column, "") for column in header})
+        normalized = {column: row.get(column) or "" for column in header}
+        try:
+            run_count = int(row.get("run_count", ""))
+            sufficient = run_count >= 2 and row.get("variance_status") == "ok"
+            if run_count < 2:
+                normalized["variance_status"] = "insufficient_runs"
+        except (TypeError, ValueError):
+            sufficient = False
+            normalized["run_count"] = "NA"
+            normalized["variance_status"] = "unknown"
+        if not normalized["variance_status"]:
+            normalized["variance_status"] = "unknown"
+        for column in header[9:]:
+            value = row.get(column)
+            try:
+                valid = value is not None and math.isfinite(float(value))
+            except (TypeError, ValueError):
+                valid = False
+            # 旧单 run 表的均值也可能来自空 aggregates 的补零，不能单独保留。
+            normalized[column] = value if sufficient and valid else "NA"
+        rows_out.append(normalized)
 
     _write_tsv(output_root / "rq3_hybrid_snapshot.tsv", rows_out, header)
     (output_root / "rq3_hybrid_snapshot.json").write_text(

@@ -141,6 +141,12 @@
 
 论文正文引用离散度时必须优先使用 `sample_stddev`，引用均值不确定性时必须同时给出 95% 置信区间。`stddev` 只用于兼容旧表，不得与样本标准差混写。
 
+单观测只支持 count/mean/min/max 和兼容用总体标准差；样本标准差、标准误与
+置信区间为 `null`，不能生成零宽置信区间。公开 aggregate/matrix 仍以
+`insufficient_runs` 表示重复不足。缺键、非法类型、非有限数或缺失指标不能
+补成零后聚合；JSON 保留未知状态，TSV 使用 `NA`。RQ3 导出不得原样沿用
+旧单 run 表的伪零统计，且不能回写旧输入文件。
+
 `matrix_manifest.json.statistics` 同时冻结计算口径：`confidence_level=0.95`、`confidence_interval_method=student_t_df_le_30_normal_asymptotic`、`sample_stddev_denominator=n-1`。自由度不超过 30 时使用双侧 Student-t 临界值表，超过 30 时使用正态渐近值 `1.96`。缺少或改变这些字段的矩阵不得与当前正式结果合并。
 
 ## 8. 证据完整性与论文就绪审计
@@ -168,7 +174,7 @@ python3 -m tools.dns_diff.cli publication-audit \
 
 审计结果落盘为 `publication_readiness.json` 与 `publication_readiness_issues.tsv`。只有 `status=ready` 的矩阵才允许进入论文主表。审计至少检查：
 
-1. 四个消融变体完整且每个变体达到最低独立重复次数；
+1. 当前实现仍检查四个变体标签及最低重复次数；`no_cache_delta` 与 `full_stack` 已确认生成行为等价，不能据此宣称四种生成机制。收敛为三个生成对照的迁移尚未实现，见第 12 节；
 2. 每个指标具备总体标准差、样本标准差、标准误与 95% 置信区间，并可由各 run
    的 `summary.json` 重算得到；
 3. 每个 run 的目录关系、`campaign_close.summary.json` 成功状态与
@@ -279,3 +285,63 @@ Python/C++ 都保留旧日志的可读性：缺失或非法发送字段输出 `n
 `test/test_native_replay_oracle.sh` 和 C++ `test_oracle.cpp`。
 native 测试直接编译当前 patch、使用锁定 headers/parser 库和事件替身；
 通过这些测试不等于真实 resolver 网络时序或缓存因果已验证。
+
+## 12. Producer 执行身份与队列摘要
+
+实际 named producer 与 matrix 的共享队列重放是两种不同执行：
+
+- `execution_mode=independent_producer_generation` 只能由实际 producer 记录；
+  manifest 保留真实 run ID、随机 seed、带时区起止时间、run 目录及组件启动事实。
+- `execution_mode=shared_queue_replay` 仍可生成普通回放报告，但不能获得正式生成
+  效果资格。matrix 不启动 producer，故不编造其随机 seed，`random_seed=null`，
+  `components.symcc.started=false`。
+- 缺失或未知 `execution_mode` 不默认视为生成。publication audit 要求已启动组件
+  有正 PID 和非空 `command_summary`，并校验状态、开关和路径一致性。
+  这是来源记录的一致性检查，不是对历史进程真实性的外部认证。
+- 显式 `PRODUCER_RANDOM_SEED` 不得被随机初始化覆盖；缺省时才生成。
+  它也不自动代表系统调度、resolver 内部熵源或整个实验完全确定。
+
+新队列摘要使用 `sha256-relative-path-size-content-v2`：
+按相对路径排序，对每个 payload 的相对路径、字节长度和内容计算 SHA-256，
+各段采用既有 NUL 分隔，排除文件名以 `*.meta.json` 结尾的旁路元数据。
+schema 中的 `QUEUE_SNAPSHOT_DIGEST_ALGORITHM` 为 Python 版本标识 owner；
+named producer 的生成端须保持同一算法与过滤规则。
+
+- metadata 或时间戳变化不代表新内容；payload、相对路径或长度变化须反映到摘要。
+- 相同摘要可以来自真实独立运行，不再要求 snapshot ID/摘要彼此不同；
+  当前正式审计仍单独检查 run ID 和随机 seed 的重复。
+- 历史 v1 可读取，但不能自动提升为 v2 来源证据；审计给出
+  `invalid_queue_snapshot_algorithm`，不重写或按新规则默默解释旧 manifest。
+- 不把共享队列复制、重放次数或 metadata 变化当作独立 producer 生成。
+
+回归入口：`test_named_seed_provenance.sh`、`test_campaign_matrix.sh`、
+`test_publication_producer_provenance.py` 与 `test_publication_readiness_audit.sh`。
+真实 solver/具体重放/队列导入测试另记；即使小目标通过，也不替代真实 DNS
+resolver 的符号传播、缓存因果与正式实验。
+
+### 生成对照与分析兼容
+
+named 的实际命令/反馈参数回归已确认 `no_cache_delta` 与 `full_stack`
+等价，`ENABLE_TRIAGE=0` 也没有关闭 helper 反馈。计划将新默认生成对照收敛为
+`full_stack / afl_only / no_mutator`，但用户暂停时该迁移尚未实施；
+当前实现仍保留四标签。旧第四标签只能解释为分析兼容，
+不得据名称推断存在独立的生成消融。`afl_only` 仍保留 DST1 mutator，
+不是未增强的原生 AFL++。未来若实现真正不同的反馈开关，须另有实际执行回归。
+
+## 13. RQ1 输入身份与观测缺失
+
+`input-model-eval` 在执行前创建新的输出/样本目录，冻结 `input.bin` 和
+legacy response 文件，并记录原始来源、快照路径、SHA-256、字节长度与实际命令。
+已存在的输出目录不复用；调用方须为每次执行指定新目录。执行后不再重读
+可变化的原输入作为本次执行身份，继承环境也不能绕过已冻结的 response。
+
+共享 DST1 parser 抽取 query、顺序 responses、post-check 的字节摘要。
+query-only/legacy 只有唯一的精确字节投影匹配时才记录关联为 verified；
+无匹配或有歧义均为 unverified，不能按样本序号造配对。随机输入是负对照。
+这些关联均不宣称不同模型的语义、on-wire 变换或 post-check 能力等价。
+
+各 rate 使用对应字段实际布尔观测的分母，同时导出总样本、observed/missing
+计数及失败数；无观测为 `null`/`NA`，合法 false 仍保留。post-check 能力
+要求可解析的非空后置查询和实际 `parse_ok=true`，不从模型名称推断。
+子进程失败、timeout 或必要 oracle 缺失会保留诊断产物并返回非零；
+“写出了报告”不等于执行完整或实验成功。

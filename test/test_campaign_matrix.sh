@@ -7,12 +7,14 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 python3 - "$ROOT_DIR" <<'PY'
 import json
+import csv
 import os
 import pathlib
 import tempfile
 from contextlib import contextmanager
 
 from tools.dns_diff import matrix as matrix_module
+from tools.dns_diff import publication_audit
 from tools.dns_diff.cli import main as cli_main
 
 
@@ -263,20 +265,50 @@ def run_comparable_scenario() -> None:
             manifest.get("toggles") == EXPECTED_ENV["full_stack"],
             f"manifest toggles 非预期: {manifest.get('toggles')!r}",
         )
+        assert_true(
+            manifest.get("execution_mode") == "shared_queue_replay"
+            and manifest["components"]["symcc"]["started"] is False
+            and manifest.get("random_seed") is None,
+            "仅执行 campaign-close 不能伪造生成或随机种子",
+        )
         snapshot = manifest.get("queue_snapshot")
         assert_true(isinstance(snapshot, dict), "manifest 缺少 queue_snapshot")
         assert_true(
-            snapshot.get("algorithm") == "sha256-relative-path-size-content-v1",
+            snapshot.get("algorithm") == "sha256-relative-path-size-content-v2",
             f"queue_snapshot 算法非预期: {snapshot.get('algorithm')!r}",
-        )
-        assert_true(
-            snapshot.get("file_count") == 2 and snapshot.get("size_bytes") > 0,
-            f"queue_snapshot 计数非预期: {snapshot!r}",
         )
         snapshot_dir = work_root / "matrix_runs" / "full_stack" / "run-01" / "queue_snapshot"
         assert_true(
             snapshot_dir.is_dir() and len(list(snapshot_dir.iterdir())) == 2,
             "queue_snapshot 目录内容非预期（期望样本 + run 元数据）",
+        )
+        expected_snapshot = (
+            snapshot["sha256"], snapshot["file_count"], snapshot["size_bytes"]
+        )
+        payload_files = [
+            path for path in snapshot_dir.iterdir()
+            if not path.name.endswith(".meta.json")
+        ]
+        assert_true(
+            snapshot["file_count"] == len(payload_files)
+            and snapshot["size_bytes"] == sum(path.stat().st_size for path in payload_files),
+            "快照计数和大小只能包含 payload，不能包含 run 元数据",
+        )
+        (snapshot_dir / "queue_snapshot.meta.json").write_text(
+            '{"run_id": "metadata-only-change"}', encoding="utf-8"
+        )
+        for digest in (
+            matrix_module._queue_snapshot_digest,
+            publication_audit._queue_snapshot_digest,
+        ):
+            assert_true(
+                digest(snapshot_dir) == expected_snapshot,
+                "metadata 变化不应改变生成端或审计端内容摘要",
+            )
+        payload_files[0].write_bytes(b"changed payload")
+        assert_true(
+            publication_audit._queue_snapshot_digest(snapshot_dir)[0] != snapshot["sha256"],
+            "真实 payload 改变必须导致摘要变化",
         )
 
         summary_root = work_root / "_summary"
@@ -438,7 +470,7 @@ def run_non_comparable_scenario() -> None:
         ).splitlines()
 
         expected_status_line = (
-            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tbaseline_compare_key_mismatch\tsymcc\t\t\t\tmatrix_internal"
+            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tbaseline_compare_key_mismatch\tsymcc\tNA\tNA\tNA\tmatrix_internal"
         )
         assert_true(
             expected_status_line in delta_lines,
@@ -537,6 +569,17 @@ def run_runtime_env_scenario() -> None:
             )
         assert_true(exit_code == 0, f"runtime_env 场景 exit_code={exit_code!r} != 0")
 
+        for filename, fields in (
+            ("variant_summary.tsv", ("total_samples_mean", "total_samples_sample_stddev", "total_samples_ci95_lower")),
+            ("delta_vs_baseline.tsv", ("baseline_mean", "variant_mean", "delta")),
+        ):
+            with (work_root / "_summary" / filename).open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            assert_true(
+                rows and all(row[field] == "NA" for row in rows for field in fields),
+                f"单 run 的 {filename} 不可用统计必须输出 NA",
+            )
+
         manifest = json.loads(
             (work_root / "_summary" / "matrix_manifest.json").read_text(
                 encoding="utf-8"
@@ -611,7 +654,7 @@ def run_missing_comparability_scenario() -> None:
         ).splitlines()
 
         expected_missing_delta_line = (
-            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tmissing_comparability_metadata\tsymcc\t\t\t\tmatrix_internal"
+            "full_stack\tafl_only\ttotal_samples\tnon-comparable\tmissing_comparability_metadata\tsymcc\tNA\tNA\tNA\tmatrix_internal"
         )
         assert_true(
             expected_missing_delta_line in delta_lines,

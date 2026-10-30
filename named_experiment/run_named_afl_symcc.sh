@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXP_DIR="$ROOT_DIR/named_experiment"
@@ -110,6 +110,10 @@ PRODUCER_REPEAT_INDEX="${PRODUCER_REPEAT_INDEX:-${REPEAT_INDEX:-}}"
 AFL_MASTER_STARTED=""
 AFL_SECONDARY_STARTED=""
 SYMCC_HELPER_STARTED=""
+AFL_MASTER_COMMAND=""
+AFL_SECONDARY_COMMAND=""
+SYMCC_HELPER_COMMAND=""
+EXECUTION_IDENTITY_INITIALIZED=0
 if [ ! -r "$DEFAULT_SYMCC_HIGH_VALUE_MANIFEST" ]; then
 	DEFAULT_SYMCC_HIGH_VALUE_MANIFEST="$UNBOUND_REPORT_HIGH_VALUE_MANIFEST"
 fi
@@ -153,6 +157,7 @@ usage() {
   SHOW_AFL_UI=1
   ENABLE_DST1_MUTATOR=1 (poison-stateful 默认)
   ENABLE_SYMCC=1
+  PRODUCER_RANDOM_SEED=<0..9223372036854775807 的十进制整数；缺省自动生成>
   DST1_MUTATOR_LIBRARY=build/linux/x86_64/release/libafl_dst1_mutator.so
   DST1_MUTATOR_ONLY=1
   NAMED_RESOLVER_AFL_SYMCC_PERSISTENT_ITERS=100000
@@ -472,20 +477,43 @@ print(f"  {'response_preserve':28s} {payload.get('response_preserve')}")
 PY
 }
 
+validate_producer_random_seed() {
+	# AFL++ 的 rand_set_seed 接收 s64；拒绝 strtoul 会静默截断或转换的输入。
+	python3 - "$PRODUCER_RANDOM_SEED" <<'PY'
+import re
+import sys
+
+seed = sys.argv[1]
+if seed and (
+    re.fullmatch(r"[0-9]+", seed) is None
+    or len(seed.lstrip("0")) > 19
+    or int(seed.lstrip("0") or "0") > 2**63 - 1
+):
+    raise SystemExit("PRODUCER_RANDOM_SEED 必须是 0..9223372036854775807 的十进制整数")
+PY
+}
+
 initialize_execution_identity() {
 	local identity=""
-	identity="$(python3 - <<'PY'
+	validate_producer_random_seed || die "非法 PRODUCER_RANDOM_SEED，未初始化执行身份"
+	identity="$(python3 - "$PRODUCER_RANDOM_SEED" <<'PY'
 import secrets
+import sys
 import uuid
 
-print(uuid.uuid4().hex, secrets.randbelow(2**31 - 1) + 1)
+seed = sys.argv[1] if sys.argv[1] else str(secrets.randbelow(2**31 - 1) + 1)
+print(uuid.uuid4().hex, seed)
 PY
 )"
 	read -r PRODUCER_RUN_ID PRODUCER_RANDOM_SEED <<<"$identity"
 	AFL_MASTER_STARTED=0
 	AFL_SECONDARY_STARTED=0
 	SYMCC_HELPER_STARTED=0
+	AFL_MASTER_COMMAND=""
+	AFL_SECONDARY_COMMAND=""
+	SYMCC_HELPER_COMMAND=""
 	rm -f "$EXECUTION_MANIFEST_FILE"
+	EXECUTION_IDENTITY_INITIALIZED=1
 }
 
 component_pid() {
@@ -533,9 +561,9 @@ write_execution_manifest() {
 		EXECUTION_MANIFEST_MASTER_PID="$master_pid" \
 		EXECUTION_MANIFEST_SECONDARY_PID="$secondary_pid" \
 		EXECUTION_MANIFEST_SYMCC_PID="$symcc_pid" \
-		EXECUTION_MANIFEST_MASTER_COMMAND="$AFL_FUZZ_BIN -M master" \
-		EXECUTION_MANIFEST_SECONDARY_COMMAND="$AFL_FUZZ_BIN -S secondary" \
-		EXECUTION_MANIFEST_SYMCC_COMMAND="$HELPER_BIN -a master" \
+		EXECUTION_MANIFEST_MASTER_COMMAND="$AFL_MASTER_COMMAND" \
+		EXECUTION_MANIFEST_SECONDARY_COMMAND="$AFL_SECONDARY_COMMAND" \
+		EXECUTION_MANIFEST_SYMCC_COMMAND="$SYMCC_HELPER_COMMAND" \
 		python3 - <<'PY'
 import datetime
 import hashlib
@@ -563,7 +591,10 @@ def queue_snapshot(queue_dir: Path) -> dict:
     file_count = 0
     size_bytes = 0
     if queue_dir.is_dir():
-        files = sorted(path for path in queue_dir.rglob("*") if path.is_file())
+        files = sorted(
+            path for path in queue_dir.rglob("*")
+            if path.is_file() and not path.name.endswith(".meta.json")
+        )
     else:
         files = []
     for path in files:
@@ -586,7 +617,7 @@ def queue_snapshot(queue_dir: Path) -> dict:
     return {
         "path": str(queue_dir.resolve()),
         "snapshot_id": sha256,
-        "algorithm": "sha256-relative-path-size-content-v1",
+        "algorithm": "sha256-relative-path-size-content-v2",
         "file_count": file_count,
         "size_bytes": size_bytes,
         "sha256": sha256,
@@ -617,6 +648,9 @@ def inferred_repeat_index(work_dir: Path) -> int:
 
 
 def component(existing: dict, *, enabled: bool, started_env: str, pid_env: str, command: str, status: str, exit_code):
+    if status != "running" and existing:
+        enabled = existing["enabled"]
+        command = existing.get("command_summary")
     started_value = os.environ.get(started_env, "").strip()
     started = started_value == "1" if started_value else bool(existing.get("started", False))
     pid_value = env_int(pid_env)
@@ -624,18 +658,13 @@ def component(existing: dict, *, enabled: bool, started_env: str, pid_env: str, 
     if not enabled:
         started = False
         pid = None
-    if status == "running":
-        component_exit_status = None
-    elif started:
-        component_exit_status = exit_code
-    else:
-        component_exit_status = None
     return {
         "enabled": enabled,
         "started": started,
         "pid": pid,
-        "exit_status": component_exit_status,
-        "command_summary": command if enabled else None,
+        # 编排器退出码不等于子进程退出码；后台/tmux 未收集的状态保持未知。
+        "exit_status": None,
+        "command_summary": command if enabled and command else None,
     }
 
 
@@ -658,9 +687,11 @@ new_toggles = {
     "ENABLE_SYMCC": os.environ["EXECUTION_MANIFEST_ENABLE_SYMCC"],
 }
 toggles = existing.get("toggles", new_toggles) if status != "running" else new_toggles
-run_id = os.environ.get("EXECUTION_MANIFEST_RUN_ID", "").strip() or existing.get("producer_run_id")
-random_seed = env_int("EXECUTION_MANIFEST_RANDOM_SEED")
-if random_seed is None:
+if status == "running":
+    run_id = os.environ.get("EXECUTION_MANIFEST_RUN_ID", "").strip()
+    random_seed = int(os.environ["EXECUTION_MANIFEST_RANDOM_SEED"].lstrip("0") or "0")
+else:
+    run_id = existing.get("producer_run_id")
     random_seed = existing.get("random_seed")
 variant_name = existing.get("variant_name") if status != "running" else None
 repeat_index = existing.get("repeat_index") if status != "running" else None
@@ -672,6 +703,10 @@ components_existing = existing.get("components", {}) if isinstance(existing.get(
 payload = {
     "contract_name": "rq3_producer_execution_manifest",
     "contract_version": 1,
+    "execution_mode": (
+        "independent_producer_generation" if status == "running"
+        else existing.get("execution_mode")
+    ),
     "status": status,
     "exit_code": exit_code,
     "producer_run_id": run_id,
@@ -715,7 +750,10 @@ import pathlib
 import sys
 
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-raise SystemExit(0 if payload.get("status") == "running" else 1)
+raise SystemExit(0 if (
+    payload.get("status") == "running"
+    and payload.get("execution_mode") == "independent_producer_generation"
+) else 1)
 PY
 }
 
@@ -1668,15 +1706,11 @@ stop_pidfile() {
 
 stop_all() {
 	if tmux_enabled; then
-		if [ "$ENABLE_SYMCC" = "1" ]; then
-			tmux kill-session -t "$HELPER_SESSION" 2>/dev/null || true
-		fi
+		tmux kill-session -t "$HELPER_SESSION" 2>/dev/null || true
 		tmux kill-session -t "$SECONDARY_SESSION" 2>/dev/null || true
 		tmux kill-session -t "$MASTER_SESSION" 2>/dev/null || true
 	fi
-	if [ "$ENABLE_SYMCC" = "1" ]; then
-		stop_pidfile "$HELPER_PID" "helper"
-	fi
+	stop_pidfile "$HELPER_PID" "helper"
 	stop_pidfile "$SECONDARY_PID" "afl-secondary"
 	stop_pidfile "$MASTER_PID" "afl-master"
 	pkill -f "$AFL_TREE/bin/named/.libs/named -g -c $NAMED_CONF -A resolver-afl-symcc:${MUTATOR_ADDR}" \
@@ -1701,7 +1735,8 @@ wait_for_master_queue() {
 		fi
 		sleep 1
 	done
-	die "等待 AFL master 初始化超时: $stats_file"
+	warn "等待 AFL master 初始化超时: $stats_file"
+	return 1
 }
 
 launch_in_background() {
@@ -1732,19 +1767,6 @@ launch_in_tmux() {
 	tmux pipe-pane -o -t "${session}:0.0" "cat >>${logfile_quoted}"
 }
 
-launch_shell_in_tmux() {
-	local session="$1"
-	local logfile="$2"
-	local command_text="$3"
-	local logfile_quoted
-
-	logfile_quoted="$(printf '%q' "$logfile")"
-
-	tmux kill-session -t "$session" 2>/dev/null || true
-	tmux new-session -d -s "$session" "$command_text"
-	tmux pipe-pane -o -t "${session}:0.0" "cat >>${logfile_quoted}"
-}
-
 attach_master_ui() {
 	[ "$SHOW_AFL_UI" -eq 1 ] || return 0
 
@@ -1772,19 +1794,22 @@ attach_master_ui() {
 start_all() {
 	local ld_path
 	local helper_target_csv
+	local symcc_random_seed
 	local -a master_no_ui=()
-	local -a master_seed_args=()
 	local -a afl_env=()
 	local -a helper_env=()
 	local -a helper_extra=()
+	local -a master_cmd=()
+	local -a secondary_cmd=()
+	local -a helper_cmd=()
 	local input_dir
 
+	validate_producer_random_seed || die "非法 PRODUCER_RANDOM_SEED，未启动 producer"
 	prepare_all
 	stop_all
 	cleanup_output
 	initialize_execution_identity
 	write_execution_manifest "running" ""
-	master_seed_args=(-s "$PRODUCER_RANDOM_SEED")
 	ld_path="$(afl_ld_library_path)"
 	input_dir="$(active_input_corpus_dir)"
 	local -a named_cpu_args=()
@@ -1827,6 +1852,14 @@ start_all() {
 		NAMED_RESOLVER_AFL_SYMCC_REPLY_TIMEOUT_MS="$REPLY_TIMEOUT_MS"
 		SYMCC_HIGH_VALUE_MANIFEST="$SYMCC_HIGH_VALUE_MANIFEST"
 	)
+	# Z3 的 random_seed 是 unsigned int；保留 AFL 原值，显式记录 solver 的低 32 位。
+	symcc_random_seed="$(python3 - "$PRODUCER_RANDOM_SEED" <<'PY'
+import sys
+
+print(int(sys.argv[1].lstrip("0") or "0") % 2**32)
+PY
+)"
+	helper_env+=(SYMCC_RANDOM_SEED="$symcc_random_seed")
 	if [ "$FUZZ_PROFILE" != "poison-stateful" ]; then
 		helper_env+=(RESPONSE_PRESERVE="$RESPONSE_PRESERVE")
 	fi
@@ -1844,92 +1877,60 @@ start_all() {
 		master_no_ui=(AFL_NO_UI=1)
 	fi
 
-	log "启动 AFL master（持久模式）"
-	if tmux_enabled; then
-		launch_in_tmux \
-			"$MASTER_SESSION" \
-			"$MASTER_LOG" \
-			env \
-			"${afl_env[@]}" \
-			"${master_no_ui[@]}" \
-			"$AFL_FUZZ_BIN" \
-			-M master \
-			"${master_seed_args[@]}" \
-			-i "$input_dir" \
-			-o "$AFL_OUT_DIR" \
-			-m none \
-			-t "$AFL_TIMEOUT_MS" \
-			-- \
-			"$AFL_TREE/bin/named/.libs/named" \
-			"${named_cpu_args[@]}" \
-			-g \
-			-c "$NAMED_CONF" \
-			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
-	else
-		launch_in_background \
-			"$MASTER_LOG" \
-			"$MASTER_PID" \
-			env \
-			"${afl_env[@]}" \
-			"${master_no_ui[@]}" \
-			"$AFL_FUZZ_BIN" \
-			-M master \
-			"${master_seed_args[@]}" \
-			-i "$input_dir" \
-			-o "$AFL_OUT_DIR" \
-			-m none \
-			-t "$AFL_TIMEOUT_MS" \
-			-- \
-			"$AFL_TREE/bin/named/.libs/named" \
-			"${named_cpu_args[@]}" \
-			-g \
-			-c "$NAMED_CONF" \
-			-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+	# 清除继承值，确保关闭 mutator 或 mutator-only 时确实改变子进程环境。
+	master_cmd=(
+		env -u AFL_CUSTOM_MUTATOR_LIBRARY -u AFL_CUSTOM_MUTATOR_ONLY -u AFL_PYTHON_MODULE
+		"${afl_env[@]}" "${master_no_ui[@]}"
+		"$AFL_FUZZ_BIN" -M master -s "$PRODUCER_RANDOM_SEED"
+		-i "$input_dir" -o "$AFL_OUT_DIR" -m none -t "$AFL_TIMEOUT_MS" --
+		"$AFL_TREE/bin/named/.libs/named" "${named_cpu_args[@]}"
+		-g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}"
+	)
+	secondary_cmd=(
+		env -u AFL_CUSTOM_MUTATOR_LIBRARY -u AFL_CUSTOM_MUTATOR_ONLY -u AFL_PYTHON_MODULE
+		"${afl_env[@]}" AFL_NO_UI=1
+		"$AFL_FUZZ_BIN" -S secondary -s "$PRODUCER_RANDOM_SEED"
+		-i "$input_dir" -o "$AFL_OUT_DIR" -m none -t "$AFL_TIMEOUT_MS" --
+		"$AFL_TREE/bin/named/.libs/named" "${named_cpu_args[@]}"
+		-g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}"
+	)
+	helper_cmd=(
+		env -u AFL_CUSTOM_MUTATOR_LIBRARY -u AFL_CUSTOM_MUTATOR_ONLY -u AFL_PYTHON_MODULE
+		"${helper_env[@]}" "$HELPER_BIN"
+		-o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}"
+		-t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named"
+		-g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}"
+	)
+	if [ "$ENABLE_CACHE_DELTA" = "0" ] || [ "$ENABLE_TRIAGE" = "0" ]; then
+		warn "named producer 不执行 cache-delta/triage；这两个开关只影响下游分析，不是生成消融"
 	fi
-	AFL_MASTER_STARTED=1
+
+	log "启动 AFL master（持久模式）"
+	AFL_MASTER_COMMAND="$(quote_cmd "${master_cmd[@]}")"
+	if tmux_enabled; then
+		launch_in_tmux "$MASTER_SESSION" "$MASTER_LOG" "${master_cmd[@]}"
+	else
+		launch_in_background "$MASTER_LOG" "$MASTER_PID" "${master_cmd[@]}"
+	fi
+	if [ -n "$(component_pid "$MASTER_PID" "$MASTER_SESSION")" ]; then
+		AFL_MASTER_STARTED=1
+	fi
+	write_execution_manifest "running" ""
+	# AFL-only 同样要求 master 就绪，不能把异步启动失败写成成功运行。
+	wait_for_master_queue
 
 	if [ "$ENABLE_SECONDARY" -eq 1 ]; then
 		log "启动 AFL secondary（持久模式）"
+		AFL_SECONDARY_COMMAND="$(quote_cmd "${secondary_cmd[@]}")"
 		if tmux_enabled; then
-			launch_in_tmux \
-				"$SECONDARY_SESSION" \
-				"$SECONDARY_LOG" \
-				env \
-				"${afl_env[@]}" \
-				AFL_NO_UI=1 \
-				"$AFL_FUZZ_BIN" \
-				-S secondary \
-				-i "$input_dir" \
-				-o "$AFL_OUT_DIR" \
-				-m none \
-				-t "$AFL_TIMEOUT_MS" \
-				-- \
-				"$AFL_TREE/bin/named/.libs/named" \
-				"${named_cpu_args[@]}" \
-				-g \
-				-c "$NAMED_CONF" \
-				-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+			launch_in_tmux "$SECONDARY_SESSION" "$SECONDARY_LOG" "${secondary_cmd[@]}"
 		else
-			launch_in_background \
-				"$SECONDARY_LOG" \
-				"$SECONDARY_PID" \
-				env \
-				"${afl_env[@]}" \
-				AFL_NO_UI=1 \
-				"$AFL_FUZZ_BIN" \
-				-S secondary \
-				-i "$input_dir" \
-				-o "$AFL_OUT_DIR" \
-				-m none \
-				-t "$AFL_TIMEOUT_MS" \
-				-- \
-				"$AFL_TREE/bin/named/.libs/named" \
-				"${named_cpu_args[@]}" \
-				-g \
-				-c "$NAMED_CONF" \
-				-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+			launch_in_background "$SECONDARY_LOG" "$SECONDARY_PID" "${secondary_cmd[@]}"
 		fi
-		AFL_SECONDARY_STARTED=1
+		if [ -n "$(component_pid "$SECONDARY_PID" "$SECONDARY_SESSION")" ]; then
+			AFL_SECONDARY_STARTED=1
+		fi
+		write_execution_manifest "running" ""
 	fi
 
 	if [ -d "$AFL_OUT_DIR/$HELPER_NAME" ]; then
@@ -1940,33 +1941,17 @@ start_all() {
 	fi
 
 	if [ "$ENABLE_SYMCC" = "1" ]; then
+		# master 已就绪；tmux 不再启动等待 shell 冒充 helper 进程。
 		log "启动 SymCC helper"
+		SYMCC_HELPER_COMMAND="$(quote_cmd "${helper_cmd[@]}")"
 		if tmux_enabled; then
-			launch_shell_in_tmux \
-				"$HELPER_SESSION" \
-				"$HELPER_LOG" \
-				"cd $(printf '%q' "$ROOT_DIR") && while [ ! -f $(printf '%q' "$AFL_OUT_DIR/master/fuzzer_stats") ]; do sleep 1; done && exec $(quote_cmd env "${helper_env[@]}" "$HELPER_BIN" -o "$HELPER_RUN_ROOT" -n "$HELPER_RUN_NAME" -a master -v "${helper_extra[@]}" -t "$helper_target_csv" -- "$SYMCC_TREE/bin/named/named" -g -c "$NAMED_CONF" -A "resolver-afl-symcc:${MUTATOR_ADDR}")"
+			launch_in_tmux "$HELPER_SESSION" "$HELPER_LOG" "${helper_cmd[@]}"
 		else
-			wait_for_master_queue
-			launch_in_background \
-				"$HELPER_LOG" \
-				"$HELPER_PID" \
-				env \
-				"${helper_env[@]}" \
-				"$HELPER_BIN" \
-				-o "$HELPER_RUN_ROOT" \
-				-n "$HELPER_RUN_NAME" \
-				-a master \
-				-v \
-				"${helper_extra[@]}" \
-				-t "$helper_target_csv" \
-				-- \
-				"$SYMCC_TREE/bin/named/named" \
-				-g \
-				-c "$NAMED_CONF" \
-				-A "resolver-afl-symcc:${MUTATOR_ADDR}"
+			launch_in_background "$HELPER_LOG" "$HELPER_PID" "${helper_cmd[@]}"
 		fi
-		SYMCC_HELPER_STARTED=1
+		if [ -n "$(component_pid "$HELPER_PID" "$HELPER_SESSION")" ]; then
+			SYMCC_HELPER_STARTED=1
+		fi
 	else
 		log "ENABLE_SYMCC=0，跳过 SymCC helper 构建/启动"
 	fi
@@ -2116,6 +2101,7 @@ dump_named_cache() {
 run_for_duration() {
 	local duration="${1:-$RUN_DURATION_SEC}"
 
+	validate_producer_random_seed || die "非法 PRODUCER_RANDOM_SEED，未启动 producer"
 	case "$duration" in
 	""|*[!0-9]*)
 		die "run 持续时间必须是正整数秒: $duration"
@@ -2125,8 +2111,10 @@ run_for_duration() {
 
 	cleanup_run_for_duration() {
 		local rc="$?"
-		stop_all >/dev/null 2>&1 || true
-		finish_execution_manifest "failed" "$rc" >/dev/null 2>&1 || true
+		if [ "$EXECUTION_IDENTITY_INITIALIZED" = "1" ]; then
+			stop_all >/dev/null 2>&1 || true
+			finish_execution_manifest "failed" "$rc" >/dev/null 2>&1 || true
+		fi
 	}
 
 	trap cleanup_run_for_duration EXIT
@@ -2146,11 +2134,11 @@ run_for_duration() {
 handle_execution_error() {
 	local rc="$1"
 	trap - ERR
-	if execution_manifest_is_running; then
+	if [ "$EXECUTION_IDENTITY_INITIALIZED" = "1" ] && execution_manifest_is_running; then
 		stop_all >/dev/null 2>&1 || true
 		finish_execution_manifest "failed" "$rc" >/dev/null 2>&1 || true
 	fi
-	return "$rc"
+	exit "$rc"
 }
 
 main() {

@@ -48,7 +48,9 @@ if sample_path is None:
     raise SystemExit('missing input path')
 data = sample_path.read_bytes()
 has_response_dir = bool(os.environ.get('NAMED_RESOLVER_AFL_SYMCC_RESPONSE_TAIL_DIR'))
-if data.startswith(b'DST1'):
+if os.environ.get('TEST_ORACLE_MODE') == 'missing':
+    summary = '原始失败日志：缺少 oracle\\n'
+elif data.startswith(b'DST1'):
     summary = 'ORACLE_SUMMARY parse_ok=1 resolver_fetch_started=1 response_accepted=1 second_query_hit=1 cache_entry_created=1 timeout=0\\n'
 elif data.startswith(b'\\x12\\x34'):
     if has_response_dir:
@@ -68,7 +70,6 @@ path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 PY
 
 printf 'options { directory "__RUNTIME_STATE_DIR__"; };\n' >"$NAMED_CONF_TEMPLATE"
-printf '\xaa\xbb\xcc\xdd' >"$LEGACY_RESPONSE_DIR/resp.bin"
 
 python3 - "$WORKDIR" <<'PY'
 from pathlib import Path
@@ -89,6 +90,7 @@ wire += query + response + post
 (root / 'query.bin').write_bytes(query)
 (root / 'legacy.bin').write_bytes(query)
 (root / 'random.bin').write_bytes(b'\x99\x88\x77\x66\x55')
+(root / 'legacy_responses' / 'resp.bin').write_bytes(response)
 PY
 
 python3 -m tools.dns_diff.cli input-model-eval \
@@ -106,6 +108,8 @@ assert_file_exists "$OUTPUT_DIR/summary.json"
 
 python3 - "$OUTPUT_DIR/summary.tsv" <<'PY'
 import csv
+import hashlib
+import json
 import pathlib
 import sys
 
@@ -120,6 +124,46 @@ if rows["legacy_response_tail"]["response_accept_rate"] != "1.000000":
     raise SystemExit("ASSERT FAIL: legacy_response_tail response_accept_rate 非 1")
 if rows["random_packet"]["parse_accept_rate"] != "0.000000":
     raise SystemExit("ASSERT FAIL: random_packet parse_accept_rate 非 0")
+root = pathlib.Path(sys.argv[1]).parent
+for model in rows:
+    meta = json.loads((root / model / "sample-01/sample.meta.json").read_text())
+    snapshot = pathlib.Path(meta["snapshot_path"])
+    assert meta["sha256"] == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    assert meta["byte_length"] == len(snapshot.read_bytes())
+    assert meta["snapshot_path"] != meta["source_path"]
+    assert "input=" + meta["snapshot_path"] in meta["command"][-1]
+    if model in ("query_only", "legacy_response_tail"):
+        assert meta["input_relation"]["status"] == "verified"
+    if model == "random_packet":
+        assert meta["input_relation"]["status"] == "negative_control"
+        assert meta["input_relation"]["semantic_equivalence_claimed"] is False
+PY
+
+set +e
+TEST_ORACLE_MODE=missing python3 -m tools.dns_diff.cli input-model-eval \
+  --output-dir "$WORKDIR/missing" \
+  --bind9-tree "$BIND9_TREE" \
+  --named-conf-template "$NAMED_CONF_TEMPLATE" \
+  --dst1-input "$WORKDIR/dst1.bin" \
+  --query-only-input "$WORKDIR/query.bin" \
+  --random-input "$WORKDIR/random.bin" \
+  --legacy-input "$WORKDIR/legacy.bin" \
+  --legacy-response-dir "$LEGACY_RESPONSE_DIR" >/dev/null
+status=$?
+set -e
+test "$status" -eq 4
+python3 - "$WORKDIR/missing" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+payload = json.loads((root / "summary.json").read_text())
+assert all(row["parse_accept_rate"] is None for row in payload["rows"])
+rows = list(csv.DictReader((root / "summary.tsv").read_text().splitlines(), delimiter="\t"))
+assert all(row["parse_accept_rate"] == "NA" for row in rows)
+assert (root / "dst1_transcript/sample-01/bind9.stderr").read_text() == "原始失败日志：缺少 oracle\n"
 PY
 
 printf 'PASS: input model eval smoke test passed\n'

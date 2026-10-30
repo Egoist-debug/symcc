@@ -60,7 +60,6 @@ class Track4MetricsAndProvenanceTest(unittest.TestCase):
                 repeat_index=1,
                 started_at="2026-09-10T00:00:00Z",
                 finished_at="2026-09-10T00:01:00Z",
-                is_replay=True,
             )
 
             manifest_path = run_dir / PRODUCER_EXECUTION_MANIFEST_NAME
@@ -84,7 +83,6 @@ class Track4MetricsAndProvenanceTest(unittest.TestCase):
                 repeat_index=2,
                 started_at="2026-09-10T00:02:00Z",
                 finished_at="2026-09-10T00:03:00Z",
-                is_replay=True,
             )
             manifest2 = json.loads((run_dir2 / PRODUCER_EXECUTION_MANIFEST_NAME).read_text(encoding="utf-8"))
             self.assertEqual(

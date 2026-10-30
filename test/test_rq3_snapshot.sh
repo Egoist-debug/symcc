@@ -47,6 +47,47 @@ if variants != ["full_stack", "afl_only", "no_mutator", "no_cache_delta"]:
 payload = json.loads(json_path.read_text(encoding="utf-8"))
 if payload.get("row_count") != 4:
     raise SystemExit(f"ASSERT FAIL: json row_count={payload.get('row_count')!r} != 4")
+assert payload["rows"] == rows
+for row in rows:
+    assert row["total_samples_mean"] == "1.000000"
+    assert row["total_samples_sample_stddev"] == "NA"
+    assert row["total_samples_ci95_lower"] == "NA"
+    assert row["total_samples_ci95_upper"] == "NA"
+PY
+
+python3 - "$SOURCE_TSV" "$WORKDIR/legacy.tsv" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+rows = list(csv.DictReader(Path(sys.argv[1]).read_text().splitlines(), delimiter="\t"))
+for row in rows:
+    row.update(run_count="1", variance_status="insufficient_runs",
+               total_samples_ci95_lower="0.000000", total_samples_ci95_upper="0.000000",
+               total_samples_sample_stddev="0.000000")
+with Path(sys.argv[2]).open("w") as stream:
+    writer = csv.DictWriter(stream, fieldnames=list(rows[0]), delimiter="\t")
+    writer.writeheader()
+    writer.writerows(rows)
+PY
+cp "$WORKDIR/legacy.tsv" "$WORKDIR/legacy.original.tsv"
+python3 -m tools.dns_diff.cli rq3-snapshot \
+  --resolver-variant-summary-tsv "$WORKDIR/legacy.tsv" \
+  --output-dir "$WORKDIR/legacy-out" >/dev/null
+cmp "$WORKDIR/legacy.tsv" "$WORKDIR/legacy.original.tsv"
+python3 - "$WORKDIR/legacy-out" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+rows = list(csv.DictReader((root / "rq3_hybrid_snapshot.tsv").read_text().splitlines(), delimiter="\t"))
+assert rows == json.loads((root / "rq3_hybrid_snapshot.json").read_text())["rows"]
+assert len(rows) == 4
+for row in rows:
+    for field in ("mean", "sample_stddev", "ci95_lower", "ci95_upper"):
+        assert row[f"total_samples_{field}"] == "NA"
 PY
 
 printf 'PASS: rq3 snapshot smoke test passed\n'

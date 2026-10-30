@@ -1,0 +1,32 @@
+{
+  "id": "symcc-paper-completion",
+  "name": "symcc-paper-completion",
+  "title": "SymCC 论文规划与代码实验补全",
+  "description": "核验 DNS 差分混合测试的论文贡献与证据，规划最小代码修复、可复现实验及投稿材料。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "zyh",
+  "assignee": "zyh",
+  "createdAt": "2026-10-30",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "paper",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "用户要求暂停并提交当前未完成检查点；恢复前先读 progress.md 的暂停记录，不得视为第二批已验收。",
+  "meta": {
+    "paused": true,
+    "pause_reason": "user_requested_checkpoint",
+    "resume_step": "2.1",
+    "checkpoint_base_commit": "c696add30c49c909e0d1d361618b71e3b1e0e754",
+    "versioned_task_dir": "docs/trellis/tasks/10-30-symcc-paper-completion"
+  }
+}

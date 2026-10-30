@@ -16,6 +16,10 @@ compile_commands.json
 
 *paper*
 
+# 保留本次 Trellis 任务检查点，不改变其他论文产物的忽略规则。
+!docs/trellis/tasks/10-30-symcc-paper-completion/
+!docs/trellis/tasks/10-30-symcc-paper-completion/**
+
 # AGENTS
 AGENTS.md
 .sisyphus

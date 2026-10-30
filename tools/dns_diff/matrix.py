@@ -14,6 +14,7 @@ from .aggregate import (
     _aggregation_key_signature,
     _extract_metrics,
     _has_missing_comparability_metadata,
+    _missing_metric_fields,
     _normalize_json_payload,
     _shared_aggregation_key,
     _stable_key_fingerprint,
@@ -28,13 +29,13 @@ from .schema import (
     AGGREGATION_KEY_FIELDS,
     BASELINE_COMPARE_KEY_FIELDS,
     CONTRACT_VERSION,
+    QUEUE_SNAPSHOT_DIGEST_ALGORITHM,
     utc_timestamp,
 )
 
 EXIT_USAGE = 2
 PRODUCER_EXECUTION_CONTRACT_NAME = "rq3_producer_execution_manifest"
 PRODUCER_EXECUTION_MANIFEST_NAME = "producer_execution_manifest.json"
-QUEUE_SNAPSHOT_DIGEST_ALGORITHM = "sha256-relative-path-size-content-v1"
 QUEUE_SNAPSHOT_DIR_NAME = "queue_snapshot"
 BASELINE_VARIANT_NAME = "full_stack"
 TOGGLE_ENV_ORDER: Tuple[str, ...] = (
@@ -129,7 +130,7 @@ class VariantAggregate:
     aggregation_key: Optional[Dict[str, Any]]
     baseline_compare_key: Optional[Dict[str, Any]]
     baseline_compare_key_status: str
-    aggregates: Dict[str, Dict[str, float]]
+    aggregates: Dict[str, Dict[str, Optional[float]]]
 
 
 def _require_mapping(value: Any, label: str) -> Dict[str, Any]:
@@ -491,7 +492,7 @@ def _queue_snapshot_digest(path: Path) -> Tuple[str, int, int]:
     for artifact_path in sorted(path.rglob("*")):
         if not artifact_path.is_file():
             continue
-        if artifact_path.name.endswith(".meta.json") or artifact_path.name == "queue_snapshot.meta.json":
+        if artifact_path.name.endswith(".meta.json"):
             continue
         relative_path = artifact_path.relative_to(path).as_posix()
         artifact_size = artifact_path.stat().st_size
@@ -519,14 +520,12 @@ def _write_producer_execution_manifest(
     repeat_index: int,
     started_at: str,
     finished_at: str,
-    is_replay: bool = True,
 ) -> None:
-    """run 成功后记录 producer 执行身份与队列快照，满足 publication-audit 契约。"""
+    """记录 campaign-close 的重放身份，不声明独立 producer 生成。"""
     close_summary = json.loads(
         (run_dir / "campaign_close.summary.json").read_text(encoding="utf-8")
     )
     producer_run_id = close_summary.get("run_id") or f"matrix-run-{run_dir.name}"
-    random_seed = int(hashlib.sha256(producer_run_id.encode("utf-8")).hexdigest()[:16], 16)
 
     snapshot_dir = run_dir / QUEUE_SNAPSHOT_DIR_NAME
     if snapshot_dir.exists():
@@ -558,20 +557,20 @@ def _write_producer_execution_manifest(
         "contract_version": CONTRACT_VERSION,
         "status": "success",
         "exit_code": 0,
-        "execution_mode": "shared_queue_replay" if is_replay else "independent_producer_generation",
+        "execution_mode": "shared_queue_replay",
         "variant_name": variant.variant_name,
         "repeat_index": repeat_index,
         "started_at": started_at,
         "finished_at": finished_at,
         "producer_run_id": producer_run_id,
-        "random_seed": random_seed,
+        "random_seed": None,
         "run_dir": str(run_dir),
         "toggles": dict(variant.env),
         "components": {
             "symcc": {
                 "enabled": symcc_enabled,
-                "started": False if is_replay else symcc_enabled,
-                "note": "共享队列回放，未独立启动 SymCC 生成器进程。" if is_replay else "独立启动 SymCC 生成器进程。",
+                "started": False,
+                "note": "共享队列回放，未独立启动 SymCC 生成器进程。",
             }
         },
         "queue_snapshot": {
@@ -708,12 +707,14 @@ def _aggregate_variant(
         variance_status = "incompatible_aggregation_key"
     elif missing_comparability_metadata:
         variance_status = "missing_comparability_metadata"
+    elif any(_missing_metric_fields(record["summary"]) for record in records):
+        variance_status = "missing_metrics"
     elif len(records) < 2:
         variance_status = "insufficient_runs"
     else:
         variance_status = "ok"
 
-    aggregates: Dict[str, Dict[str, float]] = {}
+    aggregates: Dict[str, Dict[str, Optional[float]]] = {}
     if variance_status == "ok":
         for metric_name in METRIC_NAMES:
             try:
@@ -750,7 +751,7 @@ def _aggregate_variant(
 
 def _format_metric_value(value: Optional[float]) -> str:
     if value is None:
-        return ""
+        return "NA"
     return f"{float(value):.6f}"
 
 
@@ -930,22 +931,11 @@ def _write_variant_summary_tsv(
         for metric_name in METRIC_NAMES:
             stats = aggregate.aggregates.get(metric_name)
             if isinstance(stats, Mapping):
-                row.append(_format_metric_value(float(stats.get("mean", 0.0))))
-                row.append(_format_metric_value(float(stats.get("stddev", 0.0))))
-                row.append(
-                    _format_metric_value(float(stats.get("sample_stddev", 0.0)))
-                )
-                row.append(
-                    _format_metric_value(float(stats.get("standard_error", 0.0)))
-                )
-                row.append(
-                    _format_metric_value(float(stats.get("ci95_lower", 0.0)))
-                )
-                row.append(
-                    _format_metric_value(float(stats.get("ci95_upper", 0.0)))
-                )
+                for field in ("mean", "stddev", "sample_stddev", "standard_error",
+                              "ci95_lower", "ci95_upper"):
+                    row.append(_format_metric_value(stats.get(field)))
             else:
-                row.extend(["", "", "", "", "", ""])
+                row.extend([_format_metric_value(None)] * 6)
         lines.append("\t".join(row))
 
     (output_dir / "variant_summary.tsv").write_text(
@@ -1056,9 +1046,10 @@ def _write_delta_vs_baseline_tsv(
                 and isinstance(baseline_stats, Mapping)
                 and isinstance(variant_stats, Mapping)
             ):
-                baseline_mean = float(baseline_stats.get("mean", 0.0))
-                variant_mean = float(variant_stats.get("mean", 0.0))
-                delta_value = variant_mean - baseline_mean
+                baseline_mean = baseline_stats.get("mean")
+                variant_mean = variant_stats.get("mean")
+                if baseline_mean is not None and variant_mean is not None:
+                    delta_value = variant_mean - baseline_mean
 
             lines.append(
                 "\t".join(

@@ -84,6 +84,7 @@ PY
 }
 
 SCENARIO_WORK="$WORKDIR/work"
+export BIND9_WORK_DIR="$SCENARIO_WORK"
 STABLE_INPUT_DIR="$SCENARIO_WORK/stable_transcript_corpus"
 SOURCE_DIR="$SCENARIO_WORK/transcript_corpus"
 RESPONSE_DIR="$SCENARIO_WORK/response_corpus"
@@ -137,5 +138,54 @@ grep -Fq -- 'reused_filtered_corpus' "$STATUS_OUT" || {
 	cat "$STATUS_OUT" >&2
 	exit 1
 }
+
+# 显式 seed 保持原值；执行身份独立生成，不能拿内容摘要代替。
+for seed in 0 7 0007 2147483648 4294967295 9223372036854775807; do
+	env WORK_DIR="$SCENARIO_WORK" PRODUCER_RANDOM_SEED="$seed" \
+		bash -c '
+			source "$1"
+			initialize_execution_identity
+			[ "$PRODUCER_RANDOM_SEED" = "$2" ] || {
+				printf "ASSERT FAIL: 显式 seed %s 被覆盖为 %s\n" "$2" "$PRODUCER_RANDOM_SEED" >&2
+				exit 1
+			}
+			[[ "$PRODUCER_RUN_ID" =~ ^[0-9a-f]{32}$ ]]
+		' _ "$NAMED_WRAPPER" "$seed"
+done
+
+env -u PRODUCER_RANDOM_SEED WORK_DIR="$SCENARIO_WORK" bash -c '
+	source "$1"
+	initialize_execution_identity
+	python3 - "$PRODUCER_RANDOM_SEED" "$PRODUCER_RUN_ID" <<'"'"'PY'"'"'
+import sys
+import uuid
+
+assert 0 <= int(sys.argv[1]) <= 2**63 - 1
+uuid.UUID(hex=sys.argv[2])
+PY
+' _ "$NAMED_WRAPPER"
+
+# 非法输入必须在 prepare/stop/cleanup 和 manifest 写入之前拒绝。
+for seed in -1 +1 1.5 1e2 0x10 ' 7' '7 ' $'7\n' nope 9223372036854775808 18446744073709551616; do
+	for action in initialize_execution_identity start_all run_for_duration; do
+		printf '旧 manifest 不可改写\n' >"$SCENARIO_WORK/producer_execution_manifest.json"
+		cp "$SCENARIO_WORK/producer_execution_manifest.json" "$WORKDIR/manifest.before"
+		rm -f "$SCENARIO_WORK/unexpected-action"
+		if env WORK_DIR="$SCENARIO_WORK" PRODUCER_RANDOM_SEED="$seed" \
+			bash -c '
+				source "$1"
+				prepare_all() { touch "$WORK_DIR/unexpected-action"; exit 91; }
+				stop_all() { touch "$WORK_DIR/unexpected-action"; }
+				cleanup_output() { touch "$WORK_DIR/unexpected-action"; }
+				"$2"
+			' _ "$NAMED_WRAPPER" "$action" >"$WORKDIR/invalid.log" 2>&1; then
+			printf 'ASSERT FAIL: %s 接受非法 seed %q\n' "$action" "$seed" >&2
+			exit 1
+		fi
+		grep -q 'PRODUCER_RANDOM_SEED' "$WORKDIR/invalid.log"
+		[ ! -e "$SCENARIO_WORK/unexpected-action" ]
+		cmp "$WORKDIR/manifest.before" "$SCENARIO_WORK/producer_execution_manifest.json"
+	done
+done
 
 printf 'PASS: named seed provenance regression test passed\n'

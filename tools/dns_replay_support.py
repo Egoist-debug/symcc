@@ -1,6 +1,49 @@
 """重放 oracle 的报文边界与注入事实；接纳不等于投毒或真实缓存证据。"""
 import struct
 import threading
+from pathlib import Path
+
+
+def parse_transcript(path: Path):
+    data = path.read_bytes()
+    if len(data) < 8 or data[:4] != b"DST1":
+        raise ValueError("invalid DST1 transcript header")
+    response_count = data[4]
+    if response_count > 16:
+        raise ValueError(f"unsupported response count: {response_count}")
+    if len(data) >= 10 and data[5] == 0:
+        query_len = int.from_bytes(data[6:8], "little")
+        post_len = int.from_bytes(data[8:10], "little")
+        offset = 10
+    elif data[5] == 2:
+        query_len = int.from_bytes(data[6:8], "little")
+        post_len = len(data)
+        offset = 8
+    else:
+        raise ValueError(f"unsupported transcript header flag: {data[5]}")
+    lengths = []
+    for _ in range(response_count):
+        if offset + 2 > len(data):
+            raise ValueError("truncated response length table")
+        lengths.append(int.from_bytes(data[offset : offset + 2], "little"))
+        offset += 2
+    if offset + query_len > len(data):
+        raise ValueError("truncated client query")
+    client_query = data[offset : offset + query_len]
+    offset += query_len
+    responses = []
+    for length in lengths:
+        if offset + length > len(data):
+            raise ValueError("truncated forged response")
+        responses.append(bytearray(data[offset : offset + length]))
+        offset += length
+    if post_len == len(data):
+        post_check = data[offset:]
+    else:
+        if offset + post_len != len(data):
+            raise ValueError("truncated post-check query")
+        post_check = data[offset : offset + post_len]
+    return client_query, responses, post_check
 
 
 def _name(packet, offset):

@@ -40,17 +40,6 @@ def _get_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, int):
-        return value if value >= 0 else default
-    if isinstance(value, float) and value.is_integer():
-        parsed = int(value)
-        return parsed if parsed >= 0 else default
-    return default
-
-
 def _coerce_non_negative_int_or_none(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
@@ -128,36 +117,24 @@ def _extract_metrics(summary: Mapping[str, Any]) -> Dict[str, float]:
         if isinstance(nested, Mapping):
             analysis_state = nested
 
-    oracle_audit_candidate_count = _coerce_non_negative_int_or_none(
-        summary.get("oracle_audit_candidate_count")
-    )
-    semantic_diff_count = _coerce_non_negative_int_or_none(
-        summary.get("semantic_diff_count")
-    )
-
-    return {
-        "total_samples": float(_coerce_non_negative_int(summary.get("total_samples"))),
-        "included_samples": float(
-            _coerce_non_negative_int(analysis_state.get("included"))
-        ),
-        "excluded_samples": float(
-            _coerce_non_negative_int(analysis_state.get("excluded"))
-        ),
-        "unknown_samples": float(
-            _coerce_non_negative_int(analysis_state.get("unknown"))
-        ),
-        "needs_review_count": float(
-            _coerce_non_negative_int(summary.get("needs_review_count"))
-        ),
-        "cluster_count": float(_coerce_non_negative_int(summary.get("cluster_count"))),
-        "repro_rate": _coerce_float(summary.get("repro_rate"), default=0.0),
-        "oracle_audit_candidate_count": float(oracle_audit_candidate_count)
-        if oracle_audit_candidate_count is not None
-        else math.nan,
-        "semantic_diff_count": float(semantic_diff_count)
-        if semantic_diff_count is not None
-        else math.nan,
+    raw = {
+        **{name: summary.get(name) for name in METRIC_NAMES},
+        **{f"{state}_samples": analysis_state.get(state)
+           for state in ("included", "excluded", "unknown")},
     }
+    metrics = {}
+    for name in METRIC_NAMES:
+        if name == "repro_rate":
+            value = _coerce_float(raw[name], default=math.nan)
+            metrics[name] = value if math.isfinite(value) and 0 <= value <= 1 else math.nan
+        else:
+            value = _coerce_non_negative_int_or_none(raw[name])
+            metrics[name] = float(value) if value is not None else math.nan
+    return metrics
+
+
+def _missing_metric_fields(summary: Mapping[str, Any]) -> List[str]:
+    return [name for name, value in _extract_metrics(summary).items() if not math.isfinite(value)]
 
 
 def _stable_key_fingerprint(payload: Optional[Mapping[str, Any]]) -> str:
@@ -280,7 +257,7 @@ def _shared_aggregation_key(
     return _normalize_json_payload(comparability.get("aggregation_key"))
 
 
-def _compute_metric_statistics(values: Sequence[float]) -> Dict[str, float]:
+def _compute_metric_statistics(values: Sequence[float]) -> Dict[str, Optional[float]]:
     try:
         return compute_metric_statistics(values)
     except StatisticsError as exc:
@@ -291,7 +268,7 @@ def _write_variance_tsv(
     output_dir: Path,
     *,
     variance_status: str,
-    aggregates: Mapping[str, Mapping[str, float]],
+    aggregates: Mapping[str, Mapping[str, Optional[float]]],
 ) -> None:
     lines = [
         "metric\tcount\tmean\tmin\tmax\tstddev\tsample_stddev"
@@ -302,22 +279,13 @@ def _write_variance_tsv(
             stats = aggregates.get(metric_name)
             if not isinstance(stats, Mapping):
                 continue
-            lines.append(
-                "\t".join(
-                    [
-                        metric_name,
-                        str(int(_coerce_float(stats.get("count")))),
-                        f"{_coerce_float(stats.get('mean')):.6f}",
-                        f"{_coerce_float(stats.get('min')):.6f}",
-                        f"{_coerce_float(stats.get('max')):.6f}",
-                        f"{_coerce_float(stats.get('stddev')):.6f}",
-                        f"{_coerce_float(stats.get('sample_stddev')):.6f}",
-                        f"{_coerce_float(stats.get('standard_error')):.6f}",
-                        f"{_coerce_float(stats.get('ci95_lower')):.6f}",
-                        f"{_coerce_float(stats.get('ci95_upper')):.6f}",
-                    ]
-                )
-            )
+            row = [metric_name]
+            for field in ("count", "mean", "min", "max", "stddev", "sample_stddev",
+                          "standard_error", "ci95_lower", "ci95_upper"):
+                value = stats.get(field)
+                row.append("NA" if value is None else
+                           str(int(value)) if field == "count" else f"{value:.6f}")
+            lines.append("\t".join(row))
     else:
         lines.append(f"__status__\t{variance_status}\t-\t-\t-")
 
@@ -332,7 +300,7 @@ def _build_summary_payload(
     variance_status: str,
     mixed_aggregation_key: bool,
     shared_aggregation_key: Optional[Mapping[str, Any]],
-    aggregates: Mapping[str, Mapping[str, float]],
+    aggregates: Mapping[str, Mapping[str, Optional[float]]],
 ) -> Dict[str, Any]:
     return {
         "run_count": run_count,
@@ -371,7 +339,7 @@ def run_campaign_aggregate(
     run_count = len(records)
     shared_key = _shared_aggregation_key(records)
 
-    aggregates: Dict[str, Dict[str, float]] = {}
+    aggregates: Dict[str, Dict[str, Optional[float]]] = {}
     missing_comparability_metadata = any(
         _has_missing_comparability_metadata(record) for record in records
     )
@@ -384,6 +352,10 @@ def run_campaign_aggregate(
         for run_id, missing_fields in missing_canonical_metrics.items()
         if missing_fields
     }
+    missing_metrics = {
+        record["run_id"]: fields for record in records
+        if (fields := _missing_metric_fields(record["summary"]))
+    }
 
     if mixed_aggregation_key:
         variance_status = "incompatible_aggregation_key"
@@ -391,6 +363,8 @@ def run_campaign_aggregate(
         variance_status = "missing_comparability_metadata"
     elif missing_canonical_metrics:
         variance_status = "missing_canonical_metrics"
+    elif missing_metrics:
+        variance_status = "missing_metrics"
     elif run_count < 2:
         variance_status = "insufficient_runs"
     else:
@@ -416,6 +390,7 @@ def run_campaign_aggregate(
         shared_aggregation_key=shared_key,
         aggregates=aggregates,
     )
+    summary_payload["missing_metrics"] = missing_metrics
     (aggregate_dir / "summary.json").write_text(
         json.dumps(summary_payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -436,6 +411,10 @@ def run_campaign_aggregate(
         raise CampaignAggregateError(
             "检测到 run summary 缺失 canonical 指标字段，已写入 run_matrix.tsv 并拒绝聚合: "
             f"{missing_details}"
+        )
+    if missing_metrics:
+        raise CampaignAggregateError(
+            f"检测到 run summary 缺失或非法统计指标，已写入 run_matrix.tsv 并拒绝聚合: {missing_metrics}"
         )
 
     return 0

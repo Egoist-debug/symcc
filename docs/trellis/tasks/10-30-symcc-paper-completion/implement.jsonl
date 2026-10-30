@@ -1,0 +1,8 @@
+{"file": "symcc/docs/trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "DNS 输入、符号链路、语义比较和真实执行来源的跨层验收要求"}
+{"file": "symcc/docs/trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "修改共享校验或跨语言投影前核对既有 owner，避免重复实现"}
+{"file": "symcc/docs/trellis/spec/backend/dns-evidence.md", "reason": "续接时联动缓存审计、oracle 镜像与注入正负例，避免遗漏实际消费者"}
+{"file": "symcc/docs/DNSPoisonEvidenceContract.md", "reason": "保留状态、比较键、失败、统计和旧产物兼容的权威语义"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/baseline.md", "reason": "真实仓库、提交、环境、版本和本轮授权边界"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/code-gaps.md", "reason": "首批三项已核验根因、调用方、已有修复和最小回归"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/experiment-gaps.md", "reason": "区分真实生成与重放、历史摘要规则及不可复用的统计"}
+{"file": "symcc/docs/trellis/tasks/10-30-symcc-paper-completion/research/second-batch-symbolic.md", "reason": "第二批现有真实工具链与有界符号求解/具体执行/队列导入的验证入口及限制"}

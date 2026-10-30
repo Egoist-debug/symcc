@@ -13,7 +13,8 @@ INCOMPLETE_KEY_OUT="$WORKDIR/incomplete-key"
 INVALID_KEY_VALUE_OUT="$WORKDIR/invalid-key-value"
 INCONSISTENT_KEY_OUT="$WORKDIR/inconsistent-key"
 EMPTY_CASE_OUT="$WORKDIR/empty-case"
-FIXED_QUEUE_OUT="$WORKDIR/fixed-queue"
+SAME_CONTENT_OUT="$WORKDIR/same-content"
+REPLAY_OUT="$WORKDIR/replay"
 MISSING_PRODUCER_OUT="$WORKDIR/missing-producer"
 PLACEHOLDER_REVIEWER_OUT="$WORKDIR/placeholder-reviewer"
 HIGHER_THRESHOLD_OUT="$WORKDIR/higher-threshold"
@@ -53,7 +54,11 @@ import pathlib
 import sys
 
 from tools.dns_diff.aggregate import METRIC_NAMES, _extract_metrics
-from tools.dns_diff.matrix import EXPECTED_VARIANT_ENVS, EXPECTED_VARIANT_ORDER
+from tools.dns_diff.matrix import (
+    EXPECTED_VARIANT_ENVS,
+    EXPECTED_VARIANT_ORDER,
+    _queue_snapshot_digest as manifest_queue_snapshot_digest,
+)
 from tools.dns_diff.publication_audit import (
     QUEUE_SNAPSHOT_DIGEST_ALGORITHM,
     _queue_snapshot_digest,
@@ -61,27 +66,6 @@ from tools.dns_diff.publication_audit import (
 from tools.dns_diff.statistics import compute_metric_statistics
 
 root = pathlib.Path(sys.argv[1]).resolve()
-
-
-def manifest_queue_snapshot_digest(path: pathlib.Path):
-    """模拟 producer_execution_manifest 写入端的固定摘要算法。"""
-    digest = hashlib.sha256()
-    file_count = 0
-    size_bytes = 0
-    for artifact_path in sorted(path.rglob("*")):
-        if not artifact_path.is_file():
-            continue
-        relative_path = artifact_path.relative_to(path).as_posix()
-        size = artifact_path.stat().st_size
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(size).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(artifact_path.read_bytes())
-        digest.update(b"\0")
-        file_count += 1
-        size_bytes += size
-    return digest.hexdigest(), file_count, size_bytes
 
 
 summary_dir = root / "_summary"
@@ -262,6 +246,10 @@ for variant_index, variant_name in enumerate(EXPECTED_VARIANT_ORDER):
             queue_snapshot_dir / f"id:{variant_name},{repeat_index:06d}",
             f"{variant_name}-{repeat_index}\n",
         )
+        write_json(
+            queue_snapshot_dir / "queue_snapshot.meta.json",
+            {"producer_run_id": f"{variant_name}-producer-{repeat_index}"},
+        )
         queue_sha256, queue_file_count, queue_size_bytes = _queue_snapshot_digest(
             queue_snapshot_dir
         )
@@ -284,17 +272,33 @@ for variant_index, variant_name in enumerate(EXPECTED_VARIANT_ORDER):
                 "contract_version": 1,
                 "status": "success",
                 "exit_code": 0,
+                "execution_mode": "independent_producer_generation",
                 "variant_name": variant_name,
                 "repeat_index": repeat_index,
                 "producer_run_id": f"{variant_name}-producer-{repeat_index}",
                 "random_seed": f"{variant_index + 1}{repeat_index:02d}",
                 "started_at": "2026-08-10T00:00:00Z",
                 "finished_at": "2026-08-10T00:01:00Z",
+                "run_dir": str(run_dir),
                 "toggles": EXPECTED_VARIANT_ENVS[variant_name],
                 "components": {
+                    "afl_master": {
+                        "enabled": True,
+                        "started": True,
+                        "pid": 100,
+                        "command_summary": f"afl-fuzz -M master -s {variant_index + 1}{repeat_index:02d}",
+                    },
+                    "afl_secondary": {
+                        "enabled": False,
+                        "started": False,
+                        "pid": None,
+                        "command_summary": None,
+                    },
                     "symcc": {
                         "enabled": EXPECTED_VARIANT_ENVS[variant_name]["ENABLE_SYMCC"] == "1",
                         "started": EXPECTED_VARIANT_ENVS[variant_name]["ENABLE_SYMCC"] == "1",
+                        "pid": 101 if EXPECTED_VARIANT_ENVS[variant_name]["ENABLE_SYMCC"] == "1" else None,
+                        "command_summary": "symcc_fuzzing_helper -a master" if EXPECTED_VARIANT_ENVS[variant_name]["ENABLE_SYMCC"] == "1" else None,
                     }
                 },
                 "queue_snapshot": {
@@ -746,7 +750,7 @@ cp -a "$SECOND_QUEUE_SNAPSHOT" "$WORKDIR/second-queue-snapshot.original"
 rm -rf "$SECOND_QUEUE_SNAPSHOT"
 mkdir -p "$SECOND_QUEUE_SNAPSHOT"
 cp -a "$FIRST_QUEUE_SNAPSHOT/." "$SECOND_QUEUE_SNAPSHOT/"
-python3 - "$SECOND_PRODUCER_MANIFEST_PATH" "$SECOND_QUEUE_SNAPSHOT" <<'PY'
+python3 - "$SECOND_PRODUCER_MANIFEST_PATH" "$SECOND_QUEUE_SNAPSHOT" "$PRODUCER_MANIFEST_PATH" <<'PY'
 import json
 import pathlib
 import sys
@@ -760,19 +764,36 @@ sha256, file_count, size_bytes = _queue_snapshot_digest(snapshot_path)
 payload["queue_snapshot"].update(
     {"sha256": sha256, "file_count": file_count, "size_bytes": size_bytes}
 )
+first = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+payload["queue_snapshot"]["snapshot_id"] = first["queue_snapshot"]["snapshot_id"]
 manifest_path.write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
 PY
+# 独立执行证据不变，输出内容和 snapshot_id 相同不构成拒绝理由。
+python3 -m tools.dns_diff.cli publication-audit \
+	--matrix-root "$MATRIX_ROOT" \
+	--output-dir "$SAME_CONTENT_OUT" >/dev/null
+python3 - "$SECOND_PRODUCER_MANIFEST_PATH" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["execution_mode"] = "shared_queue_replay"
+payload["components"]["symcc"]["started"] = False
+path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
 if python3 -m tools.dns_diff.cli publication-audit \
 	--matrix-root "$MATRIX_ROOT" \
-	--output-dir "$FIXED_QUEUE_OUT" >/dev/null 2>"$WORKDIR/fixed-queue.stderr"; then
-	printf 'ASSERT FAIL: 固定 queue 被多个 run 复用时应返回非零\n' >&2
+	--output-dir "$REPLAY_OUT" >/dev/null 2>"$WORKDIR/replay.stderr"; then
+	printf 'ASSERT FAIL: 共享队列 replay 不能取得正式生成资格\n' >&2
 	exit 1
 fi
 assert_audit_issue \
-	"$FIXED_QUEUE_OUT/publication_readiness.json" \
-	"duplicate_queue_snapshot"
+	"$REPLAY_OUT/publication_readiness.json" \
+	"invalid_producer_execution_mode"
 cp "$WORKDIR/second-producer-manifest.original.json" "$SECOND_PRODUCER_MANIFEST_PATH"
 rm -rf "$SECOND_QUEUE_SNAPSHOT"
 mv "$WORKDIR/second-queue-snapshot.original" "$SECOND_QUEUE_SNAPSHOT"
